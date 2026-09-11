@@ -8,7 +8,7 @@
 
 use crate::arena::Arena;
 use crate::error::GeometryError;
-use crate::geometry::{Curve3, Point3, SamplingConfig};
+use crate::geometry::{Curve3, Point3, Poly3Profile, SamplingConfig};
 use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
 use crate::topology::{
@@ -123,6 +123,9 @@ pub struct Road {
     pub link: RoadLink,
     pub road_type: RoadType,
     pub speed_limit: Option<SpeedLimit>,
+    /// Roll of the road surface about its reference line, radians against horizontal
+    /// station. Zero everywhere for a road that is flat across.
+    pub superelevation: Poly3Profile,
 }
 
 impl Road {

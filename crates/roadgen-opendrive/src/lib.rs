@@ -53,10 +53,13 @@ use opendrive::road::geometry::arc::Arc as OdArc;
 use opendrive::road::geometry::geometry_type::GeometryType;
 use opendrive::road::geometry::line::Line as OdLine;
 use opendrive::road::geometry::plan_view::PlanView;
+use opendrive::road::geometry::spiral::Spiral as OdSpiral;
 use opendrive::road::geometry::Geometry;
 use opendrive::road::link::Link;
 use opendrive::road::predecessor_successor::PredecessorSuccessor;
 use opendrive::road::profile::elevation::Elevation;
+use opendrive::road::profile::lateral_profile::LateralProfile;
+use opendrive::road::profile::super_elevation::SuperElevation;
 use opendrive::road::profile::ElevationProfile;
 use opendrive::road::road_type::RoadType as OdRoadType;
 use opendrive::road::road_type_e::RoadTypeE;
@@ -70,7 +73,7 @@ use uom::si::f64::{Angle, Curvature, Length};
 use uom::si::length::meter;
 use vec1::Vec1;
 
-use roadgen_core::geometry::{Curve3, Sample};
+use roadgen_core::geometry::{Curve3, Point3, Sample};
 use roadgen_core::id::{JunctionId, LaneId, RoadId};
 use roadgen_core::map::{Lane, Map, Projection, Road, TrafficHandedness};
 use roadgen_core::semantics::{LaneType, MarkingColor, RoadMarking, RoadType};
@@ -315,7 +318,7 @@ impl<'a> Exporter<'a> {
             }],
             plan_view: self.plan_view(road, &samples)?,
             elevation_profile: Some(elevation_profile(&samples)),
-            lateral_profile: None,
+            lateral_profile: self.lateral_profile(road),
             lanes: self.lanes(road)?,
             objects: None,
             signals: None,
@@ -331,39 +334,75 @@ impl<'a> Exporter<'a> {
     /// chain of straight segments the IR would sample it into, so that the OpenDRIVE
     /// file and the Lanelet2 file describe the same vertices.
     fn plan_view(&self, road: &Road, samples: &[Sample]) -> Result<PlanView, ExportError> {
-        let geometry = match &road.reference_line {
-            Curve3::Line(_) => {
-                let first = samples.first().expect("a curve samples both ends");
-                vec![Geometry {
-                    hdg: Angle::new::<radian>(first.tangent.heading()),
-                    length: Length::new::<meter>(road.horizontal_length()?),
-                    s: Length::new::<meter>(0.0),
-                    x: Length::new::<meter>(first.point.x),
-                    y: Length::new::<meter>(first.point.y),
-                    r#type: GeometryType::Line(OdLine {}),
-                    additional_data: AdditionalData::default(),
-                }]
-            }
-            Curve3::Arc(_) => {
-                let first = samples.first().expect("a curve samples both ends");
-                let last = samples.last().expect("a curve samples both ends");
-                // Curvature is the turn per metre of plan-view arc length, which is
-                // exactly the heading change over the sampled span.
-                let turn = last.tangent.heading() - first.tangent.heading();
-                let turn = (turn + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
-                    - std::f64::consts::PI;
-                let length = road.horizontal_length()?;
-                vec![Geometry {
-                    hdg: Angle::new::<radian>(first.tangent.heading()),
-                    length: Length::new::<meter>(length),
-                    s: Length::new::<meter>(0.0),
-                    x: Length::new::<meter>(first.point.x),
-                    y: Length::new::<meter>(first.point.y),
-                    r#type: GeometryType::Arc(OdArc {
-                        curvature: Curvature::new::<radian_per_meter>(turn / length),
-                    }),
-                    additional_data: AdditionalData::default(),
-                }]
+        let geometry = self.geometry_entries(&road.reference_line, 0.0, samples)?;
+        Ok(PlanView {
+            geometry: Vec1::try_from_vec(geometry)
+                .map_err(|_| ExportError::Empty("a road has no plan-view geometry".into()))?,
+            additional_data: AdditionalData::default(),
+        })
+    }
+
+    /// One `<geometry>` entry per piece of the reference line, starting at `offset`.
+    ///
+    /// A line, an arc and a clothoid each survive as themselves — OpenDRIVE has an
+    /// element for all three, so nothing is approximated. A composite recurses, one
+    /// entry per piece. Anything else is written as the chain of straight segments
+    /// the IR would sample it into, so that the OpenDRIVE file and the Lanelet2 file
+    /// describe the same vertices.
+    fn geometry_entries(
+        &self,
+        curve: &Curve3,
+        offset: f64,
+        samples: &[Sample],
+    ) -> Result<Vec<Geometry>, ExportError> {
+        let first = samples.first().expect("a curve samples both ends");
+        let entry =
+            |station: f64, point: Point3, heading: f64, length: f64, kind: GeometryType| Geometry {
+                hdg: Angle::new::<radian>(heading),
+                length: Length::new::<meter>(length),
+                s: Length::new::<meter>(station),
+                x: Length::new::<meter>(point.x),
+                y: Length::new::<meter>(point.y),
+                r#type: kind,
+                additional_data: AdditionalData::default(),
+            };
+
+        Ok(match curve {
+            Curve3::Line(line) => vec![entry(
+                offset,
+                line.start(),
+                first.tangent.heading(),
+                curve.horizontal_length()?,
+                GeometryType::Line(OdLine {}),
+            )],
+            Curve3::Arc(arc) => vec![entry(
+                offset,
+                arc.start(),
+                arc.heading(),
+                arc.horizontal_length(),
+                GeometryType::Arc(OdArc {
+                    curvature: Curvature::new::<radian_per_meter>(arc.curvature()),
+                }),
+            )],
+            Curve3::Clothoid(clothoid) => vec![entry(
+                offset,
+                clothoid.start(),
+                clothoid.heading(),
+                clothoid.horizontal_length(),
+                GeometryType::Spiral(OdSpiral {
+                    curvature_start: Curvature::new::<radian_per_meter>(clothoid.curvature_start()),
+                    curvature_end: Curvature::new::<radian_per_meter>(clothoid.curvature_end()),
+                }),
+            )],
+            Curve3::Composite(segments) => {
+                let mut entries = Vec::with_capacity(segments.len());
+                let mut station = offset;
+                for segment in segments {
+                    let segment_samples = segment.samples(self.map.metadata.sampling)?;
+                    entries.extend(self.geometry_entries(segment, station, &segment_samples)?);
+                    station += segment.horizontal_length()?;
+                }
+                entries
             }
             _ => samples
                 .windows(2)
@@ -373,21 +412,40 @@ impl<'a> Exporter<'a> {
                     // the vertex tangent: the segment has to end where the next one
                     // starts.
                     let heading = (next.point.y - here.point.y).atan2(next.point.x - here.point.x);
-                    Geometry {
-                        hdg: Angle::new::<radian>(heading),
-                        length: Length::new::<meter>(next.station - here.station),
-                        s: Length::new::<meter>(here.station),
-                        x: Length::new::<meter>(here.point.x),
-                        y: Length::new::<meter>(here.point.y),
-                        r#type: GeometryType::Line(OdLine {}),
-                        additional_data: AdditionalData::default(),
-                    }
+                    entry(
+                        offset + here.station,
+                        here.point,
+                        heading,
+                        next.station - here.station,
+                        GeometryType::Line(OdLine {}),
+                    )
                 })
                 .collect(),
-        };
-        Ok(PlanView {
-            geometry: Vec1::try_from_vec(geometry)
-                .map_err(|_| ExportError::Empty("a road has no plan-view geometry".into()))?,
+        })
+    }
+
+    /// The road's `<lateralProfile>`, which is where superelevation goes.
+    ///
+    /// The IR holds the roll as one profile against station; OpenDRIVE writes the
+    /// same piecewise cubic, so this is a rename rather than a computation.
+    fn lateral_profile(&self, road: &Road) -> Option<LateralProfile> {
+        if road.superelevation.is_zero() {
+            return None;
+        }
+        Some(LateralProfile {
+            super_elevation: road
+                .superelevation
+                .pieces()
+                .iter()
+                .map(|piece| SuperElevation {
+                    a: piece.a,
+                    b: piece.b,
+                    c: piece.c,
+                    d: piece.d,
+                    s: piece.station,
+                })
+                .collect(),
+            shape: Vec::new(),
             additional_data: AdditionalData::default(),
         })
     }

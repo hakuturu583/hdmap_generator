@@ -118,6 +118,8 @@ fn both_formats_carry_the_same_movements() {
         ("merge", scenarios::merge()),
         ("crossroads", scenarios::crossroads()),
         ("graded", scenarios::graded_road()),
+        ("spiral", scenarios::spiral_transition_road()),
+        ("banked", scenarios::banked_curve()),
     ] {
         // Lanelet2 has no successor tag: the routing graph rediscovers connectivity
         // from the geometry alone, so this is a real test of the export and not a
@@ -191,6 +193,10 @@ fn both_formats_put_the_lanes_in_the_same_place() {
         ("split", scenarios::split()),
         ("merge", scenarios::merge()),
         ("crossroads", scenarios::crossroads()),
+        // A transition curve and a banked cross-section are tangent-continuous too,
+        // so they hold to the same bound.
+        ("spiral", scenarios::spiral_transition_road()),
+        ("banked", scenarios::banked_curve()),
     ] {
         let worst = largest_centerline_disagreement(&map);
         assert!(

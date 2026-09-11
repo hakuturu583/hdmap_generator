@@ -12,7 +12,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use roadgen_core::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
-use roadgen_core::geometry::{Curve3, Point3, SamplingConfig};
+use roadgen_core::geometry::{Alignment, Curve3, Point3, Poly3Profile, SamplingConfig};
 use roadgen_core::id::{JunctionId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::{MapMetadata, Projection, TrafficHandedness};
 use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking, RoadType};
@@ -255,6 +255,106 @@ impl PyLaneRef {
     }
 }
 
+/// A road alignment built one piece at a time.
+///
+/// Each call appends a piece starting where the last one ended, pointing and curving
+/// the way it was, so the chain is continuous and smooth without the caller
+/// restating any of it:
+///
+/// ```python
+/// al = roadgen.Alignment(start=(0.0, 0.0, 0.0), heading=0.0)
+/// al.line(80.0, rise=1.0)
+/// al.spiral(60.0, curvature_end=1 / 120, rise=1.0)
+/// al.arc(140.0, curvature=1 / 120, rise=2.0)
+/// al.spiral(60.0, curvature_end=0.0, rise=1.0)
+/// m.add_road(lanes=[...], alignment=al)
+/// ```
+#[pyclass(name = "Alignment", module = "roadgen", skip_from_py_object)]
+pub struct PyAlignment {
+    inner: Alignment,
+}
+
+#[pymethods]
+impl PyAlignment {
+    /// Starts at `start`, pointing `heading` radians counter-clockwise from +x.
+    #[new]
+    #[pyo3(signature = (start, heading = 0.0))]
+    fn new(start: (f64, f64, f64), heading: f64) -> Self {
+        PyAlignment {
+            inner: Alignment::new(point(start), heading),
+        }
+    }
+
+    /// Appends `length` metres of straight, climbing `rise` metres.
+    #[pyo3(signature = (length, rise = 0.0))]
+    fn line(&mut self, length: f64, rise: f64) -> PyResult<()> {
+        self.step(|alignment| alignment.line(length, rise))
+    }
+
+    /// Appends `length` metres of bend at `curvature` per metre, positive turning
+    /// left, climbing `rise` metres.
+    #[pyo3(signature = (length, curvature, rise = 0.0))]
+    fn arc(&mut self, length: f64, curvature: f64, rise: f64) -> PyResult<()> {
+        self.step(|alignment| alignment.arc(length, curvature, rise))
+    }
+
+    /// Appends `length` metres of transition, curving from wherever the alignment
+    /// currently curves to `curvature_end`, and climbing `rise` metres.
+    #[pyo3(signature = (length, curvature_end, rise = 0.0))]
+    fn spiral(&mut self, length: f64, curvature_end: f64, rise: f64) -> PyResult<()> {
+        self.step(|alignment| alignment.spiral(length, curvature_end, rise))
+    }
+
+    /// Where the alignment has reached.
+    #[getter]
+    fn point(&self) -> (f64, f64, f64) {
+        let point = self.inner.point();
+        (point.x, point.y, point.z)
+    }
+
+    /// The heading it is pointing in, radians.
+    #[getter]
+    fn heading(&self) -> f64 {
+        self.inner.heading()
+    }
+
+    /// The curvature it is turning at, per metre.
+    #[getter]
+    fn curvature(&self) -> f64 {
+        self.inner.curvature()
+    }
+
+    fn __repr__(&self) -> String {
+        let point = self.inner.point();
+        format!(
+            "Alignment(at=({:.3}, {:.3}, {:.3}), heading={:.4}, curvature={:.6})",
+            point.x,
+            point.y,
+            point.z,
+            self.inner.heading(),
+            self.inner.curvature()
+        )
+    }
+}
+
+impl PyAlignment {
+    /// Applies one of the Rust builder's steps, which consume and return the
+    /// alignment, to the one held here.
+    fn step(
+        &mut self,
+        advance: impl FnOnce(Alignment) -> Result<Alignment, roadgen_core::GeometryError>,
+    ) -> PyResult<()> {
+        self.inner = advance(self.inner.clone()).map_err(value_error)?;
+        Ok(())
+    }
+
+    /// The curve so far. Cloned, so the alignment can be extended afterwards and
+    /// used for another road.
+    fn curve(&self) -> PyResult<Curve3> {
+        self.inner.clone().finish().map_err(value_error)
+    }
+}
+
 /// A road network under construction.
 ///
 /// The map builds itself the first time something asks for a result — exporting,
@@ -307,15 +407,18 @@ impl PyMap {
         })
     }
 
-    /// Adds a road, either straight (`start` and `end`) or along `points`.
+    /// Adds a road: straight (`start` and `end`), along `points`, or following an
+    /// `alignment` of lines, bends and transitions.
     #[pyo3(signature = (
         lanes,
         start = None,
         end = None,
         points = None,
+        alignment = None,
         name = None,
         type_ = "town",
         speed_limit_kph = None,
+        superelevation = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_road(
@@ -324,20 +427,23 @@ impl PyMap {
         start: Option<(f64, f64, f64)>,
         end: Option<(f64, f64, f64)>,
         points: Option<Vec<(f64, f64, f64)>>,
+        alignment: Option<&PyAlignment>,
         name: Option<String>,
         type_: &str,
         speed_limit_kph: Option<f64>,
+        superelevation: Option<Vec<(f64, f64)>>,
     ) -> PyResult<PyRoad> {
-        let reference_line = match (start, end, points) {
-            (Some(start), Some(end), None) => {
+        let reference_line = match (start, end, points, alignment) {
+            (Some(start), Some(end), None, None) => {
                 Curve3::line(point(start), point(end)).map_err(value_error)?
             }
-            (None, None, Some(points)) => {
+            (None, None, Some(points), None) => {
                 Curve3::polyline(points.into_iter().map(point)).map_err(value_error)?
             }
+            (None, None, None, Some(alignment)) => alignment.curve()?,
             _ => {
                 return Err(PyValueError::new_err(
-                    "pass either start= and end=, or points=, but not both",
+                    "pass exactly one of start= with end=, points=, or alignment=",
                 ))
             }
         };
@@ -354,6 +460,12 @@ impl PyMap {
         }
         if let Some(limit) = speed_limit_kph {
             spec = spec.with_speed_limit(SpeedLimit::from_kph(limit).map_err(value_error)?);
+        }
+        if let Some(points) = superelevation {
+            // `(station, radians)` pairs, straight between them and flat outside —
+            // the shape a caller describes a bank in.
+            spec = spec
+                .with_superelevation(Poly3Profile::piecewise_linear(points).map_err(value_error)?);
         }
         let lane_count = spec.lanes.len();
         let id = self.builder.add_road(spec).map_err(value_error)?;
@@ -679,5 +791,6 @@ fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRoad>()?;
     module.add_class::<PyJunction>()?;
     module.add_class::<PyLaneRef>()?;
+    module.add_class::<PyAlignment>()?;
     Ok(())
 }

@@ -61,6 +61,7 @@ impl UnvalidatedMap {
         check_coordinate_metadata(&self.0, &mut issues);
         check_references(&self.0, &mut issues);
         check_cross_sections(&self.0, &mut issues);
+        check_superelevation(&self.0, &mut issues);
         check_road_links(&self.0, config, &mut issues);
         check_connections(&self.0, config, &mut issues);
         check_junctions(&self.0, &mut issues);
@@ -235,6 +236,32 @@ fn check_cross_sections(map: &Map, issues: &mut Vec<ValidationIssue>) {
                 }),
                 Ok(_) => {}
             }
+        }
+    }
+}
+
+/// Beyond this roll the cross-section stops being a road surface: at a right angle
+/// the lateral axis is vertical and a lane has no width in plan at all.
+const MAX_SUPERELEVATION: f64 = std::f64::consts::FRAC_PI_4;
+
+fn check_superelevation(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for road in map.roads.iter() {
+        if road.superelevation.is_zero() {
+            continue;
+        }
+        // Sampled at the stations the geometry was generated at, which is where the
+        // roll was actually applied.
+        let Ok(samples) = road.reference_line.samples(map.metadata.sampling) else {
+            continue;
+        };
+        let peak = road
+            .superelevation
+            .peak_over(samples.iter().map(|sample| sample.station));
+        if peak >= MAX_SUPERELEVATION {
+            issues.push(ValidationIssue::ImplausibleSuperelevation {
+                road: road.id.clone(),
+                radians: peak,
+            });
         }
     }
 }

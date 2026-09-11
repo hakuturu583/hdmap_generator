@@ -121,6 +121,17 @@ impl Vector3 {
     pub fn normalize(self) -> Result<UnitVector3, GeometryError> {
         UnitVector3::try_new(self)
     }
+
+    /// Turns the vector `angle` radians about `axis`, counter-clockwise seen from
+    /// the axis's positive end.
+    ///
+    /// Rodrigues' formula. This is how a banked road tilts its cross-section: the
+    /// lateral and vertical axes turn about the tangent and nothing else moves.
+    pub fn rotated_about(self, axis: UnitVector3, angle: f64) -> Vector3 {
+        let (sin, cos) = angle.sin_cos();
+        let axis = axis.get();
+        self * cos + axis.cross(self) * sin + axis * (axis.dot(self) * (1.0 - cos))
+    }
 }
 
 impl Add for Vector3 {
@@ -248,6 +259,30 @@ impl Frame3 {
         })
     }
 
+    /// The same frame, rolled `angle` radians about its tangent.
+    ///
+    /// This is superelevation: the road surface tilts, so the lateral axis no longer
+    /// lies in the horizontal plane and a lane offset along it gains height. The sign
+    /// follows OpenDRIVE's `<superelevation>` — a positive angle raises the left-hand
+    /// side, which is a counter-clockwise turn seen along the direction of travel.
+    pub fn banked(&self, angle: f64) -> Frame3 {
+        if angle == 0.0 {
+            return *self;
+        }
+        let turn = |vector: UnitVector3| {
+            UnitVector3::try_new(vector.get().rotated_about(self.tangent, angle))
+                // A rotation preserves length, so the only way this could fail is an
+                // input that was not a unit vector to begin with.
+                .unwrap_or(vector)
+        };
+        Frame3 {
+            origin: self.origin,
+            tangent: self.tangent,
+            left: turn(self.left),
+            up: turn(self.up),
+        }
+    }
+
     /// Projects a global position into this frame: `[along, left, up]`, metres.
     ///
     /// This is the only sanctioned way to get from 3D geometry to a planar
@@ -318,6 +353,38 @@ mod tests {
         let point = Point3::new(11.0, 2.0, 9.0);
         let back = frame.to_global(frame.to_local(point));
         assert!(point.is_close(back, 1e-9));
+    }
+
+    #[test]
+    fn banking_raises_the_left_hand_side() {
+        let tangent = Vector3::new(1.0, 0.0, 0.0).normalize().unwrap();
+        let frame = Frame3::from_tangent(Point3::ORIGIN, tangent).unwrap();
+        let banked = frame.banked(0.1);
+
+        // A positive superelevation lifts the left, the way OpenDRIVE defines it.
+        assert!(banked.left.z() > 0.0);
+        assert!((banked.left.z() - 0.1_f64.sin()).abs() < 1e-12);
+        // The tangent is the axis of the roll, so it does not move.
+        assert_eq!(banked.tangent, frame.tangent);
+        // And the frame is still orthonormal.
+        assert!(banked.left.dot(banked.up).abs() < 1e-12);
+        assert!(banked.left.dot(banked.tangent).abs() < 1e-12);
+
+        // A lane 5 m to the left of a road banked by 0.1 rad sits 5·sin(0.1) higher.
+        let edge = banked.offset(5.0);
+        assert!((edge.z - 5.0 * 0.1_f64.sin()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rotating_about_an_axis_leaves_the_axis_alone() {
+        let axis = Vector3::new(1.0, 2.0, 3.0).normalize().unwrap();
+        let turned = axis.get().rotated_about(axis, 1.2);
+        assert!((turned - axis.get()).norm() < 1e-12);
+
+        // A quarter turn about +z takes +x to +y.
+        let z = Vector3::UP.normalize().unwrap();
+        let turned = Vector3::new(1.0, 0.0, 0.0).rotated_about(z, std::f64::consts::FRAC_PI_2);
+        assert!((turned - Vector3::new(0.0, 1.0, 0.0)).norm() < 1e-12);
     }
 
     #[test]
