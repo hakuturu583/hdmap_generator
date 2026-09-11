@@ -302,7 +302,10 @@ impl<'a> Exporter<'a> {
     fn proj_string(&self) -> String {
         let origin = self.map.metadata.origin;
         match self.map.metadata.projection {
-            Projection::LocalCartesian => format!(
+            // MGRS changes how the *Lanelet2* export reports a node's metric
+            // position; the map's own coordinates are still metres about its origin,
+            // so this file describes them the same way either way.
+            Projection::LocalCartesian | Projection::Mgrs => format!(
                 "+proj=tmerc +lat_0={} +lon_0={} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
                 origin.latitude(),
                 origin.longitude()

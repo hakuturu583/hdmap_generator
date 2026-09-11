@@ -45,9 +45,11 @@ use roadgen_core::topology::Direction;
 use roadgen_core::validation::ValidatedMap;
 
 mod error;
+mod grid;
 mod tags;
 
 pub use error::ExportError;
+pub use grid::MgrsGrid;
 
 /// Positions this close together are the same vertex.
 ///
@@ -58,7 +60,7 @@ const WELD_TOLERANCE: f64 = 1e-6;
 
 /// Builds the Lanelet2 map.
 pub fn to_lanelet_map(map: &ValidatedMap) -> Result<Arc<LaneletMap>, ExportError> {
-    Exporter::new(map).run()
+    Exporter::new(map)?.run()
 }
 
 /// Builds the Lanelet2 map and renders it as OSM XML.
@@ -91,6 +93,27 @@ pub fn write(map: &ValidatedMap, path: impl AsRef<Path>) -> Result<(), ExportErr
 pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = Vec::new();
     let config = map.metadata.sampling;
+
+    // An MGRS map has to fit inside one 100 km square. Checking the corners of every
+    // lane is enough to find a map that does not, and says so before the export turns
+    // it into a file whose far end is in the wrong place.
+    match LocalCoordinates::for_map(map) {
+        Err(error) => problems.push(error.to_string()),
+        Ok(coordinates @ LocalCoordinates::Mgrs { .. }) => {
+            for lane in map.lanes.iter() {
+                for curve in [&lane.left_boundary, &lane.right_boundary] {
+                    for point in [curve.start_point(), curve.end_point()] {
+                        if let Err(error) = coordinates.of(point) {
+                            problems.push(format!("lane {}: {error}", lane.id));
+                            return problems;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(LocalCoordinates::AsIs) => {}
+    }
+
     for connection in map.connections.iter() {
         let (Some(from), Some(to)) = (
             map.lanes.get(&connection.from.lane),
@@ -127,6 +150,10 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
 
 /// The projector that turns the map's metric coordinates back into latitude and
 /// longitude for the OSM file.
+///
+/// An MGRS map is written about its origin like any other, so its latitudes and
+/// longitudes come from the same local projection; what MGRS changes is the metric
+/// position reported alongside them, which [`local_coordinates`] works out per node.
 pub fn projector_for(map: &ValidatedMap) -> Result<Box<dyn Projector>, ExportError> {
     let origin = Origin::new(GpsPoint::new(
         map.metadata.origin.latitude(),
@@ -134,7 +161,7 @@ pub fn projector_for(map: &ValidatedMap) -> Result<Box<dyn Projector>, ExportErr
         map.metadata.origin.altitude(),
     ));
     Ok(match map.metadata.projection {
-        Projection::LocalCartesian => Box::new(LocalCartesian::new(origin)),
+        Projection::LocalCartesian | Projection::Mgrs => Box::new(LocalCartesian::new(origin)),
         Projection::Utm => Box::new(
             Utm::new(origin, true, false)
                 .map_err(|error| ExportError::Projection(error.message().to_owned()))?,
@@ -142,17 +169,66 @@ pub fn projector_for(map: &ValidatedMap) -> Result<Box<dyn Projector>, ExportErr
     })
 }
 
+/// The MGRS square a map's coordinates are reported in, if it uses that projection.
+pub fn grid_for(map: &ValidatedMap) -> Result<Option<MgrsGrid>, ExportError> {
+    match map.metadata.projection {
+        Projection::Mgrs => Ok(Some(MgrsGrid::containing(map.metadata.origin)?)),
+        _ => Ok(None),
+    }
+}
+
+/// How a node's `local_x` and `local_y` are worked out.
+enum LocalCoordinates {
+    /// The map's own metres, which is what every projection but MGRS reports.
+    AsIs,
+    /// Metres within an MGRS square, computed for each node from its own position.
+    Mgrs {
+        grid: MgrsGrid,
+        projector: LocalCartesian,
+    },
+}
+
+impl LocalCoordinates {
+    fn for_map(map: &ValidatedMap) -> Result<Self, ExportError> {
+        match grid_for(map)? {
+            None => Ok(LocalCoordinates::AsIs),
+            Some(grid) => Ok(LocalCoordinates::Mgrs {
+                grid,
+                projector: LocalCartesian::new(Origin::new(GpsPoint::new(
+                    map.metadata.origin.latitude(),
+                    map.metadata.origin.longitude(),
+                    map.metadata.origin.altitude(),
+                ))),
+            }),
+        }
+    }
+
+    fn of(&self, point: Point3) -> Result<(f64, f64), ExportError> {
+        match self {
+            LocalCoordinates::AsIs => Ok((point.x, point.y)),
+            LocalCoordinates::Mgrs { grid, projector } => {
+                let position = projector
+                    .reverse([point.x, point.y, point.z])
+                    .map_err(|error| ExportError::Projection(error.message().to_owned()))?;
+                grid.locate(position)
+            }
+        }
+    }
+}
+
 /// Interns vertices so that coincident positions become one `Point`.
 struct PointWelder {
     interned: HashMap<[i64; 3], Point>,
     next_id: i64,
+    coordinates: LocalCoordinates,
 }
 
 impl PointWelder {
-    fn new(first_id: i64) -> Self {
+    fn new(first_id: i64, coordinates: LocalCoordinates) -> Self {
         PointWelder {
             interned: HashMap::new(),
             next_id: first_id,
+            coordinates,
         }
     }
 
@@ -166,26 +242,29 @@ impl PointWelder {
     }
 
     /// The `Point` for this position, creating it the first time it is seen.
-    fn intern(&mut self, point: Point3) -> Point {
+    fn intern(&mut self, point: Point3) -> Result<Point, ExportError> {
         if let Some(existing) = self.interned.get(&Self::key(point)) {
-            return existing.clone();
+            return Ok(existing.clone());
         }
         let id = self.next_id;
         self.next_id += 1;
         // Autoware's OSM parsers read the metric position from `local_x`/`local_y`
         // rather than re-projecting the latitude and longitude, so both are written.
+        // Which metres those are is the projection's business: the map's own, or the
+        // position within an MGRS square.
+        let (local_x, local_y) = self.coordinates.of(point)?;
         let interned = Point::new(
             id,
             point.x,
             point.y,
             point.z,
             tags::attributes([
-                ("local_x", format!("{:.6}", point.x)),
-                ("local_y", format!("{:.6}", point.y)),
+                ("local_x", format!("{local_x:.6}")),
+                ("local_y", format!("{local_y:.6}")),
             ]),
         );
         self.interned.insert(Self::key(point), interned.clone());
-        interned
+        Ok(interned)
     }
 }
 
@@ -206,18 +285,18 @@ impl<'a> Exporter<'a> {
     /// below 1000 for hand-written maps, so generated ids start above that.
     const FIRST_ID: Id = 1000;
 
-    fn new(map: &'a ValidatedMap) -> Self {
-        Exporter {
+    fn new(map: &'a ValidatedMap) -> Result<Self, ExportError> {
+        Ok(Exporter {
             map: map.as_map(),
             lanelet_map: LaneletMap::new_map(),
-            welder: PointWelder::new(Self::FIRST_ID),
+            welder: PointWelder::new(Self::FIRST_ID, LocalCoordinates::for_map(map)?),
             // Points are numbered from `FIRST_ID` upwards and everything else from a
             // block above them, so that adding a vertex cannot renumber a lanelet.
             next_id: Self::FIRST_ID + 1_000_000,
             boundaries: HashMap::new(),
             lanelets: HashMap::new(),
             objects: HashMap::new(),
-        }
+        })
     }
 
     fn config(&self) -> SamplingConfig {
@@ -296,7 +375,7 @@ impl<'a> Exporter<'a> {
             .points()
             .iter()
             .map(|point| self.welder.intern(*point))
-            .collect();
+            .collect::<Result<Vec<_>, ExportError>>()?;
         let id = self.take_id();
         let line = LineString::new(id, points, attributes);
         self.lanelet_map.add(Primitive::LineString(line.clone()));

@@ -107,10 +107,15 @@ impl Deref for ValidatedMap {
 
 fn check_coordinate_metadata(map: &Map, issues: &mut Vec<ValidationIssue>) {
     let origin = map.metadata.origin;
-    if map.metadata.projection == Projection::Utm && origin.latitude().abs() > 84.0 {
+    // Both UTM and MGRS are built on the transverse Mercator grid, which stops at 84
+    // degrees; beyond it there is no zone to put the map in.
+    if matches!(map.metadata.projection, Projection::Utm | Projection::Mgrs)
+        && origin.latitude().abs() > 84.0
+    {
         issues.push(ValidationIssue::InvalidCoordinateMetadata {
             detail: format!(
-                "UTM is undefined beyond 84 degrees of latitude; the origin is at {}",
+                "{} is undefined beyond 84 degrees of latitude; the origin is at {}",
+                map.metadata.projection.as_str(),
                 origin.latitude()
             ),
         });
