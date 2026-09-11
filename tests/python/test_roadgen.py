@@ -360,3 +360,69 @@ def test_an_absurd_bank_is_refused():
     assert any("banked" in issue for issue in m.issues())
     with pytest.raises(ValueError):
         m.validate()
+
+
+def test_a_lane_can_taper_without_becoming_two_lanes():
+    m = roadgen.Map()
+    m.add_road(
+        start=(0.0, 0.0, 0.0),
+        end=(260.0, 0.0, 0.0),
+        name="layby",
+        lanes=[
+            roadgen.Lane(width=3.5),
+            roadgen.Lane(
+                width=2.0,
+                type_="shoulder",
+                width_profile=[(0.0, 2.0), (60.0, 2.0), (100.0, 5.0), (200.0, 2.0)],
+            ),
+        ],
+    )
+    assert m.format_warnings() == []
+
+    # Still two lanes, and one lane section: a taper is a width, not a new section.
+    assert m.lane_ids() == ["lane/layby/0", "lane/layby/1"]
+    root = ET.fromstring(m.to_opendrive_xml())
+    assert len(root.findall("road/lanes/laneSection")) == 1
+
+    # The shoulder's centreline swings out as it widens and comes back.
+    centre = m.lane_centerline("lane/layby/1")
+    offsets = [abs(point[1]) for point in centre]
+    assert max(offsets) == pytest.approx(6.0, abs=1e-6)
+    assert offsets[0] == pytest.approx(4.5, abs=1e-6)
+    assert offsets[-1] == pytest.approx(4.5, abs=1e-6)
+
+
+def test_a_lane_that_ends_needs_a_new_cross_section():
+    m = roadgen.Map()
+    lanes = lambda n: [roadgen.Lane(width=3.5) for _ in range(n)]
+    road = m.add_road(
+        start=(0.0, 0.0, 0.0),
+        end=(320.0, 0.0, 0.0),
+        name="wide",
+        lanes=lanes(3),
+        cross_sections=[(200.0, lanes(2))],
+    )
+    assert road.lane_count == 5
+    assert m.format_warnings() == []
+
+    # Two lane sections in the document, at the stations asked for.
+    root = ET.fromstring(m.to_opendrive_xml())
+    sections = root.findall("road/lanes/laneSection")
+    assert [float(section.get("s")) for section in sections] == [
+        pytest.approx(0.0),
+        pytest.approx(200.0),
+    ]
+    assert len(sections[0].findall("right/lane")) == 3
+    assert len(sections[1].findall("right/lane")) == 2
+
+    # The lanes that carry on are connected; the one that ends is not.
+    assert m.successors("lane/wide/0") == ["lane/wide/3"]
+    assert m.successors("lane/wide/1") == ["lane/wide/4"]
+    assert m.successors("lane/wide/2") == []
+
+
+def test_a_width_of_zero_is_refused_wherever_it_is_written():
+    with pytest.raises(ValueError, match="greater than zero"):
+        roadgen.Lane(width=3.5, width_profile=[(0.0, 3.5), (100.0, 0.0)])
+    with pytest.raises(ValueError, match="taper"):
+        roadgen.Lane(width=3.5, width_profile=[(0.0, 3.5)], taper="wobbly")

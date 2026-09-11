@@ -19,9 +19,13 @@ class Lane:
         left_marking: str = "solid",
         right_marking: str = "solid",
         marking_color: str = "white",
+        width_profile: Optional[Sequence[tuple[float, float]]] = None,
+        taper: str = "linear",
     ) -> None: ...
     @property
     def width(self) -> float: ...
+    @property
+    def width_profile(self) -> list[tuple[float, float]]: ...
     @property
     def direction(self) -> str: ...
     @property
@@ -91,6 +95,7 @@ class Map:
         type_: str = "town",
         speed_limit_kph: Optional[float] = None,
         superelevation: Optional[Sequence[tuple[float, float]]] = None,
+        cross_sections: Optional[Sequence[tuple[float, Sequence[Lane]]]] = None,
     ) -> Road: ...
     def add_junction(self, name: Optional[str] = None) -> Junction: ...
     def connect(

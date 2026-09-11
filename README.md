@@ -170,6 +170,8 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `add_road(lanes, start=, end=)`, `add_road(lanes, points=)` or `add_road(lanes, alignment=)` | a straight road, one along a polyline, or one following an alignment |
 | `Alignment(start, heading)` then `.line()`, `.arc()`, `.spiral()` | a reference line built piece by piece |
 | `add_road(..., superelevation=[(station, radians), ...])` | banks the cross-section |
+| `Lane(width_profile=[(station, metres), ...], taper=)` | a lane that narrows or widens |
+| `add_road(..., cross_sections=[(station, [lanes]), ...])` | where the *number* of lanes changes |
 | `add_junction(name)` | a junction to route movements through |
 | `connect(a, b, junction=None)` | joins the end of `a` to the start of `b`, pairing lanes |
 | `connect_lanes(from_lane, to_lane, junction=None)` | one specific movement |
@@ -223,6 +225,48 @@ Banking rotates the road local frame about its tangent, so a lane offset gains h
 and keeps its full width across the tilted surface. OpenDRIVE gets the same piecewise
 polynomial in `<lateralProfile><superelevation>`; Lanelet2 has no such concept and
 does not need one, because the roll is already in the heights of its vertices.
+
+## A cross-section that changes
+
+Two different things, with two different answers:
+
+**A lane that narrows or widens** stays one lane. Give it a width profile and the
+boundaries follow:
+
+```python
+shoulder = roadgen.Lane(
+    width=2.0, type_="shoulder",
+    width_profile=[(0.0, 2.0), (60.0, 2.0), (100.0, 5.0), (160.0, 5.0), (200.0, 2.0)],
+    taper="smooth",       # or "linear"
+)
+```
+
+A `WidthProfile` **cannot describe a width that reaches zero**: every knot is a
+`PositiveWidth`, and both tapers are monotone between knots, so the value between two
+positive knots stays between them. That is why there is no free cubic here — an
+OpenDRIVE `<width>` is a cubic in general, and a general cubic can dip below zero
+between its ends. The smooth taper is exactly the cubic that cannot, and it lowers to
+`<width>` with no loss.
+
+**A lane that ends** changes how many lanes the road has, so a new cross-section
+begins there:
+
+```python
+m.add_road(
+    lanes=[left, middle, outer],      # three lanes to begin with
+    cross_sections=[(200.0, [left, middle])],   # two from 200 m on
+    start=..., end=...,
+)
+```
+
+Each cross-section becomes its own `<laneSection>` in OpenDRIVE and its own set of
+lanelets in Lanelet2 — which is what both formats need anyway, since a lanelet has
+exactly two boundaries and cannot gain a neighbour halfway along. The lanes that carry
+on across the boundary are connected automatically; the one that stops is not, so a
+routing graph will not drive off the end of it.
+
+The same machinery lets a junction connector **taper between lanes of different
+widths**, instead of picking one and missing the other.
 
 ## Junctions
 
@@ -311,8 +355,6 @@ python -m pytest tests/python
 
 ## Limitations
 
-- A road has one lane section: lane widths are constant along a road, and a change of
-  cross-section is a new road.
 - Map objects — traffic lights, signs, stop lines, crosswalks — are lowered to
   Lanelet2 only. OpenDRIVE `<signal>` and `<object>` elements are not written yet.
 - Lanelet2 output uses a local-Cartesian or UTM projection about the map's origin.

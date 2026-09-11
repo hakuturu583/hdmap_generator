@@ -10,10 +10,11 @@ use std::collections::HashMap;
 
 use crate::error::{BuildError, GeometryError};
 use crate::geometry::{
-    Bezier3, Curve3, Point3, Poly3Profile, Polyline3, Sample, SamplingConfig, Vector3,
+    Bezier3, Curve3, Point3, Poly3Profile, Polyline3, Sample, SamplingConfig, Taper, Vector3,
+    WidthProfile,
 };
 use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
-use crate::map::{Lane, Map, MapMetadata, Road, TravelGeometry};
+use crate::map::{CrossSection, Lane, Map, MapMetadata, Road, TravelGeometry};
 use crate::semantics::{
     BoundaryMarking, LaneType, MapObject, MapObjectKind, ObjectGeometry, RoadMarking, RoadType,
     TrafficRule,
@@ -28,7 +29,9 @@ use crate::validation::UnvalidatedMap;
 /// One lane of a road's cross-section, as the caller describes it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaneSpec {
-    pub width: PositiveWidth,
+    /// How wide the lane is along its length. A plain [`PositiveWidth`] converts, so
+    /// a lane of constant width reads exactly as it did before profiles existed.
+    pub width: WidthProfile,
     pub direction: Direction,
     pub lane_type: LaneType,
     pub speed_limit: Option<SpeedLimit>,
@@ -40,9 +43,9 @@ pub struct LaneSpec {
 }
 
 impl LaneSpec {
-    pub fn new(width: PositiveWidth, direction: Direction) -> Self {
+    pub fn new(width: impl Into<WidthProfile>, direction: Direction) -> Self {
         LaneSpec {
-            width,
+            width: width.into(),
             direction,
             lane_type: LaneType::Driving,
             speed_limit: None,
@@ -67,6 +70,15 @@ impl LaneSpec {
         self
     }
 
+    /// Gives the lane a width that changes along the road.
+    ///
+    /// Stations are measured along the road's reference line, not from the start of
+    /// the lane's cross-section, so a taper is written where it is on the map.
+    pub fn with_width_profile(mut self, width: WidthProfile) -> Self {
+        self.width = width;
+        self
+    }
+
     pub fn with_markings(mut self, left: BoundaryMarking, right: BoundaryMarking) -> Self {
         self.left_marking = left;
         self.right_marking = right;
@@ -74,12 +86,22 @@ impl LaneSpec {
     }
 }
 
+/// One cross-section of a road, as the caller describes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossSectionSpec {
+    /// Horizontal station along the road where this cross-section takes over.
+    pub station: f64,
+    pub lanes: Vec<LaneSpec>,
+}
+
 /// A road to generate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoadSpec {
     pub name: Option<String>,
     pub reference_line: Curve3,
-    pub lanes: Vec<LaneSpec>,
+    /// The road's cross-sections. A road whose lane *count* changes partway has more
+    /// than one; a lane that merely tapers needs only a width profile.
+    pub cross_sections: Vec<CrossSectionSpec>,
     pub road_type: RoadType,
     pub speed_limit: Option<SpeedLimit>,
     /// Roll of the road surface about its reference line, radians, as a function of
@@ -92,7 +114,10 @@ impl RoadSpec {
         RoadSpec {
             name: None,
             reference_line,
-            lanes,
+            cross_sections: vec![CrossSectionSpec {
+                station: 0.0,
+                lanes,
+            }],
             road_type: RoadType::Town,
             speed_limit: None,
             superelevation: Poly3Profile::default(),
@@ -124,6 +149,45 @@ impl RoadSpec {
     pub fn with_superelevation(mut self, superelevation: Poly3Profile) -> Self {
         self.superelevation = superelevation;
         self
+    }
+
+    /// Adds a cross-section that takes over at `station`.
+    ///
+    /// Use this where the *number* of lanes changes — one appears, one ends. A lane
+    /// that only narrows or widens stays in one cross-section and carries a width
+    /// profile instead, which keeps it one lane rather than two joined ones.
+    pub fn with_cross_section(mut self, station: f64, lanes: Vec<LaneSpec>) -> Self {
+        self.cross_sections
+            .push(CrossSectionSpec { station, lanes });
+        self
+    }
+
+    /// Every lane of every cross-section, in order. A lane's position in this list
+    /// is the index a [`LaneRef`] addresses it by.
+    pub fn all_lanes(&self) -> impl Iterator<Item = &LaneSpec> {
+        self.cross_sections
+            .iter()
+            .flat_map(|section| section.lanes.iter())
+    }
+
+    /// Where the lanes of section `index` begin in [`RoadSpec::all_lanes`].
+    fn section_offset(&self, index: usize) -> usize {
+        self.cross_sections[..index]
+            .iter()
+            .map(|section| section.lanes.len())
+            .sum()
+    }
+
+    /// The section a global lane index falls in, and its position within it.
+    fn locate(&self, index: usize) -> Option<(usize, usize)> {
+        let mut remaining = index;
+        for (section, entry) in self.cross_sections.iter().enumerate() {
+            if remaining < entry.lanes.len() {
+                return Some((section, remaining));
+            }
+            remaining -= entry.lanes.len();
+        }
+        None
     }
 }
 
@@ -254,7 +318,11 @@ impl MapBuilder {
     /// Adds a road. Its identifier comes from `spec.name`, or from the road's
     /// position if it has none, so two identical scripts name the same roads.
     pub fn add_road(&mut self, spec: RoadSpec) -> Result<RoadId, BuildError> {
-        if spec.lanes.is_empty() {
+        if spec
+            .cross_sections
+            .iter()
+            .any(|section| section.lanes.is_empty())
+        {
             let name = spec
                 .name
                 .clone()
@@ -319,13 +387,45 @@ impl MapBuilder {
         let draft = self.draft(&lane.road)?;
         draft
             .spec
-            .lanes
-            .get(lane.index)
+            .all_lanes()
+            .nth(lane.index)
             .ok_or_else(|| BuildError::LaneIndexOutOfRange {
                 road: lane.road.clone(),
                 index: lane.index,
-                lanes: draft.spec.lanes.len(),
+                lanes: draft.spec.all_lanes().count(),
             })
+    }
+
+    /// Which cross-section a lane belongs to, and where it sits within it.
+    fn locate_lane(&self, lane: &LaneRef) -> Result<(usize, usize), BuildError> {
+        let draft = self.draft(&lane.road)?;
+        draft
+            .spec
+            .locate(lane.index)
+            .ok_or_else(|| BuildError::LaneIndexOutOfRange {
+                road: lane.road.clone(),
+                index: lane.index,
+                lanes: draft.spec.all_lanes().count(),
+            })
+    }
+
+    /// The cross-section adjacent to one end of a road: the first at its start, the
+    /// last at its end. Those are the lanes another road meets there.
+    fn section_at_end(&self, road: &RoadId, end: RoadEnd) -> Result<usize, BuildError> {
+        let draft = self.draft(road)?;
+        Ok(match end {
+            RoadEnd::Start => 0,
+            RoadEnd::End => draft.spec.cross_sections.len() - 1,
+        })
+    }
+
+    /// Global lane indices of one cross-section.
+    fn lanes_of_section(&self, road: &RoadId, section: usize) -> Result<Vec<usize>, BuildError> {
+        let draft = self.draft(road)?;
+        let offset = draft.spec.section_offset(section);
+        Ok((0..draft.spec.cross_sections[section].lanes.len())
+            .map(|index| offset + index)
+            .collect())
     }
 
     /// Where a lane sits in its road's cross-section, resolved against handedness.
@@ -338,12 +438,18 @@ impl MapBuilder {
 
     /// Rank of the lane outwards from the cross-section origin, counting from 1.
     fn lane_ordinal(&self, lane: &LaneRef) -> Result<usize, BuildError> {
+        // Counted within the lane's own cross-section: a lane is the n-th out from
+        // the centre of *its* section, not of the whole road.
         let side = self.lane_side(lane)?;
+        let (section, _) = self.locate_lane(lane)?;
         let mut ordinal = 0;
-        for index in 0..=lane.index {
+        for index in self.lanes_of_section(&lane.road, section)? {
             let candidate = LaneRef::new(lane.road.clone(), index);
             if self.lane_side(&candidate)? == side {
                 ordinal += 1;
+            }
+            if index == lane.index {
+                break;
             }
         }
         Ok(ordinal)
@@ -379,8 +485,12 @@ impl MapBuilder {
         to_end: RoadEnd,
         junction: Option<&JunctionId>,
     ) -> Result<Vec<(LaneId, LaneId)>, BuildError> {
-        let from_draft_lanes = self.draft(from)?.spec.lanes.len();
-        let to_draft_lanes = self.draft(to)?.spec.lanes.len();
+        // The lanes that meet are those of the cross-section at each road's end,
+        // which for a road with several sections is not all of its lanes.
+        let from_section = self.section_at_end(from, from_end)?;
+        let to_section = self.section_at_end(to, to_end)?;
+        let from_indices = self.lanes_of_section(from, from_section)?;
+        let to_indices = self.lanes_of_section(to, to_section)?;
 
         // A road end that points into the joint carries its reference direction
         // forwards through it; one that points away carries it backwards.
@@ -390,7 +500,7 @@ impl MapBuilder {
 
         // Pair lanes by the side and rank they present to the joint.
         let mut to_by_slot: HashMap<(LateralSide, usize), usize> = HashMap::new();
-        for index in 0..to_draft_lanes {
+        for index in to_indices {
             let lane = LaneRef::new(to.clone(), index);
             let mut side = self.lane_side(&lane)?;
             if !sides_agree {
@@ -404,7 +514,7 @@ impl MapBuilder {
         self.set_link(from, from_end, to, to_end, junction)?;
 
         let mut created = Vec::new();
-        for index in 0..from_draft_lanes {
+        for index in from_indices {
             let from_lane = LaneRef::new(from.clone(), index);
             let slot = (self.lane_side(&from_lane)?, self.lane_ordinal(&from_lane)?);
             let Some(&to_index) = to_by_slot.get(&slot) else {
@@ -603,7 +713,7 @@ impl MapBuilder {
         fraction: f64,
         width: f64,
     ) -> Result<ObjectId, BuildError> {
-        let lanes = (0..self.draft(road)?.spec.lanes.len())
+        let lanes = (0..self.draft(road)?.spec.all_lanes().count())
             .map(|index| LaneRef::new(road.clone(), index))
             .collect();
         self.push_object(
@@ -678,6 +788,44 @@ impl Direction {
     }
 }
 
+/// Where each edge of one cross-section sits, as a function of station.
+///
+/// A cross-section is laid out by stacking lane widths outwards from the origin, and
+/// with width profiles those widths vary along the road — so an edge's offset is a
+/// function rather than a number.
+struct SectionLayout {
+    station_range: (f64, f64),
+    lane_offset: Poly3Profile,
+    /// Widths of the left-hand lanes, ordinal 1 first.
+    left: Vec<WidthProfile>,
+    /// Widths of the right-hand lanes, ordinal 1 first.
+    right: Vec<WidthProfile>,
+}
+
+impl SectionLayout {
+    /// The lateral offset of the edge at `rank` — `0` the cross-section origin, `+n`
+    /// the n-th edge to its left, `-n` the n-th to its right — at `station`.
+    fn edge_offset(&self, rank: i32, station: f64) -> f64 {
+        let (widths, sign) = if rank >= 0 {
+            (&self.left, 1.0)
+        } else {
+            (&self.right, -1.0)
+        };
+        let stacked: f64 = widths
+            .iter()
+            .take(rank.unsigned_abs() as usize)
+            .map(|width| width.evaluate(station).metres())
+            .sum();
+        self.lane_offset.evaluate(station) + sign * stacked
+    }
+
+    /// How far the cross-section reaches from its reference line at `station`.
+    fn extent(&self, station: f64) -> f64 {
+        let outermost = |rank: i32| self.edge_offset(rank, station).abs();
+        outermost(self.left.len() as i32).max(outermost(-(self.right.len() as i32)))
+    }
+}
+
 /// The geometry of one road's reference line, plus the lateral direction to use at
 /// each sampled station.
 struct RoadGeometry {
@@ -695,8 +843,11 @@ impl RoadGeometry {
         reference_line: &Curve3,
         superelevation: &Poly3Profile,
         config: SamplingConfig,
+        section_stations: &[f64],
     ) -> Result<Self, GeometryError> {
-        let samples = reference_line.samples(config)?;
+        // A cross-section has to change at the station the caller asked for, so those
+        // stations get a vertex whether or not the sampler would have put one there.
+        let samples = reference_line.samples_including(config, section_stations)?;
         let laterals = samples
             .iter()
             .map(|sample| Ok(sample.frame()?.left.get()))
@@ -726,13 +877,28 @@ impl RoadGeometry {
         self.laterals[index].rotated_about(self.samples[index].tangent, roll)
     }
 
-    /// The curve `offset` metres to the left of the reference line.
-    fn boundary(&self, offset: f64) -> Result<Curve3, GeometryError> {
+    /// The curve that runs `offset(station)` metres to the left of the reference
+    /// line, over the stations within `range`.
+    ///
+    /// The offset is a function because a tapering lane's boundary is not a constant
+    /// distance from the reference line; the range is there because a cross-section
+    /// covers only part of its road.
+    fn boundary_over(
+        &self,
+        range: (f64, f64),
+        offset: impl Fn(f64) -> f64,
+    ) -> Result<Curve3, GeometryError> {
+        let tolerance = Polyline3::MIN_SEGMENT;
         Ok(Curve3::Polyline(Polyline3::new(
             self.samples
                 .iter()
                 .enumerate()
-                .map(|(index, sample)| sample.point + self.banked_lateral(index) * offset),
+                .filter(|(_, sample)| {
+                    sample.station >= range.0 - tolerance && sample.station <= range.1 + tolerance
+                })
+                .map(|(index, sample)| {
+                    sample.point + self.banked_lateral(index) * offset(sample.station)
+                }),
         )?))
     }
 
@@ -761,6 +927,9 @@ impl RoadGeometry {
 struct Generator {
     builder: MapBuilder,
     geometry: HashMap<RoadId, RoadGeometry>,
+    /// One layout per cross-section of each road, so a station can be asked where
+    /// the road's edges are after the lanes have been built.
+    layouts: HashMap<RoadId, Vec<SectionLayout>>,
     map: Map,
 }
 
@@ -770,6 +939,7 @@ impl Generator {
         Generator {
             builder,
             geometry: HashMap::new(),
+            layouts: HashMap::new(),
             map,
         }
     }
@@ -791,12 +961,22 @@ impl Generator {
     fn build_reference_geometry(&mut self) -> Result<(), BuildError> {
         let config = self.config();
         for draft in &self.builder.roads {
+            let stations = crate::map::required_stations(
+                draft
+                    .spec
+                    .cross_sections
+                    .iter()
+                    .map(|section| section.station),
+                draft.spec.all_lanes().map(|lane| &lane.width),
+                config,
+            );
             self.geometry.insert(
                 draft.id.clone(),
                 RoadGeometry::new(
                     &draft.spec.reference_line,
                     &draft.spec.superelevation,
                     config,
+                    &stations,
                 )?,
             );
         }
@@ -900,61 +1080,131 @@ impl Generator {
     fn build_roads(&mut self) -> Result<(), BuildError> {
         for index in 0..self.builder.roads.len() {
             let draft = self.builder.roads[index].clone();
-            let lanes = self.build_cross_section(&draft.id, &draft.spec, 0.0)?;
-            let road = Road {
-                id: draft.id.clone(),
-                name: draft.spec.name.clone(),
-                reference_line: draft.spec.reference_line.clone(),
-                lane_offset: 0.0,
-                lanes: lanes.iter().map(|lane| lane.id.clone()).collect(),
-                junction: None,
-                link: draft.link.clone(),
-                road_type: draft.spec.road_type,
-                speed_limit: draft.spec.speed_limit,
-                superelevation: draft.spec.superelevation.clone(),
-            };
+            let (road, lanes) = self.build_road(
+                &draft.id,
+                &draft.spec,
+                Poly3Profile::default(),
+                None,
+                draft.link.clone(),
+            )?;
             self.insert_road(road, lanes)?;
+            self.join_sections(&draft.id)?;
         }
         Ok(())
     }
 
-    /// Lays the cross-section out against the road's generated geometry.
-    fn build_cross_section(
-        &self,
+    /// Builds a road's cross-sections and the `Road` that owns them.
+    fn build_road(
+        &mut self,
         road: &RoadId,
         spec: &RoadSpec,
-        lane_offset: f64,
-    ) -> Result<Vec<Lane>, BuildError> {
-        let geometry = &self.geometry[road];
-        let mut left_edge = lane_offset;
-        let mut right_edge = lane_offset;
-        let mut left_count = 0usize;
-        let mut right_count = 0usize;
-        let mut lanes = Vec::with_capacity(spec.lanes.len());
+        lane_offset: Poly3Profile,
+        junction: Option<JunctionId>,
+        link: RoadLink,
+    ) -> Result<(Road, Vec<Lane>), BuildError> {
+        let length = spec.reference_line.horizontal_length()?;
+        let mut lanes: Vec<Lane> = Vec::new();
+        let mut sections: Vec<CrossSection> = Vec::new();
+        let mut layouts: Vec<SectionLayout> = Vec::new();
 
-        for (index, lane_spec) in spec.lanes.iter().enumerate() {
+        for (index, entry) in spec.cross_sections.iter().enumerate() {
+            let end = match spec.cross_sections.get(index + 1) {
+                Some(next) => next.station,
+                None => length,
+            };
+            let layout = self.lay_out_section(entry, (entry.station, end), lane_offset.clone());
+            let offset = spec.section_offset(index);
+            let section_lanes =
+                self.build_section_lanes(road, spec, entry, index, offset, &layout)?;
+            sections.push(CrossSection {
+                station: entry.station,
+                lanes: section_lanes.iter().map(|lane| lane.id.clone()).collect(),
+            });
+            lanes.extend(section_lanes);
+            layouts.push(layout);
+        }
+        self.layouts.insert(road.clone(), layouts);
+
+        Ok((
+            Road {
+                id: road.clone(),
+                name: spec.name.clone(),
+                reference_line: spec.reference_line.clone(),
+                lane_offset,
+                lanes: lanes.iter().map(|lane| lane.id.clone()).collect(),
+                sections,
+                junction,
+                link,
+                road_type: spec.road_type,
+                speed_limit: spec.speed_limit,
+                superelevation: spec.superelevation.clone(),
+            },
+            lanes,
+        ))
+    }
+
+    /// Works out which side and rank each lane of one cross-section sits at.
+    fn lay_out_section(
+        &self,
+        entry: &CrossSectionSpec,
+        station_range: (f64, f64),
+        lane_offset: Poly3Profile,
+    ) -> SectionLayout {
+        let mut layout = SectionLayout {
+            station_range,
+            lane_offset,
+            left: Vec::new(),
+            right: Vec::new(),
+        };
+        for lane_spec in &entry.lanes {
             let side = lane_spec.side.unwrap_or_else(|| {
                 self.builder
                     .metadata
                     .handedness
                     .side_for(lane_spec.direction)
             });
-            let width = lane_spec.width.metres();
-            let (left_offset, right_offset, ordinal) = match side {
+            match side {
+                LateralSide::Left => layout.left.push(lane_spec.width.clone()),
+                LateralSide::Right => layout.right.push(lane_spec.width.clone()),
+            }
+        }
+        layout
+    }
+
+    /// Generates the lanes of one cross-section against the road's geometry.
+    fn build_section_lanes(
+        &self,
+        road: &RoadId,
+        spec: &RoadSpec,
+        entry: &CrossSectionSpec,
+        section: usize,
+        index_offset: usize,
+        layout: &SectionLayout,
+    ) -> Result<Vec<Lane>, BuildError> {
+        let geometry = &self.geometry[road];
+        let (mut left_count, mut right_count) = (0usize, 0usize);
+        let mut lanes = Vec::with_capacity(entry.lanes.len());
+
+        for (position, lane_spec) in entry.lanes.iter().enumerate() {
+            let side = lane_spec.side.unwrap_or_else(|| {
+                self.builder
+                    .metadata
+                    .handedness
+                    .side_for(lane_spec.direction)
+            });
+            // A lane spans one slot of the cross-section: the edges either side of
+            // it, counted outwards from the origin.
+            let (left_edge, right_edge, ordinal) = match side {
                 LateralSide::Left => {
-                    let inner = left_edge;
-                    left_edge += width;
                     left_count += 1;
-                    (left_edge, inner, left_count)
+                    (left_count as i32, left_count as i32 - 1, left_count)
                 }
                 LateralSide::Right => {
-                    let inner = right_edge;
-                    right_edge -= width;
                     right_count += 1;
-                    (inner, right_edge, right_count)
+                    (1 - right_count as i32, -(right_count as i32), right_count)
                 }
             };
-            let center_offset = (left_offset + right_offset) / 2.0;
+            let index = index_offset + position;
             lanes.push(Lane {
                 id: LaneId::of_road(road, index),
                 road: road.clone(),
@@ -963,18 +1213,73 @@ impl Generator {
                 ordinal,
                 direction: lane_spec.direction,
                 lane_type: lane_spec.lane_type,
-                width: lane_spec.width,
+                width: lane_spec.width.clone(),
                 speed_limit: lane_spec.speed_limit.or(spec.speed_limit),
-                left_offset,
-                right_offset,
-                left_boundary: geometry.boundary(left_offset)?,
-                right_boundary: geometry.boundary(right_offset)?,
-                centerline: geometry.boundary(center_offset)?,
+                section,
+                station_range: layout.station_range,
+                left_edge,
+                right_edge,
+                left_offset: layout.edge_offset(left_edge, layout.station_range.0),
+                right_offset: layout.edge_offset(right_edge, layout.station_range.0),
+                left_boundary: geometry
+                    .boundary_over(layout.station_range, |s| layout.edge_offset(left_edge, s))?,
+                right_boundary: geometry
+                    .boundary_over(layout.station_range, |s| layout.edge_offset(right_edge, s))?,
+                centerline: geometry.boundary_over(layout.station_range, |s| {
+                    (layout.edge_offset(left_edge, s) + layout.edge_offset(right_edge, s)) / 2.0
+                })?,
                 left_marking: lane_spec.left_marking,
                 right_marking: lane_spec.right_marking,
             });
         }
         Ok(lanes)
+    }
+
+    /// Connects each lane that carries on across a cross-section boundary.
+    ///
+    /// A road with several sections holds several `Lane` objects for one stretch of
+    /// tarmac, so the movement from one to the next has to be recorded like any
+    /// other — which is also what makes the Lanelet2 export's lanelets continuous
+    /// there.
+    fn join_sections(&mut self, road: &RoadId) -> Result<(), BuildError> {
+        let Some(entry) = self.map.road(road) else {
+            return Ok(());
+        };
+        let sections = entry.sections.clone();
+        for pair in sections.windows(2) {
+            let before: Vec<Lane> = pair[0]
+                .lanes
+                .iter()
+                .filter_map(|id| self.map.lanes.get(id).cloned())
+                .collect();
+            let after: Vec<Lane> = pair[1]
+                .lanes
+                .iter()
+                .filter_map(|id| self.map.lanes.get(id).cloned())
+                .collect();
+            for earlier in &before {
+                // A lane carries on if the next section has one in the same slot
+                // going the same way; otherwise it ends here, which is the point of
+                // having a second section.
+                let Some(later) = after.iter().find(|candidate| {
+                    candidate.side == earlier.side
+                        && candidate.ordinal == earlier.ordinal
+                        && candidate.direction == earlier.direction
+                }) else {
+                    continue;
+                };
+                let (source, target) = match earlier.direction {
+                    Direction::Forward => (earlier, later),
+                    Direction::Backward => (later, earlier),
+                };
+                self.push_connection(
+                    None,
+                    LaneEndpoint::new(source.id.clone(), source.direction.exit_end()),
+                    LaneEndpoint::new(target.id.clone(), target.direction.entry_end()),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn insert_road(&mut self, road: Road, lanes: Vec<Lane>) -> Result<(), BuildError> {
@@ -1072,7 +1377,6 @@ impl Generator {
         let reference_line =
             Curve3::Bezier(Bezier3::hermite(start, start_tangent, end, end_tangent)?);
 
-        let width = from_lane.width;
         let road_id = RoadId::new(format!(
             "{}/{}_{}",
             junction.local_name(),
@@ -1082,7 +1386,8 @@ impl Generator {
 
         // The connector's lane straddles its reference line, so the cross-section
         // origin sits half a lane to the left of it.
-        let mut geometry = RoadGeometry::new(&reference_line, &Poly3Profile::default(), config)?;
+        let mut geometry =
+            RoadGeometry::new(&reference_line, &Poly3Profile::default(), config, &[])?;
         // Adopt the lateral direction of each road it meets, so the connector's
         // boundary endpoints land exactly on theirs.
         let from_end = road_end_of(from_lane.direction.exit_end());
@@ -1099,20 +1404,42 @@ impl Generator {
         geometry.laterals[last] = end_lateral;
         self.geometry.insert(road_id.clone(), geometry);
 
+        // The connector carries the source lane's width into the target's. Where the
+        // two differ — a slip road feeding a wider carriageway — it tapers between
+        // them rather than stopping short of one of its neighbours.
+        let entry = PositiveWidth::new(from_lane.exit_width())?;
+        let exit = PositiveWidth::new(to_lane.entry_width())?;
+        let width = WidthProfile::tapered(
+            0.0,
+            reference_line.horizontal_length()?,
+            entry,
+            exit,
+            Taper::Linear,
+        )?;
+        // The lane straddles the connector's reference line, so the cross-section
+        // origin sits half a lane to the left of it — and follows the taper.
+        let lane_offset = width.to_poly3(0.0).scaled(0.5);
+
         let spec = RoadSpec {
             name: None,
             reference_line: reference_line.clone(),
-            lanes: vec![LaneSpec {
-                width,
-                direction: Direction::Forward,
-                lane_type: from_lane.lane_type,
-                speed_limit: from_lane.speed_limit,
-                side: Some(LateralSide::Right),
-                left_marking: BoundaryMarking::new(RoadMarking::None, from_lane.left_marking.color),
-                right_marking: BoundaryMarking::new(
-                    RoadMarking::None,
-                    from_lane.right_marking.color,
-                ),
+            cross_sections: vec![CrossSectionSpec {
+                station: 0.0,
+                lanes: vec![LaneSpec {
+                    width,
+                    direction: Direction::Forward,
+                    lane_type: from_lane.lane_type,
+                    speed_limit: from_lane.speed_limit,
+                    side: Some(LateralSide::Right),
+                    left_marking: BoundaryMarking::new(
+                        RoadMarking::None,
+                        from_lane.left_marking.color,
+                    ),
+                    right_marking: BoundaryMarking::new(
+                        RoadMarking::None,
+                        from_lane.right_marking.color,
+                    ),
+                }],
             }],
             road_type: self
                 .map
@@ -1122,16 +1449,12 @@ impl Generator {
             speed_limit: from_lane.speed_limit,
             superelevation: Poly3Profile::default(),
         };
-        let lanes = self.build_cross_section(&road_id, &spec, width.half())?;
-        let connector_lane = lanes[0].id.clone();
-        let road = Road {
-            id: road_id.clone(),
-            name: None,
-            reference_line,
-            lane_offset: width.half(),
-            lanes: lanes.iter().map(|lane| lane.id.clone()).collect(),
-            junction: Some(junction.clone()),
-            link: RoadLink {
+        let (road, lanes) = self.build_road(
+            &road_id,
+            &spec,
+            lane_offset,
+            Some(junction.clone()),
+            RoadLink {
                 predecessor: Some(RoadLinkTarget::Road(RoadEndpoint::new(
                     from_lane.road.clone(),
                     from_end,
@@ -1141,10 +1464,8 @@ impl Generator {
                     to_end,
                 ))),
             },
-            road_type: spec.road_type,
-            speed_limit: spec.speed_limit,
-            superelevation: Poly3Profile::default(),
-        };
+        )?;
+        let connector_lane = lanes[0].id.clone();
         self.insert_road(road, lanes)?;
 
         if let Some(entry) = self.map.junctions.get_mut(junction) {
@@ -1206,9 +1527,16 @@ impl Generator {
                     let index = (((count - 1) as f64) * fraction.clamp(0.0, 1.0)).round() as usize;
                     let sample = geometry.samples[index];
                     let lateral = geometry.laterals[index];
-                    let extent = self.map.lanes_of(&road).iter().fold(0.0_f64, |acc, lane| {
-                        acc.max(lane.left_offset.abs()).max(lane.right_offset.abs())
-                    });
+                    // How far the road reaches at *this* station, which a tapering
+                    // cross-section makes a different question at every one.
+                    let extent = self.layouts[&road]
+                        .iter()
+                        .filter(|layout| {
+                            sample.station >= layout.station_range.0
+                                && sample.station <= layout.station_range.1
+                        })
+                        .map(|layout| layout.extent(sample.station))
+                        .fold(0.0_f64, f64::max);
                     let along = sample.tangent.scaled(width / 2.0);
                     let edge = |sign: f64| -> Result<Curve3, GeometryError> {
                         let center = sample.point + along * sign;

@@ -11,8 +11,11 @@ use std::path::PathBuf;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
+use roadgen_core::builder::CrossSectionSpec;
 use roadgen_core::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
-use roadgen_core::geometry::{Alignment, Curve3, Point3, Poly3Profile, SamplingConfig};
+use roadgen_core::geometry::{
+    Alignment, Curve3, Point3, Poly3Profile, SamplingConfig, Taper, WidthProfile,
+};
 use roadgen_core::id::{JunctionId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::{MapMetadata, Projection, TrafficHandedness};
 use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking, RoadType};
@@ -78,6 +81,16 @@ fn parse_marking(value: &str, color: &str) -> PyResult<BoundaryMarking> {
     Ok(BoundaryMarking::new(marking, color))
 }
 
+fn parse_taper(value: &str) -> PyResult<Taper> {
+    match value.to_ascii_lowercase().as_str() {
+        "linear" => Ok(Taper::Linear),
+        "smooth" | "ease" => Ok(Taper::Smooth),
+        other => Err(PyValueError::new_err(format!(
+            "taper must be 'linear' or 'smooth', got {other:?}"
+        ))),
+    }
+}
+
 fn point(value: (f64, f64, f64)) -> Point3 {
     Point3::new(value.0, value.1, value.2)
 }
@@ -104,6 +117,8 @@ impl PyLane {
         left_marking = "solid",
         right_marking = "solid",
         marking_color = "white",
+        width_profile = None,
+        taper = "linear",
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -115,16 +130,30 @@ impl PyLane {
         left_marking: &str,
         right_marking: &str,
         marking_color: &str,
+        width_profile: Option<Vec<(f64, f64)>>,
+        taper: &str,
     ) -> PyResult<Self> {
-        let mut spec = LaneSpec::new(
-            PositiveWidth::new(width).map_err(value_error)?,
-            parse_direction(direction)?,
-        )
-        .with_type(parse_lane_type(type_)?)
-        .with_markings(
-            parse_marking(left_marking, marking_color)?,
-            parse_marking(right_marking, marking_color)?,
-        );
+        // `width_profile` is `(station, metres)` pairs measured along the road, for a
+        // lane that narrows or widens; `width` alone is the same width throughout.
+        let profile = match width_profile {
+            None => WidthProfile::constant(PositiveWidth::new(width).map_err(value_error)?),
+            Some(knots) => WidthProfile::new(
+                knots
+                    .into_iter()
+                    .map(|(station, metres)| {
+                        Ok((station, PositiveWidth::new(metres).map_err(value_error)?))
+                    })
+                    .collect::<PyResult<Vec<_>>>()?,
+                parse_taper(taper)?,
+            )
+            .map_err(value_error)?,
+        };
+        let mut spec = LaneSpec::new(profile, parse_direction(direction)?)
+            .with_type(parse_lane_type(type_)?)
+            .with_markings(
+                parse_marking(left_marking, marking_color)?,
+                parse_marking(right_marking, marking_color)?,
+            );
         if let Some(limit) = speed_limit_kph {
             spec = spec.with_speed_limit(SpeedLimit::from_kph(limit).map_err(value_error)?);
         }
@@ -134,9 +163,25 @@ impl PyLane {
         Ok(PyLane { spec })
     }
 
+    /// The lane's width where it starts. A tapering lane is narrower or wider
+    /// elsewhere; `width_profile` gives the whole of it.
     #[getter]
     fn width(&self) -> f64 {
-        self.spec.width.metres()
+        self.spec
+            .width
+            .evaluate(self.spec.width.knots()[0].0)
+            .metres()
+    }
+
+    /// The lane's width as `(station, metres)` pairs.
+    #[getter]
+    fn width_profile(&self) -> Vec<(f64, f64)> {
+        self.spec
+            .width
+            .knots()
+            .iter()
+            .map(|(station, width)| (*station, width.metres()))
+            .collect()
     }
 
     #[getter]
@@ -152,7 +197,7 @@ impl PyLane {
     fn __repr__(&self) -> String {
         format!(
             "Lane(width={}, direction={:?}, type_={:?})",
-            self.spec.width.metres(),
+            self.width(),
             self.spec.direction.as_str(),
             self.spec.lane_type.as_str()
         )
@@ -192,7 +237,7 @@ impl PyRoad {
         })
     }
 
-    /// Every lane of this road, in cross-section order.
+    /// Every lane of this road, section by section.
     fn lanes(&self) -> Vec<PyLaneRef> {
         (0..self.lanes)
             .map(|index| PyLaneRef {
@@ -419,6 +464,7 @@ impl PyMap {
         type_ = "town",
         speed_limit_kph = None,
         superelevation = None,
+        cross_sections = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_road(
@@ -432,6 +478,7 @@ impl PyMap {
         type_: &str,
         speed_limit_kph: Option<f64>,
         superelevation: Option<Vec<(f64, f64)>>,
+        cross_sections: Option<Vec<(f64, Vec<PyLane>)>>,
     ) -> PyResult<PyRoad> {
         let reference_line = match (start, end, points, alignment) {
             (Some(start), Some(end), None, None) => {
@@ -461,13 +508,27 @@ impl PyMap {
         if let Some(limit) = speed_limit_kph {
             spec = spec.with_speed_limit(SpeedLimit::from_kph(limit).map_err(value_error)?);
         }
+        // Further cross-sections, each taking over at its station. Use these where
+        // the *number* of lanes changes; a lane that only tapers stays in one
+        // cross-section and carries a width profile instead.
+        for (station, section_lanes) in cross_sections.unwrap_or_default() {
+            if section_lanes.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "the cross-section at station {station} has no lanes"
+                )));
+            }
+            spec.cross_sections.push(CrossSectionSpec {
+                station,
+                lanes: section_lanes.into_iter().map(|lane| lane.spec).collect(),
+            });
+        }
         if let Some(points) = superelevation {
             // `(station, radians)` pairs, straight between them and flat outside —
             // the shape a caller describes a bank in.
             spec = spec
                 .with_superelevation(Poly3Profile::piecewise_linear(points).map_err(value_error)?);
         }
-        let lane_count = spec.lanes.len();
+        let lane_count = spec.all_lanes().count();
         let id = self.builder.add_road(spec).map_err(value_error)?;
         self.invalidate();
         Ok(PyRoad {

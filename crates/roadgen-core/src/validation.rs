@@ -194,31 +194,50 @@ fn check_references(map: &Map, issues: &mut Vec<ValidationIssue>) {
 
 fn check_cross_sections(map: &Map, issues: &mut Vec<ValidationIssue>) {
     for lane in map.lanes.iter() {
-        let width = lane.width.metres();
-        if width <= 0.0 {
-            issues.push(ValidationIssue::NonPositiveLaneWidth {
-                lane: lane.id.clone(),
-                width,
-            });
-        }
-        if lane.left_offset <= lane.right_offset {
+        // The width itself needs no check: `WidthProfile` cannot describe one that
+        // reaches zero. What is worth checking is that the *generated boundaries*
+        // agree with it, which catches a cross-section laid out wrongly.
+        if lane.left_edge != lane.right_edge + 1 {
             issues.push(ValidationIssue::InvalidLaneBoundary {
                 lane: lane.id.clone(),
                 detail: format!(
-                    "the left boundary is at {:.3} and the right at {:.3}; they are \
-                     crossed or coincident",
-                    lane.left_offset, lane.right_offset
+                    "the lane spans cross-section edges {} and {}, which is not one slot",
+                    lane.left_edge, lane.right_edge
                 ),
             });
         }
-        let spanned = lane.left_offset - lane.right_offset;
-        if (spanned - width).abs() > 1e-6 {
-            issues.push(ValidationIssue::InvalidLaneBoundary {
-                lane: lane.id.clone(),
-                detail: format!(
-                    "the boundaries span {spanned:.6} m but the lane is {width:.6} m wide"
-                ),
-            });
+        for (name, station, left, right) in [
+            (
+                "start",
+                lane.station_range.0,
+                lane.left_boundary.start_point(),
+                lane.right_boundary.start_point(),
+            ),
+            (
+                "end",
+                lane.station_range.1,
+                lane.left_boundary.end_point(),
+                lane.right_boundary.end_point(),
+            ),
+        ] {
+            // Measured *across the cross-section*, not as a straight-line distance.
+            // Where two roads meet at an angle the boundary is mitred, so the two
+            // points are further apart in space than the lane is wide — and that is
+            // the mitre doing its job, not a cross-section laid out wrongly.
+            let Some(lateral) = cross_section_direction(map, lane, station) else {
+                continue;
+            };
+            let spanned = (left - right).dot(lateral.get());
+            let expected = lane.width_at(station);
+            if (spanned - expected).abs() > 1e-6 {
+                issues.push(ValidationIssue::InvalidLaneBoundary {
+                    lane: lane.id.clone(),
+                    detail: format!(
+                        "at its {name} the boundaries span {spanned:.6} m across the \
+                         cross-section but the lane is {expected:.6} m wide there"
+                    ),
+                });
+            }
         }
         for (name, curve) in [
             ("left boundary", &lane.left_boundary),
@@ -264,6 +283,22 @@ fn check_superelevation(map: &Map, issues: &mut Vec<ValidationIssue>) {
             });
         }
     }
+}
+
+/// The direction a cross-section is measured along at one station: the road local
+/// frame's lateral axis, rolled by whatever superelevation the road carries there.
+fn cross_section_direction(
+    map: &Map,
+    lane: &crate::map::Lane,
+    station: f64,
+) -> Option<crate::geometry::UnitVector3> {
+    let road = map.roads.get(&lane.road)?;
+    let sample = road
+        .reference_line
+        .sample_at(station, map.metadata.sampling)
+        .ok()?;
+    let frame = sample.frame().ok()?;
+    Some(frame.banked(road.superelevation.evaluate(station)).left)
 }
 
 fn check_road_links(map: &Map, config: ValidationConfig, issues: &mut Vec<ValidationIssue>) {
@@ -447,9 +482,9 @@ fn boundary_gap(
         (to_travel.left.end_point(), to_travel.right.end_point())
     };
     // Lanes of different widths legitimately meet at a split or a merge; only the
-    // narrower overlap has to line up, so compare the smaller of the two gaps
-    // against the width difference.
-    let slack = (from.width.metres() - to.width.metres()).abs();
+    // narrower overlap has to line up, so compare the gap against the width
+    // difference where they actually meet.
+    let slack = (from.exit_width() - to.entry_width()).abs();
     let gap = from_left
         .distance_to(to_left)
         .max(from_right.distance_to(to_right));
