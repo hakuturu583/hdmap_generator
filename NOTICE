@@ -1,0 +1,35 @@
+roadgen (hdmap_generator)
+Copyright 2026 the hdmap_generator contributors
+
+This product includes software developed by the hdmap_generator contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the LICENSE
+file in the root of this distribution.
+
+--------------------------------------------------------------------------------
+Third-party dependencies
+--------------------------------------------------------------------------------
+
+This project links against the following third-party components. Their licenses
+are permissive and compatible with redistribution under Apache-2.0; each remains
+under its own terms.
+
+* opendrive (https://github.com/itdesigners/opendrive-rs)
+  OpenDRIVE 1.7 data model, parser and writer. MIT License.
+  Its documentation quotes the ASAM OpenDRIVE XML schema; ASAM grants everyone a
+  basic, non-exclusive and unlimited license to use the ASAM OpenDRIVE standard
+  (see https://www.asam.net/license).
+
+* simple_lanelet2 (https://github.com/hakuturu583/simple_lanelet2)
+  Lanelet2-compatible data model, OSM XML I/O, projections and routing.
+  BSD 3-Clause License, itself derived from Lanelet2 (Fraunhofer IOSB /
+  Karlsruhe Institute of Technology), BSD 3-Clause.
+
+* PyO3 (https://github.com/PyO3/pyo3)
+  Rust bindings for Python. Apache-2.0.
+
+* uom, vec1, xml-rs, chrono, url, thiserror, derive_more, paste, backtrace
+  Transitive dependencies of `opendrive`, each under MIT and/or Apache-2.0.
+
+* quick-xml, parking_lot, rstar
+  Transitive dependencies of `simple_lanelet2`, each under MIT and/or Apache-2.0.

@@ -1,0 +1,19 @@
+[package]
+name = "roadgen-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "PyO3 bindings exposing the roadgen canonical IR as the `roadgen` Python package"
+
+[lib]
+name = "_roadgen"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+roadgen-core.workspace = true
+roadgen-opendrive.workspace = true
+roadgen-lanelet2.workspace = true
+pyo3.workspace = true

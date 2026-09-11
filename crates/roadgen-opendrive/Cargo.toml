@@ -1,0 +1,15 @@
+[package]
+name = "roadgen-opendrive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto an OpenDRIVE document"
+
+[dependencies]
+roadgen-core.workspace = true
+opendrive.workspace = true
+uom.workspace = true
+vec1.workspace = true

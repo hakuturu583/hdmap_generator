@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/roadgen-core",
+    "crates/roadgen-opendrive",
+    "crates/roadgen-lanelet2",
+    "crates/roadgen-python",
+    "tests/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/hakuturu583/hdmap_generator"
+homepage = "https://github.com/hakuturu583/hdmap_generator"
+
+[workspace.dependencies]
+roadgen-core = { path = "crates/roadgen-core", version = "0.1.0" }
+roadgen-opendrive = { path = "crates/roadgen-opendrive", version = "0.1.0" }
+roadgen-lanelet2 = { path = "crates/roadgen-lanelet2", version = "0.1.0" }
+
+# OpenDRIVE 1.7 data model, parser and writer. MIT, which an Apache-2.0 project may
+# redistribute. Used so that neither the XML schema nor its serializer is rewritten
+# here; `roadgen-opendrive` only lowers the canonical IR onto these types.
+opendrive = "0.1.0"
+uom = "0.32"
+vec1 = "1.8"
+
+# simple_lanelet2: the Lanelet2 data model, OSM XML reader/writer and projections.
+# BSD-3-Clause, which an Apache-2.0 project may redistribute. Pinned by revision so
+# that a build is reproducible; the crates are not published to crates.io.
+ll2-core = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
+ll2-io = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
+ll2-projection = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
+ll2-routing = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
+ll2-traffic-rules = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
+
+pyo3 = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
