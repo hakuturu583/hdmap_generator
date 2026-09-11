@@ -1,0 +1,18 @@
+[package]
+name = "roadgen-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Scenario and cross-format tests for roadgen"
+
+[dependencies]
+roadgen-core.workspace = true
+roadgen-opendrive.workspace = true
+roadgen-lanelet2.workspace = true
+opendrive.workspace = true
+ll2-core.workspace = true
+ll2-io.workspace = true
+ll2-routing.workspace = true
+ll2-traffic-rules.workspace = true

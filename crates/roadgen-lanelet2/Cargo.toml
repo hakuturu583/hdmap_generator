@@ -1,0 +1,19 @@
+[package]
+name = "roadgen-lanelet2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto an Autoware-ready Lanelet2 map"
+
+[dependencies]
+roadgen-core.workspace = true
+ll2-core.workspace = true
+ll2-io.workspace = true
+ll2-projection.workspace = true
+
+[dev-dependencies]
+ll2-routing.workspace = true
+ll2-traffic-rules.workspace = true

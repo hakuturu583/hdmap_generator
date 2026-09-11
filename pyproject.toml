@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "roadgen"
+version = "0.1.0"
+description = "Generate 3D road networks and write them as OpenDRIVE and Autoware Lanelet2"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+keywords = ["opendrive", "lanelet2", "autoware", "hd-map", "road-network"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/hakuturu583/hdmap_generator"
+Repository = "https://github.com/hakuturu583/hdmap_generator"
+
+[tool.maturin]
+manifest-path = "crates/roadgen-python/Cargo.toml"
+module-name = "roadgen._roadgen"
+python-source = "python"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
