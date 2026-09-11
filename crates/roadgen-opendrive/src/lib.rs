@@ -488,7 +488,41 @@ impl<'a> Exporter<'a> {
     }
 
     fn lanes(&self, road: &Road) -> Result<Lanes, ExportError> {
-        let lanes = self.map.lanes_of(&road.id);
+        // One `<laneSection>` per IR cross-section, which is exactly what OpenDRIVE
+        // wants: a section is valid for a fixed set of lanes, and a new one begins
+        // wherever that set changes.
+        let sections = (0..road.sections.len())
+            .map(|index| self.lane_section(road, index))
+            .collect::<Result<Vec<_>, ExportError>>()?;
+
+        Ok(Lanes {
+            // `<laneOffset>` displaces the whole cross-section from the reference
+            // line. It is a polynomial in OpenDRIVE as it is in the IR, so a
+            // connector that tapers carries its taper here too.
+            lane_offset: if road.lane_offset.is_zero() {
+                Vec::new()
+            } else {
+                road.lane_offset
+                    .pieces()
+                    .iter()
+                    .map(|piece| LaneOffset {
+                        a: piece.a,
+                        b: piece.b,
+                        c: piece.c,
+                        d: piece.d,
+                        s: piece.station,
+                    })
+                    .collect()
+            },
+            lane_section: Vec1::try_from_vec(sections)
+                .map_err(|_| ExportError::Empty("a road has no lane section".into()))?,
+            additional_data: AdditionalData::default(),
+        })
+    }
+
+    fn lane_section(&self, road: &Road, index: usize) -> Result<LaneSection, ExportError> {
+        let entry = &road.sections[index];
+        let lanes = self.map.lanes_of_section(&road.id, index);
         let mut left: Vec<&Lane> = lanes
             .iter()
             .copied()
@@ -512,8 +546,8 @@ impl<'a> Exporter<'a> {
             })
             .unwrap_or((RoadMarking::None, MarkingColor::White));
 
-        let section = LaneSection {
-            s: 0.0,
+        Ok(LaneSection {
+            s: entry.station,
             single_side: None,
             left: Vec1::try_from_vec(
                 left.iter()
@@ -566,22 +600,6 @@ impl<'a> Exporter<'a> {
                 additional_data: AdditionalData::default(),
             }),
             additional_data: AdditionalData::default(),
-        };
-
-        Ok(Lanes {
-            lane_offset: if road.lane_offset.abs() > f64::EPSILON {
-                vec![LaneOffset {
-                    a: road.lane_offset,
-                    b: 0.0,
-                    c: 0.0,
-                    d: 0.0,
-                    s: 0.0,
-                }]
-            } else {
-                Vec::new()
-            },
-            lane_section: Vec1::new(section),
-            additional_data: AdditionalData::default(),
         })
     }
 
@@ -594,13 +612,24 @@ impl<'a> Exporter<'a> {
         };
         Ok(OdLane {
             link: self.lane_link(lane)?,
-            choice: vec![LaneChoice::Width(Width {
-                a: lane.width.metres(),
-                b: 0.0,
-                c: 0.0,
-                d: 0.0,
-                s_offset: Length::new::<meter>(0.0),
-            })],
+            // `<width>` is measured from the start of the lane section, so the IR's
+            // profile — which counts from the start of the road — is rebased onto it.
+            // Both of the IR's tapers are exactly a cubic, so nothing is approximated.
+            choice: lane
+                .width
+                .to_poly3(lane.station_range.0)
+                .pieces()
+                .iter()
+                .map(|piece| {
+                    LaneChoice::Width(Width {
+                        a: piece.a,
+                        b: piece.b,
+                        c: piece.c,
+                        d: piece.d,
+                        s_offset: Length::new::<meter>(piece.station.max(0.0)),
+                    })
+                })
+                .collect(),
             road_mark: vec![road_mark(outer.marking, outer.color)],
             material: Vec::new(),
             speed: lane

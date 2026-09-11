@@ -158,15 +158,50 @@ impl<'a> RoadEvaluator<'a> {
         entry.a + entry.b * ds + entry.c * ds * ds + entry.d * ds * ds * ds
     }
 
-    /// Widths of the lanes on one side, ordered outwards from the centre.
-    fn widths(&self, left: bool) -> Vec<(i64, f64)> {
-        let section = self.road.lanes.lane_section.first();
+    /// The `<laneSection>` governing station `s`, and the station it starts at.
+    ///
+    /// A section governs from its own `s` up to but *not including* the next one's:
+    /// the lanes either side of a boundary are different lanes, so asking a hair
+    /// before it has to give the earlier section.
+    fn section_at(&self, s: f64) -> (&opendrive::lane::lane_section::LaneSection, f64) {
+        let section = self
+            .road
+            .lanes
+            .lane_section
+            .iter()
+            .rfind(|section| section.s <= s)
+            .unwrap_or_else(|| self.road.lanes.lane_section.first());
+        (section, section.s)
+    }
+
+    /// Widths of the lanes on one side at station `s`, ordered outwards from the
+    /// centre.
+    ///
+    /// A `<width>` is a cubic in the distance from the start of its lane section, so
+    /// the polynomial is evaluated there rather than read as a constant.
+    fn widths(&self, left: bool, s: f64) -> Vec<(i64, f64)> {
+        let (section, section_start) = self.section_at(s);
         let width_of = |lane: &opendrive::lane::Lane| {
+            let ds = s - section_start;
             lane.choice
                 .iter()
-                .find_map(|choice| match choice {
-                    LaneChoice::Width(width) => Some(width.a),
+                .filter_map(|choice| match choice {
+                    LaneChoice::Width(width) => Some(width),
                     LaneChoice::Border(_) => None,
+                })
+                .rfind(|width| width.s_offset.value <= ds + 1e-9)
+                .or_else(|| {
+                    lane.choice.iter().find_map(|choice| match choice {
+                        LaneChoice::Width(width) => Some(width),
+                        LaneChoice::Border(_) => None,
+                    })
+                })
+                .map(|width| {
+                    let local = (ds - width.s_offset.value).max(0.0);
+                    width.a
+                        + width.b * local
+                        + width.c * local * local
+                        + width.d * local * local * local
                 })
                 .unwrap_or(0.0)
         };
@@ -200,7 +235,7 @@ impl<'a> RoadEvaluator<'a> {
     /// The lateral offset of the middle of lane `id` at station `s`.
     pub fn lane_center_offset(&self, id: i64, s: f64) -> Option<f64> {
         let mut offset = self.lane_offset_at(s);
-        for (lane_id, width) in self.widths(id > 0) {
+        for (lane_id, width) in self.widths(id > 0, s) {
             let half = width / 2.0;
             offset += if id > 0 { half } else { -half };
             if lane_id == id {
@@ -229,5 +264,20 @@ impl<'a> RoadEvaluator<'a> {
 
     pub fn length(&self) -> f64 {
         self.road.length.value
+    }
+
+    /// How many `<laneSection>` elements the road has.
+    pub fn section_count(&self) -> usize {
+        self.road.lanes.lane_section.len()
+    }
+
+    /// The station each lane section starts at.
+    pub fn section_stations(&self) -> Vec<f64> {
+        self.road
+            .lanes
+            .lane_section
+            .iter()
+            .map(|section| section.s)
+            .collect()
     }
 }

@@ -32,9 +32,8 @@ fn largest_centerline_disagreement(map: &ValidatedMap) -> f64 {
     for (index, road) in map.roads.iter().enumerate() {
         let evaluator = RoadEvaluator::find(&document, &index.to_string())
             .expect("the exporter numbers roads in the map's own order");
-        let samples = road
-            .reference_line
-            .samples(map.metadata.sampling)
+        let stations = map
+            .vertex_stations(&road.id)
             .expect("a road the map validated has geometry");
 
         for lane in map.lanes_of(&road.id) {
@@ -42,11 +41,19 @@ fn largest_centerline_disagreement(map: &ValidatedMap) -> f64 {
                 .centerline
                 .to_polyline(map.metadata.sampling)
                 .expect("a validated lane has a centreline");
-            assert_eq!(vertices.len(), samples.len());
+            let (start, end) = lane.station_range;
+            let own: Vec<f64> = stations
+                .iter()
+                .copied()
+                .filter(|station| *station >= start - 1e-9 && *station <= end + 1e-9)
+                .collect();
+            assert_eq!(vertices.len(), own.len());
 
-            for (sample, vertex) in samples.iter().zip(vertices.points()) {
+            for (station, vertex) in own.iter().zip(vertices.points()) {
+                // A lane section governs up to the next one's station but not
+                // including it, so the last vertex is asked for just inside.
                 let from_opendrive = evaluator
-                    .lane_center(opendrive_lane_id(lane), sample.station)
+                    .lane_center(opendrive_lane_id(lane), station.min(end - 1e-9))
                     .expect("the lane is in the document");
                 let from_ir = Position {
                     x: vertex.x,
@@ -120,6 +127,8 @@ fn both_formats_carry_the_same_movements() {
         ("graded", scenarios::graded_road()),
         ("spiral", scenarios::spiral_transition_road()),
         ("banked", scenarios::banked_curve()),
+        ("lane drop", scenarios::lane_drop()),
+        ("widening", scenarios::widening_road()),
     ] {
         // Lanelet2 has no successor tag: the routing graph rediscovers connectivity
         // from the geometry alone, so this is a real test of the export and not a
@@ -142,17 +151,24 @@ fn both_formats_carry_the_same_movements() {
         let lane_links: usize = document
             .road
             .iter()
+            // Across every lane section: a road whose cross-section changes carries
+            // its links on both sides of the change.
             .flat_map(|road| {
-                let section = road.lanes.lane_section.first();
-                let left = section
-                    .left
+                road.lanes
+                    .lane_section
                     .iter()
-                    .flat_map(|side| side.lane.iter().map(|l| &l.base));
-                let right = section
-                    .right
-                    .iter()
-                    .flat_map(|side| side.lane.iter().map(|l| &l.base));
-                left.chain(right).collect::<Vec<_>>()
+                    .flat_map(|section| {
+                        let left = section
+                            .left
+                            .iter()
+                            .flat_map(|side| side.lane.iter().map(|l| &l.base));
+                        let right = section
+                            .right
+                            .iter()
+                            .flat_map(|side| side.lane.iter().map(|l| &l.base));
+                        left.chain(right)
+                    })
+                    .collect::<Vec<_>>()
             })
             .filter_map(|lane| lane.link.as_ref())
             .map(|link| link.predecessor.len() + link.successor.len())
@@ -197,6 +213,11 @@ fn both_formats_put_the_lanes_in_the_same_place() {
         // so they hold to the same bound.
         ("spiral", scenarios::spiral_transition_road()),
         ("banked", scenarios::banked_curve()),
+        // A cross-section that changes along the road holds to the same bound: the
+        // OpenDRIVE reader evaluates the width polynomials and picks the lane
+        // section, and lands on the IR's vertices.
+        ("lane drop", scenarios::lane_drop()),
+        ("widening", scenarios::widening_road()),
     ] {
         let worst = largest_centerline_disagreement(&map);
         assert!(

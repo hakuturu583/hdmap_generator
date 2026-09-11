@@ -574,6 +574,112 @@ impl Curve3 {
         }
     }
 
+    /// The same stations as [`Curve3::samples`], plus each of `required`.
+    ///
+    /// A cross-section that changes partway along a road has to change at the station
+    /// the caller asked for, not at the nearest vertex the sampler happened to
+    /// produce, so the generator asks for those stations explicitly.
+    pub fn samples_including(
+        &self,
+        config: SamplingConfig,
+        required: &[f64],
+    ) -> Result<Vec<Sample>, GeometryError> {
+        let mut samples = self.samples(config)?;
+        let length = samples
+            .last()
+            .expect("a curve samples at least its two ends")
+            .station;
+        for &station in required {
+            if !station.is_finite() || station <= 0.0 || station >= length {
+                continue;
+            }
+            if samples
+                .iter()
+                .any(|sample| (sample.station - station).abs() < Polyline3::MIN_SEGMENT)
+            {
+                continue;
+            }
+            samples.push(self.sample_at(station, config)?);
+        }
+        samples.sort_by(|left, right| {
+            left.station
+                .partial_cmp(&right.station)
+                .expect("stations are finite")
+        });
+        Ok(samples)
+    }
+
+    /// The curve at one station, whether or not the sampler would have put a vertex
+    /// there.
+    ///
+    /// Exact for the analytic variants. A Bézier or a polyline is already an
+    /// approximation of itself at the configured resolution, so a station between two
+    /// of its vertices is interpolated between them rather than re-solved.
+    pub fn sample_at(&self, station: f64, config: SamplingConfig) -> Result<Sample, GeometryError> {
+        match self {
+            Curve3::Line(line) => {
+                let length = line.start().horizontal_distance_to(line.end());
+                let tangent = (line.end() - line.start()).normalize()?;
+                Ok(Sample {
+                    station,
+                    point: line.start().lerp(line.end(), station / length),
+                    tangent,
+                })
+            }
+            Curve3::Arc(arc) => {
+                let (point, tangent) = arc.at(station);
+                Ok(Sample {
+                    station,
+                    point,
+                    tangent,
+                })
+            }
+            Curve3::Clothoid(clothoid) => Ok(Sample {
+                station,
+                point: clothoid.walk(&[station])[0],
+                tangent: clothoid.tangent_at(station),
+            }),
+            Curve3::Composite(segments) => {
+                let mut offset = 0.0;
+                for segment in segments {
+                    let length = segment.horizontal_length()?;
+                    if station <= offset + length
+                        || std::ptr::eq(segment, &segments[segments.len() - 1])
+                    {
+                        return Ok(Sample {
+                            station,
+                            ..segment.sample_at(station - offset, config)?
+                        });
+                    }
+                    offset += length;
+                }
+                Err(GeometryError::NoHorizontalExtent)
+            }
+            Curve3::Bezier(_) | Curve3::Polyline(_) => {
+                let samples = self.samples(config)?;
+                let index = samples
+                    .iter()
+                    .rposition(|sample| sample.station <= station)
+                    .unwrap_or(0)
+                    .min(samples.len() - 2);
+                let (before, after) = (samples[index], samples[index + 1]);
+                let span = after.station - before.station;
+                let t = if span > 0.0 {
+                    (station - before.station) / span
+                } else {
+                    0.0
+                };
+                Ok(Sample {
+                    station,
+                    point: before.point.lerp(after.point, t),
+                    tangent: (before.tangent.get() * (1.0 - t) + after.tangent.get() * t)
+                        .normalize()
+                        .unwrap_or(before.tangent),
+                })
+            }
+        }
+    }
+
     /// The curve as vertices, at the given resolution.
     pub fn to_polyline(&self, config: SamplingConfig) -> Result<Polyline3, GeometryError> {
         Polyline3::new(self.samples(config)?.into_iter().map(|s| s.point))

@@ -68,14 +68,14 @@ pub mod units;
 pub mod validation;
 
 pub use arena::Arena;
-pub use builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
+pub use builder::{CrossSectionSpec, LaneRef, LaneSpec, MapBuilder, RoadSpec};
 pub use error::{BuildError, GeometryError, QuantityError, ValidationError, ValidationIssue};
 pub use geometry::{
     Alignment, Arc3, Clothoid3, Curve3, Frame3, Point3, Poly3Piece, Poly3Profile, Polyline3,
-    SamplingConfig, Vector3,
+    SamplingConfig, Taper, Vector3, WidthProfile,
 };
 pub use id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
-pub use map::{Lane, Map, MapMetadata, Projection, Road, TrafficHandedness};
+pub use map::{CrossSection, Lane, Map, MapMetadata, Projection, Road, TrafficHandedness};
 pub use semantics::{
     BoundaryMarking, LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
     RoadType, TrafficRule,
@@ -89,9 +89,10 @@ pub use validation::{UnvalidatedMap, ValidatedMap, ValidationConfig};
 
 /// Everything a caller normally needs, in one import.
 pub mod prelude {
-    pub use crate::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
+    pub use crate::builder::{CrossSectionSpec, LaneRef, LaneSpec, MapBuilder, RoadSpec};
     pub use crate::geometry::{
         Alignment, Arc3, Clothoid3, Curve3, Point3, Poly3Piece, Poly3Profile, SamplingConfig,
+        Taper, WidthProfile,
     };
     pub use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
     pub use crate::map::{Map, MapMetadata, Projection, TrafficHandedness};

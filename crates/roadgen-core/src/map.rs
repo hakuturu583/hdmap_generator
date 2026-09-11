@@ -8,13 +8,13 @@
 
 use crate::arena::Arena;
 use crate::error::GeometryError;
-use crate::geometry::{Curve3, Point3, Poly3Profile, SamplingConfig};
+use crate::geometry::{Curve3, Point3, Poly3Profile, SamplingConfig, WidthProfile};
 use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLink,
 };
-use crate::units::{GeoOrigin, PositiveWidth, SpeedLimit};
+use crate::units::{GeoOrigin, SpeedLimit};
 
 /// Which side of the road traffic keeps to.
 ///
@@ -105,6 +105,49 @@ impl Default for MapMetadata {
     }
 }
 
+/// Stations a road's reference line has to be sampled at, beyond whatever its own
+/// shape calls for.
+///
+/// Two things add stations. A cross-section boundary needs a vertex, so that a
+/// section starts exactly where the caller said rather than at the nearest station
+/// the sampler happened to produce. And a stretch where a lane tapers needs vertices
+/// along it: a straight road is otherwise two points, and a width that varies between
+/// them would have nothing to vary over.
+pub fn required_stations<'a>(
+    section_stations: impl Iterator<Item = f64>,
+    widths: impl Iterator<Item = &'a WidthProfile>,
+    config: SamplingConfig,
+) -> Vec<f64> {
+    let mut stations: Vec<f64> = section_stations.collect();
+    for width in widths {
+        if width.is_constant() {
+            continue;
+        }
+        for pair in width.knots().windows(2) {
+            let (from, to) = (pair[0].0, pair[1].0);
+            if to - from <= 0.0 {
+                continue;
+            }
+            let steps = ((to - from) / config.max_segment_length).ceil() as usize;
+            stations
+                .extend((0..=steps).map(|step| from + (to - from) * step as f64 / steps as f64));
+        }
+    }
+    stations
+}
+
+/// One cross-section of a road, valid from `station` until the next one.
+///
+/// A road whose lane count changes partway along has more than one of these. A lane
+/// that merely tapers does not: that is a width profile, and it needs no new section.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossSection {
+    /// Horizontal station where this cross-section takes over, metres.
+    pub station: f64,
+    /// Lanes of this section, in the order the caller wrote them.
+    pub lanes: Vec<LaneId>,
+}
+
 /// A stretch of road carrying a cross-section along one reference line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Road {
@@ -113,11 +156,15 @@ pub struct Road {
     /// The 3D curve the cross-section is laid out against.
     pub reference_line: Curve3,
     /// Lateral displacement of the cross-section's origin from the reference line,
-    /// metres to the left. Zero for an ordinary road; half a lane width for a
-    /// junction connector, whose reference line runs down the middle of its lane.
-    pub lane_offset: f64,
-    /// Lanes in the order the caller wrote them.
+    /// metres to the left, against station. Zero for an ordinary road; half the lane
+    /// width for a junction connector, whose reference line runs down the middle of
+    /// its single lane — and which follows that lane when it tapers.
+    pub lane_offset: Poly3Profile,
+    /// Every lane of the road, section by section, in the order they were written.
     pub lanes: Vec<LaneId>,
+    /// The road's cross-sections, ascending by station. There is always at least
+    /// one, and the first starts at zero.
+    pub sections: Vec<CrossSection>,
     /// Set when the road exists to carry traffic through a junction.
     pub junction: Option<JunctionId>,
     pub link: RoadLink,
@@ -144,6 +191,17 @@ impl Road {
     pub fn is_connector(&self) -> bool {
         self.junction.is_some()
     }
+
+    /// The station range section `index` covers: from its own station to the next
+    /// one's, or to the end of the road.
+    pub fn section_range(&self, index: usize) -> Result<(f64, f64), GeometryError> {
+        let start = self.sections[index].station;
+        let end = match self.sections.get(index + 1) {
+            Some(next) => next.station,
+            None => self.horizontal_length()?,
+        };
+        Ok((start, end))
+    }
 }
 
 /// One lane of one road.
@@ -162,11 +220,28 @@ pub struct Lane {
     pub ordinal: usize,
     pub direction: Direction,
     pub lane_type: LaneType,
-    pub width: PositiveWidth,
+    /// How wide the lane is along its length. Never zero anywhere.
+    pub width: WidthProfile,
     pub speed_limit: Option<SpeedLimit>,
-    /// Lateral offset of the boundary to the left of the reference line, metres.
+    /// Which of the road's cross-sections this lane belongs to.
+    pub section: usize,
+    /// The stations the lane spans, which are its section's.
+    pub station_range: (f64, f64),
+    /// Which cross-section edge bounds the lane on each side, counted outwards from
+    /// the cross-section origin: `0` is the origin itself, `+n` the n-th edge to the
+    /// left of it and `-n` the n-th to the right.
+    ///
+    /// Two lanes share an edge exactly when these agree, which is what tells the
+    /// Lanelet2 export that they share a boundary — and it keeps saying so when the
+    /// lanes taper and the lateral offsets no longer match.
+    pub left_edge: i32,
+    pub right_edge: i32,
+    /// Lateral offset of each boundary at the lane's *start*, metres. Informational:
+    /// where a lane tapers, the offset elsewhere differs, and the boundaries below
+    /// are the truth.
     pub left_offset: f64,
-    /// Lateral offset of the boundary to the right of the reference line, metres.
+    /// Lateral offset of the boundary to the right of the reference line at the
+    /// lane's start, metres.
     pub right_offset: f64,
     pub left_boundary: Curve3,
     pub right_boundary: Curve3,
@@ -184,8 +259,32 @@ pub struct TravelGeometry {
 }
 
 impl Lane {
+    /// Lateral offset of the lane's middle at its start, metres.
     pub fn center_offset(&self) -> f64 {
         (self.left_offset + self.right_offset) / 2.0
+    }
+
+    /// How wide the lane is at `station`.
+    pub fn width_at(&self, station: f64) -> f64 {
+        self.width.evaluate(station).metres()
+    }
+
+    /// How wide the lane is where traffic enters it.
+    pub fn entry_width(&self) -> f64 {
+        let (start, end) = self.station_range;
+        self.width_at(match self.direction {
+            Direction::Forward => start,
+            Direction::Backward => end,
+        })
+    }
+
+    /// How wide the lane is where traffic leaves it.
+    pub fn exit_width(&self) -> f64 {
+        let (start, end) = self.station_range;
+        self.width_at(match self.direction {
+            Direction::Forward => end,
+            Direction::Backward => start,
+        })
     }
 
     /// The lane's endpoint on its reference line, by reference-line end.
@@ -261,6 +360,45 @@ impl Map {
 
     pub fn junction(&self, id: &JunctionId) -> Option<&Junction> {
         self.junctions.get(id)
+    }
+
+    /// The stations at which a road's geometry was generated — the stations of the
+    /// vertices of every boundary and centreline it owns.
+    ///
+    /// A lane's vertices are these, restricted to the lane's own station range, which
+    /// is what lets a caller line a boundary's points up with positions along the
+    /// reference line.
+    pub fn vertex_stations(&self, road: &RoadId) -> Result<Vec<f64>, GeometryError> {
+        let Some(entry) = self.roads.get(road) else {
+            return Ok(Vec::new());
+        };
+        let lanes = self.lanes_of(road);
+        let required = required_stations(
+            entry.sections.iter().map(|section| section.station),
+            lanes.iter().map(|lane| &lane.width),
+            self.metadata.sampling,
+        );
+        Ok(entry
+            .reference_line
+            .samples_including(self.metadata.sampling, &required)?
+            .into_iter()
+            .map(|sample| sample.station)
+            .collect())
+    }
+
+    /// Lanes of one cross-section of a road.
+    pub fn lanes_of_section(&self, road: &RoadId, section: usize) -> Vec<&Lane> {
+        self.roads
+            .get(road)
+            .and_then(|road| road.sections.get(section))
+            .map(|section| {
+                section
+                    .lanes
+                    .iter()
+                    .filter_map(|id| self.lanes.get(id))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Lanes of a road, in cross-section order.

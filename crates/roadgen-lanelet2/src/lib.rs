@@ -194,9 +194,9 @@ struct Exporter<'a> {
     lanelet_map: Arc<LaneletMap>,
     welder: PointWelder,
     next_id: i64,
-    /// One linestring per road cross-section offset, shared by the lanes either side
-    /// of it — which is what makes two lanelets laterally adjacent.
-    boundaries: HashMap<(RoadId, i64), LineString>,
+    /// One linestring per cross-section edge, shared by the lanes either side of it —
+    /// which is what makes two lanelets laterally adjacent.
+    boundaries: HashMap<(RoadId, usize, i32), LineString>,
     lanelets: HashMap<LaneId, Lanelet>,
     objects: HashMap<ObjectId, Vec<LineString>>,
 }
@@ -238,38 +238,49 @@ impl<'a> Exporter<'a> {
         Ok(self.lanelet_map)
     }
 
-    /// One linestring per distinct lateral offset of each road.
+    /// One linestring per cross-section edge of each road.
+    ///
+    /// The key is the *edge* — which cross-section, and which rank out from its
+    /// origin — rather than the lateral offset, so two lanes that share a boundary
+    /// keep sharing it when they taper and their offsets stop being a fixed number.
     fn build_boundaries(&mut self) -> Result<(), ExportError> {
         for road in self.map.roads.iter() {
-            let lanes: Vec<Lane> = self.map.lanes_of(&road.id).into_iter().cloned().collect();
-            // Left to right across the cross-section, so a boundary's id order
-            // matches the way the road reads.
-            let mut offsets: Vec<(i64, &Curve3, roadgen_core::semantics::BoundaryMarking)> =
-                Vec::new();
-            for lane in &lanes {
-                for (offset, curve, marking) in [
-                    (lane.left_offset, &lane.left_boundary, lane.left_marking),
-                    (lane.right_offset, &lane.right_boundary, lane.right_marking),
-                ] {
-                    let key = offset_key(offset);
-                    if !offsets.iter().any(|(existing, _, _)| *existing == key) {
-                        offsets.push((key, curve, marking));
+            for section in 0..road.sections.len() {
+                let lanes: Vec<Lane> = self
+                    .map
+                    .lanes_of_section(&road.id, section)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                // Left to right across the cross-section, so a boundary's id order
+                // matches the way the road reads.
+                let mut edges: Vec<(i32, &Curve3, roadgen_core::semantics::BoundaryMarking)> =
+                    Vec::new();
+                for lane in &lanes {
+                    for (rank, curve, marking) in [
+                        (lane.left_edge, &lane.left_boundary, lane.left_marking),
+                        (lane.right_edge, &lane.right_boundary, lane.right_marking),
+                    ] {
+                        if !edges.iter().any(|(existing, _, _)| *existing == rank) {
+                            edges.push((rank, curve, marking));
+                        }
                     }
                 }
-            }
-            offsets.sort_by(|a, b| b.0.cmp(&a.0));
+                edges.sort_by(|a, b| b.0.cmp(&a.0));
 
-            for (key, curve, marking) in offsets {
-                let (kind, subtype) = tags::boundary_tags(marking.marking);
-                let mut attributes = vec![("type", kind.to_owned())];
-                if let Some(subtype) = subtype {
-                    attributes.push(("subtype", subtype.to_owned()));
+                for (rank, curve, marking) in edges {
+                    let (kind, subtype) = tags::boundary_tags(marking.marking);
+                    let mut attributes = vec![("type", kind.to_owned())];
+                    if let Some(subtype) = subtype {
+                        attributes.push(("subtype", subtype.to_owned()));
+                    }
+                    if kind == "line_thin" || kind == "line_thick" {
+                        attributes.push(("color", marking.color.as_str().to_owned()));
+                    }
+                    let line = self.linestring(curve, tags::attributes(attributes))?;
+                    self.boundaries
+                        .insert((road.id.clone(), section, rank), line);
                 }
-                if kind == "line_thin" || kind == "line_thick" {
-                    attributes.push(("color", marking.color.as_str().to_owned()));
-                }
-                let line = self.linestring(curve, tags::attributes(attributes))?;
-                self.boundaries.insert((road.id.clone(), key), line);
             }
         }
         Ok(())
@@ -292,11 +303,16 @@ impl<'a> Exporter<'a> {
         Ok(line)
     }
 
-    fn boundary(&self, road: &RoadId, offset: f64) -> Result<LineString, ExportError> {
+    fn boundary(&self, lane: &Lane, rank: i32) -> Result<LineString, ExportError> {
         self.boundaries
-            .get(&(road.clone(), offset_key(offset)))
+            .get(&(lane.road.clone(), lane.section, rank))
             .cloned()
-            .ok_or_else(|| ExportError::Unknown(format!("boundary of {road} at {offset}")))
+            .ok_or_else(|| {
+                ExportError::Unknown(format!(
+                    "boundary of {} section {} at edge {rank}",
+                    lane.road, lane.section
+                ))
+            })
     }
 
     fn build_lanelets(&mut self) -> Result<(), ExportError> {
@@ -304,8 +320,8 @@ impl<'a> Exporter<'a> {
             let Some(subtype) = tags::lanelet_subtype(lane.lane_type) else {
                 continue;
             };
-            let inner_left = self.boundary(&lane.road, lane.left_offset)?;
-            let inner_right = self.boundary(&lane.road, lane.right_offset)?;
+            let inner_left = self.boundary(&lane, lane.left_edge)?;
+            let inner_right = self.boundary(&lane, lane.right_edge)?;
             // A lanelet runs the way traffic does: for a backward lane that means
             // inverting both boundaries *and* swapping them, so that "left" is still
             // the driver's left.
@@ -538,9 +554,4 @@ impl<'a> Exporter<'a> {
         self.lanelet_map.add(Primitive::RegulatoryElement(element));
         Ok(())
     }
-}
-
-/// A lateral offset, quantised so that two lanes sharing a boundary agree on it.
-fn offset_key(offset: f64) -> i64 {
-    (offset / WELD_TOLERANCE).round() as i64
 }

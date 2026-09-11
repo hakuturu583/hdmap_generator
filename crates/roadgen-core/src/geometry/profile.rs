@@ -144,6 +144,23 @@ impl Poly3Profile {
             .all(|piece| piece.a == 0.0 && piece.b == 0.0 && piece.c == 0.0 && piece.d == 0.0)
     }
 
+    /// The same profile with every value multiplied by `factor`.
+    pub fn scaled(&self, factor: f64) -> Poly3Profile {
+        Poly3Profile {
+            pieces: self
+                .pieces
+                .iter()
+                .map(|piece| Poly3Piece {
+                    station: piece.station,
+                    a: piece.a * factor,
+                    b: piece.b * factor,
+                    c: piece.c * factor,
+                    d: piece.d * factor,
+                })
+                .collect(),
+        }
+    }
+
     /// The largest absolute value the profile takes at any of `stations`.
     pub fn peak_over(&self, stations: impl IntoIterator<Item = f64>) -> f64 {
         stations
@@ -206,6 +223,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0.0, 100.0]
         );
+    }
+
+    #[test]
+    fn scaling_scales_the_value_everywhere() {
+        let profile = Poly3Profile::piecewise_linear([(0.0, 4.0), (100.0, 2.0)]).unwrap();
+        let half = profile.scaled(0.5);
+        for station in [0.0, 25.0, 100.0, 200.0] {
+            assert!((half.evaluate(station) - profile.evaluate(station) / 2.0).abs() < 1e-12);
+        }
     }
 
     #[test]

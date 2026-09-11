@@ -384,6 +384,83 @@ pub fn banked_curve() -> ValidatedMap {
     finish(builder)
 }
 
+/// A lane drop: three lanes one way, the outer one tapering away and then ending.
+///
+/// This is both halves of a changing cross-section at once. The taper is a width
+/// profile — the lane stays one lane while it narrows — and the drop is a second
+/// cross-section, because past it there is one lane fewer.
+pub fn lane_drop() -> ValidatedMap {
+    let taper_start = 120.0;
+    let drop = 200.0;
+    let outer = lane(3.5, Direction::Forward).with_width_profile(
+        WidthProfile::tapered(
+            taper_start,
+            drop - taper_start,
+            PositiveWidth::new(3.5).unwrap(),
+            PositiveWidth::new(0.4).unwrap(),
+            Taper::Smooth,
+        )
+        .unwrap(),
+    );
+
+    let mut builder = MapBuilder::new(metadata("lane-drop"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(320.0, 0.0, 0.0),
+                vec![
+                    lane(3.5, Direction::Forward),
+                    lane(3.5, Direction::Forward),
+                    outer,
+                ],
+            )
+            .unwrap()
+            .with_name("wide")
+            // Past the drop the outer lane is gone and two remain.
+            .with_cross_section(
+                drop,
+                vec![lane(3.5, Direction::Forward), lane(3.5, Direction::Forward)],
+            ),
+        )
+        .unwrap();
+    finish(builder)
+}
+
+/// A carriageway that widens out into a lay-by and narrows back again, without ever
+/// changing how many lanes it has.
+pub fn widening_road() -> ValidatedMap {
+    let shoulder = lane(2.0, Direction::Forward)
+        .with_type(LaneType::Shoulder)
+        .with_width_profile(
+            WidthProfile::new(
+                [
+                    (0.0, PositiveWidth::new(2.0).unwrap()),
+                    (60.0, PositiveWidth::new(2.0).unwrap()),
+                    (100.0, PositiveWidth::new(5.0).unwrap()),
+                    (160.0, PositiveWidth::new(5.0).unwrap()),
+                    (200.0, PositiveWidth::new(2.0).unwrap()),
+                ],
+                Taper::Linear,
+            )
+            .unwrap(),
+        );
+
+    let mut builder = MapBuilder::new(metadata("widening"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(260.0, 0.0, 0.0),
+                vec![lane(3.5, Direction::Forward), shoulder],
+            )
+            .unwrap()
+            .with_name("layby"),
+        )
+        .unwrap();
+    finish(builder)
+}
+
 /// A crossroads with the traffic control a real one has: stop lines, lights and a
 /// right of way. Used to check that semantics reach the Lanelet2 map.
 pub fn controlled_crossroads() -> ValidatedMap {
