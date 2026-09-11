@@ -9,7 +9,9 @@
 use std::collections::HashMap;
 
 use crate::error::{BuildError, GeometryError};
-use crate::geometry::{Bezier3, Curve3, Point3, Polyline3, Sample, SamplingConfig, Vector3};
+use crate::geometry::{
+    Bezier3, Curve3, Point3, Poly3Profile, Polyline3, Sample, SamplingConfig, Vector3,
+};
 use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::map::{Lane, Map, MapMetadata, Road, TravelGeometry};
 use crate::semantics::{
@@ -80,6 +82,9 @@ pub struct RoadSpec {
     pub lanes: Vec<LaneSpec>,
     pub road_type: RoadType,
     pub speed_limit: Option<SpeedLimit>,
+    /// Roll of the road surface about its reference line, radians, as a function of
+    /// horizontal station. Zero everywhere is a road that is flat across.
+    pub superelevation: Poly3Profile,
 }
 
 impl RoadSpec {
@@ -90,6 +95,7 @@ impl RoadSpec {
             lanes,
             road_type: RoadType::Town,
             speed_limit: None,
+            superelevation: Poly3Profile::default(),
         }
     }
 
@@ -110,6 +116,13 @@ impl RoadSpec {
 
     pub fn with_speed_limit(mut self, limit: SpeedLimit) -> Self {
         self.speed_limit = Some(limit);
+        self
+    }
+
+    /// Banks the road: `superelevation` gives the roll in radians against the
+    /// horizontal station, positive raising the left-hand side.
+    pub fn with_superelevation(mut self, superelevation: Poly3Profile) -> Self {
+        self.superelevation = superelevation;
         self
     }
 }
@@ -669,17 +682,48 @@ impl Direction {
 /// each sampled station.
 struct RoadGeometry {
     samples: Vec<Sample>,
+    /// The horizontal lateral direction at each station, mitred where the road meets
+    /// another. Superelevation is *not* baked in here: a joint has to be mitred in
+    /// plan, and the roll is applied afterwards, per station.
     laterals: Vec<Vector3>,
+    /// Superelevation at each station, radians.
+    rolls: Vec<f64>,
 }
 
 impl RoadGeometry {
-    fn new(reference_line: &Curve3, config: SamplingConfig) -> Result<Self, GeometryError> {
+    fn new(
+        reference_line: &Curve3,
+        superelevation: &Poly3Profile,
+        config: SamplingConfig,
+    ) -> Result<Self, GeometryError> {
         let samples = reference_line.samples(config)?;
         let laterals = samples
             .iter()
             .map(|sample| Ok(sample.frame()?.left.get()))
             .collect::<Result<Vec<_>, GeometryError>>()?;
-        Ok(RoadGeometry { samples, laterals })
+        let rolls = samples
+            .iter()
+            .map(|sample| superelevation.evaluate(sample.station))
+            .collect();
+        Ok(RoadGeometry {
+            samples,
+            laterals,
+            rolls,
+        })
+    }
+
+    /// The lateral direction to offset along at one station, once the road's
+    /// superelevation has tilted it.
+    ///
+    /// The roll turns the lateral about the tangent, so an offset along it gains
+    /// height — which is what banking is. A mitred lateral is longer than a unit
+    /// vector, and the rotation preserves that.
+    fn banked_lateral(&self, index: usize) -> Vector3 {
+        let roll = self.rolls[index];
+        if roll == 0.0 {
+            return self.laterals[index];
+        }
+        self.laterals[index].rotated_about(self.samples[index].tangent, roll)
     }
 
     /// The curve `offset` metres to the left of the reference line.
@@ -687,16 +731,22 @@ impl RoadGeometry {
         Ok(Curve3::Polyline(Polyline3::new(
             self.samples
                 .iter()
-                .zip(&self.laterals)
-                .map(|(sample, lateral)| sample.point + *lateral * offset),
+                .enumerate()
+                .map(|(index, sample)| sample.point + self.banked_lateral(index) * offset),
         )?))
     }
 
+    /// The lateral direction in plan at one end, before any roll. This is what a
+    /// joint is mitred in: two roads have to agree on a direction across the ground
+    /// whatever each of them is banked to.
     fn lateral_at(&self, end: RoadEnd) -> Vector3 {
-        match end {
-            RoadEnd::Start => self.laterals[0],
-            RoadEnd::End => self.laterals[self.laterals.len() - 1],
-        }
+        self.laterals[self.index_at(end)]
+    }
+
+    /// The lateral direction at one end with the road's roll applied — the direction
+    /// a boundary is actually offset along there.
+    fn banked_lateral_at(&self, end: RoadEnd) -> Vector3 {
+        self.banked_lateral(self.index_at(end))
     }
 
     fn index_at(&self, end: RoadEnd) -> usize {
@@ -743,7 +793,11 @@ impl Generator {
         for draft in &self.builder.roads {
             self.geometry.insert(
                 draft.id.clone(),
-                RoadGeometry::new(&draft.spec.reference_line, config)?,
+                RoadGeometry::new(
+                    &draft.spec.reference_line,
+                    &draft.spec.superelevation,
+                    config,
+                )?,
             );
         }
         Ok(())
@@ -857,6 +911,7 @@ impl Generator {
                 link: draft.link.clone(),
                 road_type: draft.spec.road_type,
                 speed_limit: draft.spec.speed_limit,
+                superelevation: draft.spec.superelevation.clone(),
             };
             self.insert_road(road, lanes)?;
         }
@@ -1027,15 +1082,18 @@ impl Generator {
 
         // The connector's lane straddles its reference line, so the cross-section
         // origin sits half a lane to the left of it.
-        let mut geometry = RoadGeometry::new(&reference_line, config)?;
+        let mut geometry = RoadGeometry::new(&reference_line, &Poly3Profile::default(), config)?;
         // Adopt the lateral direction of each road it meets, so the connector's
         // boundary endpoints land exactly on theirs.
         let from_end = road_end_of(from_lane.direction.exit_end());
         let to_end = road_end_of(to_lane.direction.entry_end());
+        // The banked direction, not the plan one: the connector's boundary endpoints
+        // have to land on the approach's, which a banked road lifts off the
+        // horizontal.
         let start_lateral =
-            self.geometry[&from_lane.road].lateral_at(from_end) * from_lane.direction.sign();
+            self.geometry[&from_lane.road].banked_lateral_at(from_end) * from_lane.direction.sign();
         let end_lateral =
-            self.geometry[&to_lane.road].lateral_at(to_end) * to_lane.direction.sign();
+            self.geometry[&to_lane.road].banked_lateral_at(to_end) * to_lane.direction.sign();
         let last = geometry.laterals.len() - 1;
         geometry.laterals[0] = start_lateral;
         geometry.laterals[last] = end_lateral;
@@ -1062,6 +1120,7 @@ impl Generator {
                 .map(|road| road.road_type)
                 .unwrap_or(RoadType::Town),
             speed_limit: from_lane.speed_limit,
+            superelevation: Poly3Profile::default(),
         };
         let lanes = self.build_cross_section(&road_id, &spec, width.half())?;
         let connector_lane = lanes[0].id.clone();
@@ -1084,6 +1143,7 @@ impl Generator {
             },
             road_type: spec.road_type,
             speed_limit: spec.speed_limit,
+            superelevation: Poly3Profile::default(),
         };
         self.insert_road(road, lanes)?;
 

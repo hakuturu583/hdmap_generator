@@ -278,3 +278,85 @@ def test_a_split_without_a_junction_is_refused():
     m.connect(a, b)
     with pytest.raises(ValueError, match="junction"):
         m.connect(a, c)
+
+
+def test_an_alignment_chains_lines_bends_and_transitions():
+    m = roadgen.Map()
+    radius = 120.0
+    al = roadgen.Alignment(start=(0.0, 0.0, 4.0), heading=0.0)
+    al.line(80.0, rise=1.0)
+    al.spiral(60.0, curvature_end=1 / radius, rise=1.0)
+    al.arc(140.0, curvature=1 / radius, rise=2.0)
+    al.spiral(60.0, curvature_end=0.0, rise=1.0)
+    al.line(80.0, rise=1.0)
+
+    # The alignment tracks where it has got to, so the caller never restates it.
+    assert al.curvature == pytest.approx(0.0)
+    # Each transition turns by half its length times the bend's curvature, and the
+    # bend by all of its: (60/2 + 140 + 60/2) / radius.
+    assert al.heading == pytest.approx(200.0 / radius, abs=1e-6)
+    assert al.point[2] == pytest.approx(10.0)
+
+    m.add_road(lanes=two_way(), alignment=al, name="sweep")
+    assert m.format_warnings() == []
+
+    # The transitions reach OpenDRIVE as spirals, not as chains of line segments.
+    root = ET.fromstring(m.to_opendrive_xml())
+    kinds = [
+        child.tag
+        for geometry in root.findall("road/planView/geometry")
+        for child in geometry
+    ]
+    assert kinds == ["line", "spiral", "arc", "spiral", "line"]
+
+    # And the lane centreline really follows the bend.
+    centre = m.lane_centerline("lane/sweep/0")
+    assert centre[0][2] == pytest.approx(4.0, abs=1e-6)
+    assert centre[-1][1] > 20.0
+
+
+def test_a_banked_road_lifts_one_edge():
+    m = roadgen.Map()
+    al = roadgen.Alignment(start=(0.0, 0.0, 0.0), heading=0.0)
+    al.line(50.0)
+    al.arc(120.0, curvature=1 / 150)
+    m.add_road(
+        lanes=two_way(),
+        alignment=al,
+        name="bend",
+        # Flat to 50 m, rolled to -0.06 rad by 100 m, held from there.
+        superelevation=[(0.0, 0.0), (50.0, 0.0), (100.0, -0.06), (170.0, -0.06)],
+    )
+
+    root = ET.fromstring(m.to_opendrive_xml())
+    rolls = root.findall("road/lateralProfile/superelevation")
+    assert len(rolls) == 4
+    assert float(rolls[2].get("a")) == pytest.approx(-0.06)
+
+    # The two carriageways are no longer at the same height through the bend: the
+    # right-hand one rides higher on the banked surface.
+    forward_end = m.lane_centerline("lane/bend/0")[-1]
+    backward_start = m.lane_centerline("lane/bend/1")[0]
+    assert forward_end[2] > backward_start[2]
+
+
+def test_a_road_cannot_take_two_geometries_at_once():
+    m = roadgen.Map()
+    al = roadgen.Alignment(start=(0.0, 0.0, 0.0))
+    al.line(50.0)
+    with pytest.raises(ValueError, match="exactly one"):
+        m.add_road(lanes=two_way(), start=(0.0, 0.0, 0.0), end=(1.0, 0.0, 0.0), alignment=al)
+
+
+def test_an_absurd_bank_is_refused():
+    m = roadgen.Map()
+    m.add_road(
+        lanes=two_way(),
+        start=(0.0, 0.0, 0.0),
+        end=(100.0, 0.0, 0.0),
+        name="wall",
+        superelevation=[(0.0, 1.05)],
+    )
+    assert any("banked" in issue for issue in m.issues())
+    with pytest.raises(ValueError):
+        m.validate()

@@ -53,6 +53,22 @@ class Junction:
     @property
     def id(self) -> str: ...
 
+class Alignment:
+    """A road alignment built one piece at a time."""
+
+    def __init__(self, start: Point, heading: float = 0.0) -> None: ...
+    def line(self, length: float, rise: float = 0.0) -> None: ...
+    def arc(self, length: float, curvature: float, rise: float = 0.0) -> None: ...
+    def spiral(
+        self, length: float, curvature_end: float, rise: float = 0.0
+    ) -> None: ...
+    @property
+    def point(self) -> Point: ...
+    @property
+    def heading(self) -> float: ...
+    @property
+    def curvature(self) -> float: ...
+
 class Map:
     """A road network under construction."""
 
@@ -70,9 +86,11 @@ class Map:
         start: Optional[Point] = None,
         end: Optional[Point] = None,
         points: Optional[Iterable[Point]] = None,
+        alignment: Optional[Alignment] = None,
         name: Optional[str] = None,
         type_: str = "town",
         speed_limit_kph: Optional[float] = None,
+        superelevation: Optional[Sequence[tuple[float, float]]] = None,
     ) -> Road: ...
     def add_junction(self, name: Optional[str] = None) -> Junction: ...
     def connect(

@@ -45,6 +45,10 @@ impl<'a> RoadEvaluator<'a> {
             .map(RoadEvaluator::new)
     }
 
+    /// Integration step used for a `<spiral>`, metres. Independent of whatever the
+    /// exporter used: this walks the element from its own attributes.
+    const SPIRAL_STEP: f64 = 0.002;
+
     /// The reference line's position and heading at plan-view station `s`.
     fn reference_at(&self, s: f64) -> (f64, f64, f64) {
         let geometry = self
@@ -74,8 +78,32 @@ impl<'a> RoadEvaluator<'a> {
                     )
                 }
             }
-            // Everything this project writes other than an arc is a straight
-            // segment; a document using paramPoly3 would need more here.
+            GeometryType::Spiral(spiral) => {
+                // A spiral's curvature runs linearly from curvStart to curvEnd over
+                // the element, so its heading is a quadratic and its position is the
+                // integral of that heading's cosine and sine — a Fresnel integral,
+                // walked here with the midpoint rule at a fine step.
+                let length = geometry.length.value;
+                let (start, end) = (spiral.curvature_start.value, spiral.curvature_end.value);
+                let sharpness = if length > 0.0 {
+                    (end - start) / length
+                } else {
+                    0.0
+                };
+                let heading_at = |u: f64| hdg + start * u + 0.5 * sharpness * u * u;
+                let steps = ((ds / Self::SPIRAL_STEP).ceil() as usize).max(1);
+                let step = ds / steps as f64;
+                let (mut x, mut y) = (geometry.x.value, geometry.y.value);
+                for index in 0..steps {
+                    let u = step * (index as f64 + 0.5);
+                    let heading = heading_at(u);
+                    x += step * heading.cos();
+                    y += step * heading.sin();
+                }
+                (x, y, heading_at(ds))
+            }
+            // Everything this project writes other than an arc or a spiral is a
+            // straight segment; a document using paramPoly3 would need more here.
             _ => (
                 geometry.x.value + ds * hdg.cos(),
                 geometry.y.value + ds * hdg.sin(),
@@ -93,6 +121,22 @@ impl<'a> RoadEvaluator<'a> {
             .iter()
             .rfind(|entry| entry.s <= s + 1e-9)
             .or_else(|| profile.elevation.first())
+        else {
+            return 0.0;
+        };
+        let ds = s - entry.s;
+        entry.a + entry.b * ds + entry.c * ds * ds + entry.d * ds * ds * ds
+    }
+
+    /// The road's roll at station `s`, from `<lateralProfile><superelevation>`.
+    fn superelevation_at(&self, s: f64) -> f64 {
+        let Some(profile) = &self.road.lateral_profile else {
+            return 0.0;
+        };
+        let Some(entry) = profile
+            .super_elevation
+            .iter()
+            .rfind(|entry| entry.s <= s + 1e-9)
         else {
             return 0.0;
         };
@@ -171,11 +215,15 @@ impl<'a> RoadEvaluator<'a> {
     pub fn lane_center(&self, id: i64, s: f64) -> Option<Position> {
         let (x, y, heading) = self.reference_at(s);
         let t = self.lane_center_offset(id, s)?;
+        // Superelevation rolls the cross-section about the s-axis, so an offset `t`
+        // to the left rises by t·sin(roll) and reaches only t·cos(roll) across.
+        let roll = self.superelevation_at(s);
+        let (across, rise) = (t * roll.cos(), t * roll.sin());
         Some(Position {
             // `t` is positive to the left of the reference line.
-            x: x - t * heading.sin(),
-            y: y + t * heading.cos(),
-            z: self.elevation_at(s),
+            x: x - across * heading.sin(),
+            y: y + across * heading.cos(),
+            z: self.elevation_at(s) + rise,
         })
     }
 

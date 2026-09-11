@@ -118,6 +118,26 @@ impl Arc3 {
         })
     }
 
+    pub fn start(&self) -> Point3 {
+        self.start
+    }
+
+    pub fn heading(&self) -> f64 {
+        self.heading
+    }
+
+    pub fn curvature(&self) -> f64 {
+        self.curvature
+    }
+
+    pub fn horizontal_length(&self) -> f64 {
+        self.horizontal_length
+    }
+
+    pub fn end_z(&self) -> f64 {
+        self.end_z
+    }
+
     fn grade(&self) -> f64 {
         (self.end_z - self.start.z) / self.horizontal_length
     }
@@ -141,6 +161,166 @@ impl Arc3 {
             .normalize()
             .expect("an arc tangent always has a unit horizontal part");
         (point, tangent)
+    }
+}
+
+/// A clothoid: an arc whose curvature changes linearly along it.
+///
+/// This is the transition a road actually uses between a straight and a bend — the
+/// curve a vehicle traces while the steering wheel turns at a constant rate — and it
+/// is what OpenDRIVE's `<spiral>` describes. A straight-to-arc joint without one is a
+/// step change in lateral acceleration.
+///
+/// Grade is constant along the piece, as it is for [`Arc3`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clothoid3 {
+    start: Point3,
+    heading: f64,
+    curvature_start: f64,
+    curvature_end: f64,
+    horizontal_length: f64,
+    end_z: f64,
+}
+
+impl Clothoid3 {
+    /// Integration step for the spiral, metres.
+    ///
+    /// The position of a clothoid has no closed form in elementary functions — it is
+    /// a Fresnel integral — so it is integrated. Simpson's error falls as the fourth
+    /// power of the step, and a centimetre keeps it below a nanometre even for a
+    /// spiral far sharper than any road, which is three orders below the micrometre
+    /// at which this project welds points together.
+    const STEP: f64 = 0.01;
+    /// Bounds on the interval count, so a short span is still integrated accurately
+    /// and a very long one cannot cost unboundedly much.
+    const MIN_INTERVALS: usize = 16;
+    const MAX_INTERVALS: usize = 4096;
+
+    /// An even interval count for a span of `span` metres.
+    fn intervals_for(span: f64) -> usize {
+        let wanted = (span / Self::STEP).ceil() as usize;
+        let clamped = wanted.clamp(Self::MIN_INTERVALS, Self::MAX_INTERVALS);
+        // Simpson's rule needs an even number of intervals.
+        clamped + clamped % 2
+    }
+
+    pub fn new(
+        start: Point3,
+        heading: f64,
+        curvature_start: f64,
+        curvature_end: f64,
+        horizontal_length: f64,
+        end_z: f64,
+    ) -> Result<Self, GeometryError> {
+        if !(horizontal_length.is_finite() && horizontal_length > Polyline3::MIN_SEGMENT) {
+            return Err(GeometryError::NoHorizontalExtent);
+        }
+        if ![heading, curvature_start, curvature_end, end_z]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return Err(GeometryError::NonFiniteCoordinate);
+        }
+        Ok(Clothoid3 {
+            start,
+            heading,
+            curvature_start,
+            curvature_end,
+            horizontal_length,
+            end_z,
+        })
+    }
+
+    pub fn start(&self) -> Point3 {
+        self.start
+    }
+
+    pub fn heading(&self) -> f64 {
+        self.heading
+    }
+
+    pub fn curvature_start(&self) -> f64 {
+        self.curvature_start
+    }
+
+    pub fn curvature_end(&self) -> f64 {
+        self.curvature_end
+    }
+
+    pub fn horizontal_length(&self) -> f64 {
+        self.horizontal_length
+    }
+
+    pub fn end_z(&self) -> f64 {
+        self.end_z
+    }
+
+    /// Rate of change of curvature along the piece, per metre.
+    fn sharpness(&self) -> f64 {
+        (self.curvature_end - self.curvature_start) / self.horizontal_length
+    }
+
+    fn grade(&self) -> f64 {
+        (self.end_z - self.start.z) / self.horizontal_length
+    }
+
+    /// Heading after travelling `station` metres, which is the integral of the
+    /// curvature and so is available in closed form even though the position is not.
+    fn heading_at(&self, station: f64) -> f64 {
+        self.heading + self.curvature_start * station + 0.5 * self.sharpness() * station * station
+    }
+
+    fn tangent_at(&self, station: f64) -> UnitVector3 {
+        let heading = self.heading_at(station);
+        Vector3::new(heading.cos(), heading.sin(), self.grade())
+            .normalize()
+            .expect("a clothoid tangent always has a unit horizontal part")
+    }
+
+    /// Walks the spiral, returning the position at each requested station.
+    ///
+    /// `stations` must ascend and start at zero; they are integrated through in one
+    /// pass so that the cost is linear in the number of samples rather than
+    /// quadratic.
+    fn walk(&self, stations: &[f64]) -> Vec<Point3> {
+        let grade = self.grade();
+        let mut points = Vec::with_capacity(stations.len());
+        let (mut x, mut y) = (self.start.x, self.start.y);
+        let mut from = 0.0;
+
+        for &station in stations {
+            let span = station - from;
+            if span > 0.0 {
+                let intervals = Self::intervals_for(span);
+                let step = span / intervals as f64;
+                // Composite Simpson: the ends count once, interior odd samples four
+                // times and interior even samples twice.
+                let (mut sum_x, mut sum_y) = (0.0, 0.0);
+                for index in 0..=intervals {
+                    let heading = self.heading_at(from + step * index as f64);
+                    let weight = if index == 0 || index == intervals {
+                        1.0
+                    } else if index % 2 == 1 {
+                        4.0
+                    } else {
+                        2.0
+                    };
+                    sum_x += weight * heading.cos();
+                    sum_y += weight * heading.sin();
+                }
+                x += sum_x * step / 3.0;
+                y += sum_y * step / 3.0;
+                from = station;
+            }
+            points.push(Point3::new(x, y, self.start.z + grade * station));
+        }
+        points
+    }
+
+    fn end(&self) -> Point3 {
+        self.walk(&[self.horizontal_length])
+            .pop()
+            .expect("one station in, one point out")
     }
 }
 
@@ -236,8 +416,16 @@ impl Bezier3 {
 pub enum Curve3 {
     Line(Line3),
     Arc(Arc3),
+    /// A transition whose curvature changes linearly.
+    Clothoid(Clothoid3),
     Bezier(Bezier3),
     Polyline(Polyline3),
+    /// Several curves end to end, each starting where the last one finished.
+    ///
+    /// This is what a real alignment is: straight, transition, bend, transition,
+    /// straight. Build one with [`Curve3::composite`], which checks that the pieces
+    /// actually meet.
+    Composite(Vec<Curve3>),
 }
 
 impl Curve3 {
@@ -248,6 +436,33 @@ impl Curve3 {
     pub fn polyline(points: impl IntoIterator<Item = Point3>) -> Result<Self, GeometryError> {
         Ok(Curve3::Polyline(Polyline3::new(points)?))
     }
+
+    /// Chains curves end to end.
+    ///
+    /// A single curve is returned as itself rather than wrapped, so the exporters
+    /// keep seeing the shape the caller meant. Fails if a piece does not start where
+    /// its predecessor ended — a composite with a gap in it is not a curve.
+    pub fn composite(segments: impl IntoIterator<Item = Curve3>) -> Result<Self, GeometryError> {
+        let segments: Vec<Curve3> = segments.into_iter().collect();
+        match segments.len() {
+            0 => return Err(GeometryError::TooFewPoints { got: 0 }),
+            1 => return Ok(segments.into_iter().next().expect("length checked")),
+            _ => {}
+        }
+        for pair in segments.windows(2) {
+            let gap = pair[0].end_point().distance_to(pair[1].start_point());
+            if gap > Self::JOIN_TOLERANCE {
+                return Err(GeometryError::DisjointSegments { gap });
+            }
+        }
+        Ok(Curve3::Composite(segments))
+    }
+
+    /// How far apart two pieces of a composite may be and still count as joined.
+    ///
+    /// A millimetre: below what any map means to distinguish, and far above the
+    /// rounding that accumulates when one piece's end is computed to start the next.
+    pub const JOIN_TOLERANCE: f64 = 1e-3;
 
     /// Evaluated stations, always including both ends, in increasing station order.
     pub fn samples(&self, config: SamplingConfig) -> Result<Vec<Sample>, GeometryError> {
@@ -281,6 +496,47 @@ impl Curve3 {
                         }
                     })
                     .collect())
+            }
+            Curve3::Clothoid(clothoid) => {
+                let steps = config.segments_for(clothoid.horizontal_length);
+                let stations: Vec<f64> = (0..=steps)
+                    .map(|i| clothoid.horizontal_length * (i as f64 / steps as f64))
+                    .collect();
+                Ok(clothoid
+                    .walk(&stations)
+                    .into_iter()
+                    .zip(&stations)
+                    .map(|(point, &station)| Sample {
+                        station,
+                        point,
+                        tangent: clothoid.tangent_at(station),
+                    })
+                    .collect())
+            }
+            Curve3::Composite(segments) => {
+                let mut samples: Vec<Sample> = Vec::new();
+                let mut offset = 0.0;
+                for segment in segments {
+                    let segment_samples = segment.samples(config)?;
+                    let length = segment_samples
+                        .last()
+                        .expect("a curve samples at least its two ends")
+                        .station;
+                    for sample in segment_samples {
+                        // The joint is one station, not two: the previous piece
+                        // already put a sample there, and a repeated vertex would
+                        // become a zero-length boundary segment downstream.
+                        if !samples.is_empty() && sample.station == 0.0 {
+                            continue;
+                        }
+                        samples.push(Sample {
+                            station: offset + sample.station,
+                            ..sample
+                        });
+                    }
+                    offset += length;
+                }
+                Ok(samples)
             }
             Curve3::Bezier(bezier) => {
                 let steps = config.segments_for(bezier.control_polygon_length()).max(8);
@@ -327,8 +583,10 @@ impl Curve3 {
         match self {
             Curve3::Line(line) => line.start(),
             Curve3::Arc(arc) => arc.start,
+            Curve3::Clothoid(clothoid) => clothoid.start,
             Curve3::Bezier(bezier) => bezier.control[0],
             Curve3::Polyline(polyline) => polyline.first(),
+            Curve3::Composite(segments) => segments[0].start_point(),
         }
     }
 
@@ -336,8 +594,10 @@ impl Curve3 {
         match self {
             Curve3::Line(line) => line.end(),
             Curve3::Arc(arc) => arc.at(arc.horizontal_length).0,
+            Curve3::Clothoid(clothoid) => clothoid.end(),
             Curve3::Bezier(bezier) => bezier.control[3],
             Curve3::Polyline(polyline) => polyline.last(),
+            Curve3::Composite(segments) => segments[segments.len() - 1].end_point(),
         }
     }
 
@@ -363,12 +623,19 @@ impl Curve3 {
         match self {
             Curve3::Line(line) => Ok(line.start().horizontal_distance_to(line.end())),
             Curve3::Arc(arc) => Ok(arc.horizontal_length),
+            Curve3::Clothoid(clothoid) => Ok(clothoid.horizontal_length),
+            // A Bézier is parameterised by `t` rather than by arc length, so the
+            // only way to its length is to walk it.
             Curve3::Bezier(_) => Ok(self
                 .samples(SamplingConfig::default())?
                 .last()
                 .expect("a curve always samples at least its two ends")
                 .station),
             Curve3::Polyline(polyline) => Ok(polyline.horizontal_length()),
+            Curve3::Composite(segments) => segments
+                .iter()
+                .map(Curve3::horizontal_length)
+                .sum::<Result<f64, GeometryError>>(),
         }
     }
 
@@ -390,11 +657,31 @@ impl Curve3 {
                     arc.start.z,
                 )?)
             }
+            Curve3::Clothoid(clothoid) => {
+                // Walking the spiral backwards swaps its two curvatures and negates
+                // them, because the turn is now the other way round.
+                let end_heading = clothoid.tangent_at(clothoid.horizontal_length).heading();
+                Curve3::Clothoid(Clothoid3::new(
+                    clothoid.end(),
+                    end_heading + std::f64::consts::PI,
+                    -clothoid.curvature_end,
+                    -clothoid.curvature_start,
+                    clothoid.horizontal_length,
+                    clothoid.start.z,
+                )?)
+            }
             Curve3::Bezier(bezier) => {
                 let [a, b, c, d] = bezier.control;
                 Curve3::Bezier(Bezier3::new([d, c, b, a])?)
             }
             Curve3::Polyline(polyline) => Curve3::Polyline(polyline.reversed()),
+            Curve3::Composite(segments) => Curve3::composite(
+                segments
+                    .iter()
+                    .rev()
+                    .map(|segment| segment.reversed(config))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?,
         }
         .tap_validate(config)
     }
@@ -412,6 +699,20 @@ mod tests {
 
     fn p(x: f64, y: f64, z: f64) -> Point3 {
         Point3::new(x, y, z)
+    }
+
+    /// The position `fraction` of the way along a polyline, by 3D arc length.
+    fn point_at_fraction(polyline: &Polyline3, fraction: f64) -> Point3 {
+        let target = polyline.length() * fraction;
+        let mut walked = 0.0;
+        for pair in polyline.points().windows(2) {
+            let span = pair[0].distance_to(pair[1]);
+            if walked + span >= target {
+                return pair[0].lerp(pair[1], (target - walked) / span);
+            }
+            walked += span;
+        }
+        polyline.last()
     }
 
     #[test]
@@ -477,6 +778,167 @@ mod tests {
             let reversed = curve.reversed(config).unwrap();
             assert!(reversed.start_point().is_close(curve.end_point(), 1e-9));
             assert!(reversed.end_point().is_close(curve.start_point(), 1e-9));
+        }
+    }
+
+    #[test]
+    fn a_clothoid_with_constant_curvature_is_an_arc() {
+        // The degenerate case is the one with a closed form to check against: a
+        // spiral whose curvature does not change has to trace the same path as the
+        // arc of that curvature.
+        let (radius, length) = (60.0, 40.0);
+        let clothoid = Curve3::Clothoid(
+            Clothoid3::new(
+                p(3.0, -4.0, 2.0),
+                0.4,
+                1.0 / radius,
+                1.0 / radius,
+                length,
+                5.0,
+            )
+            .unwrap(),
+        );
+        let arc =
+            Curve3::Arc(Arc3::new(p(3.0, -4.0, 2.0), 0.4, 1.0 / radius, length, 5.0).unwrap());
+
+        let config = SamplingConfig::new(1.0).unwrap();
+        for (spiral, circle) in clothoid
+            .samples(config)
+            .unwrap()
+            .iter()
+            .zip(arc.samples(config).unwrap())
+        {
+            assert!(
+                spiral.point.is_close(circle.point, 1e-9),
+                "at s={}: {:?} vs {:?}",
+                spiral.station,
+                spiral.point,
+                circle.point
+            );
+        }
+    }
+
+    #[test]
+    fn a_clothoid_turns_by_the_integral_of_its_curvature() {
+        // Curvature ramps linearly from 0 to 1/R over L, so the heading turns by
+        // L/(2R) — the average curvature times the length.
+        let (radius, length) = (50.0, 30.0);
+        let clothoid = Curve3::Clothoid(
+            Clothoid3::new(p(0.0, 0.0, 0.0), 0.0, 0.0, 1.0 / radius, length, 0.0).unwrap(),
+        );
+        let turn = clothoid.end_tangent().unwrap().heading();
+        assert!((turn - length / (2.0 * radius)).abs() < 1e-9);
+
+        // It leaves straight, which is the whole point of a transition curve.
+        assert!(clothoid.start_tangent().unwrap().heading().abs() < 1e-12);
+        assert!((clothoid.horizontal_length().unwrap() - length).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_clothoid_matches_its_fresnel_integral() {
+        // Against the standard Euler spiral: with curvature k(s) = s (sharpness 1,
+        // starting straight at the origin), the position is (C(s), S(s)) scaled by
+        // sqrt(pi) — the Fresnel integrals. Check one station against a series.
+        let clothoid = Clothoid3::new(p(0.0, 0.0, 0.0), 0.0, 0.0, 1.0, 1.0, 0.0).unwrap();
+        let end = clothoid.walk(&[1.0])[0];
+
+        // x = ∫cos(s²/2) ds and y = ∫sin(s²/2) ds over [0, 1], by series expansion.
+        let (mut x, mut y) = (0.0, 0.0);
+        let steps = 200_000;
+        for index in 0..steps {
+            let s = (index as f64 + 0.5) / steps as f64;
+            x += (s * s / 2.0).cos() / steps as f64;
+            y += (s * s / 2.0).sin() / steps as f64;
+        }
+        assert!((end.x - x).abs() < 1e-9, "{} vs {x}", end.x);
+        assert!((end.y - y).abs() < 1e-9, "{} vs {y}", end.y);
+        // Walking there in steps gives the same answer as walking there at once: the
+        // integration is accurate enough that how it is subdivided does not show.
+        let stepped = clothoid.walk(&[0.3, 0.7, 1.0]);
+        assert!(stepped[2].is_close(end, 1e-9));
+    }
+
+    #[test]
+    fn a_composite_runs_through_its_pieces_in_order() {
+        // The alignment a road really has: straight, transition, bend.
+        let straight = Curve3::line(p(0.0, 0.0, 0.0), p(100.0, 0.0, 2.0)).unwrap();
+        let transition = Curve3::Clothoid(
+            Clothoid3::new(straight.end_point(), 0.0, 0.0, 0.02, 50.0, 3.0).unwrap(),
+        );
+        let bend = Curve3::Arc(
+            Arc3::new(
+                transition.end_point(),
+                transition.end_tangent().unwrap().heading(),
+                0.02,
+                80.0,
+                5.0,
+            )
+            .unwrap(),
+        );
+        let curve = Curve3::composite([straight, transition, bend]).unwrap();
+
+        assert!((curve.horizontal_length().unwrap() - 230.0).abs() < 1e-6);
+        assert!(curve.start_point().is_close(p(0.0, 0.0, 0.0), 1e-12));
+
+        let samples = curve.samples(SamplingConfig::new(5.0).unwrap()).unwrap();
+        // Stations ascend without repeating, and the joints appear once each.
+        assert!(samples.windows(2).all(|w| w[1].station > w[0].station));
+        assert!(samples
+            .last()
+            .unwrap()
+            .point
+            .is_close(curve.end_point(), 1e-6));
+
+        // The curve is smooth: no two consecutive tangents disagree by much, which is
+        // exactly what the transition piece buys.
+        assert!(samples
+            .windows(2)
+            .all(|w| w[0].tangent.dot(w[1].tangent) > 0.99));
+    }
+
+    #[test]
+    fn a_composite_with_a_gap_is_refused() {
+        let first = Curve3::line(p(0.0, 0.0, 0.0), p(10.0, 0.0, 0.0)).unwrap();
+        let second = Curve3::line(p(15.0, 0.0, 0.0), p(25.0, 0.0, 0.0)).unwrap();
+        assert!(matches!(
+            Curve3::composite([first, second]),
+            Err(GeometryError::DisjointSegments { .. })
+        ));
+    }
+
+    #[test]
+    fn a_composite_of_one_is_that_one() {
+        let line = Curve3::line(p(0.0, 0.0, 0.0), p(10.0, 0.0, 0.0)).unwrap();
+        assert_eq!(Curve3::composite([line.clone()]).unwrap(), line);
+        assert!(Curve3::composite([]).is_err());
+    }
+
+    #[test]
+    fn reversing_a_clothoid_and_a_composite_swaps_their_ends() {
+        let config = SamplingConfig::default();
+        let clothoid =
+            Curve3::Clothoid(Clothoid3::new(p(1.0, 2.0, 3.0), 0.3, 0.0, 0.02, 40.0, 4.0).unwrap());
+        let composite = Curve3::composite([
+            Curve3::line(p(0.0, 0.0, 0.0), p(50.0, 0.0, 1.0)).unwrap(),
+            Curve3::Arc(Arc3::new(p(50.0, 0.0, 1.0), 0.0, 0.01, 40.0, 2.0).unwrap()),
+        ])
+        .unwrap();
+
+        for curve in [clothoid, composite] {
+            let reversed = curve.reversed(config).unwrap();
+            assert!(reversed.start_point().is_close(curve.end_point(), 1e-6));
+            assert!(reversed.end_point().is_close(curve.start_point(), 1e-6));
+            // And it is the same path, not merely the same two ends: walking each
+            // to the same fraction of its length lands in the same place. The two
+            // polylines do not share vertices — a reversed composite samples its
+            // pieces in the other order — so they are compared by arc length.
+            let forward = curve.to_polyline(config).unwrap();
+            let backward = reversed.to_polyline(config).unwrap();
+            for fraction in [0.25, 0.5, 0.75] {
+                let there = point_at_fraction(&forward, fraction);
+                let back = point_at_fraction(&backward, 1.0 - fraction);
+                assert!(there.is_close(back, 1e-6), "{there:?} vs {back:?}");
+            }
         }
     }
 

@@ -28,9 +28,10 @@ the Rust core owns, so there is one model of the map and not two.
     m.export_lanelet2("map.osm")
 """
 
-from ._roadgen import Junction, Lane, LaneRef, Map, Road, __version__
+from ._roadgen import Alignment, Junction, Lane, LaneRef, Map, Road, __version__
 
 __all__ = [
+    "Alignment",
     "Junction",
     "Lane",
     "LaneRef",

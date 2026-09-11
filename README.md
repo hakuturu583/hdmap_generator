@@ -67,7 +67,9 @@ Four separations are load-bearing, and each is a module of `roadgen-core`:
 - **Geometry** (`geometry`) is three-dimensional from the start. There is no 2D point
   type. Where a planar computation is genuinely needed — an OpenDRIVE `s`
   coordinate, a lane offset — it goes through `Frame3::to_local` or a method whose
-  name says `horizontal`, so the projection is visible at the call site.
+  name says `horizontal`, so the projection is visible at the call site. Lines, arcs,
+  clothoids, Béziers and polylines are all `Curve3`, and a road's cross-section can be
+  banked by a superelevation profile.
 - **Semantics** (`semantics`) is lane types, speed limits, markings, traffic lights,
   stop lines, crosswalks and right of way, as IR concepts. No OpenDRIVE `<signal>`
   and no Lanelet2 `RegulatoryElement` appears in the IR.
@@ -165,7 +167,9 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | Call | What it does |
 | --- | --- |
 | `Map(name, origin, projection, handedness, sampling)` | a new network; `origin` is `(lat, lon, alt)` |
-| `add_road(lanes, start=, end=)` or `add_road(lanes, points=)` | a straight road, or one along a polyline |
+| `add_road(lanes, start=, end=)`, `add_road(lanes, points=)` or `add_road(lanes, alignment=)` | a straight road, one along a polyline, or one following an alignment |
+| `Alignment(start, heading)` then `.line()`, `.arc()`, `.spiral()` | a reference line built piece by piece |
+| `add_road(..., superelevation=[(station, radians), ...])` | banks the cross-section |
 | `add_junction(name)` | a junction to route movements through |
 | `connect(a, b, junction=None)` | joins the end of `a` to the start of `b`, pairing lanes |
 | `connect_lanes(from_lane, to_lane, junction=None)` | one specific movement |
@@ -179,6 +183,46 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 Handedness decides which side of the reference line a `forward` lane lands on:
 `"rht"` (the default) puts it on the right, `"lht"` on the left. A lane can override
 it with `side=`.
+
+## Alignments
+
+A road's reference line can be a straight, a polyline, or a chain of lines, bends and
+transition curves. `Alignment` carries the state between pieces — where it has got to,
+which way it is pointing, how hard it is turning — so each piece begins exactly where
+the last one ended:
+
+```python
+al = roadgen.Alignment(start=(0.0, 0.0, 4.0), heading=0.0)
+al.line(80.0, rise=1.0)
+al.spiral(60.0, curvature_end=1 / 120, rise=1.0)   # straight into the bend
+al.arc(140.0, curvature=1 / 120, rise=2.0)
+al.spiral(60.0, curvature_end=0.0, rise=1.0)       # and back out of it
+al.line(80.0, rise=1.0)
+
+m.add_road(lanes=[...], alignment=al, name="sweep")
+```
+
+The transitions are **clothoids** — curvature ramping linearly, which is what a
+vehicle traces while the steering wheel turns at a constant rate. Entering a bend
+straight from a straight is a step change in lateral acceleration; a spiral is what
+spreads it out. They reach OpenDRIVE as `<spiral>` elements, not as a chain of line
+segments.
+
+A road can also be **banked**, by a roll profile against station:
+
+```python
+m.add_road(
+    lanes=[...],
+    alignment=al,
+    # Flat to 50 m, rolled to -0.06 rad by 100 m, held from there.
+    superelevation=[(0.0, 0.0), (50.0, 0.0), (100.0, -0.06), (170.0, -0.06)],
+)
+```
+
+Banking rotates the road local frame about its tangent, so a lane offset gains height
+and keeps its full width across the tilted surface. OpenDRIVE gets the same piecewise
+polynomial in `<lateralProfile><superelevation>`; Lanelet2 has no such concept and
+does not need one, because the roll is already in the heights of its vertices.
 
 ## Junctions
 
@@ -238,7 +282,7 @@ roadgen/
 ├── crates/
 │   ├── roadgen-core/        canonical IR, generation, validation
 │   │   ├── topology/        connectivity
-│   │   ├── geometry/        3D curves, frames, sampling
+│   │   ├── geometry/        3D curves, alignments, frames, profiles, sampling
 │   │   ├── semantics/       lane types, rules, markings, objects
 │   │   ├── id/              typed identifiers
 │   │   └── validation/      UnvalidatedMap → ValidatedMap
@@ -267,10 +311,6 @@ python -m pytest tests/python
 
 ## Limitations
 
-- `Curve3` carries `Line`, `Arc`, `Bezier` and `Polyline`. Clothoids, splines,
-  superelevation and banking are not implemented; the geometry module is arranged so
-  each is an added variant and an added `samples` arm, with nothing outside it to
-  change.
 - A road has one lane section: lane widths are constant along a road, and a change of
   cross-section is a new road.
 - Map objects — traffic lights, signs, stop lines, crosswalks — are lowered to

@@ -17,6 +17,8 @@ pub enum GeometryError {
     TooFewPoints { got: usize },
     /// A coordinate was NaN or infinite.
     NonFiniteCoordinate,
+    /// Two pieces of a composite curve do not meet.
+    DisjointSegments { gap: f64 },
     /// The sampling step has to be a positive, finite number of metres.
     InvalidSampling { max_segment_length: f64 },
 }
@@ -37,6 +39,11 @@ impl fmt::Display for GeometryError {
                 write!(f, "a polyline needs at least 2 distinct points, got {got}")
             }
             GeometryError::NonFiniteCoordinate => f.write_str("a coordinate was not finite"),
+            GeometryError::DisjointSegments { gap } => write!(
+                f,
+                "consecutive pieces of a composite curve are {gap:.6} m apart; each \
+                 piece has to start where the last one ended"
+            ),
             GeometryError::InvalidSampling { max_segment_length } => write!(
                 f,
                 "the maximum segment length must be positive and finite, got {max_segment_length}"
@@ -209,6 +216,11 @@ pub enum ValidationIssue {
     InvalidCoordinateMetadata {
         detail: String,
     },
+    /// A road is banked so steeply that its surface is closer to a wall.
+    ImplausibleSuperelevation {
+        road: RoadId,
+        radians: f64,
+    },
     Geometry {
         detail: String,
     },
@@ -255,6 +267,11 @@ impl fmt::Display for ValidationIssue {
             ValidationIssue::InvalidCoordinateMetadata { detail } => {
                 write!(f, "invalid coordinate metadata: {detail}")
             }
+            ValidationIssue::ImplausibleSuperelevation { road, radians } => write!(
+                f,
+                "road {road} is banked by {:.1} degrees; beyond 45 the cross-section                  is no longer a road surface",
+                radians.to_degrees()
+            ),
             ValidationIssue::Geometry { detail } => write!(f, "geometry error: {detail}"),
         }
     }

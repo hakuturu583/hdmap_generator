@@ -322,6 +322,68 @@ pub fn graded_road() -> ValidatedMap {
     finish(builder)
 }
 
+/// A proper alignment: straight, transition, bend, transition, straight.
+///
+/// The transitions are clothoids, which is how a road actually enters a bend — and
+/// the reason OpenDRIVE has a `<spiral>` element at all.
+pub fn spiral_transition_road() -> ValidatedMap {
+    let radius = 120.0;
+    let alignment = Alignment::new(Point3::new(0.0, 0.0, 4.0), 0.0)
+        .line(80.0, 1.0)
+        .unwrap()
+        .spiral(60.0, 1.0 / radius, 1.0)
+        .unwrap()
+        .arc(140.0, 1.0 / radius, 2.0)
+        .unwrap()
+        .spiral(60.0, 0.0, 1.0)
+        .unwrap()
+        .line(80.0, 1.0)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    let mut builder = MapBuilder::new(metadata("spiral"));
+    builder
+        .add_road(
+            RoadSpec::new(alignment, two_way())
+                .with_name("sweep")
+                .with_speed_limit(SpeedLimit::from_kph(80.0).unwrap()),
+        )
+        .unwrap();
+    finish(builder)
+}
+
+/// A bend banked the way a fast one is: level on the approach, rolled through the
+/// curve, level again on the way out.
+pub fn banked_curve() -> ValidatedMap {
+    let radius = 150.0;
+    let alignment = Alignment::new(Point3::new(0.0, 0.0, 0.0), 0.0)
+        .line(50.0, 0.0)
+        .unwrap()
+        .spiral(50.0, 1.0 / radius, 0.0)
+        .unwrap()
+        .arc(120.0, 1.0 / radius, 0.0)
+        .unwrap()
+        .finish()
+        .unwrap();
+    // Flat to the start of the transition, rolled by the time the bend proper
+    // begins, and held through it. The left side rises, which for a left-hand bend
+    // is the outside going down — a right-hand bend would use the opposite sign.
+    let superelevation =
+        Poly3Profile::piecewise_linear([(0.0, 0.0), (50.0, 0.0), (100.0, -0.06), (220.0, -0.06)])
+            .unwrap();
+
+    let mut builder = MapBuilder::new(metadata("banked"));
+    builder
+        .add_road(
+            RoadSpec::new(alignment, two_way())
+                .with_name("bend")
+                .with_superelevation(superelevation),
+        )
+        .unwrap();
+    finish(builder)
+}
+
 /// A crossroads with the traffic control a real one has: stop lines, lights and a
 /// right of way. Used to check that semantics reach the Lanelet2 map.
 pub fn controlled_crossroads() -> ValidatedMap {
