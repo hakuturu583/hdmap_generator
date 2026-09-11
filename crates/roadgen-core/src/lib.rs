@@ -96,7 +96,10 @@ pub mod prelude {
     };
     pub use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
     pub use crate::map::{Map, MapMetadata, Projection, TrafficHandedness};
-    pub use crate::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking, RoadType};
+    pub use crate::semantics::{
+        BoundaryMarking, LaneType, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
+        RoadType, TrafficRule,
+    };
     pub use crate::topology::{Direction, LaneEnd, LateralSide, RoadEnd};
     pub use crate::units::{GeoOrigin, PositiveWidth, SpeedLimit};
     pub use crate::validation::{UnvalidatedMap, ValidatedMap};

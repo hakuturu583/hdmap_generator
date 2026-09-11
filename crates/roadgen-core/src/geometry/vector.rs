@@ -250,7 +250,11 @@ impl Frame3 {
             return Err(GeometryError::VerticalTangent);
         }
         let left = UnitVector3::try_new(Vector3::new(-t.y, t.x, 0.0))?;
-        let up = UnitVector3::try_new(left.get().cross(t))?;
+        // `tangent × left`, so that the frame is right-handed in that order and `up`
+        // actually points up. The other way round gives an orthonormal frame too, but
+        // one whose third axis points into the ground — which only shows up once
+        // something asks `to_local` how high above the road it is.
+        let up = UnitVector3::try_new(t.cross(left.get()))?;
         Ok(Frame3 {
             origin,
             tangent,
@@ -335,6 +339,22 @@ mod tests {
         // The frame stays orthonormal, which is what `to_local` round-tripping needs.
         assert!(frame.tangent.dot(frame.left).abs() < 1e-12);
         assert!(frame.tangent.dot(frame.up).abs() < 1e-12);
+    }
+
+    #[test]
+    fn up_points_up() {
+        for tangent in [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(-1.0, 2.0, 0.0),
+            Vector3::new(3.0, -1.0, 0.4),
+        ] {
+            let frame = Frame3::from_tangent(Point3::ORIGIN, tangent.normalize().unwrap()).unwrap();
+            assert!(frame.up.z() > 0.0, "up was {:?}", frame.up);
+            // A position five metres above the road reads as five metres up, not
+            // minus five.
+            let above = frame.origin + frame.up.scaled(5.0);
+            assert!((frame.to_local(above)[2] - 5.0).abs() < 1e-12);
+        }
     }
 
     #[test]
