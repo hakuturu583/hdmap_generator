@@ -11,6 +11,11 @@
 //!   Road connectivity → <link><predecessor>/<successor>
 //!   Junction          → <junction>
 //!   LaneConnection    → <connection>/<laneLink>
+//!   Traffic light,
+//!   traffic sign      → <signals>/<signal> with <validity>
+//!   Stop line,
+//!   crosswalk         → <objects>/<object>
+//!   Right of way      → <junction>/<priority>
 //! ```
 //!
 //! Format-specific decisions stay on this side of the boundary. OpenDRIVE's numeric
@@ -28,6 +33,7 @@ use opendrive::junction::connection::Connection;
 use opendrive::junction::contact_point::ContactPoint;
 use opendrive::junction::junction_type::JunctionType;
 use opendrive::junction::lane_link::LaneLink as JunctionLaneLink;
+use opendrive::junction::priority::Priority;
 use opendrive::junction::Junction as OdJunction;
 use opendrive::lane::center::Center;
 use opendrive::lane::center_lane::CenterLane;
@@ -48,6 +54,13 @@ use opendrive::lane::road_mark::RoadMark;
 use opendrive::lane::speed::Speed as LaneSpeed;
 use opendrive::lane::width::Width;
 use opendrive::lane::Lane as OdLane;
+use opendrive::object::corner::Corner;
+use opendrive::object::corner_road::CornerRoad;
+use opendrive::object::lane_validity::LaneValidity;
+use opendrive::object::objects::Objects;
+use opendrive::object::orientation::{ObjectType, Orientation};
+use opendrive::object::outline::Outline;
+use opendrive::object::Object;
 use opendrive::road::element_type::ElementType;
 use opendrive::road::geometry::arc::Arc as OdArc;
 use opendrive::road::geometry::geometry_type::GeometryType;
@@ -67,6 +80,8 @@ use opendrive::road::rule::Rule;
 use opendrive::road::speed::{MaxSpeed, Speed as RoadSpeed};
 use opendrive::road::unit::SpeedUnit;
 use opendrive::road::Road as OdRoad;
+use opendrive::signal::signals::Signals;
+use opendrive::signal::Signal;
 use uom::si::angle::radian;
 use uom::si::curvature::radian_per_meter;
 use uom::si::f64::{Angle, Curvature, Length};
@@ -74,20 +89,39 @@ use uom::si::length::meter;
 use vec1::Vec1;
 
 use roadgen_core::geometry::{Curve3, Point3, Sample};
+use roadgen_core::id::ObjectId;
 use roadgen_core::id::{JunctionId, LaneId, RoadId};
 use roadgen_core::map::{Lane, Map, Projection, Road, TrafficHandedness};
-use roadgen_core::semantics::{LaneType, MarkingColor, RoadMarking, RoadType};
-use roadgen_core::topology::{LaneEnd, LateralSide, RoadEnd, RoadLinkTarget};
+use roadgen_core::semantics::{
+    LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType,
+    TrafficRule,
+};
+use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd, RoadLinkTarget};
 use roadgen_core::validation::ValidatedMap;
 use roadgen_core::GeometryError;
 
 mod error;
+mod road_coordinates;
 
 pub use error::ExportError;
+pub use road_coordinates::RoadPosition;
 
 /// Width of a painted lane marking, metres. OpenDRIVE wants a number; this is the
 /// usual one, and callers who care can post-process.
 const MARKING_WIDTH: f64 = 0.13;
+
+/// How far a stop line reaches along the road, metres — the width of the paint.
+const STOP_LINE_DEPTH: f64 = 0.4;
+
+/// The signal `type` a traffic light is written with.
+///
+/// OpenDRIVE identifies a signal by a code from a *country's* catalogue rather than by
+/// a name of its own, so there is no universal value to use. This is the German
+/// catalogue's three-colour light, which is what OpenDRIVE tooling expects to find in
+/// a generated map; a caller with a different catalogue can rewrite the `type` after
+/// export.
+const TRAFFIC_LIGHT_TYPE: &str = "1000001";
+const TRAFFIC_LIGHT_SUBTYPE: &str = "-1";
 
 /// Turns a validated map into an OpenDRIVE document.
 pub fn to_opendrive(map: &ValidatedMap) -> Result<OpenDrive, ExportError> {
@@ -150,6 +184,7 @@ struct Numbering {
     roads: HashMap<RoadId, String>,
     junctions: HashMap<JunctionId, String>,
     lanes: HashMap<LaneId, i64>,
+    objects: HashMap<ObjectId, String>,
 }
 
 impl Numbering {
@@ -172,10 +207,15 @@ impl Numbering {
             };
             lanes.insert(lane.id.clone(), id);
         }
+        let mut objects = HashMap::new();
+        for (index, object) in map.objects.iter().enumerate() {
+            objects.insert(object.id.clone(), index.to_string());
+        }
         Numbering {
             roads,
             junctions,
             lanes,
+            objects,
         }
     }
 }
@@ -320,8 +360,8 @@ impl<'a> Exporter<'a> {
             elevation_profile: Some(elevation_profile(&samples)),
             lateral_profile: self.lateral_profile(road),
             lanes: self.lanes(road)?,
-            objects: None,
-            signals: None,
+            objects: self.objects(road)?,
+            signals: self.signals(road)?,
             surface: None,
             railroad: None,
             additional_data: AdditionalData::default(),
@@ -755,7 +795,7 @@ impl<'a> Exporter<'a> {
         };
         Ok(Some(OdJunction {
             connection,
-            priority: Vec::new(),
+            priority: self.priorities(junction)?,
             controller: Vec::new(),
             surface: None,
             id: self.junction_id(junction)?.to_owned(),
@@ -767,6 +807,318 @@ impl<'a> Exporter<'a> {
             r#type: Some(JunctionType::Default),
             additional_data: AdditionalData::default(),
         }))
+    }
+
+    /// The road a map object belongs to: the road of the first lane it governs.
+    ///
+    /// An object that governs lanes of more than one road — a light over a whole
+    /// junction mouth — is written against the first, which is the one whose
+    /// coordinates it is nearest to.
+    fn owning_road(&self, object: &MapObject) -> Option<&Road> {
+        let lane = self.map.lanes.get(object.lanes.first()?)?;
+        self.map.road(&lane.road)
+    }
+
+    /// Objects belonging to `road`, in the map's own order.
+    fn objects_of<'b>(&'b self, road: &'b Road) -> impl Iterator<Item = &'b MapObject> + 'b {
+        self.map.objects.iter().filter(move |object| {
+            self.owning_road(object)
+                .is_some_and(|owner| owner.id == road.id)
+        })
+    }
+
+    /// `<validity>` naming the lanes an object governs, as a range of OpenDRIVE ids.
+    fn validity(&self, object: &MapObject, road: &Road) -> Result<Vec<LaneValidity>, ExportError> {
+        let mut ids: Vec<i64> = Vec::new();
+        for lane in &object.lanes {
+            let Some(entry) = self.map.lanes.get(lane) else {
+                continue;
+            };
+            if entry.road != road.id {
+                continue;
+            }
+            ids.push(self.lane_id(lane)?);
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        ids.sort_unstable();
+        Ok(vec![LaneValidity {
+            from_lane: ids[0],
+            to_lane: ids[ids.len() - 1],
+        }])
+    }
+
+    /// Which way along the road an object faces: the direction of the traffic it
+    /// governs.
+    fn orientation(&self, object: &MapObject) -> Orientation {
+        match object
+            .lanes
+            .first()
+            .and_then(|lane| self.map.lanes.get(lane))
+            .map(|lane| lane.direction)
+        {
+            Some(Direction::Backward) => Orientation::Minus,
+            _ => Orientation::Plus,
+        }
+    }
+
+    /// The middle of an object's geometry, and how far it reaches across.
+    fn span(&self, object: &MapObject) -> Option<(Point3, f64)> {
+        let (from, to) = match &object.geometry {
+            ObjectGeometry::Point(position) => (*position, *position),
+            ObjectGeometry::Line(curve) => (curve.start_point(), curve.end_point()),
+            // A band's diagonal, whose midpoint is the middle of the band.
+            ObjectGeometry::Band { left, right } => (left.start_point(), right.end_point()),
+        };
+        Some((from.lerp(to, 0.5), from.distance_to(to)))
+    }
+
+    fn signals(&self, road: &Road) -> Result<Option<Signals>, ExportError> {
+        let mut signals = Vec::new();
+        for object in self.objects_of(road) {
+            let (kind, subtype, dynamic) = match &object.kind {
+                MapObjectKind::TrafficLight => (
+                    TRAFFIC_LIGHT_TYPE.to_owned(),
+                    TRAFFIC_LIGHT_SUBTYPE.to_owned(),
+                    true,
+                ),
+                // A traffic sign carries the caller's own catalogue code, which is
+                // exactly what OpenDRIVE's `type` is.
+                MapObjectKind::TrafficSign { code } => (code.clone(), "-1".to_owned(), false),
+                _ => continue,
+            };
+            let Some((centre, width)) = self.span(object) else {
+                continue;
+            };
+            let Some(position) = road_coordinates::locate(self.map, road, centre) else {
+                continue;
+            };
+            signals.push(Signal {
+                validity: self.validity(object, road)?,
+                dependency: Vec::new(),
+                reference: Vec::new(),
+                choice: None,
+                country: None,
+                country_revision: None,
+                dynamic,
+                height: None,
+                h_offset: None,
+                id: self.object_id(&object.id)?.to_owned(),
+                name: Some(object.id.to_string()),
+                orientation: self.orientation(object),
+                pitch: None,
+                roll: None,
+                s: Length::new::<meter>(position.s),
+                subtype,
+                t: Length::new::<meter>(position.t),
+                text: None,
+                r#type: kind,
+                unit: None,
+                value: None,
+                width: (width > 0.0).then(|| Length::new::<meter>(width)),
+                z_offset: Length::new::<meter>(position.height),
+                additional_data: AdditionalData::default(),
+            });
+        }
+        if signals.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Signals {
+            signal: signals,
+            signal_reference: Vec::new(),
+            additional_data: AdditionalData::default(),
+        }))
+    }
+
+    fn objects(&self, road: &Road) -> Result<Option<Objects>, ExportError> {
+        let mut objects = Vec::new();
+        for object in self.objects_of(road) {
+            let entry = match &object.kind {
+                // A stop line is paint on the road surface, so it is a `roadMark`
+                // object reaching a little way along the road and right across it.
+                MapObjectKind::StopLine => {
+                    let Some((centre, width)) = self.span(object) else {
+                        continue;
+                    };
+                    let Some(position) = road_coordinates::locate(self.map, road, centre) else {
+                        continue;
+                    };
+                    Object {
+                        dynamic: Some(false),
+                        hdg: None,
+                        height: None,
+                        id: self.object_id(&object.id)?.to_owned(),
+                        length: Some(Length::new::<meter>(STOP_LINE_DEPTH)),
+                        name: Some("stopLine".to_owned()),
+                        orientation: Some(self.orientation(object)),
+                        perp_to_road: None,
+                        pitch: None,
+                        radius: None,
+                        roll: None,
+                        s: Length::new::<meter>(position.s),
+                        subtype: Some("stopLine".to_owned()),
+                        t: Length::new::<meter>(position.t),
+                        r#type: Some(ObjectType::RoadMark),
+                        valid_length: None,
+                        width: Some(Length::new::<meter>(width)),
+                        z_offset: Length::new::<meter>(position.height),
+                        repeat: Vec::new(),
+                        outline: None,
+                        outlines: None,
+                        material: Vec::new(),
+                        validity: self.validity(object, road)?,
+                        parking_space: None,
+                        markings: None,
+                        borders: None,
+                        surface: None,
+                        additional_data: AdditionalData::default(),
+                    }
+                }
+                // A crosswalk has real extent, so it gets an outline: its four
+                // corners, each in the road's own coordinates.
+                MapObjectKind::Crosswalk => {
+                    let ObjectGeometry::Band { left, right } = &object.geometry else {
+                        continue;
+                    };
+                    let ring = [
+                        left.start_point(),
+                        left.end_point(),
+                        right.end_point(),
+                        right.start_point(),
+                    ];
+                    let corners: Vec<Corner> = ring
+                        .iter()
+                        .filter_map(|point| road_coordinates::locate(self.map, road, *point))
+                        .map(|position| {
+                            Corner::Road(CornerRoad {
+                                dz: Length::new::<meter>(position.height),
+                                height: Length::new::<meter>(0.0),
+                                id: None,
+                                s: Length::new::<meter>(position.s),
+                                t: Length::new::<meter>(position.t),
+                            })
+                        })
+                        .collect();
+                    let Ok(choice) = Vec1::try_from_vec(corners) else {
+                        continue;
+                    };
+                    let centre =
+                        road_coordinates::locate(self.map, road, ring[0].lerp(ring[2], 0.5));
+                    let Some(position) = centre else {
+                        continue;
+                    };
+                    Object {
+                        dynamic: Some(false),
+                        hdg: None,
+                        height: None,
+                        id: self.object_id(&object.id)?.to_owned(),
+                        length: None,
+                        name: Some(object.id.to_string()),
+                        orientation: Some(Orientation::None),
+                        perp_to_road: None,
+                        pitch: None,
+                        radius: None,
+                        roll: None,
+                        s: Length::new::<meter>(position.s),
+                        subtype: None,
+                        t: Length::new::<meter>(position.t),
+                        r#type: Some(ObjectType::Crosswalk),
+                        valid_length: None,
+                        width: None,
+                        z_offset: Length::new::<meter>(position.height),
+                        repeat: Vec::new(),
+                        outline: Some(Outline {
+                            closed: Some(true),
+                            fill_type: None,
+                            id: None,
+                            lane_type: None,
+                            outer: Some(true),
+                            choice,
+                            additional_data: AdditionalData::default(),
+                        }),
+                        outlines: None,
+                        material: Vec::new(),
+                        validity: self.validity(object, road)?,
+                        parking_space: None,
+                        markings: None,
+                        borders: None,
+                        surface: None,
+                        additional_data: AdditionalData::default(),
+                    }
+                }
+                _ => continue,
+            };
+            objects.push(entry);
+        }
+        if objects.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Objects {
+            object: objects,
+            object_reference: Vec::new(),
+            tunnel: Vec::new(),
+            bridge: Vec::new(),
+            additional_data: AdditionalData::default(),
+        }))
+    }
+
+    /// `<priority>` entries for a junction, from the map's right-of-way rules.
+    ///
+    /// OpenDRIVE says which *connecting road* has priority over which, so a rule
+    /// written over lanes becomes the pairs of connectors those lanes feed.
+    fn priorities(&self, junction: &JunctionId) -> Result<Vec<Priority>, ExportError> {
+        let Some(entry) = self.map.junction(junction) else {
+            return Ok(Vec::new());
+        };
+        // Which connector each approach lane feeds, within this junction.
+        let connectors_for = |lanes: &[LaneId]| -> Vec<&RoadId> {
+            let mut found: Vec<&RoadId> = Vec::new();
+            for lane in lanes {
+                for connection in self.map.connections_from(lane) {
+                    if connection.junction.as_ref() != Some(junction) {
+                        continue;
+                    }
+                    if let Some(target) = self.map.lanes.get(&connection.to.lane) {
+                        if entry.connecting_roads.contains(&target.road)
+                            && !found.contains(&&target.road)
+                        {
+                            found.push(&target.road);
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        let mut priorities = Vec::new();
+        for rule in &self.map.rules {
+            let TrafficRule::RightOfWay {
+                right_of_way,
+                yielding,
+                ..
+            } = rule
+            else {
+                continue;
+            };
+            for high in connectors_for(right_of_way) {
+                for low in connectors_for(yielding) {
+                    priorities.push(Priority {
+                        high: Some(self.road_id(high)?.to_owned()),
+                        low: Some(self.road_id(low)?.to_owned()),
+                    });
+                }
+            }
+        }
+        Ok(priorities)
+    }
+
+    fn object_id(&self, object: &ObjectId) -> Result<&str, ExportError> {
+        self.numbering
+            .objects
+            .get(object)
+            .map(String::as_str)
+            .ok_or_else(|| ExportError::Unknown(object.to_string()))
     }
 
     fn road_id(&self, road: &RoadId) -> Result<&str, ExportError> {

@@ -426,3 +426,49 @@ def test_a_width_of_zero_is_refused_wherever_it_is_written():
         roadgen.Lane(width=3.5, width_profile=[(0.0, 3.5), (100.0, 0.0)])
     with pytest.raises(ValueError, match="taper"):
         roadgen.Lane(width=3.5, width_profile=[(0.0, 3.5)], taper="wobbly")
+
+
+def test_traffic_control_reaches_opendrive_too():
+    m = roadgen.Map()
+    north = m.add_road(
+        start=(0.0, 70.0, 0.0), end=(0.0, 14.0, 0.0), lanes=two_way(), name="north",
+    )
+    east = m.add_road(
+        start=(70.0, 0.0, 0.0), end=(14.0, 0.0, 0.0), lanes=two_way(), name="east",
+    )
+    junction = m.add_junction("x")
+    m.connect_lanes(north.lane(0), east.lane(1), junction=junction)
+    m.connect_lanes(east.lane(0), north.lane(1), junction=junction)
+
+    stop_line = m.add_stop_line(north.lane(0))
+    light = m.add_traffic_light(north.lane(0), height=5.0)
+    m.add_traffic_light_rule([light], [north.lane(0)], stop_line=stop_line)
+    m.add_right_of_way([east.lane(0)], [north.lane(0)], stop_line=stop_line)
+    m.add_crosswalk(north, fraction=0.6, width=4.0)
+    m.add_traffic_sign(north.lane(0), code="de206")
+
+    root = ET.fromstring(m.to_opendrive_xml())
+
+    # The light and the sign are signals on the road they govern, and the light is
+    # five metres above the surface, over the middle of its lane.
+    signals = root.findall("road/signals/signal")
+    assert len(signals) == 2
+    by_type = {signal.get("type"): signal for signal in signals}
+    assert "de206" in by_type
+    light_element = by_type["1000001"]
+    # OpenDRIVE spells this one "yes"/"no", not "true"/"false".
+    assert light_element.get("dynamic") == "yes"
+    assert float(light_element.get("zOffset")) == pytest.approx(5.0, abs=1e-6)
+    assert float(light_element.get("t")) == pytest.approx(-1.75, abs=1e-6)
+    validity = light_element.find("validity")
+    assert validity.get("fromLane") == "-1" and validity.get("toLane") == "-1"
+
+    # The stop line and the crosswalk are objects.
+    objects = root.findall("road/objects/object")
+    kinds = {obj.get("type") for obj in objects}
+    assert kinds == {"roadMark", "crosswalk"}
+    crosswalk = next(obj for obj in objects if obj.get("type") == "crosswalk")
+    assert len(crosswalk.findall("outline/cornerRoad")) == 4
+
+    # And the right-of-way rule becomes a junction priority.
+    assert root.findall("junction/priority")

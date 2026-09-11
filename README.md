@@ -283,6 +283,31 @@ m.connect(trunk, slip, junction=junction)
 That one model lowers cleanly both ways: the connectors become OpenDRIVE connecting
 roads inside a `<junction>`, and lanelets that a Lanelet2 routing graph walks through.
 
+## Traffic control
+
+Lights, signs, stop lines and crosswalks are IR objects — a position and the lanes they
+govern — and both formats get them:
+
+| IR | OpenDRIVE | Lanelet2 |
+| --- | --- | --- |
+| Traffic light | `<signal dynamic="true">` with `<validity>` | `traffic_light` way + `traffic_light` regulatory element |
+| Traffic sign | `<signal>` carrying the caller's catalogue code | `traffic_sign` way, code as its subtype |
+| Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` |
+| Crosswalk | `<object type="crosswalk">` with its four corners | a lanelet of subtype `crosswalk` |
+| Right of way | `<junction><priority high low>` | `right_of_way` regulatory element |
+
+OpenDRIVE places an object at `(s, t, zOffset)` in one road's own coordinates, so the
+exporter projects the IR's position through the road local frame — a nearest-point
+search for the station, then `Frame3::to_local`. Height is measured away from the road
+surface rather than straight up, which is what "five metres above the road" means on a
+slope and what `zOffset` carries.
+
+A signal's `type` is a code from a *country's* catalogue rather than a name of its own,
+so a traffic sign passes the caller's code straight through, and a traffic light is
+written as the German catalogue's three-colour light (`1000001`) — the value OpenDRIVE
+tooling expects in a generated map, and one a caller with another catalogue can rewrite
+after export.
+
 ## Validation
 
 `validate()` reports everything wrong at once, rather than failing on the first
@@ -355,8 +380,6 @@ python -m pytest tests/python
 
 ## Limitations
 
-- Map objects — traffic lights, signs, stop lines, crosswalks — are lowered to
-  Lanelet2 only. OpenDRIVE `<signal>` and `<object>` elements are not written yet.
 - Lanelet2 output uses a local-Cartesian or UTM projection about the map's origin.
   MGRS is not offered, because writing MGRS coordinates needs a grid the generated
   map does not have; Autoware's `local` and `local_cartesian_utm` projectors read the

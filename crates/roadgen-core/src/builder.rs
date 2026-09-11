@@ -1504,7 +1504,26 @@ impl Generator {
                         true => (travel.left.end_point(), travel.right.end_point()),
                         false => (travel.left.start_point(), travel.right.start_point()),
                     };
-                    let raise = |point: Point3| Point3::new(point.x, point.y, point.z + height);
+                    // Height is measured away from the road surface, not straight up:
+                    // that is what "five metres above the road" means on a slope, and
+                    // it is the quantity OpenDRIVE's `zOffset` carries.
+                    let station = match end {
+                        LaneEnd::Start => lane.station_range.0,
+                        LaneEnd::End => lane.station_range.1,
+                    };
+                    let up = self
+                        .map
+                        .road(&lane.road)
+                        .ok_or_else(|| BuildError::UnknownRoad(lane.road.clone()))
+                        .and_then(|road| {
+                            let sample = road.reference_line.sample_at(station, config)?;
+                            Ok(sample
+                                .frame()?
+                                .banked(road.superelevation.evaluate(station))
+                                .up
+                                .scaled(height))
+                        })?;
+                    let raise = |point: Point3| point + up;
                     MapObject {
                         id: id.clone(),
                         kind,
@@ -1522,20 +1541,30 @@ impl Generator {
                     width,
                     lanes,
                 } => {
-                    let geometry = &self.geometry[&road];
-                    let count = geometry.samples.len();
-                    let index = (((count - 1) as f64) * fraction.clamp(0.0, 1.0)).round() as usize;
-                    let sample = geometry.samples[index];
-                    let lateral = geometry.laterals[index];
+                    // The station the caller asked for, not the nearest vertex to
+                    // it: a straight road has only two, and rounding to one of them
+                    // would put a crosswalk at the very end of it.
+                    let entry = self
+                        .map
+                        .road(&road)
+                        .ok_or_else(|| BuildError::UnknownRoad(road.clone()))?;
+                    let length = entry.horizontal_length()?;
+                    let half = (width / 2.0).min(length / 2.0);
+                    let station = (length * fraction.clamp(0.0, 1.0)).clamp(half, length - half);
+                    let sample = entry.reference_line.sample_at(station, config)?;
+                    let lateral = sample
+                        .frame()?
+                        .banked(entry.superelevation.evaluate(station))
+                        .left
+                        .get();
                     // How far the road reaches at *this* station, which a tapering
                     // cross-section makes a different question at every one.
                     let extent = self.layouts[&road]
                         .iter()
                         .filter(|layout| {
-                            sample.station >= layout.station_range.0
-                                && sample.station <= layout.station_range.1
+                            station >= layout.station_range.0 && station <= layout.station_range.1
                         })
-                        .map(|layout| layout.extent(sample.station))
+                        .map(|layout| layout.extent(station))
                         .fold(0.0_f64, f64::max);
                     let along = sample.tangent.scaled(width / 2.0);
                     let edge = |sign: f64| -> Result<Curve3, GeometryError> {
