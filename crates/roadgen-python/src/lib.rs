@@ -696,6 +696,19 @@ impl PyMap {
             .collect())
     }
 
+    /// The MGRS grid square the map's coordinates are reported in, or `None` if it
+    /// does not use the MGRS projection.
+    ///
+    /// This is the reference Autoware's `map_projector_info` needs alongside the map.
+    fn mgrs_grid(&mut self) -> PyResult<Option<String>> {
+        self.ensure_built()?;
+        Ok(
+            roadgen_lanelet2::grid_for(self.built.as_ref().expect("just built"))
+                .map_err(runtime_error)?
+                .map(|grid| grid.code().to_owned()),
+        )
+    }
+
     /// Constraints the two output formats impose beyond validation.
     fn format_warnings(&mut self) -> PyResult<Vec<String>> {
         self.ensure_built()?;

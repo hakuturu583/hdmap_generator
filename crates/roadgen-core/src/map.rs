@@ -54,14 +54,29 @@ impl TrafficHandedness {
     }
 }
 
-/// How the map's metric coordinates relate to the globe.
+/// How the map's metric coordinates are tied to the globe, and how they are reported
+/// to a consumer that wants grid coordinates.
+///
+/// In every case a map's own x and y are metres about its origin — that is what makes
+/// a generated map easy to write. What differs is the frame those metres are read
+/// against, and therefore which grid position a consumer reconstructs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Projection {
     /// East/north/up metres about the origin. The natural choice for a generated
     /// map, whose coordinates start at the origin by construction.
     LocalCartesian,
-    /// UTM, in the zone the origin falls in.
+    /// UTM, in the zone the origin falls in, with the origin's easting and northing
+    /// subtracted.
     Utm,
+    /// UTM again, but reported to Autoware as metres within the 100 km MGRS square
+    /// the origin falls in — which is the coordinate system an Autoware map built
+    /// with the MGRS projector uses.
+    ///
+    /// The map is still written about its origin; what the Lanelet2 export adds is
+    /// each node's position within that square, computed for that node rather than
+    /// assumed from the origin's. A map whose extent leaves the square cannot be
+    /// expressed this way, and the exporter says so.
+    Mgrs,
 }
 
 impl Projection {
@@ -69,6 +84,7 @@ impl Projection {
         match self {
             Projection::LocalCartesian => "local_cartesian",
             Projection::Utm => "utm",
+            Projection::Mgrs => "mgrs",
         }
     }
 
@@ -76,6 +92,7 @@ impl Projection {
         Some(match value.to_ascii_lowercase().as_str() {
             "local_cartesian" | "local" | "localcartesian" => Projection::LocalCartesian,
             "utm" => Projection::Utm,
+            "mgrs" => Projection::Mgrs,
             _ => return None,
         })
     }

@@ -472,3 +472,48 @@ def test_traffic_control_reaches_opendrive_too():
 
     # And the right-of-way rule becomes a junction priority.
     assert root.findall("junction/priority")
+
+
+def test_an_mgrs_map_reports_grid_coordinates():
+    m = roadgen.Map(origin=(35.68, 139.76, 0.0), projection="mgrs")
+    m.add_road(
+        start=(0.0, 0.0, 0.0), end=(200.0, 0.0, 2.0), lanes=two_way(), name="main",
+    )
+    assert m.format_warnings() == []
+
+    # The square's reference, for Autoware's map_projector_info.
+    grid = m.mgrs_grid()
+    assert grid is not None and grid.startswith("54S")
+
+    # The map is built about (0, 0), but its nodes say where they are in the square.
+    root = ET.fromstring(m.to_lanelet2_osm())
+    for node in root.findall("node"):
+        local = {tag.get("k"): float(tag.get("v")) for tag in node.findall("tag")}
+        assert 0.0 <= local["local_x"] < 100_000.0
+        assert 0.0 <= local["local_y"] < 100_000.0
+        assert local["local_x"] > 1000.0
+
+    # A map that does not use MGRS has no grid, and reports its own metres.
+    plain = roadgen.Map(origin=(35.68, 139.76, 0.0))
+    plain.add_road(
+        start=(0.0, 0.0, 0.0), end=(200.0, 0.0, 2.0), lanes=two_way(), name="main",
+    )
+    assert plain.mgrs_grid() is None
+    root = ET.fromstring(plain.to_lanelet2_osm())
+    values = [
+        float(tag.get("v"))
+        for node in root.findall("node")
+        for tag in node.findall("tag")
+        if tag.get("k") == "local_x"
+    ]
+    assert max(values) < 1000.0
+
+
+def test_a_map_that_leaves_its_mgrs_square_is_reported():
+    m = roadgen.Map(origin=(35.68, 139.76, 0.0), projection="mgrs")
+    m.add_road(
+        start=(0.0, 0.0, 0.0), end=(150_000.0, 0.0, 0.0), lanes=two_way(), name="long",
+    )
+    assert any("MGRS square" in warning for warning in m.format_warnings())
+    with pytest.raises(RuntimeError, match="MGRS square"):
+        m.to_lanelet2_osm()

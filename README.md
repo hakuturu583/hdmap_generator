@@ -178,6 +178,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `add_stop_line`, `add_traffic_light`, `add_traffic_sign`, `add_crosswalk` | road furniture |
 | `add_traffic_light_rule`, `add_right_of_way`, `add_speed_limit` | rules over lanes |
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
+| `mgrs_grid()` | the grid square an MGRS map is reported in |
 | `export_opendrive(path)` / `export_lanelet2(path)` | write the files |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
@@ -308,6 +309,29 @@ written as the German catalogue's three-colour light (`1000001`) — the value O
 tooling expects in a generated map, and one a caller with another catalogue can rewrite
 after export.
 
+## Coordinates
+
+A map's own x and y are always metres about its origin — that is what makes a generated
+map easy to write. `projection` says what frame those metres are read against, and
+therefore what a consumer reconstructs:
+
+| `projection` | Lanelet2 `local_x`/`local_y` |
+| --- | --- |
+| `"local_cartesian"` (default) | the map's own metres |
+| `"utm"` | the same, with latitudes and longitudes taken through UTM |
+| `"mgrs"` | metres within the 100 km MGRS square the origin falls in |
+
+MGRS is the coordinate system an Autoware map built with the MGRS projector uses.
+Each node's grid position is worked out **from that node's own latitude and
+longitude**, not by shifting the whole map by the origin's grid position: a metre of
+local east is not a metre of UTM easting, and over a few kilometres the difference
+shows. `Map.mgrs_grid()` gives the square's reference for `map_projector_info`.
+
+A map with MGRS coordinates has to fit inside one square. `ll2`'s MGRS projector takes
+the easting and northing modulo 100 km, so a map running over the edge would silently
+come back on the other side; `format_warnings()` reports it instead, and exporting
+fails rather than writing it.
+
 ## Validation
 
 `validate()` reports everything wrong at once, rather than failing on the first
@@ -380,10 +404,6 @@ python -m pytest tests/python
 
 ## Limitations
 
-- Lanelet2 output uses a local-Cartesian or UTM projection about the map's origin.
-  MGRS is not offered, because writing MGRS coordinates needs a grid the generated
-  map does not have; Autoware's `local` and `local_cartesian_utm` projectors read the
-  `local_x`/`local_y` tags this writes.
 
 ## Licence
 
