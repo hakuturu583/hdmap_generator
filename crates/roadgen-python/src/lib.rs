@@ -730,13 +730,26 @@ impl PyMap {
         )
     }
 
-    /// Constraints the two output formats impose beyond validation.
+    /// Constraints OpenDRIVE and Lanelet2 impose beyond validation.
     fn format_warnings(&mut self) -> PyResult<Vec<String>> {
         self.ensure_built()?;
         let map = self.built.as_ref().expect("just built");
         let mut warnings = roadgen_opendrive::check(map);
         warnings.extend(roadgen_lanelet2::check(map));
         Ok(warnings)
+    }
+
+    /// What a ClipGT export loses.
+    ///
+    /// Kept apart from `format_warnings` because these are properties of the format
+    /// rather than of the map: ClipGT carries no topology, so any map with a
+    /// connection in it reports one, and folding that into the general warnings would
+    /// make them noise for a caller who never touches ClipGT.
+    fn clipgt_warnings(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        Ok(roadgen_clipgt::check(
+            self.built.as_ref().expect("just built"),
+        ))
     }
 
     /// Writes the map as OpenDRIVE.
@@ -751,6 +764,41 @@ impl PyMap {
         self.ensure_built()?;
         roadgen_lanelet2::write(self.built.as_ref().expect("just built"), path)
             .map_err(runtime_error)
+    }
+
+    /// Writes the map as a ClipGT clip: a directory of per-layer parquet files.
+    ///
+    /// Returns the clip id the files were named with, which is `clip_id` when given
+    /// and otherwise the map's own name reduced to something a file name can hold.
+    /// `route` names the lanes the ego vehicle drives; without it, a route is found
+    /// by following successors from the first drivable lane outside a junction.
+    #[pyo3(signature = (
+        directory,
+        clip_id = None,
+        frame_rate = 30.0,
+        speed = 10.0,
+        route = None,
+    ))]
+    fn export_clipgt(
+        &mut self,
+        directory: PathBuf,
+        clip_id: Option<&str>,
+        frame_rate: f64,
+        speed: f64,
+        route: Option<Vec<String>>,
+    ) -> PyResult<String> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let mut config = match clip_id {
+            Some(id) => roadgen_clipgt::ClipConfig::new(id),
+            None => roadgen_clipgt::ClipConfig::for_map(map),
+        }
+        .with_frame_rate(frame_rate)
+        .with_speed(speed);
+        if let Some(route) = route {
+            config = config.with_route(route.into_iter().map(LaneId::new).collect());
+        }
+        roadgen_clipgt::write(map, directory, &config).map_err(runtime_error)
     }
 
     // `&mut self` because the map builds itself on demand; the name is the one the

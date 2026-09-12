@@ -6,6 +6,7 @@ this side.
 """
 
 import itertools
+import json
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -586,3 +587,134 @@ def test_a_map_that_leaves_its_mgrs_square_is_reported():
     assert any("MGRS square" in warning for warning in m.format_warnings())
     with pytest.raises(RuntimeError, match="MGRS square"):
         m.to_lanelet2_osm()
+
+
+# --------------------------------------------------------------------------- #
+# ClipGT
+#
+# These read the written directory the way ClipGTLoader reads one — the same file
+# names, the same columns, the same keys reached through — so that a test failing
+# here means a Cosmos reader would have failed too.
+# --------------------------------------------------------------------------- #
+
+
+def clipgt_map():
+    """A graded, signalised crossroads: something with every layer in it."""
+    m = roadgen.Map(name="demo town")
+    arms = {}
+    for name, start, end in (
+        ("north", (0.0, 70.0, 4.0), (0.0, 14.0, 1.0)),
+        ("east", (70.0, 0.0, 0.0), (14.0, 0.0, 1.0)),
+        ("south", (0.0, -70.0, 0.0), (0.0, -14.0, 1.0)),
+        ("west", (-70.0, 0.0, 2.0), (-14.0, 0.0, 1.0)),
+    ):
+        arms[name] = m.add_road(start=start, end=end, lanes=two_way(), name=name)
+    junction = m.add_junction("x")
+    for a, b in itertools.combinations(arms, 2):
+        m.connect(arms[a], arms[b], junction=junction, ends=("end", "end"))
+
+    approach = arms["north"].lane(0)
+    stop_line = m.add_stop_line(approach)
+    light = m.add_traffic_light(approach, height=5.0)
+    m.add_traffic_light_rule([light], [approach], stop_line=stop_line)
+    m.add_traffic_sign(approach, code="STOP", height=2.4)
+    m.add_crosswalk(arms["north"], fraction=0.82, width=4.0)
+    return m
+
+
+def read_layer(directory, clip_id, layer):
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+    return pd.read_parquet(directory / f"{clip_id}.{layer}.parquet")
+
+
+def test_a_clipgt_directory_is_one_a_reader_would_accept(tmp_path):
+    pytest.importorskip("pyarrow")
+    clip_id = clipgt_map().export_clipgt(tmp_path)
+    # The name comes from the map's, reduced to something a file name can hold.
+    assert clip_id == "demo_town"
+
+    # `can_load` looks for exactly these two before it looks at anything else.
+    for required in ("calibration_estimate", "egomotion_estimate"):
+        assert (tmp_path / f"{clip_id}.{required}.parquet").is_file()
+
+    # And the calibration's first row parses as a rig, which is how it is read.
+    calibration = read_layer(tmp_path, clip_id, "calibration_estimate")
+    rig = json.loads(str(calibration.iloc[0]["calibration_estimate"]["rig_json"]))
+    assert rig["rig"]["sensors"] == [], "the IR knows nothing about cameras"
+
+
+def test_clipgt_lanes_are_read_as_two_rails_with_heights(tmp_path):
+    pytest.importorskip("pyarrow")
+    m = clipgt_map()
+    clip_id = m.export_clipgt(tmp_path)
+    lanes = read_layer(tmp_path, clip_id, "lane")
+
+    heights = []
+    for _, row in lanes.iterrows():
+        lane = row["lane"]
+        for side in ("left_rail", "right_rail"):
+            assert side in lane and lane[side] is not None
+            points = [(pt["x"], pt["y"], pt["z"]) for pt in lane[side]]
+            assert len(points) >= 2
+            heights.extend(z for _, _, z in points)
+
+    # The arms run downhill into the junction from 4 m, 2 m and 0 m, so a rail that
+    # came out flat would mean the third dimension had been dropped somewhere.
+    assert max(heights) - min(heights) > 3.0
+
+
+def test_a_clipgt_ego_track_drives_the_map(tmp_path):
+    pytest.importorskip("pyarrow")
+    clip_id = clipgt_map().export_clipgt(tmp_path, speed=15.0, frame_rate=10.0)
+    ego = read_layer(tmp_path, clip_id, "egomotion_estimate")
+
+    stamps, positions = [], []
+    for _, row in ego.iterrows():
+        motion, key = row["egomotion_estimate"], row["key"]
+        location, orientation = motion["location"], motion["orientation"]
+        positions.append((location["x"], location["y"], location["z"]))
+        stamps.append(key["timestamp_micros"])
+        norm = sum(orientation[axis] ** 2 for axis in ("x", "y", "z", "w")) ** 0.5
+        assert abs(norm - 1.0) < 1e-9, "orientations are unit quaternions"
+
+    assert len(stamps) > 2
+    assert all(b - a == 100_000 for a, b in zip(stamps, stamps[1:]))
+    # It goes somewhere, and it goes downhill: the route starts on a graded arm.
+    start, finish = positions[0], positions[-1]
+    assert (start[0] - finish[0]) ** 2 + (start[1] - finish[1]) ** 2 > 100.0
+    assert abs(start[2] - finish[2]) > 0.5
+
+
+def test_clipgt_traffic_control_reaches_its_own_layers(tmp_path):
+    pytest.importorskip("pyarrow")
+    clip_id = clipgt_map().export_clipgt(tmp_path)
+
+    lights = read_layer(tmp_path, clip_id, "traffic_light")
+    assert len(lights) == 1
+    centre = lights.iloc[0]["traffic_light"]["center"]
+    assert centre["z"] > 4.9, "a light hangs above the road"
+
+    signs = read_layer(tmp_path, clip_id, "traffic_sign")
+    assert signs.iloc[0]["traffic_sign"]["category"] == "STOP"
+
+    assert len(read_layer(tmp_path, clip_id, "wait_line")) == 1
+    crossing = read_layer(tmp_path, clip_id, "crosswalk").iloc[0]["crosswalk"]
+    assert len(crossing["location"]) >= 4
+
+    area = read_layer(tmp_path, clip_id, "intersection_area").iloc[0]
+    assert len(area["intersection_area"]["location"]) >= 3
+
+
+def test_clipgt_says_what_it_cannot_carry(tmp_path):
+    m = clipgt_map()
+    warnings = m.clipgt_warnings()
+    assert any("topology" in warning for warning in warnings)
+    # And it stays out of the general warnings, which are about the other two
+    # formats and would otherwise be noise for a caller who never writes a clip.
+    assert m.format_warnings() == []
+
+
+def test_a_clip_id_that_would_escape_the_directory_is_refused(tmp_path):
+    with pytest.raises(RuntimeError, match="clip id"):
+        clipgt_map().export_clipgt(tmp_path, clip_id="../escape")
