@@ -52,12 +52,12 @@ m.export_clipgt("clip/")
                      │
                  Validation
                      │
-          ┌──────────┴───────────┐
-          ▼                      ▼
-      OpenDRIVE           Autoware Lanelet2
-       exporter                exporter
-          │                      │
-     `opendrive` crate     `simple_lanelet2`
+       ┌──────────┬───────────┴─────────┐
+       ▼          ▼                     ▼
+   OpenDRIVE   Autoware Lanelet2     ClipGT
+   exporter        exporter         exporter
+       │              │                 │
+ `opendrive`   `simple_lanelet2`  arrow / parquet
 ```
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
@@ -135,6 +135,7 @@ pip install target/wheels/roadgen-*.whl
 roadgen-core = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-opendrive = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-lanelet2 = { git = "https://github.com/hakuturu583/hdmap_generator" }
+roadgen-clipgt = { git = "https://github.com/hakuturu583/hdmap_generator" }
 ```
 
 ```rust
@@ -158,6 +159,10 @@ builder.connect(&a, &b)?;
 let map = builder.finish()?.validate()?;
 roadgen_opendrive::write(&map, "map.xodr")?;
 roadgen_lanelet2::write(&map, "map.osm")?;
+
+let clip = roadgen_clipgt::ClipConfig::new("clip")
+    .with_scenario_file("scenario.yaml")?;
+roadgen_clipgt::write(&map, "clips/", &clip)?;
 ```
 
 ## The Python API
@@ -179,10 +184,10 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `add_stop_line`, `add_traffic_light`, `add_traffic_sign`, `add_crosswalk` | road furniture |
 | `add_traffic_light_rule`, `add_right_of_way`, `add_speed_limit` | rules over lanes |
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
-| `clipgt_warnings()` | what a ClipGT export would lose |
+| `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
 | `export_opendrive(path)` / `export_lanelet2(path)` | write the files |
-| `export_clipgt(directory, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
+| `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 
@@ -359,7 +364,7 @@ ClipGT is the scene format NVIDIA's Cosmos world-scenario tooling reads: a direc
 of Parquet files named `{clip_id}.{layer}.parquet`, one row per element.
 
 ```python
-clip_id = m.export_clipgt("clips/", speed=15.0, frame_rate=30.0)
+clip_id = m.export_clipgt("clips/", scenario="scenario.yaml")
 ```
 
 | Layer | What goes in it |
@@ -379,18 +384,69 @@ computed for it; nothing here is projected to the horizontal plane.
 
 **It is a scene format, not a map format.** A reader will not look at a directory at
 all unless it holds an egomotion table, so a map on its own cannot be written as a
-clip — something has to drive through it. `export_clipgt` generates a route (follow
-successors from the first drivable lane outside a junction, unless `route=` names
-one), travels it at `speed`, and samples at `frame_rate`. Each pose takes the road's
-own frame, so the vehicle climbs with the grade and rolls with the banking. The
-calibration table holds a rig with no sensors, because the IR knows nothing about
-cameras and inventing one would be worse than saying so.
+clip — something has to drive through it, and something has to be looking.
+
+### The scenario file
+
+Where the vehicle drives and what is bolted to it are not properties of the map: the
+same network should be drivable several ways, with several rigs, without editing it.
+So both come from a YAML file.
+
+```yaml
+clip_id: town
+frame_rate: 30.0
+speed: 12.0                    # metres per second
+
+route:
+  start: lane/north/0          # set off here and follow successors
+  # lanes: [lane/north/0, ...] # or drive exactly these, in this order
+
+sensors:
+  - name: camera:front_wide_120fov
+    position: [1.7, 0.0, 1.45]       # metres, in the rig's forward-left-up frame
+    roll_pitch_yaw: [0.0, 0.0, 0.0]  # degrees
+    width: 1920
+    height: 1080
+    fov_degrees: 120.0               # an ideal equidistant f-theta lens
+  - name: camera:rear_tele_30fov
+    position: [-0.9, 0.0, 1.3]
+    roll_pitch_yaw: [0.0, -1.5, 180.0]
+    width: 1920
+    height: 1080
+    cx: 955.0                        # defaults to the middle of the frame
+    polynomial: [0.0, 1830.0, 0.0, 0.0, 0.0, 0.0]
+    polynomial_type: angle-to-pixeldistance   # the default
+    linear: [1.0, 0.0, 0.0]                   # the affine term, identity by default
+```
+
+[`examples/clipgt-scenario.yaml`](examples/clipgt-scenario.yaml) is this file, kept in
+the repository and loaded by a test so that it cannot quietly stop working.
+
+Everything is optional and anything left out keeps the value it already had, so a
+scenario can say only what it wants to change. Arguments passed to `export_clipgt`
+override the file; arguments left out keep it. **An unknown key is an error**, not a
+silence: a scenario is written by hand, and a `speed_kph` that should have been
+`speed` is worth being told about.
+
+`fov_degrees` is a convenience, not a calibration: it produces the textbook
+equidistant fisheye `r = f·θ` with `f` chosen so the horizontal half-angle lands on
+the edge of the frame. A measured lens goes in `polynomial` instead.
+
+A sensor's name is prefixed with `camera:` if it has no prefix, because a reader
+discovers cameras by that prefix and skips anything else. Each one also gets a
+`{clip_id}.{camera}.json` of frame timestamps, so a reader that syncs poses to frames
+finds the frames the track was actually generated at rather than resampling.
+
+With no `sensors`, the calibration table still holds a rig — an empty one, which is
+what the IR knows about cameras on its own. The clip loads; there is just nothing to
+render from, and `clipgt_warnings()` says so.
 
 **What it cannot carry.** ClipGT has no topology: a lane is two rails, with no
 successor, no predecessor and no junction movement, so a clip is a picture of the
 roads rather than a network you can route on. Element ids are the Parquet row index,
-so the IR's stable identifiers do not survive either. `Map.clipgt_warnings()` reports
-that rather than letting a caller assume a round trip. The `pole`, `road_island` and
+so the IR's stable identifiers do not survive either. `Map.clipgt_warnings(scenario)`
+reports that rather than letting a caller assume a round trip, and checks the
+scenario's route against the map while it is there. The `pole`, `road_island` and
 `road_marking` layers have no counterpart in the IR and are not written.
 
 ## Validation
@@ -444,6 +500,7 @@ roadgen/
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
 │   └── roadgen-python/      PyO3 bindings
+├── examples/                a ClipGT scenario file
 ├── python/roadgen/          the Python package
 ├── tests/
 │   ├── integration/         scenarios and cross-format checks

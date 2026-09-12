@@ -11,6 +11,8 @@ pub enum ExportError {
     InvalidClipId(String),
     /// An ego track was asked for but the map has nowhere to drive.
     NoRoute(String),
+    /// The scenario file does not describe a scenario.
+    Scenario(String),
     /// The Arrow schema and the data disagreed, which means this crate is wrong.
     Schema(String),
     Io(String),
@@ -37,6 +39,7 @@ impl fmt::Display for ExportError {
                 "no ego route could be found: {detail}. ClipGT needs an egomotion \
                  track before a reader will accept the directory as a clip"
             ),
+            ExportError::Scenario(detail) => write!(f, "the scenario is unusable: {detail}"),
             ExportError::Schema(detail) => write!(f, "the ClipGT tables are malformed: {detail}"),
             ExportError::Io(detail) => write!(f, "{detail}"),
         }

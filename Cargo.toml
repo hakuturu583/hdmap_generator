@@ -45,6 +45,13 @@ ll2-traffic-rules = { git = "https://github.com/hakuturu583/simple_lanelet2", re
 arrow = { version = "59", default-features = false }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
 
+# The ClipGT scenario file, and the rig JSON a clip's calibration table carries.
+# serde and serde_json are MIT/Apache-2.0; serde_norway is the maintained fork of
+# serde_yaml, under the same licences.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9"
+
 pyo3 = "0.29"
 
 tempfile = "3"

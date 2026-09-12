@@ -7,6 +7,7 @@ this side.
 
 import itertools
 import json
+import textwrap
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -718,3 +719,82 @@ def test_clipgt_says_what_it_cannot_carry(tmp_path):
 def test_a_clip_id_that_would_escape_the_directory_is_refused(tmp_path):
     with pytest.raises(RuntimeError, match="clip id"):
         clipgt_map().export_clipgt(tmp_path, clip_id="../escape")
+
+
+def write_scenario(tmp_path, text):
+    path = tmp_path / "scenario.yaml"
+    path.write_text(textwrap.dedent(text))
+    return path
+
+
+def test_a_scenario_file_sets_the_route_and_the_rig(tmp_path):
+    pytest.importorskip("pyarrow")
+    m = clipgt_map()
+    scenario = write_scenario(
+        tmp_path,
+        """\
+        clip_id: from_yaml
+        frame_rate: 10.0
+        speed: 9.0
+
+        route:
+          start: lane/east/0
+
+        sensors:
+          - name: camera:front_wide_120fov
+            position: [1.7, 0.0, 1.45]
+            width: 1920
+            height: 1080
+            fov_degrees: 120.0
+        """,
+    )
+    out = tmp_path / "clip"
+    assert m.export_clipgt(out, scenario=scenario) == "from_yaml"
+
+    # The rig reached the calibration table.
+    calibration = read_layer(out, "from_yaml", "calibration_estimate")
+    rig = json.loads(str(calibration.iloc[0]["calibration_estimate"]["rig_json"]))
+    sensors = rig["rig"]["sensors"]
+    assert len(sensors) == 1
+    assert sensors[0]["name"] == "camera:front_wide_120fov"
+    assert sensors[0]["nominalSensor2Rig_FLU"]["t"] == [1.7, 0.0, 1.45]
+    assert sensors[0]["properties"]["width"] == "1920"
+
+    # The route is the one the file named: the east arm points at the junction from
+    # (70, 0), which is nowhere near where a default route would have started.
+    ego = read_layer(out, "from_yaml", "egomotion_estimate")
+    first = ego.iloc[0]["egomotion_estimate"]["location"]
+    assert abs(first["x"] - 70.0) < 1.0 and abs(first["y"] - 1.75) < 1.0
+
+    # At 10 Hz, as asked.
+    stamps = [row["key"]["timestamp_micros"] for _, row in ego.iterrows()]
+    assert all(b - a == 100_000 for a, b in zip(stamps, stamps[1:]))
+
+    # And the camera got a frame per pose.
+    frames = json.loads((out / "from_yaml.camera_front_wide_120fov.json").read_text())
+    assert [frame["timestamp"] for frame in frames] == stamps
+
+
+def test_arguments_override_the_scenario_file(tmp_path):
+    pytest.importorskip("pyarrow")
+    m = clipgt_map()
+    scenario = write_scenario(tmp_path, "clip_id: from_yaml\nspeed: 9.0\n")
+    out = tmp_path / "clip"
+    # What is passed wins; what is not keeps the file's value.
+    assert m.export_clipgt(out, scenario=scenario, clip_id="override") == "override"
+    assert (out / "override.egomotion_estimate.parquet").is_file()
+
+
+def test_a_scenario_with_a_mistyped_key_is_refused(tmp_path):
+    scenario = write_scenario(tmp_path, "speed_kph: 40.0\n")
+    with pytest.raises(ValueError, match="speed_kph"):
+        clipgt_map().export_clipgt(tmp_path / "clip", scenario=scenario)
+
+
+def test_a_scenario_route_is_checked_against_the_map(tmp_path):
+    m = clipgt_map()
+    scenario = write_scenario(tmp_path, "route:\n  start: lane/nowhere/0\n")
+    warnings = m.clipgt_warnings(scenario=scenario)
+    assert any("lane/nowhere/0" in warning for warning in warnings)
+    with pytest.raises(RuntimeError, match="lane/nowhere/0"):
+        m.export_clipgt(tmp_path / "clip", scenario=scenario)

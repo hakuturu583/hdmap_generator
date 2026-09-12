@@ -1,0 +1,44 @@
+# A ClipGT scenario: where the vehicle drives, and what is bolted to it.
+#
+# Neither is a property of the map, so both live here rather than in the code that
+# builds the roads. Pass it with:
+#
+#     m.export_clipgt("clips/", scenario="examples/clipgt-scenario.yaml")
+#
+# Every key is optional; anything left out keeps the value it already had. An
+# unknown key is an error rather than being ignored.
+
+clip_id: town
+frame_rate: 30.0
+speed: 12.0                      # metres per second
+
+route:
+  # Set off in this lane and follow the first successor at every branch. Lane names
+  # are the ones `Map.lane_ids()` prints; the `lane/` prefix may be left off.
+  start: lane/north/0
+  # Or drive exactly these, in this order:
+  # lanes: [lane/north/0, lane/x/north_0_east_1/0, lane/east/1]
+
+sensors:
+  # A reader discovers cameras by the `camera:` prefix, which is added if it is
+  # missing. `:` becomes `_` in the file name of the camera's frame timestamps.
+  - name: camera:front_wide_120fov
+    position: [1.7, 0.0, 1.45]         # metres, in the rig's forward-left-up frame
+    roll_pitch_yaw: [0.0, 0.0, 0.0]    # degrees, applied as an xyz Euler triple
+    width: 1920
+    height: 1080
+    # An ideal equidistant f-theta lens: r = f·θ, with f chosen so that the
+    # horizontal half-angle lands on the edge of the frame. A measured lens goes in
+    # `polynomial` instead.
+    fov_degrees: 120.0
+
+  - name: camera:rear_tele_30fov
+    position: [-0.9, 0.0, 1.3]
+    roll_pitch_yaw: [0.0, -1.5, 180.0]
+    width: 1920
+    height: 1080
+    cx: 955.0                          # defaults to the middle of the frame
+    cy: 545.0
+    polynomial: [0.0, 1830.0, 0.0, 0.0, 0.0, 0.0]
+    polynomial_type: angle-to-pixeldistance   # the default
+    linear: [1.0, 0.0, 0.0]                   # the affine term; this is the identity
