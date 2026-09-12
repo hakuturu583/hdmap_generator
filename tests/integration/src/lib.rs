@@ -3,6 +3,7 @@
 //! Nothing in this crate is published; it exists so that the scenario maps and the
 //! independent OpenDRIVE reader are written once and used by every test file.
 
+pub mod clipgt_read;
 pub mod opendrive_eval;
 pub mod scenarios;
 
@@ -27,6 +28,17 @@ pub fn reload_lanelet2(map: &ValidatedMap) -> Arc<LaneletMap> {
     let xml = roadgen_lanelet2::to_osm_xml(map).expect("the map should export as Lanelet2");
     let projector = roadgen_lanelet2::projector_for(map).expect("a projector");
     ll2_io::load_str(&xml, projector.as_ref()).expect("a Lanelet2 loader should accept the export")
+}
+
+/// Exports a clip into a fresh directory and hands back both, so the directory lives
+/// as long as the test does.
+pub fn write_clip(
+    map: &ValidatedMap,
+    config: &roadgen_clipgt::ClipConfig,
+) -> (tempfile::TempDir, String) {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let clip = roadgen_clipgt::write(map, directory.path(), config).expect("the map should export");
+    (directory, clip)
 }
 
 /// A routing graph over a loaded Lanelet2 map, built the way a consumer would.

@@ -1,4 +1,4 @@
-"""Generate 3D road networks and write them as OpenDRIVE and Autoware Lanelet2.
+"""Generate 3D road networks and write them as OpenDRIVE, Autoware Lanelet2 or ClipGT.
 
 The road network itself — topology, geometry, semantics, validation — lives in
 Rust. This package is the front end: every object here is a handle on something
@@ -26,6 +26,7 @@ the Rust core owns, so there is one model of the map and not two.
     m.connect(a, b)
     m.export_opendrive("map.xodr")
     m.export_lanelet2("map.osm")
+    m.export_clipgt("clip/")
 """
 
 from ._roadgen import Alignment, Junction, Lane, LaneRef, Map, Road, __version__

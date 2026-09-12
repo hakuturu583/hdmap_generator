@@ -4,6 +4,7 @@ members = [
     "crates/roadgen-core",
     "crates/roadgen-opendrive",
     "crates/roadgen-lanelet2",
+    "crates/roadgen-clipgt",
     "crates/roadgen-python",
     "tests/integration",
 ]
@@ -20,6 +21,7 @@ homepage = "https://github.com/hakuturu583/hdmap_generator"
 roadgen-core = { path = "crates/roadgen-core", version = "0.1.0" }
 roadgen-opendrive = { path = "crates/roadgen-opendrive", version = "0.1.0" }
 roadgen-lanelet2 = { path = "crates/roadgen-lanelet2", version = "0.1.0" }
+roadgen-clipgt = { path = "crates/roadgen-clipgt", version = "0.1.0" }
 
 # OpenDRIVE 1.7 data model, parser and writer. MIT, which an Apache-2.0 project may
 # redistribute. Used so that neither the XML schema nor its serializer is rewritten
@@ -37,7 +39,15 @@ ll2-projection = { git = "https://github.com/hakuturu583/simple_lanelet2", rev =
 ll2-routing = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
 ll2-traffic-rules = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
 
+# Arrow and Parquet, for ClipGT's nested per-layer tables. Both Apache-2.0, so an
+# Apache-2.0 project may redistribute them. Used so that neither the Parquet
+# container nor the Arrow type system is rewritten here.
+arrow = { version = "59", default-features = false }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
+
 pyo3 = "0.29"
+
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

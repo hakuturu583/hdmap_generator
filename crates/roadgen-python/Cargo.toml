@@ -16,4 +16,5 @@ crate-type = ["cdylib", "rlib"]
 roadgen-core.workspace = true
 roadgen-opendrive.workspace = true
 roadgen-lanelet2.workspace = true
+roadgen-clipgt.workspace = true
 pyo3.workspace = true

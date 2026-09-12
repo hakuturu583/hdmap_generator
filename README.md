@@ -1,7 +1,7 @@
 # roadgen
 
-Generate 3D road networks, and write the same network out as **OpenDRIVE** and as an
-**Autoware-ready Lanelet2** map.
+Generate 3D road networks, and write the same network out as **OpenDRIVE**, as an
+**Autoware-ready Lanelet2** map, and as a **ClipGT** clip for NVIDIA Cosmos.
 
 This is a generator, not a converter. Nothing here parses an existing HD map: you
 describe roads, lanes, junctions and the movements between them, and the library
@@ -30,6 +30,7 @@ b = m.add_road(
 m.connect(a, b)
 m.export_opendrive("map.xodr")
 m.export_lanelet2("map.osm")
+m.export_clipgt("clip/")
 ```
 
 ## How it is put together
@@ -178,8 +179,10 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `add_stop_line`, `add_traffic_light`, `add_traffic_sign`, `add_crosswalk` | road furniture |
 | `add_traffic_light_rule`, `add_right_of_way`, `add_speed_limit` | rules over lanes |
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
+| `clipgt_warnings()` | what a ClipGT export would lose |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
 | `export_opendrive(path)` / `export_lanelet2(path)` | write the files |
+| `export_clipgt(directory, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 
@@ -350,6 +353,46 @@ the easting and northing modulo 100 km, so a map running over the edge would sil
 come back on the other side; `format_warnings()` reports it instead, and exporting
 fails rather than writing it.
 
+## ClipGT
+
+ClipGT is the scene format NVIDIA's Cosmos world-scenario tooling reads: a directory
+of Parquet files named `{clip_id}.{layer}.parquet`, one row per element.
+
+```python
+clip_id = m.export_clipgt("clips/", speed=15.0, frame_rate=30.0)
+```
+
+| Layer | What goes in it |
+| --- | --- |
+| `lane` | each drivable lane's two rails, in travel order |
+| `lane_line` | one row per painted cross-section edge, with its colour and style |
+| `road_boundary` | the outermost edge on each side of every cross-section |
+| `crosswalk`, `wait_line` | crossings and stop lines |
+| `traffic_light`, `traffic_sign` | position, orientation and category |
+| `intersection_area` | a junction's outline |
+| `egomotion_estimate`, `calibration_estimate` | see below |
+
+Coordinates are **FLU** — x forward, y left, z up — which is the same shape of frame
+as the IR's east-north-up, so they are written through unchanged, heights and all. A
+rail on a graded, banked road carries the elevation and the cross-fall the generator
+computed for it; nothing here is projected to the horizontal plane.
+
+**It is a scene format, not a map format.** A reader will not look at a directory at
+all unless it holds an egomotion table, so a map on its own cannot be written as a
+clip — something has to drive through it. `export_clipgt` generates a route (follow
+successors from the first drivable lane outside a junction, unless `route=` names
+one), travels it at `speed`, and samples at `frame_rate`. Each pose takes the road's
+own frame, so the vehicle climbs with the grade and rolls with the banking. The
+calibration table holds a rig with no sensors, because the IR knows nothing about
+cameras and inventing one would be worse than saying so.
+
+**What it cannot carry.** ClipGT has no topology: a lane is two rails, with no
+successor, no predecessor and no junction movement, so a clip is a picture of the
+roads rather than a network you can route on. Element ids are the Parquet row index,
+so the IR's stable identifiers do not survive either. `Map.clipgt_warnings()` reports
+that rather than letting a caller assume a round trip. The `pole`, `road_island` and
+`road_marking` layers have no counterpart in the IR and are not written.
+
 ## Validation
 
 `validate()` reports everything wrong at once, rather than failing on the first
@@ -364,7 +407,7 @@ Each exporter adds the constraints its own format imposes, through
 from Python). Those constraints stay on the exporter's side of the boundary and are
 never pushed back into the IR.
 
-## Agreement between the two formats
+## Agreement between OpenDRIVE and Lanelet2
 
 The test suite exports each scenario, reads the OpenDRIVE back with the `opendrive`
 crate's parser and the Lanelet2 map back with `simple_lanelet2`'s loader, and
@@ -399,6 +442,7 @@ roadgen/
 │   │   └── validation/      UnvalidatedMap → ValidatedMap
 │   ├── roadgen-opendrive/   lowering onto the `opendrive` crate
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
+│   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
 │   └── roadgen-python/      PyO3 bindings
 ├── python/roadgen/          the Python package
 ├── tests/
@@ -420,14 +464,17 @@ maturin develop                 # build and install the Python extension
 python -m pytest tests/python
 ```
 
-## Limitations
-
-
 ## Licence
 
 Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
 Dependencies are kept to licences an Apache-2.0 project may redistribute — the
-OpenDRIVE data model and writer (`opendrive`, MIT) and the Lanelet2 model, OSM I/O and
-projections (`simple_lanelet2`, BSD-3-Clause), plus MIT/Apache-2.0 transitive crates.
+OpenDRIVE data model and writer (`opendrive`, MIT), the Lanelet2 model, OSM I/O and
+projections (`simple_lanelet2`, BSD-3-Clause), and Arrow and Parquet
+(`arrow`/`parquet`, Apache-2.0), plus MIT/Apache-2.0 transitive crates.
+
+The ClipGT layer names and field names were read off the public
+[`clipgt_loader.py`](https://github.com/nvidia-cosmos/cosmos-transfer2.5/blob/main/cosmos_transfer2/_src/imaginaire/auxiliary/world_scenario/dataloaders/clipgt_loader.py).
+That file is NVIDIA's and carries a proprietary header; none of it is reproduced here,
+only the names two programs have to agree on to exchange data.
 Check licence compatibility before adding a dependency.

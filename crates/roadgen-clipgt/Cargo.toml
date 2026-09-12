@@ -1,0 +1,17 @@
+[package]
+name = "roadgen-clipgt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto NVIDIA Cosmos' ClipGT scene format"
+
+[dependencies]
+roadgen-core.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
