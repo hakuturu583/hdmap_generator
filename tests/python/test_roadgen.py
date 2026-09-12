@@ -5,6 +5,7 @@ every result comes from the Rust core, and there is no second model of the map o
 this side.
 """
 
+import itertools
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -156,6 +157,74 @@ def test_a_junction_generates_connectors():
     reached = [lane for hop in first_hop for lane in m.successors(hop)]
     assert sorted(reached) == ["lane/slip/0", "lane/straight_on/0"]
     assert m.format_warnings() == []
+
+
+def crossroads(ends):
+    """Four approaches pointing at a shared centre, joined by the given ends."""
+    m = roadgen.Map()
+    arms = {}
+    for name, start, end in (
+        ("north", (0.0, 70.0, 0.0), (0.0, 14.0, 0.0)),
+        ("east", (70.0, 0.0, 0.0), (14.0, 0.0, 0.0)),
+        ("south", (0.0, -70.0, 0.0), (0.0, -14.0, 0.0)),
+        ("west", (-70.0, 0.0, 0.0), (-14.0, 0.0, 0.0)),
+    ):
+        arms[name] = m.add_road(start=start, end=end, lanes=two_way(), name=name)
+    junction = m.add_junction("x")
+    for a, b in itertools.combinations(arms, 2):
+        # `ends=None` means "don't pass it", so the default can be tested too.
+        if ends is None:
+            m.connect(arms[a], arms[b], junction=junction)
+        else:
+            m.connect(arms[a], arms[b], junction=junction, ends=ends)
+    return m, arms
+
+
+def connector_reach(m, arms):
+    """How far the generated connectors stray from the junction's centre."""
+    connectors = [
+        lane
+        for lane in m.lane_ids()
+        if not any(lane.startswith(f"lane/{name}/") for name in arms)
+    ]
+    assert len(connectors) == 12, "one connector per movement"
+    return max(
+        max(max(abs(x), abs(y)) for x, y, _ in m.lane_centerline(lane))
+        for lane in connectors
+    )
+
+
+def test_approaches_that_meet_end_to_end_can_say_so():
+    # Every arm points at the centre, so every arm meets the joint at its end.
+    m, arms = crossroads(("end", "end"))
+    assert len(m.road_ids()) == 16, "four arms and twelve connectors"
+    # The approaches stop 14 m out, so the connectors belong inside that circle.
+    assert connector_reach(m, arms) <= 14.0 + 1e-6
+    assert m.format_warnings() == []
+
+
+def test_the_default_still_joins_one_road_into_the_next():
+    # `connect` without `ends` is unchanged: the end of one road, the start of the
+    # next. On approaches that all point inwards that is the wrong pairing, and it
+    # shows up as connectors running out to the arms' far tips rather than as an
+    # error — which is exactly why `ends` has to be sayable.
+    m, arms = crossroads(("end", "start"))
+    assert connector_reach(m, arms) > 70.0
+
+    default, _ = crossroads(None)
+    assert default.connections() == m.connections()
+
+
+def test_an_unknown_road_end_is_refused():
+    m = roadgen.Map()
+    a = m.add_road(
+        start=(0.0, 0.0, 0.0), end=(100.0, 0.0, 0.0), lanes=two_way(), name="a"
+    )
+    b = m.add_road(
+        start=(100.0, 0.0, 0.0), end=(200.0, 0.0, 0.0), lanes=two_way(), name="b"
+    )
+    with pytest.raises(ValueError, match="'start' or 'end'"):
+        m.connect(a, b, ends=("end", "middle"))
 
 
 def test_a_polyline_road_keeps_its_gradient():

@@ -19,7 +19,7 @@ use roadgen_core::geometry::{
 use roadgen_core::id::{JunctionId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::{MapMetadata, Projection, TrafficHandedness};
 use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking, RoadType};
-use roadgen_core::topology::{Direction, LaneEnd, LateralSide};
+use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd};
 use roadgen_core::units::{GeoOrigin, PositiveWidth, SpeedLimit};
 use roadgen_core::validation::{UnvalidatedMap, ValidatedMap};
 
@@ -62,6 +62,16 @@ fn parse_end(value: &str) -> PyResult<LaneEnd> {
         "end" => Ok(LaneEnd::End),
         other => Err(PyValueError::new_err(format!(
             "end must be 'start' or 'end', got {other:?}"
+        ))),
+    }
+}
+
+fn parse_road_end(value: &str) -> PyResult<RoadEnd> {
+    match value.to_ascii_lowercase().as_str() {
+        "start" => Ok(RoadEnd::Start),
+        "end" => Ok(RoadEnd::End),
+        other => Err(PyValueError::new_err(format!(
+            "a road end must be 'start' or 'end', got {other:?}"
         ))),
     }
 }
@@ -544,21 +554,32 @@ impl PyMap {
         PyJunction { id }
     }
 
-    /// Joins the end of `a` to the start of `b`, pairing lanes across the joint.
+    /// Joins two roads, pairing lanes across the joint.
+    ///
+    /// `ends` says which end of each road meets, and defaults to the end of `a`
+    /// meeting the start of `b` — one road carrying on into the next. A junction
+    /// whose approaches all point at the centre meets end to end instead, which
+    /// only `ends` can say.
     ///
     /// Returns the movements it created, as `(from_lane_id, to_lane_id)` pairs.
-    #[pyo3(signature = (a, b, junction = None))]
+    #[pyo3(signature = (a, b, junction = None, ends = ("end", "start")))]
     fn connect(
         &mut self,
         a: &PyRoad,
         b: &PyRoad,
         junction: Option<&PyJunction>,
+        ends: (&str, &str),
     ) -> PyResult<Vec<(String, String)>> {
-        let movements = match junction {
-            Some(junction) => self.builder.connect_via(&junction.id, &a.id, &b.id),
-            None => self.builder.connect(&a.id, &b.id),
-        }
-        .map_err(value_error)?;
+        let movements = self
+            .builder
+            .connect_ends(
+                &a.id,
+                parse_road_end(ends.0)?,
+                &b.id,
+                parse_road_end(ends.1)?,
+                junction.map(|junction| &junction.id),
+            )
+            .map_err(value_error)?;
         self.invalidate();
         Ok(movements
             .into_iter()

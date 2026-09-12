@@ -99,7 +99,11 @@ class Map:
     ) -> Road: ...
     def add_junction(self, name: Optional[str] = None) -> Junction: ...
     def connect(
-        self, a: Road, b: Road, junction: Optional[Junction] = None
+        self,
+        a: Road,
+        b: Road,
+        junction: Optional[Junction] = None,
+        ends: tuple[str, str] = ("end", "start"),
     ) -> list[tuple[str, str]]: ...
     def connect_lanes(
         self, from_lane: LaneRef, to_lane: LaneRef, junction: Optional[Junction] = None
