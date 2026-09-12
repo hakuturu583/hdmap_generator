@@ -173,7 +173,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `Lane(width_profile=[(station, metres), ...], taper=)` | a lane that narrows or widens |
 | `add_road(..., cross_sections=[(station, [lanes]), ...])` | where the *number* of lanes changes |
 | `add_junction(name)` | a junction to route movements through |
-| `connect(a, b, junction=None)` | joins the end of `a` to the start of `b`, pairing lanes |
+| `connect(a, b, junction=None, ends=("end", "start"))` | joins two roads by the named ends, pairing lanes |
 | `connect_lanes(from_lane, to_lane, junction=None)` | one specific movement |
 | `add_stop_line`, `add_traffic_light`, `add_traffic_sign`, `add_crosswalk` | road furniture |
 | `add_traffic_light_rule`, `add_right_of_way`, `add_speed_limit` | rules over lanes |
@@ -283,6 +283,24 @@ m.connect(trunk, slip, junction=junction)
 
 That one model lowers cleanly both ways: the connectors become OpenDRIVE connecting
 roads inside a `<junction>`, and lanelets that a Lanelet2 routing graph walks through.
+
+`connect` joins the end of the first road to the start of the second, which is the
+shape of a road carrying on into the next one. A crossroads is the other shape: its
+approaches all point *at* the centre, so they meet the joint end to end, and `ends`
+says so.
+
+```python
+junction = m.add_junction("x")
+for a, b in itertools.combinations(arms, 2):
+    m.connect(a, b, junction=junction, ends=("end", "end"))
+```
+
+One call per *pair* of arms, not per movement: joining two two-way roads already
+generates the connectors for both directions.
+
+Get this wrong and nothing complains — the map validates and both files are written —
+but the connectors run to the far tips of the approaches rather than across the
+junction, so it is worth reading the connector lengths once.
 
 ## Traffic control
 
