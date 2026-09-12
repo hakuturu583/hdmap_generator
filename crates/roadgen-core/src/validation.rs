@@ -60,7 +60,7 @@ impl UnvalidatedMap {
         let mut issues = Vec::new();
         check_coordinate_metadata(&self.0, &mut issues);
         check_references(&self.0, &mut issues);
-        check_cross_sections(&self.0, &mut issues);
+        check_cross_sections(&self.0, config, &mut issues);
         check_superelevation(&self.0, &mut issues);
         check_road_links(&self.0, config, &mut issues);
         check_connections(&self.0, config, &mut issues);
@@ -197,7 +197,7 @@ fn check_references(map: &Map, issues: &mut Vec<ValidationIssue>) {
     }
 }
 
-fn check_cross_sections(map: &Map, issues: &mut Vec<ValidationIssue>) {
+fn check_cross_sections(map: &Map, config: ValidationConfig, issues: &mut Vec<ValidationIssue>) {
     for lane in map.lanes.iter() {
         // The width itself needs no check: `WidthProfile` cannot describe one that
         // reaches zero. What is worth checking is that the *generated boundaries*
@@ -234,7 +234,10 @@ fn check_cross_sections(map: &Map, issues: &mut Vec<ValidationIssue>) {
             };
             let spanned = (left - right).dot(lateral.get());
             let expected = lane.width_at(station);
-            if (spanned - expected).abs() > 1e-6 {
+            // The cross-section direction at the end of a junction connector between curved
+            // arms is itself sampled, so the span misses the width by micrometres there;
+            // the position tolerance is the right yardstick, not machine precision.
+            if (spanned - expected).abs() > config.position_tolerance {
                 issues.push(ValidationIssue::InvalidLaneBoundary {
                     lane: lane.id.clone(),
                     detail: format!(
@@ -591,6 +594,65 @@ mod tests {
             )
             .unwrap();
         builder.connect(&a, &b).unwrap();
+        builder.finish().unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn junction_connectors_between_curved_arms_validate() {
+        // Straight out of a real drive (Odaiba, left-hand traffic): a one-lane ramp joining
+        // a curved, sloping main road through a junction. The connector's boundaries missed
+        // the lane width by 7 µm at its start and failed validation at machine precision.
+        use crate::geometry::Curve3;
+        use crate::map::TrafficHandedness;
+        let mut builder = MapBuilder::default();
+        builder.metadata_mut().handedness = TrafficHandedness::LeftHand;
+        let ramp = builder
+            .add_road(
+                RoadSpec::new(
+                    Curve3::polyline([
+                        Point3::new(0.0, 0.0, 0.0),
+                        Point3::new(2.1, -3.5, -0.01),
+                        Point3::new(5.4, -10.8, 0.09),
+                        Point3::new(7.3, -21.5, 0.05),
+                        Point3::new(6.2, -27.1, -0.08),
+                        Point3::new(3.7, -32.4, -0.09),
+                        Point3::new(-0.5, -37.5, -0.14),
+                    ])
+                    .unwrap(),
+                    vec![LaneSpec::new(
+                        PositiveWidth::new(3.5).unwrap(),
+                        Direction::Forward,
+                    )],
+                )
+                .with_name("ramp"),
+            )
+            .unwrap();
+        let main = builder
+            .add_road(
+                RoadSpec::new(
+                    Curve3::polyline([
+                        Point3::new(-0.5, -37.5, -0.14),
+                        Point3::new(-12.3, -46.5, -0.24),
+                        Point3::new(-27.3, -56.4, -0.31),
+                        Point3::new(-44.2, -67.8, -0.49),
+                        Point3::new(-61.5, -79.5, -0.68),
+                        Point3::new(-77.8, -91.1, -0.91),
+                        Point3::new(-92.0, -101.5, -1.09),
+                        Point3::new(-106.8, -111.5, -1.28),
+                        Point3::new(-119.6, -120.0, -1.29),
+                    ])
+                    .unwrap(),
+                    vec![
+                        LaneSpec::new(PositiveWidth::new(3.3).unwrap(), Direction::Forward),
+                        LaneSpec::new(PositiveWidth::new(3.3).unwrap(), Direction::Forward),
+                        LaneSpec::new(PositiveWidth::new(3.4).unwrap(), Direction::Backward),
+                    ],
+                )
+                .with_name("main"),
+            )
+            .unwrap();
+        let junction = builder.add_junction(Some("j"));
+        builder.connect_via(&junction, &ramp, &main).unwrap();
         builder.finish().unwrap().validate().unwrap();
     }
 
