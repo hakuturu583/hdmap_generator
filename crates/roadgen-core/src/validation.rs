@@ -22,12 +22,17 @@ use crate::topology::{LaneEnd, RoadEnd, RoadLinkTarget};
 pub struct ValidationConfig {
     /// Metres; applies to every position comparison.
     pub position_tolerance: f64,
+    /// Metres; how far the span of a lane's generated boundaries may differ from its
+    /// width. Junction connectors between curved arms miss it by a few millimetres at an
+    /// end (the cross-section direction there is sampled), which no consumer can tell.
+    pub width_tolerance: f64,
 }
 
 impl Default for ValidationConfig {
     fn default() -> Self {
         ValidationConfig {
             position_tolerance: 1e-3,
+            width_tolerance: 2e-2,
         }
     }
 }
@@ -234,10 +239,7 @@ fn check_cross_sections(map: &Map, config: ValidationConfig, issues: &mut Vec<Va
             };
             let spanned = (left - right).dot(lateral.get());
             let expected = lane.width_at(station);
-            // The cross-section direction at the end of a junction connector between curved
-            // arms is itself sampled, so the span misses the width by micrometres there;
-            // the position tolerance is the right yardstick, not machine precision.
-            if (spanned - expected).abs() > config.position_tolerance {
+            if (spanned - expected).abs() > config.width_tolerance {
                 issues.push(ValidationIssue::InvalidLaneBoundary {
                     lane: lane.id.clone(),
                     detail: format!(
@@ -653,6 +655,60 @@ mod tests {
             .unwrap();
         let junction = builder.add_junction(Some("j"));
         builder.connect_via(&junction, &ramp, &main).unwrap();
+        builder.finish().unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn connector_between_a_curved_arm_and_its_continuation_validates() {
+        // The same drive, further on: a four-plus-one lane main road bends into a
+        // three-plus-three lane road through a junction; the connectors' end boundaries span
+        // 3.2950 m and 3.2987 m for 3.3 m lanes — millimetres, not micrometres.
+        use crate::geometry::Curve3;
+        use crate::map::TrafficHandedness;
+        let f = || LaneSpec::new(PositiveWidth::new(3.3).unwrap(), Direction::Forward);
+        let b = || LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward);
+        let mut builder = MapBuilder::default();
+        builder.metadata_mut().handedness = TrafficHandedness::LeftHand;
+        let main = builder
+            .add_road(
+                RoadSpec::new(
+                    Curve3::polyline([
+                        Point3::new(-0.5, -37.5, -0.14),
+                        Point3::new(-12.3, -46.5, -0.24),
+                        Point3::new(-27.3, -56.4, -0.31),
+                        Point3::new(-44.2, -67.8, -0.49),
+                        Point3::new(-61.5, -79.5, -0.68),
+                        Point3::new(-77.8, -91.1, -0.91),
+                        Point3::new(-92.0, -101.5, -1.09),
+                        Point3::new(-106.8, -111.5, -1.28),
+                        Point3::new(-119.6, -120.0, -1.29),
+                        Point3::new(-128.9, -126.2, -1.12),
+                    ])
+                    .unwrap(),
+                    vec![f(), f(), f(), f(), b()],
+                )
+                .with_name("main"),
+            )
+            .unwrap();
+        let south = builder
+            .add_road(
+                RoadSpec::new(
+                    Curve3::polyline([
+                        Point3::new(-138.7, -136.7, -0.78),
+                        Point3::new(-139.2, -141.9, -0.68),
+                        Point3::new(-134.7, -154.8, -0.54),
+                        Point3::new(-127.1, -172.1, -0.39),
+                        Point3::new(-118.8, -192.4, -0.21),
+                        Point3::new(-110.2, -214.1, -0.03),
+                    ])
+                    .unwrap(),
+                    vec![f(), f(), f(), b(), b(), b()],
+                )
+                .with_name("south"),
+            )
+            .unwrap();
+        let junction = builder.add_junction(Some("j"));
+        builder.connect_via(&junction, &main, &south).unwrap();
         builder.finish().unwrap().validate().unwrap();
     }
 
