@@ -175,7 +175,8 @@ pub struct Road {
     /// Lateral displacement of the cross-section's origin from the reference line,
     /// metres to the left, against station. Zero for an ordinary road; half the lane
     /// width for a junction connector, whose reference line runs down the middle of
-    /// its single lane — and which follows that lane when it tapers.
+    /// its single lane — positive when that lane is on the right (right-hand
+    /// traffic), negative when on the left — and which follows the lane's taper.
     pub lane_offset: Poly3Profile,
     /// Every lane of the road, section by section, in the order they were written.
     pub lanes: Vec<LaneId>,

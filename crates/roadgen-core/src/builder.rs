@@ -1384,8 +1384,6 @@ impl Generator {
             to_lane.id.local_name()
         ));
 
-        // The connector's lane straddles its reference line, so the cross-section
-        // origin sits half a lane to the left of it.
         let mut geometry =
             RoadGeometry::new(&reference_line, &Poly3Profile::default(), config, &[])?;
         // Adopt the lateral direction of each road it meets, so the connector's
@@ -1416,9 +1414,19 @@ impl Generator {
             exit,
             Taper::Linear,
         )?;
-        // The lane straddles the connector's reference line, so the cross-section
-        // origin sits half a lane to the left of it — and follows the taper.
-        let lane_offset = width.to_poly3(0.0).scaled(0.5);
+        // The lane straddles the connector's reference line. It goes on the side a
+        // forward lane takes under the map's handedness — right under right-hand
+        // traffic, left under left-hand — because OpenDRIVE derives a lane's travel
+        // direction from its side and the road's rule: a connector written on the
+        // wrong side would read as running against its own reference line. The
+        // cross-section origin then sits half a lane the other way, so that the lane
+        // is centred on the reference line, and follows the taper.
+        let side = self.map.metadata.handedness.side_for(Direction::Forward);
+        let half_width = width.to_poly3(0.0).scaled(0.5);
+        let lane_offset = match side {
+            LateralSide::Right => half_width,
+            LateralSide::Left => half_width.scaled(-1.0),
+        };
 
         let spec = RoadSpec {
             name: None,
@@ -1430,7 +1438,7 @@ impl Generator {
                     direction: Direction::Forward,
                     lane_type: from_lane.lane_type,
                     speed_limit: from_lane.speed_limit,
-                    side: Some(LateralSide::Right),
+                    side: Some(side),
                     left_marking: BoundaryMarking::new(
                         RoadMarking::None,
                         from_lane.left_marking.color,
