@@ -345,7 +345,7 @@ impl<'a> Exporter<'a> {
                         }
                     }
                 }
-                edges.sort_by(|a, b| b.0.cmp(&a.0));
+                edges.sort_by_key(|edge| std::cmp::Reverse(edge.0));
 
                 for (rank, curve, marking) in edges {
                     let (kind, subtype) = tags::boundary_tags(marking.marking);
