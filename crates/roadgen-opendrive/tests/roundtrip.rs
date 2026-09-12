@@ -164,6 +164,97 @@ fn a_junction_becomes_a_junction_element() {
     assert_eq!(connectors, 2);
 }
 
+/// A junction with two roads in a row, under the given handedness.
+fn junction_map(handedness: TrafficHandedness) -> ValidatedMap {
+    let mut builder = MapBuilder::new(MapMetadata {
+        handedness,
+        ..MapMetadata::default()
+    });
+    let approach = builder
+        .add_road(RoadSpec::line(Point3::ORIGIN, Point3::new(100.0, 0.0, 0.0), lanes()).unwrap())
+        .unwrap();
+    let exit = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(120.0, 0.0, 0.0),
+                Point3::new(220.0, 0.0, 0.0),
+                lanes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let junction = builder.add_junction(Some("j0"));
+    builder.connect_via(&junction, &approach, &exit).unwrap();
+    builder.finish().unwrap().validate().unwrap()
+}
+
+#[test]
+fn a_connector_lane_sits_on_the_side_traffic_drives_on() {
+    // OpenDRIVE derives a lane's travel direction from its side and the road's
+    // rule: under right-hand traffic a right lane (-1) runs along the reference
+    // line, under left-hand traffic a left lane (+1) does. A connector always runs
+    // from the approach into the exit, so its one lane has to be on that side —
+    // and, with the lane offset moved the other way, still centred on its
+    // reference line.
+    for (handedness, expected_id) in [
+        (TrafficHandedness::RightHand, -1),
+        (TrafficHandedness::LeftHand, 1),
+    ] {
+        let map = junction_map(handedness);
+        let parsed = OpenDrive::from_xml_str(&roadgen_opendrive::to_xml(&map).unwrap()).unwrap();
+        for connection in parsed.junction[0].connection.iter() {
+            assert_eq!(connection.lane_link[0].to, expected_id, "{handedness:?}");
+        }
+        for road in parsed.road.iter().filter(|road| road.junction != "-1") {
+            let section = road.lanes.lane_section.first();
+            let (side_lanes, offset_sign) = if expected_id > 0 {
+                assert!(
+                    section.right.is_none(),
+                    "{handedness:?}: nothing on the right"
+                );
+                (section.left.as_ref().unwrap().lane.len(), -1.0)
+            } else {
+                assert!(
+                    section.left.is_none(),
+                    "{handedness:?}: nothing on the left"
+                );
+                (section.right.as_ref().unwrap().lane.len(), 1.0)
+            };
+            assert_eq!(side_lanes, 1);
+            // Half a 3.5 m lane, towards the side the lane is not on.
+            let offset = &road.lanes.lane_offset[0];
+            assert!(
+                (offset.a - offset_sign * 1.75).abs() < 1e-9,
+                "{handedness:?}: {}",
+                offset.a
+            );
+        }
+        // And in the IR the connector's lane is centred on its reference line either
+        // way: the boundaries lie 1.75 m each side of it.
+        for road in map.roads.iter().filter(|road| road.is_connector()) {
+            let lane = map.lane(&road.lanes[0]).unwrap();
+            let mid = road.reference_line.start_point();
+            let left = lane.left_boundary.start_point();
+            let right = lane.right_boundary.start_point();
+            let dist = |p: Point3| ((p.x - mid.x).powi(2) + (p.y - mid.y).powi(2)).sqrt();
+            assert!(
+                (dist(left) - 1.75).abs() < 1e-6,
+                "{handedness:?}: left {}",
+                dist(left)
+            );
+            assert!(
+                (dist(right) - 1.75).abs() < 1e-6,
+                "{handedness:?}: right {}",
+                dist(right)
+            );
+            assert!(
+                (left.y - right.y).abs() - 3.5 < 1e-6,
+                "{handedness:?}: on opposite sides"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_same_map_exports_byte_for_byte_the_same_twice() {
     assert_eq!(
