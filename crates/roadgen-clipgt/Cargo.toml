@@ -12,6 +12,9 @@ description = "Lowers the roadgen canonical IR onto NVIDIA Cosmos' ClipGT scene 
 roadgen-core.workspace = true
 arrow.workspace = true
 parquet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

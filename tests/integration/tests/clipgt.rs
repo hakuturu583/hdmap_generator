@@ -369,13 +369,13 @@ fn the_same_map_exports_identically_twice() {
 #[test]
 fn what_the_format_cannot_carry_is_reported() {
     let map = scenarios::controlled_crossroads();
-    let problems = roadgen_clipgt::check(&map);
+    let problems = roadgen_clipgt::check(&map, None);
     assert!(
         problems.iter().any(|problem| problem.contains("topology")),
         "{problems:?}"
     );
     // A map with nothing to lose says nothing.
-    assert!(roadgen_clipgt::check(&scenarios::straight_road()).is_empty());
+    assert!(roadgen_clipgt::check(&scenarios::straight_road(), None).is_empty());
 }
 
 /// Whether `point`'s shadow lies in the polygon's, by the winding rule.

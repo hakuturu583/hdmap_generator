@@ -739,17 +739,26 @@ impl PyMap {
         Ok(warnings)
     }
 
-    /// What a ClipGT export loses.
+    /// What a ClipGT export loses, and what its scenario leaves out.
     ///
     /// Kept apart from `format_warnings` because these are properties of the format
     /// rather than of the map: ClipGT carries no topology, so any map with a
     /// connection in it reports one, and folding that into the general warnings would
-    /// make them noise for a caller who never touches ClipGT.
-    fn clipgt_warnings(&mut self) -> PyResult<Vec<String>> {
+    /// make them noise for a caller who never touches ClipGT. Pass the scenario to
+    /// have its route and rig checked too.
+    #[pyo3(signature = (scenario = None))]
+    fn clipgt_warnings(&mut self, scenario: Option<PathBuf>) -> PyResult<Vec<String>> {
         self.ensure_built()?;
-        Ok(roadgen_clipgt::check(
-            self.built.as_ref().expect("just built"),
-        ))
+        let map = self.built.as_ref().expect("just built");
+        let config = match scenario {
+            Some(path) => Some(
+                roadgen_clipgt::ClipConfig::for_map(map)
+                    .with_scenario_file(path)
+                    .map_err(value_error)?,
+            ),
+            None => None,
+        };
+        Ok(roadgen_clipgt::check(map, config.as_ref()))
     }
 
     /// Writes the map as OpenDRIVE.
@@ -770,33 +779,51 @@ impl PyMap {
     ///
     /// Returns the clip id the files were named with, which is `clip_id` when given
     /// and otherwise the map's own name reduced to something a file name can hold.
-    /// `route` names the lanes the ego vehicle drives; without it, a route is found
-    /// by following successors from the first drivable lane outside a junction.
+    ///
+    /// `scenario` is the path to a YAML file naming the ego route and the camera rig
+    /// — the two parts of a clip that are not the map. Everything after it overrides
+    /// what the file says, and everything left as `None` keeps it, so a scenario can
+    /// be used as written or nudged in one place.
     #[pyo3(signature = (
         directory,
+        scenario = None,
         clip_id = None,
-        frame_rate = 30.0,
-        speed = 10.0,
+        frame_rate = None,
+        speed = None,
         route = None,
     ))]
     fn export_clipgt(
         &mut self,
         directory: PathBuf,
+        scenario: Option<PathBuf>,
         clip_id: Option<&str>,
-        frame_rate: f64,
-        speed: f64,
+        frame_rate: Option<f64>,
+        speed: Option<f64>,
         route: Option<Vec<String>>,
     ) -> PyResult<String> {
         self.ensure_built()?;
         let map = self.built.as_ref().expect("just built");
-        let mut config = match clip_id {
-            Some(id) => roadgen_clipgt::ClipConfig::new(id),
-            None => roadgen_clipgt::ClipConfig::for_map(map),
+        let mut config = roadgen_clipgt::ClipConfig::for_map(map);
+        if let Some(path) = scenario {
+            config = config.with_scenario_file(path).map_err(value_error)?;
         }
-        .with_frame_rate(frame_rate)
-        .with_speed(speed);
+        if let Some(id) = clip_id {
+            config.clip_id = id.to_owned();
+        }
+        if let Some(frame_rate) = frame_rate {
+            config.frame_rate = frame_rate;
+        }
+        if let Some(speed) = speed {
+            config.speed = speed;
+        }
         if let Some(route) = route {
-            config = config.with_route(route.into_iter().map(LaneId::new).collect());
+            config = config.with_route(
+                route
+                    .iter()
+                    .map(String::as_str)
+                    .map(roadgen_clipgt::scenario::lane_id)
+                    .collect(),
+            );
         }
         roadgen_clipgt::write(map, directory, &config).map_err(runtime_error)
     }

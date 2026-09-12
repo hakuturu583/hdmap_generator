@@ -19,7 +19,7 @@ use roadgen_core::{RoadId, ValidatedMap};
 use crate::columns;
 use crate::ego;
 use crate::error::ExportError;
-use crate::ClipConfig;
+use crate::{scenario, ClipConfig, Route};
 
 /// A layer's name and its single-batch contents.
 pub struct Layer {
@@ -41,7 +41,7 @@ const SIGN_DIMENSIONS: Point3 = Point3::new(0.8, 0.3, 0.8);
 /// Every layer of the clip, in the order they are written.
 pub fn all(map: &ValidatedMap, config: &ClipConfig) -> Result<Vec<Layer>, ExportError> {
     Ok(vec![
-        calibration()?,
+        calibration(config)?,
         egomotion(map, config)?,
         lanes(map)?,
         lane_lines(map)?,
@@ -58,10 +58,13 @@ pub fn all(map: &ValidatedMap, config: &ClipConfig) -> Result<Vec<Layer>, Export
 // Scene layers
 // --------------------------------------------------------------------------- //
 
-/// The rig. The IR knows nothing about cameras, so the honest rig is an empty one —
-/// and a reader that asks for the first row still finds one, which it must.
-fn calibration() -> Result<Layer, ExportError> {
-    let rig = columns::strings(&[r#"{"rig":{"sensors":[]}}"#.to_owned()]);
+/// The rig, as the scenario describes it.
+///
+/// With no sensors configured this is a rig with none — which is what the IR knows
+/// about cameras on its own. The table always has its one row either way, because a
+/// reader takes the first one without looking.
+fn calibration(config: &ClipConfig) -> Result<Layer, ExportError> {
+    let rig = columns::strings(&[scenario::rig_json(&config.sensors)]);
     let record = Record::new().add("rig_json", Arc::new(rig));
     layer(
         "calibration_estimate",
@@ -71,16 +74,7 @@ fn calibration() -> Result<Layer, ExportError> {
 
 /// Where the ego vehicle is, frame by frame.
 fn egomotion(map: &ValidatedMap, config: &ClipConfig) -> Result<Layer, ExportError> {
-    let route = match &config.route {
-        Some(route) => route.clone(),
-        None => {
-            let start = ego::default_start(map).ok_or_else(|| {
-                ExportError::NoRoute("the map has no drivable lane outside a junction".into())
-            })?;
-            ego::route_from(map, &start)
-        }
-    };
-    let poses = ego::track(map, &route, config.speed, config.frame_rate)?;
+    let poses = poses(map, config)?;
 
     let timestamps: Vec<i64> = poses.iter().map(|pose| pose.timestamp_micros).collect();
     let positions: Vec<Point3> = poses.iter().map(|pose| pose.position).collect();
@@ -94,6 +88,31 @@ fn egomotion(map: &ValidatedMap, config: &ClipConfig) -> Result<Layer, ExportErr
         "egomotion_estimate",
         vec![("key", key), ("egomotion_estimate", motion)],
     )
+}
+
+/// The ego track the clip is built around.
+///
+/// Public to the crate because the camera timestamps file has to be the same frames,
+/// not a second set that happens to look alike.
+pub fn poses(map: &ValidatedMap, config: &ClipConfig) -> Result<Vec<ego::Pose>, ExportError> {
+    let route = match &config.route {
+        Some(Route::Lanes(lanes)) => lanes.clone(),
+        Some(Route::From(start)) => {
+            if map.lane(start).is_none() {
+                return Err(ExportError::NoRoute(format!(
+                    "{start} is not a lane of this map"
+                )));
+            }
+            ego::route_from(map, start)
+        }
+        None => {
+            let start = ego::default_start(map).ok_or_else(|| {
+                ExportError::NoRoute("the map has no drivable lane outside a junction".into())
+            })?;
+            ego::route_from(map, &start)
+        }
+    };
+    ego::track(map, &route, config.speed, config.frame_rate)
 }
 
 // --------------------------------------------------------------------------- //

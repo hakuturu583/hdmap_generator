@@ -30,6 +30,7 @@ pub mod columns;
 pub mod ego;
 pub mod error;
 mod layers;
+pub mod scenario;
 mod table;
 
 use std::path::Path;
@@ -39,6 +40,16 @@ use roadgen_core::{LaneId, ValidatedMap};
 
 pub use ego::Pose;
 pub use error::ExportError;
+pub use scenario::{PolynomialType, Sensor};
+
+/// Which lanes the ego vehicle drives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Set off here and follow the first successor at every branch.
+    From(LaneId),
+    /// Drive exactly these lanes, in this order.
+    Lanes(Vec<LaneId>),
+}
 
 /// How a map is turned into a clip.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,8 +60,11 @@ pub struct ClipConfig {
     pub frame_rate: f64,
     /// How fast the ego vehicle travels, metres per second.
     pub speed: f64,
-    /// Lanes to drive, in order. Found automatically when `None`.
-    pub route: Option<Vec<LaneId>>,
+    /// Where the ego vehicle drives. When `None`, a start is found and followed.
+    pub route: Option<Route>,
+    /// The rig. An empty one is a clip with no cameras, which loads but cannot be
+    /// rendered from.
+    pub sensors: Vec<Sensor>,
 }
 
 impl Default for ClipConfig {
@@ -60,6 +74,7 @@ impl Default for ClipConfig {
             frame_rate: 30.0,
             speed: 10.0,
             route: None,
+            sensors: Vec::new(),
         }
     }
 }
@@ -82,9 +97,32 @@ impl ClipConfig {
         self
     }
 
+    /// Drives exactly these lanes, in this order.
     pub fn with_route(mut self, route: Vec<LaneId>) -> Self {
-        self.route = Some(route);
+        self.route = Some(Route::Lanes(route));
         self
+    }
+
+    /// Sets off at `start` and follows successors from there.
+    pub fn starting_at(mut self, start: LaneId) -> Self {
+        self.route = Some(Route::From(start));
+        self
+    }
+
+    pub fn with_sensors(mut self, sensors: Vec<Sensor>) -> Self {
+        self.sensors = sensors;
+        self
+    }
+
+    /// Reads a scenario file over this configuration: anything the file does not
+    /// mention keeps the value it already has.
+    pub fn with_scenario_file(self, path: impl AsRef<Path>) -> Result<Self, ExportError> {
+        scenario::from_yaml_file(path, self)
+    }
+
+    /// The same, from YAML text already in hand.
+    pub fn with_scenario_str(self, text: &str) -> Result<Self, ExportError> {
+        scenario::from_yaml_str(text, self)
     }
 
     /// The clip id a map exports under when the caller names none: its own name,
@@ -126,14 +164,44 @@ pub fn write(
         let path = directory.join(format!("{clip}.{}.parquet", layer.name));
         table::write(&path, &layer.batch)?;
     }
+    write_camera_timestamps(map, directory, clip, config)?;
     Ok(clip.to_owned())
 }
 
-/// What this map loses on the way into ClipGT.
+/// Writes `{clip_id}.{camera}.json` for each configured camera: the frames it saw, as
+/// the timestamps of the ego poses.
 ///
-/// Every one of these is a property of the format rather than of the map, so a clean
-/// map still reports the topology it is about to shed; that is the point.
-pub fn check(map: &ValidatedMap) -> Vec<String> {
+/// A reader uses this to line poses up with frames instead of resampling to a nominal
+/// rate. Here the two are the same thing — the track was generated at the clip's own
+/// frame rate — so the file says so rather than leaving the reader to assume it.
+fn write_camera_timestamps(
+    map: &ValidatedMap,
+    directory: &Path,
+    clip: &str,
+    config: &ClipConfig,
+) -> Result<(), ExportError> {
+    if config.sensors.is_empty() {
+        return Ok(());
+    }
+    let frames: Vec<serde_json::Value> = layers::poses(map, config)?
+        .iter()
+        .map(|pose| serde_json::json!({ "timestamp": pose.timestamp_micros }))
+        .collect();
+    let text = serde_json::Value::Array(frames).to_string();
+    for sensor in &config.sensors {
+        let path = directory.join(format!("{clip}.{}.json", sensor.canonical_name()));
+        std::fs::write(&path, &text)
+            .map_err(|error| ExportError::Io(format!("{}: {error}", path.display())))?;
+    }
+    Ok(())
+}
+
+/// What this map loses on the way into ClipGT, and what the scenario leaves out.
+///
+/// Most of these are properties of the format rather than of the map, so a perfectly
+/// clean map still reports the topology it is about to shed; that is the point. Pass
+/// the configuration to have the route and the rig checked as well.
+pub fn check(map: &ValidatedMap, config: Option<&ClipConfig>) -> Vec<String> {
     let mut problems = Vec::new();
     if !map.connections.is_empty() {
         problems.push(format!(
@@ -173,7 +241,33 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
                 .into(),
         );
     }
+
+    if let Some(config) = config {
+        if config.sensors.is_empty() {
+            problems.push(
+                "the scenario configures no sensors, so the clip carries a rig with no \
+                 cameras: it will load, but there is nothing to render from"
+                    .into(),
+            );
+        }
+        for lane in route_lanes(config) {
+            if map.lane(lane).is_none() {
+                problems.push(format!(
+                    "the scenario's route names {lane}, which is not a lane of this map"
+                ));
+            }
+        }
+    }
     problems
+}
+
+/// The lanes a configured route names, whether it lists them or starts at one.
+fn route_lanes(config: &ClipConfig) -> &[LaneId] {
+    match &config.route {
+        Some(Route::Lanes(lanes)) => lanes,
+        Some(Route::From(start)) => std::slice::from_ref(start),
+        None => &[],
+    }
 }
 
 /// A clip id has to be a single path component, because it is the prefix of every
