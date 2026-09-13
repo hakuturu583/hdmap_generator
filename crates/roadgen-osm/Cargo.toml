@@ -1,0 +1,14 @@
+[package]
+name = "roadgen-osm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto plain OpenStreetMap XML"
+
+[dependencies]
+roadgen-core.workspace = true
+ll2-io.workspace = true
+ll2-projection.workspace = true

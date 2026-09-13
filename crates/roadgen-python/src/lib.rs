@@ -769,10 +769,30 @@ impl PyMap {
     }
 
     /// Writes the map as a Lanelet2 OSM file.
+    ///
+    /// This is Lanelet2's *use* of the OSM container — ways are lane boundaries and
+    /// relations are lanelets. For a file an OSM router or renderer understands, use
+    /// `export_osm`.
     fn export_lanelet2(&mut self, path: PathBuf) -> PyResult<()> {
         self.ensure_built()?;
         roadgen_lanelet2::write(self.built.as_ref().expect("just built"), path)
             .map_err(runtime_error)
+    }
+
+    /// Writes the map as a plain OpenStreetMap file.
+    ///
+    /// One `highway` way per road, junctions as shared nodes, and turn restrictions
+    /// for the movements the map does not permit. Both this and `export_lanelet2`
+    /// write `.osm`; they are not interchangeable.
+    fn export_osm(&mut self, path: PathBuf) -> PyResult<()> {
+        self.ensure_built()?;
+        roadgen_osm::write(self.built.as_ref().expect("just built"), path).map_err(runtime_error)
+    }
+
+    /// What a plain OpenStreetMap export loses.
+    fn osm_warnings(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        Ok(roadgen_osm::check(self.built.as_ref().expect("just built")))
     }
 
     /// Writes the map as a ClipGT clip: a directory of per-layer parquet files.
@@ -835,6 +855,13 @@ impl PyMap {
     fn to_opendrive_xml(&mut self) -> PyResult<String> {
         self.ensure_built()?;
         roadgen_opendrive::to_xml(self.built.as_ref().expect("just built")).map_err(runtime_error)
+    }
+
+    /// The plain OpenStreetMap document as a string.
+    #[allow(clippy::wrong_self_convention)]
+    fn to_osm_xml(&mut self) -> PyResult<String> {
+        self.ensure_built()?;
+        roadgen_osm::to_xml(self.built.as_ref().expect("just built")).map_err(runtime_error)
     }
 
     /// The Lanelet2 map as OSM XML.

@@ -5,6 +5,7 @@ members = [
     "crates/roadgen-opendrive",
     "crates/roadgen-lanelet2",
     "crates/roadgen-clipgt",
+    "crates/roadgen-osm",
     "crates/roadgen-python",
     "tests/integration",
 ]
@@ -22,6 +23,7 @@ roadgen-core = { path = "crates/roadgen-core", version = "0.1.0" }
 roadgen-opendrive = { path = "crates/roadgen-opendrive", version = "0.1.0" }
 roadgen-lanelet2 = { path = "crates/roadgen-lanelet2", version = "0.1.0" }
 roadgen-clipgt = { path = "crates/roadgen-clipgt", version = "0.1.0" }
+roadgen-osm = { path = "crates/roadgen-osm", version = "0.1.0" }
 
 # OpenDRIVE 1.7 data model, parser and writer. MIT, which an Apache-2.0 project may
 # redistribute. Used so that neither the XML schema nor its serializer is rewritten
