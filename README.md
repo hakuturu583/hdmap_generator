@@ -1,7 +1,8 @@
 # roadgen
 
 Generate 3D road networks, and write the same network out as **OpenDRIVE**, as an
-**Autoware-ready Lanelet2** map, and as a **ClipGT** clip for NVIDIA Cosmos.
+**Autoware-ready Lanelet2** map, as plain **OpenStreetMap**, and as a **ClipGT** clip
+for NVIDIA Cosmos.
 
 This is a generator, not a converter. Nothing here parses an existing HD map: you
 describe roads, lanes, junctions and the movements between them, and the library
@@ -30,6 +31,7 @@ b = m.add_road(
 m.connect(a, b)
 m.export_opendrive("map.xodr")
 m.export_lanelet2("map.osm")
+m.export_osm("openstreetmap.osm")
 m.export_clipgt("clip/")
 ```
 
@@ -52,12 +54,12 @@ m.export_clipgt("clip/")
                      │
                  Validation
                      │
-       ┌──────────┬───────────┴─────────┐
-       ▼          ▼                     ▼
-   OpenDRIVE   Autoware Lanelet2     ClipGT
-   exporter        exporter         exporter
-       │              │                 │
- `opendrive`   `simple_lanelet2`  arrow / parquet
+    ┌────────┬────────┴─────┬──────────┐
+    ▼        ▼              ▼          ▼
+OpenDRIVE  Lanelet2  OpenStreetMap  ClipGT
+ exporter  exporter    exporter    exporter
+    │         │            │           │
+`opendrive`   `simple_lanelet2`   arrow/parquet
 ```
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
@@ -136,6 +138,7 @@ roadgen-core = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-opendrive = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-lanelet2 = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-clipgt = { git = "https://github.com/hakuturu583/hdmap_generator" }
+roadgen-osm = { git = "https://github.com/hakuturu583/hdmap_generator" }
 ```
 
 ```rust
@@ -159,6 +162,7 @@ builder.connect(&a, &b)?;
 let map = builder.finish()?.validate()?;
 roadgen_opendrive::write(&map, "map.xodr")?;
 roadgen_lanelet2::write(&map, "map.osm")?;
+roadgen_osm::write(&map, "openstreetmap.osm")?;
 
 let clip = roadgen_clipgt::ClipConfig::new("clip")
     .with_scenario_file("scenario.yaml")?;
@@ -185,10 +189,11 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `add_traffic_light_rule`, `add_right_of_way`, `add_speed_limit` | rules over lanes |
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
 | `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
+| `osm_warnings()` | what a plain OpenStreetMap export would lose |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
-| `export_opendrive(path)` / `export_lanelet2(path)` | write the files |
+| `export_opendrive(path)` / `export_lanelet2(path)` / `export_osm(path)` | write the files |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
-| `to_opendrive_xml()` / `to_lanelet2_osm()` | the same, as strings |
+| `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 
 Handedness decides which side of the reference line a `forward` lane lands on:
@@ -358,6 +363,81 @@ the easting and northing modulo 100 km, so a map running over the edge would sil
 come back on the other side; `format_warnings()` reports it instead, and exporting
 fails rather than writing it.
 
+## OpenStreetMap
+
+`export_lanelet2` and `export_osm` both write `.osm`, and they are **not
+interchangeable**. Lanelet2 uses the OSM container for something else: its ways are
+lane boundaries, its relations are lanelets, and nothing in it carries a `highway`
+tag, so a router or a renderer sees no roads at all. `export_osm` writes OSM as OSM
+means it.
+
+```python
+m.export_osm("map.osm")
+```
+
+OSM describes a road as **one way down the centreline** with the lanes as a *count*:
+
+```xml
+<way id="-4">
+  <nd ref="-2" /><nd ref="-3" /><nd ref="-1" />
+  <tag k="highway" v="residential" />
+  <tag k="lanes" v="2" />
+  <tag k="lanes:forward" v="1" />
+  <tag k="lanes:backward" v="1" />
+  <tag k="name" v="north" />
+  <tag k="oneway" v="no" />
+</way>
+```
+
+`highway` comes from the road type, `maxspeed` from the speed limit in km/h, and
+`sidewalk` from where the footways are in the cross-section. `oneway` is `yes`, `no`
+or **`-1`** — the last for a road whose every lane runs against the reference line,
+which is why the way's node order follows that line rather than being reversed for
+convenience.
+
+Furniture goes on the way's own nodes, which is where OSM puts it:
+`highway=traffic_signals`, `highway=stop`, `highway=crossing` and `traffic_sign=<the
+caller's code>`. A node is inserted at the object's own position rather than snapped
+to the nearest vertex — a straight road has two of those, and everything on it would
+otherwise pile up on one end. Where several controls share a point, the stronger
+keeps the node's single `highway` tag: a signalised stop is signals, not a stop sign.
+A crossing also gets a `highway=footway` + `footway=crossing` way across the road.
+
+### Junctions, which is where the two models disagree
+
+OSM has no connector roads. Arms meet at **one shared node**, and every turn is legal
+unless a `type=restriction` relation says otherwise. The IR is the other way round: it
+enumerates the movements that *are* permitted and draws a connector for each.
+
+So a junction becomes a single node where the arms' centrelines would actually cross,
+every arm's way is extended to it, and a pair of arms with **no** movement between
+them becomes a `no_left_turn` / `no_right_turn` / `no_straight_on` relation. The
+connectors are not written: twelve ways across a crossroads would be twelve roads
+that do not exist.
+
+Extending the arms is the one place this export moves geometry, and it is what makes
+the result routable — four ways stopping 14 m short of each other are four dead ends.
+The node is the least-squares intersection of the arm centrelines rather than the
+average of their ends, so two arms meeting at a corner land where the roads cross and
+not out in the middle of the bend.
+
+U-turns are deliberately never written. The IR enumerates movements between
+*different* arms, so it never says anything about turning back the way you came, and
+a `no_u_turn` on every arm would be inventing a rule the map does not hold.
+
+### What it cannot carry
+
+- **Height.** An OSM node is a latitude and a longitude; elevation is the `ele` *tag*
+  convention rather than part of the geometry. The heights survive as those tags and
+  nothing else.
+- **Lane geometry.** A lane is a number. Widths, boundaries, markings, tapers and
+  cross-section changes have nowhere to go — a road whose lane count changes is
+  written with its first section's, and `osm_warnings()` names it.
+- **Superelevation**, and any per-lane rule.
+
+Identifiers are negative and the file carries no `version`, which is how OSM data
+says it was never uploaded. That is what a generated map is.
+
 ## ClipGT
 
 ClipGT is the scene format NVIDIA's Cosmos world-scenario tooling reads: a directory
@@ -499,6 +579,7 @@ roadgen/
 │   ├── roadgen-opendrive/   lowering onto the `opendrive` crate
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
+│   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
 │   └── roadgen-python/      PyO3 bindings
 ├── examples/                a ClipGT scenario file
 ├── python/roadgen/          the Python package

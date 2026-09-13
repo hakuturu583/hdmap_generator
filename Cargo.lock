@@ -1143,6 +1143,7 @@ dependencies = [
  "arrow",
  "ll2-core",
  "ll2-io",
+ "ll2-projection",
  "ll2-routing",
  "ll2-traffic-rules",
  "opendrive",
@@ -1151,6 +1152,7 @@ dependencies = [
  "roadgen-core",
  "roadgen-lanelet2",
  "roadgen-opendrive",
+ "roadgen-osm",
  "serde_json",
  "tempfile",
 ]
@@ -1178,6 +1180,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roadgen-osm"
+version = "0.1.0"
+dependencies = [
+ "ll2-io",
+ "ll2-projection",
+ "roadgen-core",
+]
+
+[[package]]
 name = "roadgen-python"
 version = "0.1.0"
 dependencies = [
@@ -1186,6 +1197,7 @@ dependencies = [
  "roadgen-core",
  "roadgen-lanelet2",
  "roadgen-opendrive",
+ "roadgen-osm",
 ]
 
 [[package]]

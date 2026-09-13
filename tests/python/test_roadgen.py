@@ -798,3 +798,74 @@ def test_a_scenario_route_is_checked_against_the_map(tmp_path):
     assert any("lane/nowhere/0" in warning for warning in warnings)
     with pytest.raises(RuntimeError, match="lane/nowhere/0"):
         m.export_clipgt(tmp_path / "clip", scenario=scenario)
+
+
+# --------------------------------------------------------------------------- #
+# Plain OpenStreetMap
+# --------------------------------------------------------------------------- #
+
+
+def test_the_osm_export_is_osm_not_lanelet2(tmp_path):
+    m = clipgt_map()
+    path = tmp_path / "town.osm"
+    m.export_osm(path)
+    root = ET.fromstring(path.read_text())
+
+    assert root.get("generator") == "roadgen"
+    ways = {
+        way.get("id"): {tag.get("k"): tag.get("v") for tag in way.findall("tag")}
+        for way in root.findall("way")
+    }
+    # One `highway` way per arm, which is the thing a router looks for and the thing
+    # the Lanelet2 file does not have.
+    roads = [tags for tags in ways.values() if "highway" in tags and tags["highway"] != "footway"]
+    assert len(roads) == 4
+    for tags in roads:
+        assert tags["highway"] == "residential"
+        assert tags["lanes"] == "2"
+        assert tags["oneway"] == "no"
+
+    # The Lanelet2 file of the same map has no `highway` tag anywhere.
+    assert "highway" not in m.to_lanelet2_osm()
+
+
+def test_the_osm_arms_meet_at_one_node():
+    # Its own map, with a real origin, so that the junction node's latitude and
+    # longitude are worth asserting rather than being the zero the default gives.
+    m = roadgen.Map(name="tokyo", origin=(35.68, 139.76, 0.0))
+    arms = {}
+    for name, start, end in (
+        ("north", (0.0, 70.0, 0.0), (0.0, 14.0, 0.0)),
+        ("east", (70.0, 0.0, 0.0), (14.0, 0.0, 0.0)),
+        ("south", (0.0, -70.0, 0.0), (0.0, -14.0, 0.0)),
+        ("west", (-70.0, 0.0, 0.0), (-14.0, 0.0, 0.0)),
+    ):
+        arms[name] = m.add_road(start=start, end=end, lanes=two_way(), name=name)
+    junction = m.add_junction("x")
+    for a, b in itertools.combinations(arms, 2):
+        m.connect(arms[a], arms[b], junction=junction, ends=("end", "end"))
+    root = ET.fromstring(m.to_osm_xml())
+
+    arms = [
+        [nd.get("ref") for nd in way.findall("nd")]
+        for way in root.findall("way")
+        if any(tag.get("k") == "name" for tag in way.findall("tag"))
+    ]
+    assert len(arms) == 4
+    shared = set(arms[0]).intersection(*(set(arm) for arm in arms[1:]))
+    assert len(shared) == 1, "every arm reaches the junction's node"
+
+    # Which is at the crossing, not at the average of the arms' ends.
+    junction = shared.pop()
+    node = next(n for n in root.findall("node") if n.get("id") == junction)
+    assert abs(float(node.get("lat")) - 35.68) < 1e-7
+    assert abs(float(node.get("lon")) - 139.76) < 1e-7
+
+
+def test_osm_says_what_it_cannot_carry():
+    m = clipgt_map()
+    warnings = m.osm_warnings()
+    assert any("lane geometry" in warning for warning in warnings)
+    assert any("ele" in warning for warning in warnings), "the arms are at different heights"
+    # And it stays out of the general warnings, which are about the two XML formats.
+    assert m.format_warnings() == []

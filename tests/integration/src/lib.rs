@@ -41,6 +41,86 @@ pub fn write_clip(
     (directory, clip)
 }
 
+/// Exports to plain OpenStreetMap and reads the result back with the same document
+/// model a consumer would, along with a way of turning its nodes back into metres.
+pub fn reload_osm(map: &ValidatedMap) -> OsmReading {
+    let xml = roadgen_osm::to_xml(map).expect("the map should export as OSM");
+    let (document, errors) = ll2_io::osm::parse(&xml).expect("an OSM parser should accept it");
+    assert!(
+        errors.is_empty(),
+        "the file should parse cleanly: {errors:?}"
+    );
+
+    let projector = ll2_projection::LocalCartesian::new(ll2_projection::Origin::new(
+        ll2_projection::GpsPoint::new(
+            map.metadata.origin.latitude(),
+            map.metadata.origin.longitude(),
+            map.metadata.origin.altitude(),
+        ),
+    ));
+    let metres = document
+        .nodes
+        .values()
+        .map(|node| {
+            let point = ll2_projection::Projector::forward(
+                &projector,
+                ll2_projection::GpsPoint::new(node.lat, node.lon, node.ele),
+            )
+            .expect("a node should project back");
+            (
+                node.id,
+                roadgen_core::geometry::Point3::new(point[0], point[1], node.ele),
+            )
+        })
+        .collect();
+    OsmReading {
+        xml,
+        document,
+        metres,
+    }
+}
+
+/// An exported OSM file, parsed, with its nodes back in the map's own metres.
+pub struct OsmReading {
+    pub xml: String,
+    pub document: ll2_io::osm::Document,
+    pub metres: std::collections::HashMap<i64, roadgen_core::geometry::Point3>,
+}
+
+impl OsmReading {
+    /// The way tagged with this `name`.
+    pub fn way_named(&self, name: &str) -> &ll2_io::osm::Way {
+        self.document
+            .ways
+            .values()
+            .find(|way| way.tags.get("name").is_some_and(|value| value == name))
+            .unwrap_or_else(|| panic!("no way called {name:?}"))
+    }
+
+    /// Every way carrying a `highway` tag with this value.
+    pub fn ways_tagged(&self, key: &str, value: &str) -> Vec<&ll2_io::osm::Way> {
+        self.document
+            .ways
+            .values()
+            .filter(|way| way.tags.get(key).is_some_and(|found| found == value))
+            .collect()
+    }
+
+    /// Every node carrying this tag.
+    pub fn nodes_tagged(&self, key: &str, value: &str) -> Vec<&ll2_io::osm::Node> {
+        self.document
+            .nodes
+            .values()
+            .filter(|node| node.tags.get(key).is_some_and(|found| found == value))
+            .collect()
+    }
+
+    /// Where a node sits in the map's own metres.
+    pub fn at(&self, id: i64) -> roadgen_core::geometry::Point3 {
+        self.metres[&id]
+    }
+}
+
 /// A routing graph over a loaded Lanelet2 map, built the way a consumer would.
 pub fn routing_graph(map: &LaneletMap) -> RoutingGraph {
     let rules = TrafficRules::create(locations::GERMANY, participants::VEHICLE)
