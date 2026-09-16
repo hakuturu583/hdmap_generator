@@ -6,6 +6,7 @@ members = [
     "crates/roadgen-lanelet2",
     "crates/roadgen-clipgt",
     "crates/roadgen-osm",
+    "crates/roadgen-sumo",
     "crates/roadgen-python",
     "tests/integration",
 ]
@@ -24,6 +25,7 @@ roadgen-opendrive = { path = "crates/roadgen-opendrive", version = "0.1.0" }
 roadgen-lanelet2 = { path = "crates/roadgen-lanelet2", version = "0.1.0" }
 roadgen-clipgt = { path = "crates/roadgen-clipgt", version = "0.1.0" }
 roadgen-osm = { path = "crates/roadgen-osm", version = "0.1.0" }
+roadgen-sumo = { path = "crates/roadgen-sumo", version = "0.1.0" }
 
 # OpenDRIVE 1.7 data model, parser and writer. MIT, which an Apache-2.0 project may
 # redistribute. Used so that neither the XML schema nor its serializer is rewritten
@@ -40,6 +42,12 @@ ll2-io = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f14
 ll2-projection = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
 ll2-routing = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
 ll2-traffic-rules = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
+
+# quick-xml, for the SUMO plain-XML network. MIT, which an Apache-2.0 project may
+# redistribute. SUMO's node, edge and connection files have no data model worth
+# depending on — they are attributes on flat elements — so what is borrowed here is
+# the writer: correct escaping and indentation, rather than a `format!` per element.
+quick-xml = "0.41"
 
 # Arrow and Parquet, for ClipGT's nested per-layer tables. Both Apache-2.0, so an
 # Apache-2.0 project may redistribute them. Used so that neither the Parquet

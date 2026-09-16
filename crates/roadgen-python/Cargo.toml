@@ -18,4 +18,5 @@ roadgen-opendrive.workspace = true
 roadgen-lanelet2.workspace = true
 roadgen-clipgt.workspace = true
 roadgen-osm.workspace = true
+roadgen-sumo.workspace = true
 pyo3.workspace = true

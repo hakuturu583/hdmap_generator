@@ -1,8 +1,8 @@
 # roadgen
 
 Generate 3D road networks, and write the same network out as **OpenDRIVE**, as an
-**Autoware-ready Lanelet2** map, as plain **OpenStreetMap**, and as a **ClipGT** clip
-for NVIDIA Cosmos.
+**Autoware-ready Lanelet2** map, as plain **OpenStreetMap**, as a **SUMO** network,
+and as a **ClipGT** clip for NVIDIA Cosmos.
 
 This is a generator, not a converter. Nothing here parses an existing HD map: you
 describe roads, lanes, junctions and the movements between them, and the library
@@ -32,6 +32,7 @@ m.connect(a, b)
 m.export_opendrive("map.xodr")
 m.export_lanelet2("map.osm")
 m.export_osm("openstreetmap.osm")
+m.export_sumo("sumo/")
 m.export_clipgt("clip/")
 ```
 
@@ -54,12 +55,12 @@ m.export_clipgt("clip/")
                      │
                  Validation
                      │
-    ┌────────┬────────┴─────┬──────────┐
-    ▼        ▼              ▼          ▼
-OpenDRIVE  Lanelet2  OpenStreetMap  ClipGT
- exporter  exporter    exporter    exporter
-    │         │            │           │
-`opendrive`   `simple_lanelet2`   arrow/parquet
+    ┌────────┬────────┴─────┬───────┬───────┐
+    ▼        ▼              ▼       ▼       ▼
+OpenDRIVE Lanelet2  OpenStreetMap  SUMO  ClipGT
+ exporter  exporter    exporter   exporter exporter
+    │         │            │         │       │
+`opendrive`   `simple_lanelet2`  plain XML  arrow/parquet
 ```
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
@@ -190,8 +191,11 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
 | `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
 | `osm_warnings()` | what a plain OpenStreetMap export would lose |
+| `sumo_warnings()` | what a SUMO export would lose |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
 | `export_opendrive(path)` / `export_lanelet2(path)` / `export_osm(path)` | write the files |
+| `export_sumo(directory)` | write a SUMO plain-XML network and its netconvert configuration; returns the prefix |
+| `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
@@ -438,6 +442,107 @@ a `no_u_turn` on every arm would be inventing a rule the map does not hold.
 Identifiers are negative and the file carries no `version`, which is how OSM data
 says it was never uploaded. That is what a generated map is.
 
+## SUMO
+
+SUMO's simulator reads a `.net.xml`, and a `.net.xml` is a **build product**: it
+carries the shape of every junction, the internal lane through every movement, and
+the right-of-way matrix that decides who waits for whom — all computed by
+`netconvert`. Writing one directly would mean reimplementing netconvert, and getting
+it subtly wrong.
+
+So what `export_sumo` writes is netconvert's own input, the **plain XML** network,
+which is the format a generator is meant to produce:
+
+```python
+prefix = m.export_sumo("network/")     # returns the name the files were given
+```
+
+| file | what is in it |
+| --- | --- |
+| `<name>.nod.xml` | junctions and road ends, as points |
+| `<name>.edg.xml` | one edge per direction of travel, with its lanes |
+| `<name>.con.xml` | which lane may be left for which lane |
+| `<name>.netccfg` | the netconvert run that turns the three into a `.net.xml` |
+
+```bash
+netconvert -c network/demo_town.netccfg
+```
+
+### One road, two edges
+
+A SUMO edge is a one-way bundle of lanes, so a road carrying traffic both ways is two
+of them pointing at each other:
+
+```xml
+<edge id="north.fwd" from="n_north_start" to="j_x" priority="4" numLanes="1"
+      speed="13.890" spreadType="center" name="north"
+      shape="-1.750,70.000,0.000 -1.750,14.000,0.000">
+  <lane index="0" width="3.500" disallow="pedestrian"
+        shape="-1.750,70.000,0.000 -1.750,14.000,0.000"/>
+</edge>
+```
+
+Every lane is written with **its own shape**, so what SUMO gets is the geometry the
+generator computed — not a centreline with a width laid out from it, which is what a
+network imported from OpenStreetMap has to make do with. The heights go with it: a
+SUMO shape is `x,y,z`, so the relief that plain OSM could only put in `ele` tags is
+part of the geometry here.
+
+Lanes are numbered from the **right in the direction of travel**, index 0 outwards.
+The IR counts outwards from the reference line instead, which for the opposing
+carriageway is the other way round — so the same physical lane has different numbers
+in the two directions. `sumo_lane_ids()` is the way back:
+
+```python
+dict(m.sumo_lane_ids())["lane/north/1"]     # 'north.bwd_0'
+```
+
+`speed` is the road's limit in m/s, or SUMO's own default for the OSM `highway` value
+the road type maps to. `priority` is the ladder netconvert reads to work out who
+yields at an uncontrolled junction — the same ladder the OpenStreetMap export climbs,
+moved one rung apart by a right-of-way rule. What may use a lane is the whole of what
+SUMO knows about lane type: a driving lane is written as one pedestrians are kept out
+of, a footway as one that admits only them, a bike lane only bicycles and a hard
+shoulder only emergency vehicles.
+
+A road whose **cross-section changes** becomes a chain of edges with a node between
+them, because an edge has one lane count from end to end.
+
+### Junctions, which SUMO models the same way round as the IR
+
+The IR draws a junction as a set of connector roads, one per movement. SUMO draws it
+as a **node**: the arms stop at its edge, and netconvert generates an internal lane
+for every connection across it. The two models agree about the thing that matters —
+the movements are enumerated, not guessed — so the connectors are not written as
+edges. Each becomes the `<connection>` saying its approach lane may be left for its
+exit lane:
+
+```xml
+<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"/>
+```
+
+This is why the arms are left exactly where the IR puts them, 14 m short of the
+centre: **the gap is the junction**, and netconvert fills it. Nothing here moves
+geometry, which is the one thing the OpenStreetMap export has to do.
+
+A junction with a traffic light on an approach becomes a `traffic_light` node.
+netconvert generates the phases, because the IR holds no signal timing to write.
+
+### What it cannot carry
+
+- **Lane markings.** Which line is painted between two lanes, and in what colour, has
+  nowhere to go.
+- **One width per lane.** A tapering lane is written at its mean width along — the
+  area of the lane divided by its length — and `sumo_warnings()` names it.
+- **Superelevation.** A SUMO lane is flat across. The heights along it survive.
+- **Lanes traffic does not run along** — borders, painted islands, parking bays — are
+  dropped rather than written as something they are not.
+- **Crosswalks and signs.** A SUMO crossing belongs to a node and a sign is an
+  additional file, not part of the network.
+- **The geo-reference.** The network is in the map's own metres about its origin, and
+  the generated configuration turns off netconvert's offset normalisation so that it
+  stays that way — the same coordinates as the other four exports.
+
 ## ClipGT
 
 ClipGT is the scene format NVIDIA's Cosmos world-scenario tooling reads: a directory
@@ -580,6 +685,7 @@ roadgen/
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
 │   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
+│   ├── roadgen-sumo/        lowering onto SUMO's plain-XML network
 │   └── roadgen-python/      PyO3 bindings
 ├── examples/                a ClipGT scenario file
 ├── python/roadgen/          the Python package
@@ -601,6 +707,12 @@ cargo fmt --all --check
 maturin develop                 # build and install the Python extension
 python -m pytest tests/python
 ```
+
+The SUMO tests run SUMO. `netconvert` builds the exported network and `sumo` loads
+it, so what they check is not the exporter's opinion of what it wrote. Install it
+with `apt install sumo` (and `pip install sumolib` for the Python side); without it
+those tests **skip**, saying so. Setting `ROADGEN_REQUIRE_SUMO=1` turns the skip into
+a failure, which is what CI does.
 
 ## Licence
 

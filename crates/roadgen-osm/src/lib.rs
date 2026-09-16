@@ -209,7 +209,7 @@ impl<'a> Exporter<'a> {
     fn build(&mut self) -> Result<(), ExportError> {
         // Junction nodes first: a road's way has to be able to end on one.
         for junction in self.map.junctions.iter() {
-            let centre = junction_centre(self.map, &junction.id);
+            let centre = self.map.junction_centre(&junction.id);
             if let Some(centre) = centre {
                 let node = self.node_at(centre)?;
                 self.junction_nodes.insert(junction.id.clone(), node);
@@ -524,75 +524,6 @@ impl<'a> Exporter<'a> {
 // --------------------------------------------------------------------------- //
 // Junction geometry
 // --------------------------------------------------------------------------- //
-
-/// Where a junction's arms should meet.
-///
-/// Not the average of the arm ends, which for two arms meeting at a corner lands out
-/// in the middle of the bend rather than where the roads cross. This is the point
-/// closest to every arm's centreline *carried on* — for a symmetric crossroads that
-/// is the true centre, and for a corner it is where the two lines intersect.
-///
-/// Least squares over the lines: minimising the distance to each of them means
-/// solving `Σ(I − dᵢdᵢᵀ) p = Σ(I − dᵢdᵢᵀ) aᵢ`, in plan view. Arms that are all
-/// parallel make that singular — a road split in two through a junction does it —
-/// and then the average of the ends is the right answer anyway.
-fn junction_centre(map: &Map, junction: &JunctionId) -> Option<Point3> {
-    let mut ends: Vec<(Point3, (f64, f64))> = Vec::new();
-    for road in map.roads.iter() {
-        if road.is_connector() {
-            continue;
-        }
-        for end in [RoadEnd::Start, RoadEnd::End] {
-            if road.link.at(end) != Some(&RoadLinkTarget::Junction(junction.clone())) {
-                continue;
-            }
-            let tangent = match end {
-                RoadEnd::End => road.reference_line.end_tangent().ok()?,
-                RoadEnd::Start => road.reference_line.start_tangent().ok()?,
-            };
-            let direction = tangent.get();
-            let horizontal = direction.x.hypot(direction.y);
-            if horizontal < 1e-9 {
-                continue;
-            }
-            ends.push((
-                road.endpoint(end),
-                (direction.x / horizontal, direction.y / horizontal),
-            ));
-        }
-    }
-    if ends.is_empty() {
-        return None;
-    }
-
-    let height = ends.iter().map(|(point, _)| point.z).sum::<f64>() / ends.len() as f64;
-    let average = Point3::new(
-        ends.iter().map(|(point, _)| point.x).sum::<f64>() / ends.len() as f64,
-        ends.iter().map(|(point, _)| point.y).sum::<f64>() / ends.len() as f64,
-        height,
-    );
-
-    let (mut axx, mut axy, mut ayy) = (0.0, 0.0, 0.0);
-    let (mut bx, mut by) = (0.0, 0.0);
-    for (point, (dx, dy)) in &ends {
-        // I − ddᵀ, the projection onto the line's normal.
-        let (pxx, pxy, pyy) = (1.0 - dx * dx, -dx * dy, 1.0 - dy * dy);
-        axx += pxx;
-        axy += pxy;
-        ayy += pyy;
-        bx += pxx * point.x + pxy * point.y;
-        by += pxy * point.x + pyy * point.y;
-    }
-    let determinant = axx * ayy - axy * axy;
-    if determinant.abs() < 1e-9 {
-        return Some(average);
-    }
-    Some(Point3::new(
-        (ayy * bx - axy * by) / determinant,
-        (axx * by - axy * bx) / determinant,
-        height,
-    ))
-}
 
 /// How strong a control a `highway` value is, so that two at one point do not
 /// overwrite each other by accident.

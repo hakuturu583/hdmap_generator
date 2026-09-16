@@ -1148,11 +1148,13 @@ dependencies = [
  "ll2-traffic-rules",
  "opendrive",
  "parquet",
+ "quick-xml",
  "roadgen-clipgt",
  "roadgen-core",
  "roadgen-lanelet2",
  "roadgen-opendrive",
  "roadgen-osm",
+ "roadgen-sumo",
  "serde_json",
  "tempfile",
 ]
@@ -1198,6 +1200,15 @@ dependencies = [
  "roadgen-lanelet2",
  "roadgen-opendrive",
  "roadgen-osm",
+ "roadgen-sumo",
+]
+
+[[package]]
+name = "roadgen-sumo"
+version = "0.1.0"
+dependencies = [
+ "quick-xml",
+ "roadgen-core",
 ]
 
 [[package]]

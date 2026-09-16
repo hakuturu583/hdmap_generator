@@ -17,12 +17,22 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The SUMO export is checked by handing it to SUMO: netconvert builds the
+      # network and sumo loads it. ROADGEN_REQUIRE_SUMO turns the tests' "SUMO is not
+      # installed, skipping" into a failure, so losing the install cannot quietly stop
+      # those checks running.
+      - name: Install SUMO
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sumo
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+        env:
+          ROADGEN_REQUIRE_SUMO: "1"
 
   python:
     runs-on: ubuntu-latest
@@ -33,13 +43,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # netconvert builds the SUMO network the export describes; sumolib, SUMO's
+      # own Python library, reads what it built. ROADGEN_REQUIRE_SUMO below turns the
+      # tests' "not installed, skipping" into a failure.
+      - name: Install netconvert
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sumo
       - name: Install
         run: |
           python -m pip install --upgrade pip
           # pandas and pyarrow are how the ClipGT tests read the written parquet,
-          # which is how a Cosmos reader reads it.
-          pip install maturin pytest pandas pyarrow
+          # which is how a Cosmos reader reads it. sumolib reads the SUMO network.
+          pip install maturin pytest pandas pyarrow sumolib
           maturin build --release --out dist
           pip install --find-links dist roadgen
       - name: Test
         run: python -m pytest tests/python -q
+        env:
+          ROADGEN_REQUIRE_SUMO: "1"

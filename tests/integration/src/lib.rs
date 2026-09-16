@@ -6,6 +6,7 @@
 pub mod clipgt_read;
 pub mod opendrive_eval;
 pub mod scenarios;
+pub mod sumo_build;
 
 use std::sync::Arc;
 

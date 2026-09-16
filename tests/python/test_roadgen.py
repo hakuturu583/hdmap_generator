@@ -7,6 +7,10 @@ this side.
 
 import itertools
 import json
+import os
+import pathlib
+import shutil
+import subprocess
 import textwrap
 import xml.etree.ElementTree as ET
 
@@ -869,3 +873,111 @@ def test_osm_says_what_it_cannot_carry():
     assert any("ele" in warning for warning in warnings), "the arms are at different heights"
     # And it stays out of the general warnings, which are about the two XML formats.
     assert m.format_warnings() == []
+
+
+# --------------------------------------------------------------------------- #
+# SUMO
+# --------------------------------------------------------------------------- #
+
+
+def sumo_tools():
+    """netconvert, and SUMO's own Python library for reading what it builds.
+
+    A test that says "SUMO can read this" has to be SUMO reading it. When the tools
+    are not installed the test skips, unless ``ROADGEN_REQUIRE_SUMO`` is set — which
+    CI does set, so the check never quietly stops running.
+    """
+    netconvert = shutil.which("netconvert")
+    if netconvert is None and os.environ.get("SUMO_HOME"):
+        candidate = pathlib.Path(os.environ["SUMO_HOME"]) / "bin" / "netconvert"
+        netconvert = str(candidate) if candidate.is_file() else None
+    try:
+        import sumolib
+    except ImportError:
+        sumolib = None
+
+    if netconvert is None or sumolib is None:
+        missing = ", ".join(
+            name
+            for name, found in (("netconvert", netconvert), ("sumolib", sumolib))
+            if found is None
+        )
+        if os.environ.get("ROADGEN_REQUIRE_SUMO"):
+            raise AssertionError(f"ROADGEN_REQUIRE_SUMO is set but {missing} is not installed")
+        pytest.skip(f"{missing} not installed")
+    return netconvert, sumolib
+
+
+def build_with_netconvert(m, directory):
+    """Exports, builds with netconvert, and hands back the network SUMO read."""
+    netconvert, sumolib = sumo_tools()
+    prefix = m.export_sumo(str(directory))
+    result = subprocess.run(
+        [netconvert, "-c", f"{prefix}.netccfg"],
+        cwd=directory,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"netconvert rejected the export:\n{result.stderr}"
+    built = directory / f"{prefix}.net.xml"
+    assert built.is_file()
+    # sumolib is SUMO's own reader: if it accepts the file, SUMO accepts the file.
+    return prefix, sumolib.net.readNet(str(built), withInternal=True)
+
+
+def test_a_sumo_export_is_a_network_netconvert_builds(tmp_path):
+    m = clipgt_map()
+    prefix, net = build_with_netconvert(m, tmp_path)
+    assert prefix == "demo_town"
+
+    # Four arms, each carrying traffic both ways, and nothing else: the connectors
+    # are movements across the junction rather than edges of their own.
+    roads = sorted(edge.getID() for edge in net.getEdges() if edge.getFunction() != "internal")
+    assert roads == [
+        "east.bwd",
+        "east.fwd",
+        "north.bwd",
+        "north.fwd",
+        "south.bwd",
+        "south.fwd",
+        "west.bwd",
+        "west.fwd",
+    ]
+
+    # The junction is where the arms would cross, and it is signalised because the
+    # map puts a traffic light on the approach to it.
+    junction = net.getNode("j_x")
+    assert junction.getType() == "traffic_light"
+    assert abs(junction.getCoord()[0]) < 0.05 and abs(junction.getCoord()[1]) < 0.05
+
+    # And SUMO found a route through it, which is the thing a network is for.
+    north = net.getEdge("north.fwd")
+    reachable = {edge.getID() for edge in north.getOutgoing()}
+    assert {"east.bwd", "south.bwd", "west.bwd"} <= reachable
+
+
+def test_a_sumo_lane_is_where_the_export_says_it_is(tmp_path):
+    m = clipgt_map()
+    _prefix, net = build_with_netconvert(m, tmp_path)
+
+    written = dict(m.sumo_lane_ids())
+    assert written, "every drivable lane should reach the network"
+    for lane_id, sumo_id in written.items():
+        lane = net.getLane(sumo_id)
+        shape = [(x, y) for x, y, *_ in lane.getShape3D()]
+        centerline = [(x, y) for x, y, *_ in m.lane_centerline(lane_id)]
+        # SUMO orders a lane the way traffic drives it, which for a lane running
+        # against its road's reference line is the other way round.
+        assert len(shape) == len(centerline)
+        if shape[0] != pytest.approx(centerline[0], abs=0.02):
+            centerline.reverse()
+        for found, wanted in zip(shape, centerline):
+            assert found == pytest.approx(wanted, abs=0.02)
+
+
+def test_sumo_says_what_it_cannot_carry():
+    warnings = clipgt_map().sumo_warnings()
+    assert any("markings" in warning for warning in warnings)
+    assert any("netconvert generates the phases" in warning for warning in warnings)
+    # And, as with the OpenStreetMap export, it stays out of the general warnings.
+    assert clipgt_map().format_warnings() == []
