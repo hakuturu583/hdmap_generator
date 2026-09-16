@@ -64,7 +64,7 @@ use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
 use roadgen_core::map::{Lane, Road};
 use roadgen_core::semantics::{MapObjectKind, TrafficRule};
 use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
-use roadgen_core::{JunctionId, LaneId, RoadId, ValidatedMap};
+use roadgen_core::{JunctionId, LaneId, ValidatedMap};
 
 pub use classes::Permission;
 pub use error::ExportError;
@@ -244,6 +244,22 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         ));
     }
 
+    if map
+        .rules
+        .iter()
+        .any(|rule| matches!(rule, TrafficRule::RightOfWay { .. }))
+    {
+        problems.push(
+            "SUMO's right of way is a matrix over pairs of movements, and a plain XML \
+             file cannot state one: a right-of-way rule is written as the edge \
+             priorities of the approaches it names, with the junction marked \
+             `rightOfWay=\"edgePriority\"` so that they decide it. Which approach holds \
+             right of way survives; which of its own movements must still give way to \
+             an oncoming one is netconvert's"
+                .to_owned(),
+        );
+    }
+
     if !map.junctions.is_empty() {
         problems.push(format!(
             "the connector roads of the {} junctions are not written as edges: SUMO \
@@ -293,6 +309,10 @@ impl NodeKind {
 struct Node {
     point: Point3,
     kind: NodeKind,
+    /// Set where the IR states a right of way, and it makes the edge priorities
+    /// *decide* the junction rather than being one input among several. See
+    /// [`Exporter::priority_of`].
+    edge_priority: bool,
 }
 
 struct Edge {
@@ -331,10 +351,13 @@ struct Exporter<'a> {
     slots: HashMap<LaneId, Slot>,
     /// Junctions a traffic light controls an approach to.
     signalised: HashSet<JunctionId>,
-    /// Roads that keep right of way where another yields to them, and the roads that
-    /// yield.
-    right_of_way: HashSet<RoadId>,
-    yielding: HashSet<RoadId>,
+    /// Lanes that keep right of way where another yields to them, and the lanes that
+    /// yield. Held as lanes, not roads: a rule about one carriageway's approach must
+    /// not move the opposing carriageway's priority with it.
+    right_of_way: HashSet<LaneId>,
+    yielding: HashSet<LaneId>,
+    /// Junctions a right-of-way rule speaks about.
+    ruled: HashSet<JunctionId>,
 }
 
 impl<'a> Exporter<'a> {
@@ -349,6 +372,7 @@ impl<'a> Exporter<'a> {
             signalised: HashSet::new(),
             right_of_way: HashSet::new(),
             yielding: HashSet::new(),
+            ruled: HashSet::new(),
         };
         exporter.read_rules();
         exporter
@@ -377,16 +401,13 @@ impl<'a> Exporter<'a> {
             else {
                 continue;
             };
-            for (lanes, roads) in [
-                (right_of_way, &mut self.right_of_way),
-                (yielding, &mut self.yielding),
-            ] {
-                for lane in lanes {
-                    if let Some(lane) = self.map.lane(lane) {
-                        roads.insert(lane.road.clone());
-                    }
+            for lane in right_of_way.iter().chain(yielding) {
+                if let Some(junction) = self.junction_ahead_of(lane) {
+                    self.ruled.insert(junction);
                 }
             }
+            self.right_of_way.extend(right_of_way.iter().cloned());
+            self.yielding.extend(yielding.iter().cloned());
         }
     }
 
@@ -431,8 +452,12 @@ impl<'a> Exporter<'a> {
     // Nodes
     // ----------------------------------------------------------------------- //
 
-    fn node(&mut self, id: String, point: Point3, kind: NodeKind) -> String {
-        self.nodes.entry(id.clone()).or_insert(Node { point, kind });
+    fn node(&mut self, id: String, point: Point3, kind: NodeKind, edge_priority: bool) -> String {
+        self.nodes.entry(id.clone()).or_insert(Node {
+            point,
+            kind,
+            edge_priority,
+        });
         id
     }
 
@@ -454,6 +479,7 @@ impl<'a> Exporter<'a> {
                     format!("j_{}", identifier(junction.local_name())),
                     point,
                     kind,
+                    self.ruled.contains(&junction),
                 )
             }
             Some(RoadLinkTarget::Road(other)) => {
@@ -477,12 +503,14 @@ impl<'a> Exporter<'a> {
                     format!("n_{}_{}", first.0, first.1.as_str()),
                     point,
                     NodeKind::Unstated,
+                    false,
                 )
             }
             None => self.node(
                 format!("n_{}_{}", identifier(road.id.local_name()), end.as_str()),
                 road.endpoint(end),
                 NodeKind::DeadEnd,
+                false,
             ),
         }
     }
@@ -496,6 +524,7 @@ impl<'a> Exporter<'a> {
             format!("n_{}_s{section}", identifier(road.id.local_name())),
             point,
             NodeKind::Unstated,
+            false,
         ))
     }
 
@@ -594,7 +623,7 @@ impl<'a> Exporter<'a> {
             from,
             to,
             name: road.name.clone(),
-            priority: self.priority_of(road),
+            priority: self.priority_of(road, lanes),
             speed: road
                 .speed_limit
                 .map(|limit| limit.mps())
@@ -673,15 +702,31 @@ impl<'a> Exporter<'a> {
         )?)
     }
 
-    /// Where an edge of this road sits in the priority order.
+    /// Where an edge sits in the priority order.
     ///
-    /// The road type sets the rung, and a right-of-way rule moves the two arms it
-    /// names apart: netconvert reads nothing else about who yields at an uncontrolled
-    /// junction, so a rule that does not change the order would not be written at all.
-    fn priority_of(&self, road: &Road) -> i32 {
+    /// The road type sets the rung, and a right-of-way rule moves this edge off it:
+    /// up if it carries a lane that keeps right of way, down if it carries one that
+    /// yields.
+    ///
+    /// Judged from *this edge's own lanes* rather than from its road, because the
+    /// rule is about lanes. A road is two edges pointing at each other, and a rule
+    /// naming the northbound approach says nothing whatever about the southbound one.
+    ///
+    /// This is the whole of what the format can carry. SUMO's right of way is the
+    /// `<request>` matrix — which movement gives way to which other movement, pair by
+    /// pair — and a plain XML file has no way to state it: netconvert computes it,
+    /// and an edge priority is one of the things it computes it from. So the junction
+    /// this edge runs into is marked `rightOfWay="edgePriority"` (see
+    /// [`Exporter::road_end_node`]), which makes these numbers *decide* who yields
+    /// instead of being weighed against netconvert's own reading of the geometry. The
+    /// IR's statement then survives as far as the format allows: which approach holds
+    /// right of way. Which of its movements must still give way to an oncoming one is
+    /// netconvert's, and [`crate::check`] says so.
+    fn priority_of(&self, road: &Road, lanes: &[&Lane]) -> i32 {
         let base = classes::priority(road.road_type);
-        let raise = i32::from(self.right_of_way.contains(&road.id));
-        let lower = i32::from(self.yielding.contains(&road.id));
+        let carries = |named: &HashSet<LaneId>| lanes.iter().any(|lane| named.contains(&lane.id));
+        let raise = i32::from(carries(&self.right_of_way));
+        let lower = i32::from(carries(&self.yielding));
         (base + raise - lower).max(1)
     }
 
@@ -787,6 +832,11 @@ impl<'a> Exporter<'a> {
             ];
             if let Some(kind) = node.kind.as_str() {
                 attributes.push(("type", kind.to_owned()));
+            }
+            if node.edge_priority {
+                // The map said who yields here, so the priorities decide it rather
+                // than netconvert's reading of the geometry.
+                attributes.push(("rightOfWay", "edgePriority".to_owned()));
             }
             document.leaf("node", &attributes);
         }

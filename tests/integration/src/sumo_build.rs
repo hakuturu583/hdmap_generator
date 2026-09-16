@@ -205,6 +205,12 @@ pub struct SumoConnection {
     pub via: Option<String>,
     /// The traffic light controlling the movement, if any.
     pub tl: Option<String>,
+    /// What netconvert decided about right of way: `M` for a movement that keeps it,
+    /// `m` for one that must give way, `O`/`o` for one a signal controls. This is the
+    /// outcome, not the priority the export asked for.
+    pub state: Option<String>,
+    /// `s`, `l`, `r`, `t` — straight, left, right, turnaround.
+    pub direction: Option<String>,
 }
 
 impl SumoNetwork {
@@ -280,6 +286,8 @@ impl SumoNetwork {
                             to_lane: number(&attributes, "toLane") as usize,
                             via: attributes.get("via").cloned(),
                             tl: attributes.get("tl").cloned(),
+                            state: attributes.get("state").cloned(),
+                            direction: attributes.get("dir").cloned(),
                         }),
                         _ => {}
                     }
@@ -335,6 +343,16 @@ impl SumoNetwork {
                 )
             })
             .collect()
+    }
+}
+
+impl SumoNetwork {
+    /// The movement from one edge to another, as netconvert wrote it.
+    pub fn movement(&self, from: &str, to: &str) -> &SumoConnection {
+        self.connections
+            .iter()
+            .find(|connection| connection.from == from && connection.to == to)
+            .unwrap_or_else(|| panic!("no movement from {from:?} to {to:?}"))
     }
 }
 

@@ -498,12 +498,39 @@ dict(m.sumo_lane_ids())["lane/north/1"]     # 'north.bwd_0'
 ```
 
 `speed` is the road's limit in m/s, or SUMO's own default for the OSM `highway` value
-the road type maps to. `priority` is the ladder netconvert reads to work out who
-yields at an uncontrolled junction — the same ladder the OpenStreetMap export climbs,
-moved one rung apart by a right-of-way rule. What may use a lane is the whole of what
-SUMO knows about lane type: a driving lane is written as one pedestrians are kept out
-of, a footway as one that admits only them, a bike lane only bicycles and a hard
-shoulder only emergency vehicles.
+the road type maps to. What may use a lane is the whole of what SUMO knows about lane
+type: a driving lane is written as one pedestrians are kept out of, a footway as one
+that admits only them, a bike lane only bicycles and a hard shoulder only emergency
+vehicles.
+
+### Right of way
+
+SUMO's right of way is a **matrix over pairs of movements** — which stream gives way
+to which other stream — and a plain XML file has no way to state one: `<request>` is
+something netconvert computes and writes into the `.net.xml`. What the format does
+have is the edge `priority` ladder, the same one the OpenStreetMap export climbs.
+
+So a `RightOfWay` rule moves the **approach edges it names** one rung apart, and the
+junction is marked `rightOfWay="edgePriority"`:
+
+```xml
+<node id="j_t" x="0.000" y="0.000" z="0.000" rightOfWay="edgePriority"/>
+```
+
+That attribute is what keeps this from being a hint. Without it netconvert weighs the
+priorities against its own reading of the geometry, and a map that gives the stem of a
+tee right of way over the road across the top of it gets the road across the top
+anyway. With it, the numbers decide.
+
+The rule names *lanes*, so the priority goes on the edges that carry them and not on
+the road: a rule about the northbound approach leaves the southbound carriageway
+where its road type put it.
+
+What survives, then, is **which approach holds right of way** — and the tests check
+that by reading the `state` netconvert wrote on each movement, not the priority the
+export asked for. What does not survive is anything finer: whether a particular
+movement of the priority arm must still give way to an oncoming one is netconvert's
+decision, and `sumo_warnings()` says so.
 
 A road whose **cross-section changes** becomes a chain of edges with a node between
 them, because an edge has one lane count from end to end.
@@ -539,6 +566,8 @@ netconvert generates the phases, because the IR holds no signal timing to write.
   dropped rather than written as something they are not.
 - **Crosswalks and signs.** A SUMO crossing belongs to a node and a sign is an
   additional file, not part of the network.
+- **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
+  right of way and no more.
 - **The geo-reference.** The network is in the map's own metres about its origin, and
   the generated configuration turns off netconvert's offset normalisation so that it
   stays that way — the same coordinates as the other four exports.

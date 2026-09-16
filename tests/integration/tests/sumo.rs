@@ -331,25 +331,99 @@ fn a_traffic_light_makes_its_junction_a_signalised_node() {
     );
 }
 
-/// A right-of-way rule is the one thing the IR says about who waits at an
-/// uncontrolled junction, and an edge's priority is the one thing netconvert reads.
+/// A right-of-way rule has to reach the network as *right of way*, not as a hint
+/// netconvert is free to weigh against its own reading of the geometry.
+///
+/// So this reads what netconvert decided — the `state` on each movement, `M` for one
+/// that keeps right of way and `m` for one that must give way — rather than the
+/// priority the export asked for. The junction is deliberately unsignalised: at a
+/// `traffic_light` node the phases decide and the priorities barely matter, which
+/// would make the check say nothing.
 #[test]
-fn the_arm_that_yields_is_written_below_the_one_it_yields_to() {
+fn a_right_of_way_rule_decides_who_gives_way() {
     if !sumo_build::sumo_available() {
         return;
     }
-    let map = scenarios::controlled_crossroads();
+    let mut builder = MapBuilder::new(scenarios::metadata("priority"));
+    let arms: Vec<_> = [
+        (
+            "north",
+            Point3::new(0.0, 70.0, 0.0),
+            Point3::new(0.0, 14.0, 0.0),
+        ),
+        (
+            "east",
+            Point3::new(70.0, 0.0, 0.0),
+            Point3::new(14.0, 0.0, 0.0),
+        ),
+        (
+            "west",
+            Point3::new(-70.0, 0.0, 0.0),
+            Point3::new(-14.0, 0.0, 0.0),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, start, end)| {
+        builder
+            .add_road(
+                RoadSpec::line(start, end, scenarios::two_way())
+                    .unwrap()
+                    .with_name(name),
+            )
+            .unwrap()
+    })
+    .collect();
+    let junction = builder.add_junction(Some("t"));
+    for other in &arms[1..] {
+        builder
+            .connect_ends(&arms[0], RoadEnd::End, other, RoadEnd::End, Some(&junction))
+            .unwrap();
+    }
+    // The stem of the tee keeps right of way over the road across the top of it —
+    // the opposite of what the geometry alone suggests, so nothing but the rule can
+    // produce this answer.
+    builder.add_right_of_way(
+        vec![LaneRef::new(arms[0].clone(), 0)],
+        vec![
+            LaneRef::new(arms[1].clone(), 0),
+            LaneRef::new(arms[2].clone(), 0),
+        ],
+        None,
+    );
+    let map = builder.finish().unwrap().validate().unwrap();
     let (_directory, network) = sumo_build::build(&map);
 
-    // `controlled_crossroads` gives the east arm right of way over the north one.
-    let east = network.edge("east.fwd").priority.unwrap();
-    let north = network.edge("north.fwd").priority.unwrap();
+    let gives_way = |from: &str, to: &str| {
+        network
+            .movement(from, to)
+            .state
+            .as_deref()
+            .unwrap_or_default()
+            == "m"
+    };
     assert!(
-        east > north,
-        "east should outrank north, but they are {east} and {north}"
+        !gives_way("north.fwd", "east.bwd") && !gives_way("north.fwd", "west.bwd"),
+        "the stem was given right of way, so nothing it does should yield: {:?}",
+        network.connections
+    );
+    assert!(
+        gives_way("east.fwd", "north.bwd") || gives_way("west.fwd", "north.bwd"),
+        "the arms that yield to it should give way: {:?}",
+        network.connections
+    );
+
+    // And the rule named the approach lanes, so it moved the approach edges and left
+    // the opposing carriageways where their road type put them.
+    let base = network.edge("north.bwd").priority.unwrap();
+    assert_eq!(network.edge("east.bwd").priority.unwrap(), base);
+    assert_eq!(network.edge("west.bwd").priority.unwrap(), base);
+    assert!(
+        network.edge("north.fwd").priority.unwrap() > network.edge("east.fwd").priority.unwrap(),
+        "the approach that keeps right of way should outrank the one that yields"
     );
 }
 
+/// A SUMO edge has one lane count from end to end, so a road that drops a lane is a
 /// A SUMO edge has one lane count from end to end, so a road that drops a lane is a
 /// chain of edges with a node between them.
 #[test]
