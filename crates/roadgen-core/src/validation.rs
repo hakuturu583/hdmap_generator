@@ -659,6 +659,82 @@ mod tests {
     }
 
     #[test]
+    fn a_junction_between_curved_arms_validates_at_any_sampling_resolution() {
+        // A roundabout: two arcs of a ring joined through a junction, which is the
+        // shape that found this. A connector's reference line is a Bézier, and a
+        // Bézier used to be measured at the *default* sampling however finely the map
+        // was actually sampled — so a map sampled at anything finer reported a length
+        // shorter than its own last vertex's station, the lane was cut before that
+        // vertex, and the connector stopped a sampling step short of the lane it
+        // joined. The map was sound; the resolution decided whether it validated.
+        use crate::geometry::{Alignment, SamplingConfig};
+        use crate::map::MapMetadata;
+        let radius = 22.25;
+        let gap = 20.0_f64.to_radians();
+
+        for step in [0.25, 0.5, 1.0, 2.0, 4.0] {
+            let metadata = MapMetadata {
+                sampling: SamplingConfig::new(step).unwrap(),
+                ..MapMetadata::default()
+            };
+            let mut builder = MapBuilder::new(metadata);
+
+            let arms: Vec<_> = (0..2)
+                .map(|index| {
+                    let start_angle = index as f64 * std::f64::consts::FRAC_PI_2 + gap / 2.0;
+                    let start =
+                        Point3::new(radius * start_angle.cos(), radius * start_angle.sin(), 0.0);
+                    let alignment =
+                        Alignment::new(start, start_angle + std::f64::consts::FRAC_PI_2)
+                            .arc(
+                                (std::f64::consts::FRAC_PI_2 - gap) * radius,
+                                1.0 / radius,
+                                0.0,
+                            )
+                            .unwrap();
+                    builder
+                        .add_road(
+                            RoadSpec::new(
+                                alignment.finish().unwrap(),
+                                vec![LaneSpec::new(
+                                    PositiveWidth::new(3.5).unwrap(),
+                                    Direction::Forward,
+                                )],
+                            )
+                            .with_name(format!("arc{index}")),
+                        )
+                        .unwrap()
+                })
+                .collect();
+
+            let junction = builder.add_junction(Some("j"));
+            builder
+                .connect_ends(
+                    &arms[0],
+                    RoadEnd::End,
+                    &arms[1],
+                    RoadEnd::Start,
+                    Some(&junction),
+                )
+                .unwrap();
+
+            let issues = builder
+                .finish()
+                .unwrap()
+                .issues(ValidationConfig::default());
+            assert!(
+                issues.is_empty(),
+                "sampled at {step} m: {}",
+                issues
+                    .iter()
+                    .map(ValidationIssue::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+    }
+
+    #[test]
     fn connector_between_a_curved_arm_and_its_continuation_validates() {
         // The same drive, further on: a four-plus-one lane main road bends into a
         // three-plus-three lane road through a junction; the connectors' end boundaries span
