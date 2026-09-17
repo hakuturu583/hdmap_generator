@@ -1,0 +1,13 @@
+[package]
+name = "roadgen-sumo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto a SUMO plain-XML network"
+
+[dependencies]
+roadgen-core.workspace = true
+quick-xml.workspace = true

@@ -5,11 +5,11 @@ build-backend = "maturin"
 [project]
 name = "roadgen"
 version = "0.1.0"
-description = "Generate 3D road networks and write them as OpenDRIVE and Autoware Lanelet2"
+description = "Generate 3D road networks and write them as OpenDRIVE, Autoware Lanelet2, OpenStreetMap, SUMO and ClipGT"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
-keywords = ["opendrive", "lanelet2", "autoware", "hd-map", "road-network"]
+keywords = ["opendrive", "lanelet2", "autoware", "sumo", "hd-map", "road-network"]
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Rust",

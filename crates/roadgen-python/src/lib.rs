@@ -795,6 +795,52 @@ impl PyMap {
         Ok(roadgen_osm::check(self.built.as_ref().expect("just built")))
     }
 
+    /// Writes the map as a SUMO network: a directory of plain-XML files, plus the
+    /// `netconvert` configuration that builds them into a `.net.xml`.
+    ///
+    /// Returns the prefix the files were named with, which is the map's own name
+    /// reduced to something a file name and a SUMO identifier can both hold.
+    ///
+    /// ```text
+    /// prefix = m.export_sumo("network/")
+    /// subprocess.run(["netconvert", "-c", f"network/{prefix}.netccfg"])
+    /// ```
+    ///
+    /// The `.net.xml` is deliberately not written here: building it is netconvert's
+    /// job, it carries the shape of every junction and the right-of-way matrix, and
+    /// producing one without netconvert would mean reimplementing it.
+    fn export_sumo(&mut self, directory: PathBuf) -> PyResult<String> {
+        self.ensure_built()?;
+        roadgen_sumo::write(self.built.as_ref().expect("just built"), directory)
+            .map_err(runtime_error)
+    }
+
+    /// What a SUMO export loses.
+    fn sumo_warnings(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        Ok(roadgen_sumo::check(
+            self.built.as_ref().expect("just built"),
+        ))
+    }
+
+    /// Where each lane of the map ended up in the SUMO network, as the
+    /// `<edge>_<index>` identifier the built network gives it.
+    ///
+    /// A SUMO lane has no name of its own — it is the n-th lane of an edge — and the
+    /// numbering is not the IR's: SUMO counts from the right of the direction of
+    /// travel, and a two-way road is two edges. So this is the only way back from a
+    /// lane of the map to a lane of the network.
+    fn sumo_lane_ids(&mut self) -> PyResult<Vec<(String, String)>> {
+        self.ensure_built()?;
+        let network = roadgen_sumo::to_plain_xml(self.built.as_ref().expect("just built"))
+            .map_err(runtime_error)?;
+        Ok(network
+            .lanes
+            .into_iter()
+            .map(|(lane, written)| (lane.as_str().to_owned(), written))
+            .collect())
+    }
+
     /// Writes the map as a ClipGT clip: a directory of per-layer parquet files.
     ///
     /// Returns the clip id the files were named with, which is `clip_id` when given
