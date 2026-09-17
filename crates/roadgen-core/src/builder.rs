@@ -1374,8 +1374,16 @@ impl Generator {
         let start_tangent = from_travel.centerline.end_tangent()?;
         let end = to_travel.centerline.start_point();
         let end_tangent = to_travel.centerline.start_tangent()?;
-        let reference_line =
-            Curve3::Bezier(Bezier3::hermite(start, start_tangent, end, end_tangent)?);
+        // The connector is realised at the map's resolution, which is fixed into the
+        // curve: a Bézier's length is its vertices walked end to end, so the
+        // resolution has to be settled before anything asks how long it is.
+        let reference_line = Curve3::Bezier(Bezier3::hermite(
+            start,
+            start_tangent,
+            end,
+            end_tangent,
+            config,
+        )?);
 
         let road_id = RoadId::new(format!(
             "{}/{}_{}",

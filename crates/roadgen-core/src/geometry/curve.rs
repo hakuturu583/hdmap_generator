@@ -331,16 +331,68 @@ impl Clothoid3 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bezier3 {
     control: [Point3; 4],
+    /// How many straight segments this curve is realised as.
+    ///
+    /// A cubic is parameterised by `t` rather than by arc length, so a station along
+    /// it can only be had by walking it — and a walk taken in smaller steps measures
+    /// a longer curve. The resolution is therefore part of the curve, fixed when it
+    /// is built, rather than something each caller brings: [`Curve3::sample_at`] says
+    /// the same thing from the other side, that a Bézier "is already an approximation
+    /// of itself at the configured resolution".
+    ///
+    /// Were the resolution the caller's, the same curve would report one length to a
+    /// road generated at two metres and another to one generated at one; a lane cut
+    /// to the first would stop short of the last vertex the second produced, and a
+    /// junction connector would end a sampling step away from the lane it joins.
+    segments: usize,
 }
 
 impl Bezier3 {
-    pub fn new(control: [Point3; 4]) -> Result<Self, GeometryError> {
+    /// The curve through these control points, realised at `config`'s resolution.
+    pub fn new(control: [Point3; 4], config: SamplingConfig) -> Result<Self, GeometryError> {
         for point in control {
             if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
                 return Err(GeometryError::NonFiniteCoordinate);
             }
         }
-        Ok(Bezier3 { control })
+        let polygon: f64 = control
+            .windows(2)
+            .map(|pair| pair[0].distance_to(pair[1]))
+            .sum();
+        // The control polygon is longer than the curve, so stepping it out at the
+        // configured length errs towards more vertices rather than fewer. Eight is
+        // the floor: below that a corner stops looking like one.
+        Ok(Bezier3 {
+            control,
+            segments: config.segments_for(polygon).max(8),
+        })
+    }
+
+    /// How many straight segments the curve is realised as.
+    pub fn segments(&self) -> usize {
+        self.segments
+    }
+
+    /// The same curve walked the other way, at the same resolution.
+    pub fn reversed(&self) -> Bezier3 {
+        let [a, b, c, d] = self.control;
+        Bezier3 {
+            control: [d, c, b, a],
+            segments: self.segments,
+        }
+    }
+
+    /// The length of the curve as the IR realises it: its vertices, end to end, in
+    /// plan.
+    pub fn horizontal_length(&self) -> f64 {
+        let mut length = 0.0;
+        let mut previous = self.at(0.0);
+        for step in 1..=self.segments {
+            let point = self.at(step as f64 / self.segments as f64);
+            length += previous.horizontal_distance_to(point);
+            previous = point;
+        }
+        length
     }
 
     /// The cubic through `start` and `end` leaving along `start_tangent` and
@@ -350,6 +402,7 @@ impl Bezier3 {
         start_tangent: UnitVector3,
         end: Point3,
         end_tangent: UnitVector3,
+        config: SamplingConfig,
     ) -> Result<Self, GeometryError> {
         let chord = start.distance_to(end);
         if chord < Polyline3::MIN_SEGMENT {
@@ -359,14 +412,15 @@ impl Bezier3 {
         // round the corner, short enough not to overshoot when the ends face away
         // from each other.
         let handle = chord / 3.0;
-        Ok(Bezier3 {
-            control: [
+        Bezier3::new(
+            [
                 start,
                 start + start_tangent.scaled(handle),
                 end - end_tangent.scaled(handle),
                 end,
             ],
-        })
+            config,
+        )
     }
 
     pub fn control(&self) -> &[Point3; 4] {
@@ -398,14 +452,6 @@ impl Bezier3 {
             }
         }
         Err(GeometryError::ZeroLengthVector)
-    }
-
-    /// Length of the control polygon, an upper bound used to pick a step count.
-    fn control_polygon_length(&self) -> f64 {
-        self.control
-            .windows(2)
-            .map(|pair| pair[0].distance_to(pair[1]))
-            .sum()
     }
 }
 
@@ -539,7 +585,8 @@ impl Curve3 {
                 Ok(samples)
             }
             Curve3::Bezier(bezier) => {
-                let steps = config.segments_for(bezier.control_polygon_length()).max(8);
+                // The curve's own resolution, not the caller's: see [`Bezier3`].
+                let steps = bezier.segments();
                 let mut samples = Vec::with_capacity(steps + 1);
                 let mut station = 0.0;
                 let mut previous = bezier.at(0.0);
@@ -730,13 +777,10 @@ impl Curve3 {
             Curve3::Line(line) => Ok(line.start().horizontal_distance_to(line.end())),
             Curve3::Arc(arc) => Ok(arc.horizontal_length),
             Curve3::Clothoid(clothoid) => Ok(clothoid.horizontal_length),
-            // A Bézier is parameterised by `t` rather than by arc length, so the
-            // only way to its length is to walk it.
-            Curve3::Bezier(_) => Ok(self
-                .samples(SamplingConfig::default())?
-                .last()
-                .expect("a curve always samples at least its two ends")
-                .station),
+            // A Bézier is parameterised by `t` rather than by arc length, so its
+            // length is its vertices walked end to end — the same vertices
+            // `samples` produces, whatever resolution the caller asks for.
+            Curve3::Bezier(bezier) => Ok(bezier.horizontal_length()),
             Curve3::Polyline(polyline) => Ok(polyline.horizontal_length()),
             Curve3::Composite(segments) => segments
                 .iter()
@@ -776,10 +820,7 @@ impl Curve3 {
                     clothoid.start.z,
                 )?)
             }
-            Curve3::Bezier(bezier) => {
-                let [a, b, c, d] = bezier.control;
-                Curve3::Bezier(Bezier3::new([d, c, b, a])?)
-            }
+            Curve3::Bezier(bezier) => Curve3::Bezier(bezier.reversed()),
             Curve3::Polyline(polyline) => Curve3::Polyline(polyline.reversed()),
             Curve3::Composite(segments) => Curve3::composite(
                 segments
@@ -865,6 +906,7 @@ mod tests {
             start_tangent,
             p(20.0, 20.0, 1.0),
             end_tangent,
+            SamplingConfig::default(),
         )
         .unwrap();
         let curve = Curve3::Bezier(bezier);
@@ -1046,6 +1088,63 @@ mod tests {
                 assert!(there.is_close(back, 1e-6), "{there:?} vs {back:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_beziers_length_is_what_it_samples_to_at_any_resolution() {
+        // A curve that reports one length and samples to another is a curve whose
+        // last vertex falls outside the range a lane is cut to — which is a junction
+        // connector that stops a sampling step short of the lane it joins.
+        let built_at = SamplingConfig::new(1.0).unwrap();
+        let bezier = Curve3::Bezier(
+            Bezier3::hermite(
+                p(0.0, 0.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.05).normalize().unwrap(),
+                p(14.0, 9.0, 0.7),
+                Vector3::new(0.0, 1.0, 0.02).normalize().unwrap(),
+                built_at,
+            )
+            .unwrap(),
+        );
+        let stated = bezier.horizontal_length().unwrap();
+
+        for step in [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0] {
+            let config = SamplingConfig::new(step).unwrap();
+            let samples = bezier.samples(config).unwrap();
+            let sampled = samples.last().unwrap().station;
+            assert!(
+                (sampled - stated).abs() < 1e-12,
+                "asked at {step} m it samples to {sampled} but says it is {stated} long"
+            );
+            // And the length is the vertices end to end, which is what the OpenDRIVE
+            // export writes them out as.
+            let walked = bezier.to_polyline(config).unwrap().horizontal_length();
+            assert!((walked - stated).abs() < 1e-9, "{walked} vs {stated}");
+        }
+    }
+
+    #[test]
+    fn a_reversed_bezier_keeps_its_resolution_and_its_length() {
+        let config = SamplingConfig::new(0.75).unwrap();
+        let bezier = Curve3::Bezier(
+            Bezier3::hermite(
+                p(0.0, 0.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0).normalize().unwrap(),
+                p(20.0, 12.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0).normalize().unwrap(),
+                config,
+            )
+            .unwrap(),
+        );
+        let reversed = bezier.reversed(config).unwrap();
+        assert!(
+            (reversed.horizontal_length().unwrap() - bezier.horizontal_length().unwrap()).abs()
+                < 1e-9
+        );
+        assert_eq!(
+            reversed.samples(config).unwrap().len(),
+            bezier.samples(config).unwrap().len()
+        );
     }
 
     #[test]
