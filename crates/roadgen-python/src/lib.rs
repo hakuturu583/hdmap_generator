@@ -748,16 +748,14 @@ impl PyMap {
     /// have its route and rig checked too.
     #[pyo3(signature = (scenario = None))]
     fn clipgt_warnings(&mut self, scenario: Option<PathBuf>) -> PyResult<Vec<String>> {
-        self.ensure_built()?;
-        let map = self.built.as_ref().expect("just built");
         let config = match scenario {
-            Some(path) => Some(
-                roadgen_clipgt::ClipConfig::for_map(map)
-                    .with_scenario_file(path)
-                    .map_err(value_error)?,
-            ),
-            None => None,
+            Some(path) => Some(self.clipgt_config(Some(path), None, None, None, None)?),
+            None => {
+                self.ensure_built()?;
+                None
+            }
         };
+        let map = self.built.as_ref().expect("just built");
         Ok(roadgen_clipgt::check(map, config.as_ref()))
     }
 
@@ -890,30 +888,8 @@ impl PyMap {
         speed: Option<f64>,
         route: Option<Vec<String>>,
     ) -> PyResult<String> {
-        self.ensure_built()?;
+        let config = self.clipgt_config(scenario, clip_id, frame_rate, speed, route)?;
         let map = self.built.as_ref().expect("just built");
-        let mut config = roadgen_clipgt::ClipConfig::for_map(map);
-        if let Some(path) = scenario {
-            config = config.with_scenario_file(path).map_err(value_error)?;
-        }
-        if let Some(id) = clip_id {
-            config.clip_id = id.to_owned();
-        }
-        if let Some(frame_rate) = frame_rate {
-            config.frame_rate = frame_rate;
-        }
-        if let Some(speed) = speed {
-            config.speed = speed;
-        }
-        if let Some(route) = route {
-            config = config.with_route(
-                route
-                    .iter()
-                    .map(String::as_str)
-                    .map(roadgen_clipgt::scenario::lane_id)
-                    .collect(),
-            );
-        }
         roadgen_clipgt::write(map, directory, &config).map_err(runtime_error)
     }
 
@@ -1106,6 +1082,37 @@ impl PyMap {
             self.built = Some(self.build()?.validate().map_err(value_error)?);
         }
         Ok(())
+    }
+
+    /// The clip configuration the ClipGT methods share: the map's own defaults, the
+    /// scenario file over them, and the arguments over that.
+    fn clipgt_config(
+        &mut self,
+        scenario: Option<PathBuf>,
+        clip_id: Option<&str>,
+        frame_rate: Option<f64>,
+        speed: Option<f64>,
+        route: Option<Vec<String>>,
+    ) -> PyResult<roadgen_clipgt::ClipConfig> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let mut config = roadgen_clipgt::ClipConfig::for_map(map);
+        if let Some(path) = scenario {
+            config = config.with_scenario_file(path).map_err(value_error)?;
+        }
+        if let Some(id) = clip_id {
+            config.clip_id = id.to_owned();
+        }
+        if let Some(frame_rate) = frame_rate {
+            config.frame_rate = frame_rate;
+        }
+        if let Some(speed) = speed {
+            config.speed = speed;
+        }
+        if let Some(route) = route {
+            config = config.with_route(route.iter().map(LaneId::parse_printed).collect());
+        }
+        Ok(config)
     }
 
     /// The scene configuration the GPUDrive methods share: the map's own defaults, the

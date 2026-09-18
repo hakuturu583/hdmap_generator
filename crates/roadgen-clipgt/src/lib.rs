@@ -29,7 +29,7 @@
 pub mod columns;
 pub mod ego;
 pub mod error;
-mod layers;
+pub mod layers;
 pub mod scenario;
 mod table;
 
@@ -40,6 +40,7 @@ use roadgen_core::{LaneId, ValidatedMap};
 
 pub use ego::Pose;
 pub use error::ExportError;
+pub use layers::Layer;
 // The route is the IR's own: `Route::From` names a lane of the map and the
 // successors are the map's, so both exporters that drive a map say it the same way.
 pub use roadgen_core::Route;
@@ -141,6 +142,16 @@ impl ClipConfig {
     }
 }
 
+/// Renders `map` as the clip's tables, without writing anything.
+///
+/// The other exporters each hand back the document they built — an `OpenDrive`, a
+/// `LaneletMap`, a string of XML — and this is ClipGT's: one `RecordBatch` per layer,
+/// in the order they are written. A caller that wants to look at a clip rather than
+/// keep it does not have to go through the file system to do it.
+pub fn to_layers(map: &ValidatedMap, config: &ClipConfig) -> Result<Vec<Layer>, ExportError> {
+    layers::all(map, config)
+}
+
 /// Writes `map` into `directory` as a ClipGT clip, creating the directory if needed.
 ///
 /// Returns the clip id the files were named with.
@@ -154,7 +165,7 @@ pub fn write(
     std::fs::create_dir_all(directory)
         .map_err(|error| ExportError::Io(format!("{}: {error}", directory.display())))?;
 
-    for layer in layers::all(map, config)? {
+    for layer in to_layers(map, config)? {
         let path = directory.join(format!("{clip}.{}.parquet", layer.name));
         table::write(&path, &layer.batch)?;
     }
