@@ -297,6 +297,30 @@ and keeps its full width across the tilted surface. OpenDRIVE gets the same piec
 polynomial in `<lateralProfile><superelevation>`; Lanelet2 has no such concept and
 does not need one, because the roll is already in the heights of its vertices.
 
+### Corners
+
+Two straight roads that meet at an angle — the map at the top of this file — are a
+kink, and a kink is something only one of the formats can hold. Lanelet2 is a list of
+points and can be cut on the slant; OpenDRIVE derives every lane from the reference
+line and a width measured *perpendicular* to it, so however it is written the two
+cross-sections end on different lines: a wedge of nothing on the outside of the turn,
+an overlap on the inside, in a file every consumer takes at face value. CARLA drives
+its traffic on that file.
+
+So the corner is not written. When `connect()` joins two roads whose headings differ,
+each is cut back a little and a circular arc, tangent to both, takes the corner's
+place — half on each road, so no road is added and every link stays where it was.
+The arc's radius is 6 m plus however far the cross-section reaches on the inside of
+the turn, which keeps the inside kerb a curve a vehicle can follow whatever the road's
+width; on a road too short for that it shrinks to fit, down to a corner as tight as the
+road is wide, and past that the build fails and says so. A road that *arrives* at the
+joint on a curve is not bent either: give it an alignment that is tangent-continuous
+with the road it meets, or join the two through a junction.
+
+The result is the same in every format, because it is in the IR: `roadgen-viewer`'s
+OpenDRIVE panel draws a line, an arc and a line, Lanelet2 gets the arc's vertices, and
+the CARLA surface goes round the corner too.
+
 ## A cross-section that changes
 
 Two different things, with two different answers:
@@ -1372,12 +1396,13 @@ compares:
   compared with the IR's vertices, which are also the Lanelet2 map's vertices.
 
 Where a map's reference lines are tangent-continuous the two agree to within a
-micrometre. There is one place they cannot: **where two roads meet at an angle**,
-their lane boundaries can either meet or follow the reference lines, not both. The IR
-mitres such a joint so the boundaries meet, because Lanelet2 expresses continuity
-through shared points and would otherwise lose the connection; OpenDRIVE derives lane
-boundaries from the reference line and a width and has no way to say the same thing.
-`a_kink_between_two_roads_is_the_one_place_the_formats_differ` pins that down.
+micrometre — and the generator makes them so: **where two roads meet at an angle** the
+corner is [rounded into an arc](#corners) before anything is written, so the joint
+that used to be the one place the formats disagreed is now a place they agree.
+`two_roads_that_meet_at_an_angle_are_rounded_so_the_formats_agree` pins that down.
+The mitre the IR applies where road ends meet is still there for the joints that
+remain — a junction's arms, and roads that meet along one tangent — and is what makes
+their boundary points the *same* points rather than merely nearby ones.
 
 ## Layout
 

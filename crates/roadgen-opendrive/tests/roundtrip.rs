@@ -57,7 +57,19 @@ fn the_reference_line_keeps_its_length_and_its_climb() {
     let parsed =
         OpenDrive::from_xml_str(&roadgen_opendrive::to_xml(&two_roads()).unwrap()).unwrap();
     let first = &parsed.road[0];
-    assert!((first.length.value - 100.0).abs() < 1e-6);
+    // The bend is rounded: the road gives up `setback` metres of its straight and
+    // gets half of an arc back. The inside of the 26.6-degree turn is the 3.5 m
+    // forward lane, so the arc's radius is that plus the corner radius.
+    let angle = 50.0_f64.atan2(100.0);
+    let radius = 3.5 + roadgen_core::builder::CORNER_INNER_RADIUS;
+    let expected = 100.0 - radius * (angle / 2.0).tan() + radius * angle / 2.0;
+    assert!(
+        (first.length.value - expected).abs() < 1e-6,
+        "road a is {} m long, expected {expected}",
+        first.length.value
+    );
+    let plan = &first.plan_view.geometry;
+    assert_eq!(plan.len(), 2, "a line and the half arc: {plan:?}");
 
     // The 2 m climb over 100 m of plan view becomes a slope of 0.02 in the
     // elevation profile, with the road starting at z = 10.
