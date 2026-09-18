@@ -54,15 +54,21 @@ m.export_gpudrive("scene.json")
                      ▼
               Canonical Road IR
                      │
-                 Validation
+                 validate()
+                     ▼
+                ValidatedMap
                      │
-    ┌────────┬────────┴─────┬───────┬───────┬─────────┐
-    ▼        ▼              ▼       ▼       ▼         ▼
-OpenDRIVE Lanelet2  OpenStreetMap  SUMO  ClipGT   GPUDrive
- exporter  exporter    exporter   exporter exporter exporter
-    │         │            │         │       │         │
-`opendrive`   `simple_lanelet2`  plain XML  arrow/parquet  JSON
+                     ├──▶ OpenDRIVE      map.xodr            `opendrive`
+                     ├──▶ Lanelet2       map.osm             `simple_lanelet2`
+                     ├──▶ OpenStreetMap  plain .osm          `ll2-io`
+                     ├──▶ SUMO           .nod/.edg/.con.xml  `quick-xml` + netconvert
+                     ├──▶ ClipGT         .parquet layers     `arrow`/`parquet`
+                     └──▶ GPUDrive       scene .json         `serde_json`
 ```
+
+Every exporter reads a `ValidatedMap` and writes nothing back into it: what a format
+cannot hold comes back to the caller through that exporter's `check()`, never as a
+field in the IR.
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
 
