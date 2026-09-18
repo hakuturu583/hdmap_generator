@@ -320,3 +320,51 @@ fn a_painted_line_comes_back_painted() {
         "a two-way road came back with no paint on it"
     );
 }
+
+#[test]
+fn two_roads_that_meet_at_an_angle_share_one_edge() {
+    // Where two roads meet at an angle the IR mitres the joint, so the lane boundaries
+    // of one end on the same line the other's begin on. The surface has to be cut
+    // along that same line: cut perpendicular to each reference line instead, the two
+    // roads leave a wedge of nothing on the outside of the kink and overlap on the
+    // inside — which is what a camera sees, so it is checked on the mesh and not on
+    // the network. Every driving-lane boundary point at either end of every road has
+    // to be a vertex of the road surface.
+    let map = scenarios::two_roads_joined();
+    let config = PackageConfig::for_map(&map);
+    let meshes = roadgen_carla::to_meshes(&map, &config);
+    let surface: Vec<Point3> = meshes
+        .iter()
+        .filter(|mesh| mesh.role == Role::Road)
+        .flat_map(|mesh| mesh.positions.iter().copied())
+        .collect();
+
+    let mut missing = Vec::new();
+    for lane in map.lanes.iter() {
+        if lane.lane_type != LaneType::Driving {
+            continue;
+        }
+        for (which, point) in [
+            ("left start", lane.left_boundary.start_point()),
+            ("left end", lane.left_boundary.end_point()),
+            ("right start", lane.right_boundary.start_point()),
+            ("right end", lane.right_boundary.end_point()),
+        ] {
+            let nearest = surface
+                .iter()
+                .map(|vertex| vertex.distance_to(point))
+                .fold(f64::INFINITY, f64::min);
+            if nearest > 1e-6 {
+                missing.push(format!(
+                    "{} of {} is {nearest:.3} m from the surface",
+                    which, lane.id
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the surface does not pass through the lane boundaries at the joint:\n  {}",
+        missing.join("\n  ")
+    );
+}

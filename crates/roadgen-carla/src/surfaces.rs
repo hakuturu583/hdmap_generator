@@ -45,6 +45,7 @@ use roadgen_core::geometry::{Frame3, Point3, Vector3};
 use roadgen_core::map::{Map, Road};
 use roadgen_core::semantics::{LaneType, MarkingColor, RoadMarking};
 use roadgen_core::topology::LateralSide;
+use roadgen_core::topology::RoadEnd;
 
 use crate::materials;
 use crate::mesh::Mesh;
@@ -147,6 +148,15 @@ impl Ordinals {
 struct Rung {
     station: f64,
     frame: Frame3,
+    /// The direction a lateral offset is laid along at this station.
+    ///
+    /// Everywhere but a road's ends this is the frame's own `left`. At an end that
+    /// meets another road at an angle it is the *mitred* lateral the IR laid the lane
+    /// boundaries along — not a unit vector, and not perpendicular to the reference
+    /// line — so that this road's cross-section and the next one's end on the same
+    /// line. Cut perpendicular to each reference line instead, the two roads leave a
+    /// wedge of nothing on the outside of the kink and overlap on the inside.
+    left: Vector3,
 }
 
 impl Rung {
@@ -156,7 +166,7 @@ impl Rung {
     /// Both are measured in the *banked* frame, so a superelevated road's kerb stands
     /// perpendicular to its surface rather than to the horizon.
     fn at(&self, lateral: f64, rise: f64) -> Point3 {
-        self.frame.to_global([0.0, lateral, rise])
+        self.frame.origin + self.left * lateral + self.frame.up.scaled(rise)
     }
 }
 
@@ -174,12 +184,63 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
         let Ok(frame) = sample.frame() else {
             continue;
         };
+        let frame = frame.banked(road.superelevation.evaluate(station));
         rungs.push(Rung {
             station,
-            frame: frame.banked(road.superelevation.evaluate(station)),
+            frame,
+            left: frame.left.get(),
         });
     }
-    (rungs.len() >= 2).then_some(rungs)
+    if rungs.len() < 2 {
+        return None;
+    }
+    // The ends take the lateral the lane boundaries were actually built along, which
+    // is the mitred one wherever this road meets another at an angle.
+    if let Some(left) = boundary_lateral(map, road, RoadEnd::Start) {
+        rungs[0].left = left;
+    }
+    if let Some(left) = boundary_lateral(map, road, RoadEnd::End) {
+        rungs.last_mut().expect("two or more rungs").left = left;
+    }
+    Some(rungs)
+}
+
+/// The lateral direction the IR laid this road's lane boundaries along at one end,
+/// read back off a boundary rather than recomputed: the IR is the one place that
+/// knows whether the joint was mitred, and by how much.
+///
+/// Recovered as the vector from a lane's right boundary to its left one, divided by
+/// the lane's width there. A lane that has tapered to nothing at that end says
+/// nothing about the direction, so the first lane with some width answers.
+fn boundary_lateral(map: &Map, road: &Road, end: RoadEnd) -> Option<Vector3> {
+    let section = match end {
+        RoadEnd::Start => 0,
+        RoadEnd::End => road.sections.len().checked_sub(1)?,
+    };
+    let station = match end {
+        RoadEnd::Start => 0.0,
+        RoadEnd::End => road.horizontal_length().ok()?,
+    };
+    map.lanes_of_section(&road.id, section)
+        .into_iter()
+        .find_map(|lane| {
+            let width = lane.width_at(station);
+            if width < 1e-6 {
+                return None;
+            }
+            let (left, right) = match end {
+                RoadEnd::Start => (
+                    lane.left_boundary.start_point(),
+                    lane.right_boundary.start_point(),
+                ),
+                RoadEnd::End => (
+                    lane.left_boundary.end_point(),
+                    lane.right_boundary.end_point(),
+                ),
+            };
+            let lateral = (left - right) * (1.0 / width);
+            (lateral.norm() > 0.5).then_some(lateral)
+        })
 }
 
 /// What one cross-section of one road is made of, left to right.
@@ -579,7 +640,7 @@ impl<'a> Layout<'a> {
             .iter()
             .map(|rung| {
                 let cuts = self.cuts(rung.station);
-                (rung.at(cuts[cut] + shift, rise), rung.frame.left.get())
+                (rung.at(cuts[cut] + shift, rise), rung.left)
             })
             .collect()
     }
