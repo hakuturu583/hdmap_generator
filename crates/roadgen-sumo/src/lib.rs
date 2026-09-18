@@ -159,6 +159,14 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             .to_owned(),
     ];
 
+    if !map.buildings.is_empty() {
+        problems.push(format!(
+            "a SUMO network is a traffic network and holds no scenery, so the map's \
+             {} buildings are not written",
+            map.buildings.len()
+        ));
+    }
+
     let dropped: BTreeSet<&str> = map
         .lanes
         .iter()

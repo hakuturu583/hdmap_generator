@@ -7,6 +7,7 @@
 
 use ll2_io::osm::Tags;
 
+use roadgen_core::buildings::Building;
 use roadgen_core::map::{Map, Road};
 use roadgen_core::semantics::{LaneType, RoadType};
 use roadgen_core::topology::Direction;
@@ -158,5 +159,90 @@ mod tests {
         ] {
             assert!(!highway_value(road_type).is_empty());
         }
+    }
+}
+
+/// Every tag a building's way carries.
+///
+/// OSM's `building` key is open: the tens of values the wiki lists are a convention
+/// that renderers and routers know, not a schema anything enforces. So the word the
+/// generator used goes down as it stands — a grammar that emits `house` produces
+/// `building=house`, which is the conventional value, and one that emits something
+/// of its own produces that instead of losing it to `building=yes`.
+pub fn building_tags(building: &Building) -> Tags {
+    let mut tags = Tags::new();
+    tags.insert("building".into(), building_value(&building.kind));
+    tags.insert("building:levels".into(), building.levels.to_string());
+    // OSM's bare `height` is metres, to be read as the height of the building rather
+    // than of the ground it stands on.
+    tags.insert("height".into(), format!("{:.1}", building.height));
+    tags
+}
+
+/// A building's kind as an OSM value: lower case, and word characters only.
+///
+/// `building=yes` for a kind that survives none of that, which is OSM's own way of
+/// saying "a building, and nothing more is claimed".
+fn building_value(kind: &str) -> String {
+    let value: String = kind
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let value = value.trim_matches('_').to_owned();
+    if value.is_empty() {
+        "yes".to_owned()
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+mod building_tests {
+    use roadgen_core::buildings::Footprint;
+    use roadgen_core::geometry::Point3;
+    use roadgen_core::id::BuildingId;
+
+    use super::*;
+
+    fn building(kind: &str) -> Building {
+        Building {
+            id: BuildingId::new("a"),
+            footprint: Footprint::new(vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(10.0, 0.0, 0.0),
+                Point3::new(10.0, 8.0, 0.0),
+                Point3::new(0.0, 8.0, 0.0),
+            ])
+            .unwrap(),
+            height: 9.5,
+            levels: 3,
+            kind: kind.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_buildings_kind_becomes_the_building_value() {
+        let tags = building_tags(&building("apartments"));
+        assert_eq!(tags.get("building").map(String::as_str), Some("apartments"));
+        assert_eq!(tags.get("building:levels").map(String::as_str), Some("3"));
+        assert_eq!(tags.get("height").map(String::as_str), Some("9.5"));
+    }
+
+    #[test]
+    fn a_kind_osm_could_not_spell_becomes_one_it_can() {
+        assert_eq!(
+            building_tags(&building("Semi Detached"))
+                .get("building")
+                .map(String::as_str),
+            Some("semi_detached")
+        );
+        assert_eq!(
+            building_tags(&building("  "))
+                .get("building")
+                .map(String::as_str),
+            Some("yes")
+        );
     }
 }

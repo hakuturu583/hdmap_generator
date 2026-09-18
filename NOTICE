@@ -25,6 +25,10 @@ under its own terms.
   BSD 3-Clause License, itself derived from Lanelet2 (Fraunhofer IOSB /
   Karlsruhe Institute of Technology), BSD 3-Clause.
 
+* symbios-shape (https://github.com/TheJanusStream/symbios-shape)
+  A derivation engine for CGA shape grammars, used by `roadgen-buildings` to turn a
+  lot into the buildings standing on it. MIT License.
+
 * PyO3 (https://github.com/PyO3/pyo3)
   Rust bindings for Python. Apache-2.0.
 
@@ -33,3 +37,6 @@ under its own terms.
 
 * quick-xml, parking_lot, rstar
   Transitive dependencies of `simple_lanelet2`, each under MIT and/or Apache-2.0.
+
+* glam, nom, rand, rand_pcg, symbios-genetics
+  Transitive dependencies of `symbios-shape`, each under MIT and/or Apache-2.0.

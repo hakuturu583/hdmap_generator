@@ -9,9 +9,10 @@
 use std::collections::HashSet;
 
 use crate::arena::Arena;
+use crate::buildings::Building;
 use crate::error::GeometryError;
 use crate::geometry::{Curve3, Point3, Poly3Profile, Polyline3, SamplingConfig, WidthProfile};
-use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
+use crate::id::{BuildingId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLink, RoadLinkTarget,
@@ -381,6 +382,9 @@ pub struct Map {
     pub connections: Arena<ConnectionId, LaneConnection>,
     pub objects: Arena<ObjectId, MapObject>,
     pub rules: Vec<TrafficRule>,
+    /// What stands beside the road. Empty unless a generator filled it; nothing in
+    /// this crate does.
+    pub buildings: Arena<BuildingId, Building>,
 }
 
 impl Map {
@@ -393,6 +397,7 @@ impl Map {
             connections: Arena::new(),
             objects: Arena::new(),
             rules: Vec::new(),
+            buildings: Arena::new(),
         }
     }
 
@@ -406,6 +411,10 @@ impl Map {
 
     pub fn junction(&self, id: &JunctionId) -> Option<&Junction> {
         self.junctions.get(id)
+    }
+
+    pub fn building(&self, id: &BuildingId) -> Option<&Building> {
+        self.buildings.get(id)
     }
 
     /// The stations at which a road's geometry was generated — the stations of the

@@ -15,8 +15,25 @@
 //!   traffic sign      → <signals>/<signal> with <validity>
 //!   Stop line,
 //!   crosswalk         → <objects>/<object>
+//!   Building          → <objects>/<object type="building"> with an <outline>
 //!   Right of way      → <junction>/<priority>
 //! ```
+//!
+//! # Buildings, which belong to no road
+//!
+//! Every OpenDRIVE object hangs off a `<road>` and is placed in that road's own
+//! `(s, t)` coordinates. A building hangs off nothing: it stands on the ground, and
+//! the road it happens to be beside is a fact about the map rather than about the
+//! building. So the exporter picks the nearest road and says where the building is
+//! relative to *that* — which is the format's idea of a position and the only one it
+//! has.
+//!
+//! The outline is written as `<cornerLocal>`, not `<cornerRoad>`. Both would place
+//! the corners; only the first keeps them rigid. A `cornerRoad` corner is its own
+//! `(s, t)` pair, so beside a bend a straight wall is written as a curved one, and a
+//! consumer evaluating the file back gets a banana. `cornerLocal` measures every
+//! corner in one frame — the road's, at the building's own station — so the shape
+//! that comes back is the shape that went in.
 //!
 //! Format-specific decisions stay on this side of the boundary. OpenDRIVE's numeric
 //! ids, its insistence that `s` be measured in the xy-plane, and its rule that a
@@ -55,6 +72,7 @@ use opendrive::lane::speed::Speed as LaneSpeed;
 use opendrive::lane::width::Width;
 use opendrive::lane::Lane as OdLane;
 use opendrive::object::corner::Corner;
+use opendrive::object::corner_local::CornerLocal;
 use opendrive::object::corner_road::CornerRoad;
 use opendrive::object::lane_validity::LaneValidity;
 use opendrive::object::objects::Objects;
@@ -88,9 +106,10 @@ use uom::si::f64::{Angle, Curvature, Length};
 use uom::si::length::meter;
 use vec1::Vec1;
 
+use roadgen_core::buildings::Building;
 use roadgen_core::geometry::{Curve3, Point3, Sample};
 use roadgen_core::id::ObjectId;
-use roadgen_core::id::{JunctionId, LaneId, RoadId};
+use roadgen_core::id::{BuildingId, JunctionId, LaneId, RoadId};
 use roadgen_core::map::{Lane, Map, Projection, Road, TrafficHandedness};
 use roadgen_core::semantics::{
     LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType,
@@ -185,6 +204,8 @@ struct Numbering {
     junctions: HashMap<JunctionId, String>,
     lanes: HashMap<LaneId, i64>,
     objects: HashMap<ObjectId, String>,
+    /// Buildings share the object id space, numbered after the furniture.
+    buildings: HashMap<BuildingId, String>,
 }
 
 impl Numbering {
@@ -211,11 +232,16 @@ impl Numbering {
         for (index, object) in map.objects.iter().enumerate() {
             objects.insert(object.id.clone(), index.to_string());
         }
+        let mut buildings = HashMap::new();
+        for (index, building) in map.buildings.iter().enumerate() {
+            buildings.insert(building.id.clone(), (map.objects.len() + index).to_string());
+        }
         Numbering {
             roads,
             junctions,
             lanes,
             objects,
+            buildings,
         }
     }
 }
@@ -1054,6 +1080,11 @@ impl<'a> Exporter<'a> {
             };
             objects.push(entry);
         }
+        for building in self.buildings_of(road) {
+            if let Some(entry) = self.building_object(road, building)? {
+                objects.push(entry);
+            }
+        }
         if objects.is_empty() {
             return Ok(None);
         }
@@ -1114,6 +1145,155 @@ impl<'a> Exporter<'a> {
             }
         }
         Ok(priorities)
+    }
+
+    /// The road a building is written against: the nearest one it could be measured
+    /// from.
+    ///
+    /// Nearest by the horizontal distance from the building's centre to the road's
+    /// reference line, and never a junction connector — a connector is one movement
+    /// through a junction, so measuring a building from it would put the same
+    /// building somewhere else depending on which turn happened to be closest.
+    fn owning_road_of(&self, building: &Building) -> Option<&Road> {
+        let centre = building.footprint.centroid();
+        let mut best: Option<(&Road, f64)> = None;
+        for road in self.map.roads.iter() {
+            if road.is_connector() {
+                continue;
+            }
+            let Ok(line) = road.reference_line.to_polyline(self.map.metadata.sampling) else {
+                continue;
+            };
+            let distance = line
+                .points()
+                .iter()
+                .map(|point| point.horizontal_distance_to(centre))
+                .fold(f64::INFINITY, f64::min);
+            if best.is_none_or(|(_, previous)| distance < previous) {
+                best = Some((road, distance));
+            }
+        }
+        best.map(|(road, _)| road)
+    }
+
+    /// Buildings written against `road`, in the map's own order.
+    fn buildings_of<'b>(&'b self, road: &'b Road) -> impl Iterator<Item = &'b Building> + 'b {
+        self.map.buildings.iter().filter(move |building| {
+            self.owning_road_of(building)
+                .is_some_and(|owner| owner.id == road.id)
+        })
+    }
+
+    /// One building, as an object with a closed outline.
+    ///
+    /// `None` when the road has no geometry to measure against, which leaves the
+    /// building out of the file rather than putting it in the wrong place.
+    fn building_object(
+        &self,
+        road: &Road,
+        building: &Building,
+    ) -> Result<Option<Object>, ExportError> {
+        let centre = building.footprint.centroid();
+        let Some(position) = road_coordinates::locate(self.map, road, centre) else {
+            return Ok(None);
+        };
+        // One frame for the whole outline, taken at the building's own station: that
+        // is what makes the corners rigid, and it is why `hdg` below is zero.
+        //
+        // The plan view's frame, not the road surface's. OpenDRIVE's `s` is measured
+        // in the xy-plane and a `u`/`v` pair lives in that plane too, so the heading
+        // here is the reference line's *horizontal* heading and the banking is left
+        // out of it: a building is not on the road surface, and measuring it along a
+        // surface tilted for a bend would put the wall somewhere the wall is not.
+        let Ok(sample) = road
+            .reference_line
+            .sample_at(position.s, self.map.metadata.sampling)
+        else {
+            return Ok(None);
+        };
+        let origin = sample.point;
+        let heading = sample.tangent.heading();
+        let (cos, sin) = (heading.cos(), heading.sin());
+        // Where the pivot sits, in the road's own coordinates.
+        let plan = |point: Point3| -> [f64; 3] {
+            let (dx, dy) = (point.x - origin.x, point.y - origin.y);
+            [
+                dx * cos + dy * sin,
+                -dx * sin + dy * cos,
+                point.z - origin.z,
+            ]
+        };
+        let pivot = plan(centre);
+
+        let corners: Vec<Corner> = building
+            .footprint
+            .points()
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let local = plan(*point);
+                Corner::Local(CornerLocal {
+                    height: Length::new::<meter>(building.height),
+                    id: Some(index as u64),
+                    u: Length::new::<meter>(local[0] - pivot[0]),
+                    v: Length::new::<meter>(local[1] - pivot[1]),
+                    z: Length::new::<meter>(local[2] - pivot[2]),
+                })
+            })
+            .collect();
+        let Ok(choice) = Vec1::try_from_vec(corners) else {
+            return Ok(None);
+        };
+
+        Ok(Some(Object {
+            dynamic: Some(false),
+            hdg: Some(Angle::new::<radian>(0.0)),
+            height: Some(Length::new::<meter>(building.height)),
+            id: self.building_id(&building.id)?.to_owned(),
+            length: None,
+            name: Some(building.id.to_string()),
+            orientation: Some(Orientation::None),
+            perp_to_road: None,
+            pitch: None,
+            radius: None,
+            roll: None,
+            s: Length::new::<meter>(position.s),
+            // The word the generator used, which OpenDRIVE's `subtype` is exactly as
+            // free-form as OSM's `building` value.
+            subtype: Some(building.kind.clone()),
+            t: Length::new::<meter>(pivot[1]),
+            r#type: Some(ObjectType::Building),
+            valid_length: None,
+            width: None,
+            z_offset: Length::new::<meter>(pivot[2]),
+            repeat: Vec::new(),
+            outline: Some(Outline {
+                closed: Some(true),
+                fill_type: None,
+                id: None,
+                lane_type: None,
+                outer: Some(true),
+                choice,
+                additional_data: AdditionalData::default(),
+            }),
+            outlines: None,
+            material: Vec::new(),
+            // A building governs no lanes, so there is nothing for a validity to say.
+            validity: Vec::new(),
+            parking_space: None,
+            markings: None,
+            borders: None,
+            surface: None,
+            additional_data: AdditionalData::default(),
+        }))
+    }
+
+    fn building_id(&self, building: &BuildingId) -> Result<&str, ExportError> {
+        self.numbering
+            .buildings
+            .get(building)
+            .map(String::as_str)
+            .ok_or_else(|| ExportError::Unknown(building.to_string()))
     }
 
     fn object_id(&self, object: &ObjectId) -> Result<&str, ExportError> {

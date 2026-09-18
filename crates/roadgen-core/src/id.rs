@@ -80,6 +80,9 @@ define_id!(
 define_id!(
     /// Identifies a map object such as a traffic light or a stop line.
     ObjectId, "object");
+define_id!(
+    /// Identifies a building, e.g. `building/north/left/3`.
+    BuildingId, "building");
 
 impl LaneId {
     /// The identifier of lane number `index` of `road`.

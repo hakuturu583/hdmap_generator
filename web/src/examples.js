@@ -176,4 +176,65 @@ for warning in m.format_warnings():
     print("note:", warning)
 `,
   },
+  {
+    name: 'A town, generated',
+    description: 'Streets, and a CGA shape grammar putting buildings along them.',
+    code: `# Buildings are off until you ask for them. Switched on, every street
+# grows two frontages of lots and a CGA shape grammar — the CityEngine
+# formalism — decides what stands on each. Python only says whether to,
+# and by what rules.
+import roadgen
+
+def two_way():
+    return [
+        roadgen.Lane(width=3.5, direction="forward"),
+        roadgen.Lane(width=3.5, direction="backward"),
+    ]
+
+m = roadgen.Map(name="town", origin=(35.6586, 139.7454, 0.0))
+for index, y in enumerate((0.0, 180.0)):
+    m.add_road(start=(0.0, y, 0.0), end=(420.0, y, 0.0),
+               lanes=two_way(), name=f"street{index}")
+m.add_road(start=(210.0, -140.0, 0.0), end=(210.0, 320.0, 0.0),
+           lanes=two_way(), name="avenue")
+
+# The rules are one piece of text, and the layout is in it: the six attr
+# declarations are read back out of the grammar, so there is one thing to
+# edit. roadgen.building_rules("town") hands the built-in set back to
+# start from.
+m.generate_buildings(rules="""
+attr Setback = 5
+attr LotWidth = 16
+attr LotDepth = 20
+attr LotGap = 3
+attr CornerClearance = 14
+attr FloorHeight = 3.2
+
+Lot     --> Size(scope.x - 2, 0, scope.z - 6) Center(XZ) Plot
+Plot    --> 40% House | 35% Terrace | else: Block
+
+House   --> Extrude(rand(6, 9)) I("house")
+Terrace --> Split(X) { ~1: Unit | ~1: Unit }
+Unit    --> Extrude(rand(6.5, 8.5)) I("terrace")
+Block   --> Extrude(FloorHeight * rand(3, 6)) I("apartments")
+""", seed=4)
+
+m.validate()
+
+m.export_opendrive("map.xodr")
+m.export_lanelet2("lanelet2.osm")
+m.export_osm("openstreetmap.osm")
+m.export_sumo("sumo/")
+m.export_clipgt("clip/")
+m.export_gpudrive("scene.json")
+
+# Only two of the six have anywhere to put a footprint: OpenStreetMap, as
+# closed building ways, and OpenDRIVE, as objects with an outline. The
+# OpenDRIVE panel is the one that draws them.
+print(len(m.building_ids()), "buildings")
+for warning in m.sumo_warnings():
+    if "buildings" in warning:
+        print("note:", warning)
+`,
+  },
 ]

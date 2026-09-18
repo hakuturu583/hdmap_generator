@@ -70,6 +70,7 @@ impl UnvalidatedMap {
         check_road_links(&self.0, config, &mut issues);
         check_connections(&self.0, config, &mut issues);
         check_junctions(&self.0, &mut issues);
+        check_buildings(&self.0, &mut issues);
         issues
     }
 
@@ -107,6 +108,36 @@ impl Deref for ValidatedMap {
     type Target = Map;
     fn deref(&self) -> &Map {
         &self.0
+    }
+}
+
+/// Buildings are checked for the two things a [`Footprint`](crate::buildings::Footprint)
+/// cannot already rule out: that the building rises, and that its storey count is one
+/// a building could have. The outline itself needs no check — a `Footprint` cannot be
+/// built from fewer than three vertices, from a non-finite coordinate or from a ring
+/// that encloses no area.
+///
+/// Whether a building stands clear of the road is deliberately *not* checked. A map
+/// may perfectly well describe a building the road passes under, and the generator
+/// that places buildings is the thing that owes the caller a setback — validation is
+/// not where a generator's taste is enforced.
+fn check_buildings(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for building in map.buildings.iter() {
+        if !building.height.is_finite() || building.height <= 0.0 {
+            issues.push(ValidationIssue::ImplausibleBuilding {
+                building: building.id.clone(),
+                detail: format!(
+                    "height is {}, and a building rises above its footprint",
+                    building.height
+                ),
+            });
+        }
+        if building.levels == 0 {
+            issues.push(ValidationIssue::ImplausibleBuilding {
+                building: building.id.clone(),
+                detail: "no storeys; a building has at least one".to_owned(),
+            });
+        }
     }
 }
 

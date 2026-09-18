@@ -20,6 +20,14 @@
 //!
 //! A `<border>` lane — width stated as an absolute offset rather than a width — is
 //! read as the offset it is. roadgen never writes one; a document from elsewhere may.
+//!
+//! # Buildings
+//!
+//! An `<object type="building">` carries an `<outline>`, and the outline is where the
+//! footprint is. Its corners are `<cornerLocal>` — measured from the object's pivot,
+//! in the road frame at the object's own station — so drawing one means evaluating
+//! the reference line once and laying the corners out against it, which is the same
+//! `(s, t)` walk every lane edge in this file goes through.
 
 use std::f64::consts::PI;
 
@@ -31,6 +39,8 @@ use opendrive::lane::road_mark::color::Color;
 use opendrive::lane::road_mark::type_simplified::TypeSimplified;
 use opendrive::lane::road_mark::RoadMark;
 use opendrive::lane::Lane;
+use opendrive::object::corner::Corner;
+use opendrive::object::orientation::ObjectType;
 use opendrive::road::geometry::geometry_type::GeometryType;
 use opendrive::road::Road;
 use uom::si::angle::radian;
@@ -56,11 +66,14 @@ pub fn draw(xml: &str) -> Result<Drawing, ViewError> {
     let mut drawing = Drawing::new("OpenDRIVE");
     let mut lanes = 0usize;
 
+    let mut buildings = 0usize;
+
     for road in &document.road {
         let reference = ReferenceLine::of(road);
         if reference.is_empty() {
             continue;
         }
+        buildings += draw_buildings(&mut drawing, road, &reference);
         for (index, section) in road.lanes.lane_section.iter().enumerate() {
             let end = road
                 .lanes
@@ -133,12 +146,75 @@ pub fn draw(xml: &str) -> Result<Drawing, ViewError> {
         document.road.len(),
         document.junction.len()
     ));
+    if buildings > 0 {
+        drawing.note(format!(
+            "{buildings} buildings, drawn from the outline each object carries"
+        ));
+    }
     drawing.note(
         "the shapes are evaluated, not read: OpenDRIVE holds a reference line and \
          width polynomials, and this walks them"
             .to_owned(),
     );
     Ok(drawing)
+}
+
+/// Draws every building object of one road, and says how many there were.
+///
+/// An object with no outline is not drawn. OpenDRIVE lets one say "a building, this
+/// wide and this long, at this point", and a box inferred from two numbers is not a
+/// footprint — it is a guess, and this viewer exists to show what a file says rather
+/// than what it might have meant.
+fn draw_buildings(drawing: &mut Drawing, road: &Road, reference: &ReferenceLine) -> usize {
+    let Some(objects) = &road.objects else {
+        return 0;
+    };
+    let mut drawn = 0;
+    for object in &objects.object {
+        if object.r#type != Some(ObjectType::Building) {
+            continue;
+        }
+        let Some(outline) = &object.outline else {
+            continue;
+        };
+        let pivot_s = object.s.get::<meter>();
+        let pivot_t = object.t.get::<meter>();
+        let pivot = reference.at(pivot_s, pivot_t);
+        // The world direction the object's local u axis points: the reference line's
+        // heading where the object sits, turned by the object's own `hdg`.
+        let heading = reference.heading_at(pivot_s)
+            + object.hdg.map(|hdg| hdg.get::<radian>()).unwrap_or(0.0);
+
+        let mut ring = Vec::with_capacity(outline.choice.len());
+        for corner in outline.choice.iter() {
+            ring.push(match corner {
+                // `u` and `v` are a *Cartesian* frame anchored at the pivot, not a
+                // walk along the reference line: the corner is the pivot plus that
+                // offset, turned into the world. Reading them as `(s, t)` instead is
+                // the classic way to fan a building out along the inside of a bend —
+                // and it is why the exporter writes them this way in the first place,
+                // so that the shape survives.
+                Corner::Local(local) => {
+                    let (u, v) = (local.u.get::<meter>(), local.v.get::<meter>());
+                    Point::new(
+                        pivot.x + u * heading.cos() - v * heading.sin(),
+                        pivot.y + u * heading.sin() + v * heading.cos(),
+                    )
+                }
+                // A corner of its own `(s, t)`, which is how the standard's other
+                // outline form says it — and which does follow the reference line.
+                Corner::Road(on_road) => {
+                    reference.at(on_road.s.get::<meter>(), on_road.t.get::<meter>())
+                }
+            });
+        }
+        if ring.len() < 3 || ring.iter().any(|point| !point.x.is_finite()) {
+            continue;
+        }
+        drawing.area(Kind::Building, ring);
+        drawn += 1;
+    }
+    drawn
 }
 
 /// Which side of the reference line a lane is on. OpenDRIVE numbers lanes outwards
@@ -361,6 +437,14 @@ impl ReferenceLine {
 
     fn is_empty(&self) -> bool {
         self.pieces.is_empty()
+    }
+
+    /// Which way the reference line points at station `s`, radians.
+    fn heading_at(&self, s: f64) -> f64 {
+        match self.piece_at(s) {
+            Some(piece) => piece.at(s - piece.start).2,
+            None => 0.0,
+        }
     }
 
     /// The point `offset` metres to the left of the reference line at station `s`.

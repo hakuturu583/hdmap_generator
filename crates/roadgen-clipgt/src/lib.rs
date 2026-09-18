@@ -208,6 +208,13 @@ fn write_camera_timestamps(
 /// the configuration to have the route and the rig checked as well.
 pub fn check(map: &ValidatedMap, config: Option<&ClipConfig>) -> Vec<String> {
     let mut problems = Vec::new();
+    if !map.buildings.is_empty() {
+        problems.push(format!(
+            "ClipGT's layers describe the road surface and its markings, so the map's \
+             {} buildings are not written",
+            map.buildings.len()
+        ));
+    }
     if !map.connections.is_empty() {
         problems.push(format!(
             "ClipGT holds no lane topology, so the map's {} lane connections are not \

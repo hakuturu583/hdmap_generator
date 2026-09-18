@@ -31,6 +31,13 @@
 //! them becomes a restriction. Extending the arms is the one place this exporter
 //! moves geometry, and it is what makes the result routable: four ways that stop
 //! short of each other are four dead ends.
+//!
+//! # Buildings
+//!
+//! The one thing OSM holds better than any other format here. A building is a closed
+//! way tagged `building`, which is exactly what the IR has — an outline on the ground
+//! — so nothing is lost and nothing has to be invented. It is the only part of this
+//! export that [`check`] has no complaint about.
 
 pub mod error;
 pub mod tags;
@@ -230,6 +237,40 @@ impl<'a> Exporter<'a> {
 
         self.add_furniture()?;
         self.add_restrictions();
+        self.add_buildings()?;
+        Ok(())
+    }
+
+    /// Every building, as a closed way.
+    ///
+    /// The outline goes down as it stands: OSM wants the ring anticlockwise and
+    /// closed by repeating its first node, and a [`Footprint`](roadgen_core::Footprint)
+    /// is already the first of those and one node short of the second.
+    fn add_buildings(&mut self) -> Result<(), ExportError> {
+        for building in self.map.buildings.iter() {
+            let mut nodes = Vec::with_capacity(building.footprint.len() + 1);
+            for point in building.footprint.points() {
+                nodes.push(self.node_at(*point)?);
+            }
+            nodes.dedup();
+            if nodes.len() < 3 {
+                continue;
+            }
+            // A closed way is one whose first node is also its last. Two buildings
+            // in a terrace share the corner nodes between them, which is welding
+            // doing what it does for roads and is what OSM expects of a terrace.
+            nodes.push(nodes[0]);
+
+            let id = self.take_id();
+            self.document.ways.insert(
+                id,
+                Way {
+                    id,
+                    nodes,
+                    tags: tags::building_tags(building),
+                },
+            );
+        }
         Ok(())
     }
 
