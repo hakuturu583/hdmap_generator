@@ -6,23 +6,23 @@
 //! would actually receive.
 //!
 //! ```text
-//!   map.xodr      sumo/        clip/         scene.json
-//!      │            │            │               │
-//!   OpenDRIVE     SUMO        ClipGT         GPUDrive
-//!      └────────────┴─────┬──────┴───────────────┘
-//!                      Drawing
-//!                         │
-//!                        SVG
+//!   map.xodr    sumo/     Town01.fbx    clip/      scene.json
+//!      │          │           │           │            │
+//!   OpenDRIVE   SUMO       CARLA       ClipGT      GPUDrive
+//!      └──────────┴─────┬─────┴───────────┴────────────┘
+//!                    Drawing
+//!                       │
+//!                      SVG
 //! ```
 //!
-//! # Why these four
+//! # Why these five
 //!
 //! Because the other two have viewers already. A Lanelet2 map and a plain
 //! OpenStreetMap file are both OSM XML in geographic coordinates, so any map library
 //! draws them, and the demo page hands them to Leaflet rather than to this. What is
 //! here is the formats with nothing to hand them to: an OpenDRIVE document whose
-//! shape has to be evaluated before it can be drawn, SUMO's plain XML, ClipGT's
-//! Parquet layers, and a GPUDrive scene.
+//! shape has to be evaluated before it can be drawn, SUMO's plain XML, a CARLA
+//! package's FBX, ClipGT's Parquet layers, and a GPUDrive scene.
 //!
 //! # It reads, it does not convert
 //!
@@ -48,6 +48,7 @@
 pub mod clipgt;
 pub mod drawing;
 pub mod error;
+pub mod fbx;
 pub mod gpudrive;
 pub mod opendrive;
 pub mod read;
@@ -79,4 +80,9 @@ pub fn clipgt_directory(path: &Path) -> Result<Drawing, ViewError> {
 /// Draws a GPUDrive scene file.
 pub fn gpudrive_file(path: &Path) -> Result<Drawing, ViewError> {
     gpudrive::draw(&read::text(path)?)
+}
+
+/// Draws the FBX of a CARLA package.
+pub fn fbx_file(path: &Path) -> Result<Drawing, ViewError> {
+    fbx::draw(&read::text(path)?)
 }

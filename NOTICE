@@ -32,6 +32,10 @@ under its own terms.
 * PyO3 (https://github.com/PyO3/pyo3)
   Rust bindings for Python. Apache-2.0.
 
+* serde, serde_json, serde_norway
+  Serialization, for the ClipGT and GPUDrive scenario files, the GPUDrive scene and
+  the CARLA package descriptor. MIT and/or Apache-2.0.
+
 * uom, vec1, xml-rs, chrono, url, thiserror, derive_more, paste, backtrace
   Transitive dependencies of `opendrive`, each under MIT and/or Apache-2.0.
 
@@ -40,3 +44,29 @@ under its own terms.
 
 * glam, nom, rand, rand_pcg, symbios-genetics
   Transitive dependencies of `symbios-shape`, each under MIT and/or Apache-2.0.
+
+--------------------------------------------------------------------------------
+Assets a CARLA package fetches
+--------------------------------------------------------------------------------
+
+`roadgen-carla` writes a manifest naming textures published by Poly Haven
+(https://polyhaven.com) and `roadgen.fetch_textures()` downloads them into the
+package. Nothing is redistributed here: this repository holds the names, not the
+files, and a package that has not been through the fetcher has none of them.
+
+Poly Haven's assets are published under CC0 1.0 Universal
+(https://creativecommons.org/publicdomain/zero/1.0/) — public domain, no attribution
+required. Each package names the assets it uses in its own `Textures/CREDITS.md`, as
+a courtesy and so that a package can be traced back to where its surfaces came from.
+
+--------------------------------------------------------------------------------
+Formats this project writes
+--------------------------------------------------------------------------------
+
+`roadgen-carla` writes files for the CARLA simulator (https://carla.org/, MIT). No
+CARLA source or asset is reproduced or redistributed here. What `roadgen-carla`
+holds is the *conventions two programs must agree on to exchange a map* — folder
+names, mesh-name substrings, semantic label values and the shape of the package
+descriptor — determined by reading CARLA's own `SSTags.h`, `MoveAssetsCommandlet.cpp`,
+`PrepareAssetsForCookingCommandlet.cpp`, `Tagger.cpp`, `ObjectLabel.h` and
+`Util/Tools/Import.py` on the `ue5-dev` branch.

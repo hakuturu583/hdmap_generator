@@ -1,4 +1,4 @@
-"""Generate 3D road networks and write them as OpenDRIVE, Lanelet2, OSM, SUMO, ClipGT or GPUDrive.
+"""Generate 3D road networks and write them as OpenDRIVE, Lanelet2, OSM, SUMO, ClipGT, GPUDrive or a CARLA package.
 
 The road network itself — topology, geometry, semantics, validation — lives in
 Rust. This package is the front end: every object here is a handle on something
@@ -29,6 +29,7 @@ the Rust core owns, so there is one model of the map and not two.
     m.export_sumo("sumo/")
     m.export_clipgt("clip/")
     m.export_gpudrive("scene.json")
+    m.export_carla("Import/")                  # a CARLA UE5 asset package
 
 A town can be generated beside the roads, and the only two things to say about
 it are whether to and by what rules:
@@ -53,6 +54,18 @@ Every export can be drawn back:
 The `render_*` functions read the file rather than the map, so what they draw is
 what a consumer would receive. They return an SVG document as text — in a notebook,
 `IPython.display.SVG(svg)`; anywhere else, a string to write out or put in a page.
+
+The CARLA export is a folder: the descriptor CARLA's importer reads, the map's `.fbx`,
+the `.xodr` of the same name beside it, and a manifest naming the textures. CARLA
+decides what a mesh *means* by matching its name, so the one thing worth reading before
+importing one is `m.carla_warnings()`. The textures are listed rather than shipped, and
+`roadgen.fetch_textures(folder)` downloads them:
+
+    m.export_carla("Import/", name="Town01")
+    for warning in m.carla_warnings(name="Town01"):
+        print(warning)
+    roadgen.fetch_textures("Import/Town01")
+    svg = roadgen.render_carla("Import/Town01/Town01.fbx")
 """
 
 from ._roadgen import (
@@ -65,11 +78,13 @@ from ._roadgen import (
     __version__,
     building_presets,
     building_rules,
+    render_carla,
     render_clipgt,
     render_gpudrive,
     render_opendrive,
     render_sumo,
 )
+from .textures import TextureError, fetch_textures, texture_manifest
 
 __all__ = [
     "Alignment",
@@ -78,11 +93,15 @@ __all__ = [
     "LaneRef",
     "Map",
     "Road",
+    "TextureError",
     "__version__",
     "building_presets",
     "building_rules",
+    "fetch_textures",
+    "render_carla",
     "render_clipgt",
     "render_gpudrive",
     "render_opendrive",
     "render_sumo",
+    "texture_manifest",
 ]

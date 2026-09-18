@@ -1245,6 +1245,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "roadgen-carla"
+version = "0.1.0"
+dependencies = [
+ "roadgen-buildings",
+ "roadgen-core",
+ "roadgen-opendrive",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "roadgen-clipgt"
 version = "0.1.0"
 dependencies = [
@@ -1284,6 +1296,7 @@ dependencies = [
  "parquet",
  "quick-xml",
  "roadgen-buildings",
+ "roadgen-carla",
  "roadgen-clipgt",
  "roadgen-core",
  "roadgen-gpudrive",
@@ -1334,6 +1347,7 @@ version = "0.1.0"
 dependencies = [
  "pyo3",
  "roadgen-buildings",
+ "roadgen-carla",
  "roadgen-clipgt",
  "roadgen-core",
  "roadgen-gpudrive",
@@ -1361,6 +1375,7 @@ dependencies = [
  "opendrive",
  "parquet",
  "quick-xml",
+ "roadgen-carla",
  "roadgen-gpudrive",
  "serde_json",
  "uom",

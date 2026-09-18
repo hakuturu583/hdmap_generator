@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 roadgen-core.workspace = true
 roadgen-buildings.workspace = true
+roadgen-carla.workspace = true
 roadgen-opendrive.workspace = true
 roadgen-lanelet2.workspace = true
 roadgen-clipgt.workspace = true

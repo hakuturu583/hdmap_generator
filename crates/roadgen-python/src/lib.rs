@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use roadgen_core::builder::CrossSectionSpec;
 use roadgen_core::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
@@ -1081,6 +1082,125 @@ impl PyMap {
         roadgen_gpudrive::write(map, path, &config).map_err(runtime_error)
     }
 
+    /// Writes the map as a CARLA UE5 asset package.
+    ///
+    /// A folder holding the descriptor CARLA's `Import.py` reads, and under it the
+    /// map's `.fbx`, the `.xodr` of the same name, and the manifest that fetches the
+    /// textures. Point CARLA's importer at the folder.
+    ///
+    /// Returns a dict: the paths written, how many meshes and triangles, how many
+    /// meshes will carry each CARLA semantic class, and the textures still to fetch.
+    ///
+    /// `name` is the map's name, which is the `.fbx`, the `.xodr`, the level CARLA
+    /// builds and the prefix of every mesh name in the file — CARLA works out a
+    /// mesh's semantic class by matching its *name*, so this one string decides how
+    /// the whole map segments. `carla_warnings()` says when it would decide wrongly.
+    ///
+    /// `buildings` is `"in_map"` (they stand in the level and CARLA tags them
+    /// Terrain), `"props"` (tagged Buildings, and not placed) or `"omitted"`. The
+    /// choice exists because CARLA's import pipeline will not do both; see
+    /// `carla_warnings()`.
+    ///
+    /// `use_carla_materials` lets CARLA replace this package's materials with its own,
+    /// which is what its documentation recommends and what its own maps do. Turn it
+    /// off to see the Poly Haven textures the package ships.
+    #[pyo3(signature = (
+        directory,
+        name = None,
+        package = None,
+        buildings = None,
+        use_carla_materials = None,
+        kerb_height = None,
+        verge_width = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn export_carla(
+        &mut self,
+        py: Python<'_>,
+        directory: PathBuf,
+        name: Option<&str>,
+        package: Option<&str>,
+        buildings: Option<&str>,
+        use_carla_materials: Option<bool>,
+        kerb_height: Option<f64>,
+        verge_width: Option<f64>,
+    ) -> PyResult<Py<PyDict>> {
+        let config = self.carla_config(
+            name,
+            package,
+            buildings,
+            use_carla_materials,
+            kerb_height,
+            verge_width,
+        )?;
+        let map = self.built.as_ref().expect("just built");
+        let written = roadgen_carla::write(map, directory, &config).map_err(runtime_error)?;
+
+        let report = PyDict::new(py);
+        report.set_item("descriptor", written.descriptor.to_string_lossy())?;
+        report.set_item("fbx", written.fbx.to_string_lossy())?;
+        report.set_item("xodr", written.xodr.to_string_lossy())?;
+        report.set_item(
+            "props",
+            written.props.as_ref().map(|path| path.to_string_lossy()),
+        )?;
+        report.set_item("meshes", written.meshes)?;
+        report.set_item("triangles", written.triangles)?;
+        // Keyed by the tag a segmentation camera reports, because that is the name
+        // anybody checking this will be looking for.
+        let labels = PyDict::new(py);
+        for (label, count) in &written.labels {
+            labels.set_item(label.as_str(), count)?;
+        }
+        report.set_item("labels", labels)?;
+        report.set_item(
+            "textures",
+            written
+                .textures
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(report.into())
+    }
+
+    /// What a CARLA package cannot carry, and what its import will get wrong quietly.
+    ///
+    /// Kept apart from `format_warnings` for the same reason ClipGT's and GPUDrive's
+    /// are: most of these are properties of CARLA's *import*, which classifies a mesh
+    /// by its name and has no way to report having classified one wrongly. Takes the
+    /// same arguments as `export_carla`, so a package can be checked before it is
+    /// written.
+    #[pyo3(signature = (
+        name = None,
+        package = None,
+        buildings = None,
+        use_carla_materials = None,
+        kerb_height = None,
+        verge_width = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn carla_warnings(
+        &mut self,
+        name: Option<&str>,
+        package: Option<&str>,
+        buildings: Option<&str>,
+        use_carla_materials: Option<bool>,
+        kerb_height: Option<f64>,
+        verge_width: Option<f64>,
+    ) -> PyResult<Vec<String>> {
+        let config = self.carla_config(
+            name,
+            package,
+            buildings,
+            use_carla_materials,
+            kerb_height,
+            verge_width,
+        )?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(roadgen_carla::check(map, &config))
+    }
+
     /// The GPUDrive scene as a JSON string, with the same arguments as
     /// `export_gpudrive`.
     #[pyo3(signature = (
@@ -1294,6 +1414,54 @@ impl PyMap {
         Ok(config)
     }
 
+    /// The CARLA package configuration, with everything the caller left out taken
+    /// from the map.
+    #[allow(clippy::too_many_arguments)]
+    fn carla_config(
+        &mut self,
+        name: Option<&str>,
+        package: Option<&str>,
+        buildings: Option<&str>,
+        use_carla_materials: Option<bool>,
+        kerb_height: Option<f64>,
+        verge_width: Option<f64>,
+    ) -> PyResult<roadgen_carla::PackageConfig> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let mut config = match name {
+            Some(name) => roadgen_carla::PackageConfig::new(name),
+            None => roadgen_carla::PackageConfig::for_map(map),
+        };
+        if let Some(package) = package {
+            config = config.with_package(package);
+        }
+        if let Some(buildings) = buildings {
+            config.buildings = match buildings.to_ascii_lowercase().as_str() {
+                "in_map" | "map" | "in-map" => roadgen_carla::BuildingPlacement::InMap,
+                "props" | "prop" => roadgen_carla::BuildingPlacement::Props,
+                "omitted" | "none" | "off" => roadgen_carla::BuildingPlacement::Omitted,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "`{other}` is not a place to put buildings: `in_map` stands \
+                         them in the level and lets CARLA tag them Terrain, `props` \
+                         has them tagged Buildings and not placed, `omitted` leaves \
+                         them out"
+                    )))
+                }
+            };
+        }
+        if let Some(use_carla_materials) = use_carla_materials {
+            config.use_carla_materials = use_carla_materials;
+        }
+        if let Some(kerb_height) = kerb_height {
+            config.surfaces.kerb_height = kerb_height;
+        }
+        if let Some(verge_width) = verge_width {
+            config.surfaces.verge_width = verge_width;
+        }
+        Ok(config)
+    }
+
     /// The scene configuration the GPUDrive methods share: the map's own defaults, the
     /// scenario file over them, and the arguments over that.
     #[allow(clippy::too_many_arguments)]
@@ -1387,6 +1555,20 @@ fn render_gpudrive(path: PathBuf) -> PyResult<String> {
         .to_svg())
 }
 
+/// Draws the FBX at `path` — the one `export_carla` wrote.
+///
+/// Coloured by the semantic class CARLA will give each mesh, worked out from the
+/// mesh's *name* by the same substring match CARLA's own import uses. So a mesh drawn
+/// in the wrong colour is one that will segment wrongly in the simulator, and the
+/// picture is the only place that is visible before the map is loaded.
+#[pyfunction]
+#[pyo3(name = "render_carla")]
+fn render_carla(path: PathBuf) -> PyResult<String> {
+    Ok(roadgen_viewer::fbx_file(&path)
+        .map_err(runtime_error)?
+        .to_svg())
+}
+
 /// The names of the built-in building rule sets.
 #[pyfunction]
 fn building_presets() -> Vec<String> {
@@ -1437,6 +1619,7 @@ fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(render_sumo, module)?)?;
     module.add_function(wrap_pyfunction!(render_clipgt, module)?)?;
     module.add_function(wrap_pyfunction!(render_gpudrive, module)?)?;
+    module.add_function(wrap_pyfunction!(render_carla, module)?)?;
     module.add_function(wrap_pyfunction!(building_presets, module)?)?;
     module.add_function(wrap_pyfunction!(building_rules, module)?)?;
     Ok(())

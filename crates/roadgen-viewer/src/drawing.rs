@@ -56,7 +56,10 @@ impl Mark {
 /// so an area lands under the lines that bound it and a device on top of everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
-    /// A building's footprint, as an area. First, so that everything the road
+    /// Ground: a verge, a patch of terrain. First of all, because everything else
+    /// in a map stands on it.
+    Terrain,
+    /// A building's footprint, as an area. Early, so that everything the road
     /// network is made of is drawn over the town rather than under it.
     Building,
     /// A junction's extent, as an area.
@@ -65,6 +68,9 @@ pub enum Kind {
     /// which is not everywhere: GPUDrive's map is centrelines and has no widths at
     /// all, so its picture has no surface under them.
     Surface,
+    /// A pavement, a kerb, a gutter: the made ground beside the carriageway that is
+    /// not part of it. Over the surface, because a kerb stands on the road it edges.
+    Sidewalk,
     /// The edge of the drivable surface, painted or not.
     Boundary,
     /// A painted line between lanes.

@@ -2,8 +2,8 @@
 
 Generate 3D road networks — with a town beside them, if you want one — and write the
 same network out as **OpenDRIVE**, as an **Autoware-ready Lanelet2** map, as plain
-**OpenStreetMap**, as a **SUMO** network, as a **ClipGT** clip for NVIDIA Cosmos, and
-as a **GPUDrive** scene.
+**OpenStreetMap**, as a **SUMO** network, as a **CARLA UE5 asset package**, as a
+**ClipGT** clip for NVIDIA Cosmos, and as a **GPUDrive** scene.
 
 This is a generator, not a converter. Nothing here parses an existing HD map: you
 describe roads, lanes, junctions and the movements between them, and the library
@@ -40,6 +40,7 @@ m.export_opendrive("map.xodr")
 m.export_lanelet2("map.osm")
 m.export_osm("openstreetmap.osm")
 m.export_sumo("sumo/")
+m.export_carla("Import/")       # .fbx + .xodr + the descriptor CARLA imports
 m.export_clipgt("clip/")
 m.export_gpudrive("scene.json")
 ```
@@ -69,6 +70,7 @@ m.export_gpudrive("scene.json")
                      ├──▶ Lanelet2       map.osm             `simple_lanelet2`
                      ├──▶ OpenStreetMap  plain .osm          `ll2-io`
                      ├──▶ SUMO           .nod/.edg/.con.xml  `quick-xml` + netconvert
+                     ├──▶ CARLA          .fbx + .xodr        `roadgen-opendrive`
                      ├──▶ ClipGT         .parquet layers     `arrow`/`parquet`
                      └──▶ GPUDrive       scene .json         `serde_json`
 
@@ -228,6 +230,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
 | `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
 | `gpudrive_warnings(scenario=None)` | what a GPUDrive export would lose, and what its scene runs up against |
+| `carla_warnings(name=, package=, buildings=, ...)` | what a CARLA package cannot carry, and what its import will get wrong quietly |
 | `osm_warnings()` | what a plain OpenStreetMap export would lose |
 | `sumo_warnings()` | what a SUMO export would lose |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
@@ -236,9 +239,11 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
+| `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=)` | write a CARLA UE5 package; returns what was written and what each mesh will be tagged |
+| `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
-| `render_opendrive(path)` / `render_sumo(directory)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
+| `render_opendrive(path)` / `render_sumo(directory)` / `render_carla(path)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
 | `building_presets()` / `building_rules(name=None)` | the built-in rule sets, and one of them as text to edit |
 
 The `render_*` functions are module-level rather than methods on `Map`, because they
@@ -581,6 +586,7 @@ part/high_street/left/3/0/1        ← the one standing on it
 | --- | --- |
 | **OpenStreetMap** | [Simple 3D Buildings](https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings): the outline as a closed `building=<kind>` way, a `building:part=yes` way per part where there is more than one, with `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and `roof:direction`. The solid survives; the frontage, a sloping base and the union of several parts' outlines do not, and `check` says so. |
 | **OpenDRIVE** | one `<object type="building">` carrying an `<outline>` per part, corners as `<cornerLocal>`. The massing survives; the roof shape does not, and `format_warnings()` says how many were flattened. |
+| **CARLA** | actual walls and roofs, from `Solid::shell()`. The whole solid survives — it is the only export that draws the roof rather than describing it — but CARLA's import will tag it `Terrain` unless the town is exported as [props](#where-the-town-goes-and-why-it-is-a-choice), in which case it is tagged and not placed. |
 | Lanelet2, SUMO, ClipGT, GPUDrive | nothing; each one's warnings say how many were dropped. |
 
 OSM measures a roof's direction clockwise from north, as a bearing; the IR measures it
@@ -831,6 +837,223 @@ netconvert generates the phases, because the IR holds no signal timing to write.
   the generated configuration turns off netconvert's offset normalisation so that it
   stays that way — the same coordinates as the other four exports.
 
+## CARLA
+
+[CARLA](https://carla.org/) is a driving simulator built on Unreal Engine. A map in it
+is **two files that have to agree**: an `.fbx` holding the surface the sensors see, and
+an `.xodr` holding the road network the traffic drives. This writes both, plus the
+descriptor CARLA's importer reads and a manifest naming the textures.
+
+```python
+m.export_carla("Import/", name="Town01")
+for warning in m.carla_warnings(name="Town01"):
+    print(warning)
+roadgen.fetch_textures("Import/Town01")     # optional; see Textures below
+```
+
+```text
+Import/
+├── Town01Package.json          what CARLA's Import.py reads
+└── Town01/
+    ├── Town01.fbx              the surface
+    ├── Town01.xodr             the road network — same name, which CARLA insists on
+    └── Textures/
+        ├── polyhaven.json      what to fetch, and where each file goes
+        └── CREDITS.md
+```
+
+The `.fbx` and the `.xodr` share a name because CARLA requires it in three separate
+places: `Import.py` pairs them by name when it generates a descriptor itself, it copies
+the `.xodr` to `Content/<Package>/Maps/<name>/OpenDrive/<name>.xodr` so that the level
+and its road network agree, and `UOpenDrive::LoadXODR` finds the file by the level's own
+name at runtime. The `.xodr` is written by the OpenDRIVE exporter rather than by this
+one — two writers for one format would be two chances to disagree about the map CARLA
+drives and the map it draws.
+
+### A tag is a mesh name
+
+This is the thing worth knowing about CARLA before writing anything for it, and it is
+not in the documentation — it is in `MoveAssetsCommandlet.cpp`.
+
+**CARLA's semantic segmentation does not read a mesh, a material or a property.** It
+reads the *folder* the imported asset ended up in:
+
+```text
+  /Game/<Package>/Static/<Folder>/<Map>/<Mesh>
+   0     1         2       3        4      5
+                           ▲
+                           └── ATagger::GetLabelByPath reads this, and only this
+```
+
+and the import puts an asset in a folder by matching its **name** against six
+substrings. So the name of a mesh inside the FBX *is* its semantic ground truth,
+spelled at one remove. The grammar is RoadRunner's, which is what CARLA was built
+against:
+
+```text
+  <mapName>_<meshType>_<meshSubtype>_<ordinal>
+```
+
+| What roadgen writes | Folder | Tag | Stencil |
+| --- | --- | --- | --- |
+| `Town01_Road_Road_0` | `Road` | `Roads` | 1 |
+| `Town01_Road_Marking_0` | `RoadLine` | `RoadLines` | 24 |
+| `Town01_Road_Sidewalk_0` | `SideWalk` | `Sidewalks` | 2 |
+| `Town01_Road_Curb_0` | `SideWalk` | `Sidewalks` | 2 |
+| `Town01_Road_Gutter_0` | `SideWalk` | `Sidewalks` | 2 |
+| `Town01_Terrain_Ground_0` | `Terrain` | `Terrain` | 10 |
+
+Get it wrong and nothing fails. The mesh imports, the map loads, the camera renders —
+and the pavements come back labelled as ground. `Map.carla_warnings()` exists mostly
+for this, and so does the [picture](#which-viewer-draws-what): the CARLA panel is
+coloured by running each mesh name back through CARLA's own classifier, so a mesh drawn
+in the wrong colour is one that will segment wrongly in the simulator.
+
+Three things found by reading the commandlets rather than the documentation, each of
+which will quietly ruin a map, and each of which `carla_warnings()` reports:
+
+- **The match is `Contains`, in a fixed order, and `Terrain` is tested bare and third.**
+  Every mesh name begins with the map's name — so a *map* called `TerrainTown` puts its
+  pavements, kerbs and gutters in the Terrain folder, and keeps its road surface,
+  because `Road_Road` is tested first. It is exactly the kind of failure that survives
+  a screenshot.
+- **Anything unrecognised becomes Terrain.** The classifier's last arm is not "leave it
+  alone", it is `Terrain`. A typo in a mesh name does not fail to import; it segments as
+  ground.
+- **`light` and `sign` are rejected outright.** `ValidateStaticMesh` drops any mesh
+  whose name — or whose *material's* name — contains either word, case-insensitively,
+  before it is placed. A road called `Sign Street` takes its whole surface with it, and
+  nothing is logged.
+
+### The surface
+
+Six classes, from the cross-section the generator already produced — the real one, lane
+by lane, sampled along the reference line, so a road that tapers or gains a lane is
+measured where it actually is:
+
+```text
+   grass        pavement          road surface         pavement       grass
+  ┌──────┐┌───────────────┐┌─────┬─────────────┬─────┐┌────────────┐┌──────┐
+  │verge ││   sidewalk    ││gut- │   driving   │gut- ││  sidewalk  ││verge │
+  │      ││               ││ ter │             │ ter ││            ││      │
+  └──────┘└───────────────┘└─────┴─────────────┴─────┘└────────────┘└──────┘
+            ▲             ╲                           ╱             ▲
+            │              ╲ curb                curb ╱             │
+            └─ raised by the kerb height ──────────────┘            └─ Terrain
+```
+
+A lane whose type is `sidewalk` is raised by the kerb height, which puts a vertical face
+between it and the surface beside it — that face is the **curb**, and the strip of road
+at the foot of it is the **gutter**, split off the outermost part of the carriageway the
+way a real one is. Neither is a lane in the IR and neither should be: they are what a
+*surface* has and a road network does not. Painted lines are geometry rather than
+texture — a broken line is a strip per dash, cut by arc length so that a three-metre
+dash is three metres however the sampler laid its vertices.
+
+Beyond the outermost band is a **verge**: grass, for as far as the road network can
+honestly say anything about the land, following the road's own elevation. There is no
+landscape past it, and there should not be — a road network says nothing about the shape
+of the country it runs through, and generating hills here would be inventing a terrain
+model rather than deriving one. CARLA's editor is where a map gets terrain.
+
+### Where the town goes, and why it is a choice
+
+CARLA's map import has exactly six names in it. `UMoveAssetsCommandlet` sorts a map's
+meshes into `Road`, `RoadLine`, `SideWalk` and `Terrain` and nothing else, and then
+`UPrepareAssetsForCookingCommandlet` places into the world exactly what it finds in
+those four folders. **A building can be in the map or correctly tagged, and the import
+pipeline will not do both.**
+
+```python
+m.export_carla("Import/", buildings="in_map")   # the default
+m.export_carla("Import/", buildings="props")
+m.export_carla("Import/", buildings="omitted")
+```
+
+| | In the level | Tagged |
+| --- | --- | --- |
+| `in_map` | yes | `Terrain` (10) |
+| `props` | no | `Buildings` (3) |
+
+`in_map` is the default, because a CARLA map with no town in it is not a town, and a
+wrong label on a building is recoverable in the editor while a missing town is a
+re-export. `props` writes a second `.fbx` and declares it in the descriptor's `props`
+array with `tag: "Building"` — which is the one place in the whole pipeline where a tag
+is *stated* rather than spelled into a mesh name.
+
+### Textures
+
+The surfaces are scanned PBR materials from [Poly Haven](https://polyhaven.com),
+published under CC0, so a generated town can ship with photographic surfaces and no
+licence attached to them.
+
+**Nothing is fetched while exporting.** An exporter that reached for the network could
+not run offline, could not run in CI and could not run in the browser — and the
+[demo page](#the-demo-page) runs this crate compiled to WebAssembly. So the package
+*references* its textures and carries a manifest saying exactly which Poly Haven asset,
+at which resolution, belongs at which path; `roadgen.fetch_textures(folder)` reads that
+manifest and downloads them.
+
+A package with no textures in it is still a complete, importable CARLA package: every
+material carries a flat colour that stands in for its texture. And CARLA replaces them
+all anyway when `use_carla_materials` is on, which it is by default — its road materials
+are built for its lighting and its sensors, and a map that wears them looks like the
+maps it will be benchmarked against. Pass `use_carla_materials=False` to see the
+package's own.
+
+Lane markings have no texture and are not meant to: a painted line is flat white or flat
+yellow, its edge comes from the geometry, and scanned paint would tile visibly down a
+straight line. The two marking materials are colours — and `M_RoadMarking_Yellow` is
+named that way on purpose, because `PrepareAssetsForCooking` picks CARLA's yellow lane
+material for the slot whose name holds `Yellow`.
+
+The slugs in the manifest are the ones roadgen was written against, and Poly Haven's
+catalogue is theirs to change. A slug that has gone is reported by name rather than
+guessed at, and the manifest is JSON in the package: swapping one is editing a file.
+
+### Coordinates, which is the part that can silently be wrong
+
+Three conventions have to line up and only two of them are roadgen's.
+
+**roadgen** is right-handed: x east, y north, z up, metres. **CARLA and Unreal** are
+left-handed — `carla::geom::RightHandedVector3D` says so in as many words, and
+`MapBuilder.cpp` negates the y of every OpenDRIVE point it parses under a comment
+reading `Unreal Y axis hack`. **Unreal's FBX importer** closes the gap: with
+`bConvertScene` set, which CARLA's import settings do set, it converts the frame the
+file declares into Unreal's, negating Y on the way.
+
+So the mesh is written in roadgen's own frame, unflipped, and declared Z-up
+right-handed; the importer flips it, CARLA flips the `.xodr` the same way, and the two
+land on top of each other. Flipping Y here as well would flip it twice, and a map
+mirrored about its own centreline is a map whose roads all turn the wrong way — which
+looks plausible enough in a screenshot to survive a review. Units are metres, declared
+as such, and CARLA's importer scales them into Unreal's centimetres itself.
+
+The FBX is written in **text** rather than binary. Binary FBX is smaller and imports
+faster; it also needs DEFLATE for its array records and ends in an undocumented footer
+block the SDK checks. Text needs neither, so this crate has no compression dependency,
+no magic constants, and produces a file that can be opened in an editor and diffed when
+a map comes out wrong.
+
+### What it cannot carry
+
+`Map.carla_warnings()` reports all of it. Beyond the tagging traps above and whichever
+trade the town was exported under:
+
+- **A junction is written once per movement through it.** A junction in the IR is a
+  connector road per turn, and each carries its own carriageway, so the middle of a
+  junction is coplanar with itself and will z-fight. CARLA's own maps have a single
+  junction surface, which a road network has no way to describe.
+- **Traffic lights and signs are in the `.xodr` and not in the mesh.** That is the right
+  way round — CARLA spawns its own from the OpenDRIVE, and a mesh named for one would be
+  dropped by `ValidateStaticMesh` anyway — but nothing in the surface marks where they
+  stand.
+- **Crosswalks are not painted.** A crossing is an object in the IR rather than a lane
+  boundary, and this exporter paints boundaries.
+- **Roughness maps are fetched but not wired up.** FBX's material model is Phong, which
+  has a shininess exponent and no roughness map. The files are in the package for a
+  material rebuilt in the editor.
+
 ## ClipGT
 
 ClipGT is the scene format NVIDIA's Cosmos world-scenario tooling reads: a directory
@@ -1028,7 +1251,8 @@ An editor on the left, a viewer on the right. Write roadgen, press Run, and the 
 fills with what the script wrote; the switch above it flips between the formats — in
 the same frame, so what changes is the format and nothing else. That is the argument
 the rest of this README makes, made in one screen: one description of a road network,
-six files, and what each format could and could not carry written under each picture.
+seven exports, and what each format could and could not carry written under each
+picture.
 
 Whichever format is showing, its files are listed under the switch with their sizes, a
 `source` toggle and a `save` button, so the bytes behind the picture are a click away.
@@ -1054,7 +1278,7 @@ which is what makes it possible to change one line and watch one format.
 | Export | Drawn by | Why |
 | --- | --- | --- |
 | Lanelet2, OpenStreetMap | [Leaflet](https://leafletjs.com/) and [osmtogeojson](https://github.com/tyrasd/osmtogeojson) | Both are OSM XML in latitudes and longitudes. A map library already knows what to do with that, and puts the result on the Earth rather than on a blank sheet. |
-| OpenDRIVE, SUMO, ClipGT, GPUDrive | `roadgen-viewer`, in this repository | There is no off-the-shelf browser viewer for these that an Apache-2.0 project can ship. |
+| OpenDRIVE, SUMO, CARLA, ClipGT, GPUDrive | `roadgen-viewer`, in this repository | There is no off-the-shelf browser viewer for these that an Apache-2.0 project can ship. |
 
 `roadgen-viewer` reads the **written file** — with the same libraries that wrote it,
 and never the IR — and draws it as SVG. That is what makes the pictures worth looking
@@ -1064,7 +1288,7 @@ in the wheel, so a notebook can draw an export too:
 ```python
 from IPython.display import SVG
 m.export_opendrive("map.xodr")
-SVG(roadgen.render_opendrive("map.xodr"))       # or render_sumo, render_clipgt, render_gpudrive
+SVG(roadgen.render_opendrive("map.xodr"))       # or render_sumo, render_carla, render_clipgt, render_gpudrive
 ```
 
 OpenDRIVE is the interesting one to draw. It does not hold a road as a shape: it
@@ -1168,6 +1392,7 @@ roadgen/
 │   │   ├── id/              typed identifiers
 │   │   └── validation/      UnvalidatedMap → ValidatedMap
 │   ├── roadgen-buildings/   a town beside the roads, from a CGA shape grammar
+│   ├── roadgen-carla/       meshes, FBX and the package CARLA UE5 imports
 │   ├── roadgen-opendrive/   lowering onto the `opendrive` crate
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers

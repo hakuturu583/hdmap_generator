@@ -1,0 +1,19 @@
+[package]
+name = "roadgen-carla"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto a CARLA UE5 asset package: FBX meshes, the package descriptor and the OpenDRIVE beside them"
+
+[dependencies]
+roadgen-core.workspace = true
+roadgen-opendrive.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+roadgen-buildings.workspace = true
+tempfile.workspace = true

@@ -23,7 +23,7 @@ WORK = "/work"
 
 #: The order the panels come out in: the map formats first, the scene formats after,
 #: because a scene is a map plus something driving through it.
-ORDER = ["OpenDRIVE", "Lanelet2", "OpenStreetMap", "SUMO", "ClipGT", "GPUDrive"]
+ORDER = ["OpenDRIVE", "Lanelet2", "OpenStreetMap", "SUMO", "CARLA", "ClipGT", "GPUDrive"]
 
 
 def run(code):
@@ -134,7 +134,14 @@ def _directory(path):
 
 def _file(path):
     if path.endswith(".xodr"):
+        # A CARLA package holds one of these too, beside its .fbx. It is the same
+        # OpenDRIVE and the same picture, so the package's panel is the FBX and this
+        # one is left to the export a script wrote on its own.
+        if _in_carla_package(path):
+            return []
         return [_drawn("OpenDRIVE", path, roadgen.render_opendrive)]
+    if path.endswith(".fbx"):
+        return [_drawn("CARLA", path, roadgen.render_carla, files=_carla_package(path))]
     if path.endswith(".osm"):
         return [_osm(path)]
     if path.endswith(".json"):
@@ -148,11 +155,41 @@ def _file(path):
     return []
 
 
-def _drawn(format_, path, render):
+def _carla_package(path):
+    """The files of the CARLA package an .fbx belongs to, as the panel lists them.
+
+    A CARLA map is not one file: the mesh is only half of it, and a reader who cannot
+    see the .xodr and the descriptor beside it cannot see whether the export is a map
+    or a model. Listed rather than walked, so the textures — hundreds of megabytes,
+    once fetched — do not fill the panel.
+    """
+    folder = os.path.dirname(path)
+    stem = os.path.splitext(path)[0]
+    wanted = [path, stem + ".xodr"]
+    wanted += [
+        os.path.join(os.path.dirname(folder), name)
+        for name in sorted(os.listdir(os.path.dirname(folder) or "."))
+        if name.endswith(".json")
+    ]
+    wanted += [os.path.join(folder, "Textures", "polyhaven.json")]
+    return [_entry(one) for one in wanted if os.path.isfile(one)]
+
+
+def _in_carla_package(path):
+    """Whether an .xodr is the one beside a CARLA package's mesh.
+
+    By looking, rather than by knowing where the exporter puts things: a CARLA map is
+    an .fbx and an .xodr of the same name in one folder, and that is the whole test.
+    """
+    stem = os.path.splitext(path)[0]
+    return os.path.exists(stem + ".fbx")
+
+
+def _drawn(format_, path, render, files=None):
     try:
-        return _view(format_, path, svg=render(path))
+        return _view(format_, path, svg=render(path), files=files)
     except Exception as exception:
-        return _view(format_, path, error=str(exception))
+        return _view(format_, path, error=str(exception), files=files)
 
 
 def _osm(path):
@@ -177,14 +214,21 @@ def _osm(path):
     )
 
 
-def _view(format_, path, svg=None, note=None, error=None):
+def _view(format_, path, svg=None, note=None, error=None, files=None):
     """One panel's worth of answer.
 
     The picture is either an SVG the viewer drew, or nothing — in which case the page
     draws the file itself and `note` is what there is to say about it.
+
+    `files` is what the panel lists under the switch. It defaults to the export — one
+    file, or a directory's contents — and is given explicitly where an export is
+    neither: a CARLA package is a mesh, a road network and a descriptor spread across
+    two folders.
     """
     relative = os.path.relpath(path, WORK)
-    if os.path.isdir(path):
+    if files is not None:
+        contents = sorted(files, key=lambda entry: entry["path"])
+    elif os.path.isdir(path):
         contents = sorted(
             (_entry(os.path.join(path, name)) for name in os.listdir(path)),
             key=lambda entry: entry["path"],

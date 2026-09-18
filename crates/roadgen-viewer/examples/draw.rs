@@ -11,7 +11,7 @@ use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: draw <map.xodr | scene.json | sumo/ | clip/>");
+        eprintln!("usage: draw <map.xodr | scene.json | map.fbx | sumo/ | clip/>");
         std::process::exit(2);
     };
     let path = Path::new(&path);
@@ -27,6 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .is_some_and(|extension| extension == "json")
     {
         roadgen_viewer::gpudrive_file(path)?
+    } else if path.extension().is_some_and(|extension| extension == "fbx") {
+        roadgen_viewer::fbx_file(path)?
     } else {
         roadgen_viewer::opendrive_file(path)?
     };

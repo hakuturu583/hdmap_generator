@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/roadgen-core",
     "crates/roadgen-buildings",
+    "crates/roadgen-carla",
     "crates/roadgen-opendrive",
     "crates/roadgen-lanelet2",
     "crates/roadgen-clipgt",
@@ -25,6 +26,7 @@ homepage = "https://github.com/hakuturu583/hdmap_generator"
 [workspace.dependencies]
 roadgen-core = { path = "crates/roadgen-core", version = "0.1.0" }
 roadgen-buildings = { path = "crates/roadgen-buildings", version = "0.1.0" }
+roadgen-carla = { path = "crates/roadgen-carla", version = "0.1.0" }
 roadgen-opendrive = { path = "crates/roadgen-opendrive", version = "0.1.0" }
 roadgen-lanelet2 = { path = "crates/roadgen-lanelet2", version = "0.1.0" }
 roadgen-clipgt = { path = "crates/roadgen-clipgt", version = "0.1.0" }
