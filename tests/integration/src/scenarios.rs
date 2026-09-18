@@ -254,27 +254,35 @@ pub fn merge() -> ValidatedMap {
 
 /// 7. A four-way crossroads: four two-way approaches, every turn enumerated.
 pub fn crossroads() -> ValidatedMap {
-    let mut builder = MapBuilder::new(metadata("crossroads"));
+    finish(crossroads_builder("crossroads", 70.0))
+}
+
+/// The same crossroads, with arms `reach` metres long, before it is finished.
+///
+/// Long arms are what give a test frontages worth generating on; taking the builder
+/// back is what lets a caller add to the map before it is validated.
+pub fn crossroads_builder(name: &str, reach: f64) -> MapBuilder {
+    let mut builder = MapBuilder::new(metadata(name));
     // Each approach points at the centre, so all four meet at their `End`.
     let arms = [
         (
             "north",
-            Point3::new(0.0, 70.0, 0.0),
+            Point3::new(0.0, reach, 0.0),
             Point3::new(0.0, 14.0, 0.0),
         ),
         (
             "east",
-            Point3::new(70.0, 0.0, 0.0),
+            Point3::new(reach, 0.0, 0.0),
             Point3::new(14.0, 0.0, 0.0),
         ),
         (
             "south",
-            Point3::new(0.0, -70.0, 0.0),
+            Point3::new(0.0, -reach, 0.0),
             Point3::new(0.0, -14.0, 0.0),
         ),
         (
             "west",
-            Point3::new(-70.0, 0.0, 0.0),
+            Point3::new(-reach, 0.0, 0.0),
             Point3::new(-14.0, 0.0, 0.0),
         ),
     ];
@@ -298,7 +306,7 @@ pub fn crossroads() -> ValidatedMap {
                 .unwrap();
         }
     }
-    finish(builder)
+    builder
 }
 
 /// 8. A road that climbs, then levels off, then climbs again.

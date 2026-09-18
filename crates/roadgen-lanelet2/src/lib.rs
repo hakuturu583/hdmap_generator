@@ -94,6 +94,15 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = Vec::new();
     let config = map.metadata.sampling;
 
+    if !map.buildings.is_empty() {
+        problems.push(format!(
+            "Lanelet2 describes the road and what governs it, not what stands beside \
+             it, so the map's {} buildings ({} parts) are not written",
+            map.buildings.len(),
+            map.building_parts.len()
+        ));
+    }
+
     // An MGRS map has to fit inside one 100 km square. Checking the corners of every
     // lane is enough to find a map that does not, and says so before the export turns
     // it into a file whose far end is in the wrong place.

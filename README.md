@@ -1,8 +1,9 @@
 # roadgen
 
-Generate 3D road networks, and write the same network out as **OpenDRIVE**, as an
-**Autoware-ready Lanelet2** map, as plain **OpenStreetMap**, as a **SUMO** network,
-as a **ClipGT** clip for NVIDIA Cosmos, and as a **GPUDrive** scene.
+Generate 3D road networks — with a town beside them, if you want one — and write the
+same network out as **OpenDRIVE**, as an **Autoware-ready Lanelet2** map, as plain
+**OpenStreetMap**, as a **SUMO** network, as a **ClipGT** clip for NVIDIA Cosmos, and
+as a **GPUDrive** scene.
 
 This is a generator, not a converter. Nothing here parses an existing HD map: you
 describe roads, lanes, junctions and the movements between them, and the library
@@ -34,6 +35,7 @@ b = m.add_road(
     ],
 )
 m.connect(a, b)
+m.generate_buildings()          # a town along every frontage, from a shape grammar
 m.export_opendrive("map.xodr")
 m.export_lanelet2("map.osm")
 m.export_osm("openstreetmap.osm")
@@ -57,8 +59,8 @@ m.export_gpudrive("scene.json")
        │             │             │
        └─────────────┼─────────────┘
                      ▼
-              Canonical Road IR
-                     │
+              Canonical Road IR ◀──── roadgen-buildings ◀── CGA shape grammar
+                     │                                        `symbios-shape`
                  validate()
                      ▼
                 ValidatedMap
@@ -76,6 +78,12 @@ m.export_gpudrive("scene.json")
 Every exporter reads a `ValidatedMap` and writes nothing back into it: what a format
 cannot hold comes back to the caller through that exporter's `check()`, never as a
 field in the IR.
+
+`roadgen-buildings` is the one arrow pointing *into* the IR, and it is a generator
+rather than an exporter — it reads roads and writes [buildings](#buildings), the
+same way the builder reads a `RoadSpec` and writes lanes. It runs after generation
+and before validation, because a lot is measured against geometry that does not exist
+until the first and buildings are part of what the second checks.
 
 The arrow at the bottom goes the other way, and is the only one that does.
 `roadgen-viewer` reads the **written files** — never the IR — so a picture it draws
@@ -96,7 +104,9 @@ Four separations are load-bearing, and each is a module of `roadgen-core`:
   banked by a superelevation profile.
 - **Semantics** (`semantics`) is lane types, speed limits, markings, traffic lights,
   stop lines, crosswalks and right of way, as IR concepts. No OpenDRIVE `<signal>`
-  and no Lanelet2 `RegulatoryElement` appears in the IR.
+  and no Lanelet2 `RegulatoryElement` appears in the IR. A **building** is not one of
+  these — it means nothing to traffic — so it lives in `buildings` with an arena and
+  an identifier of its own.
 - **Physical encoding** lives in the exporter crates, which depend on the core and
   are never depended upon by it.
 
@@ -160,6 +170,7 @@ roadgen-opendrive = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-lanelet2 = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-clipgt = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-osm = { git = "https://github.com/hakuturu583/hdmap_generator" }
+roadgen-buildings = { git = "https://github.com/hakuturu583/hdmap_generator" }
 ```
 
 ```rust
@@ -180,7 +191,10 @@ let b = builder.add_road(
 )?;
 builder.connect(&a, &b)?;
 
-let map = builder.finish()?.validate()?;
+let mut map = builder.finish()?;
+roadgen_buildings::generate(&mut map, &roadgen_buildings::Rules::default())?;
+
+let map = map.validate()?;
 roadgen_opendrive::write(&map, "map.xodr")?;
 roadgen_lanelet2::write(&map, "map.osm")?;
 roadgen_osm::write(&map, "openstreetmap.osm")?;
@@ -207,6 +221,9 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `connect(a, b, junction=None, ends=("end", "start"))` | joins two roads by the named ends, pairing lanes |
 | `connect_lanes(from_lane, to_lane, junction=None)` | one specific movement |
 | `add_stop_line`, `add_traffic_light`, `add_traffic_sign`, `add_crosswalk` | road furniture |
+| `generate_buildings(enabled=True, rules=None, seed=0)` | a town beside the roads, on or off, by the rules you give it |
+| `building_ids()`, `building_kind(id)`, `building_frontage(id)`, `building_parts(id)` | what it generated |
+| `building_footprint(part)`, `building_part_shape(part)`, `building_part_kind(part)`, `building_shell(part)` | one part's outline, its heights and roof, what it is, and the faces that bound it |
 | `add_traffic_light_rule`, `add_right_of_way`, `add_speed_limit` | rules over lanes |
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
 | `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
@@ -222,6 +239,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 | `render_opendrive(path)` / `render_sumo(directory)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
+| `building_presets()` / `building_rules(name=None)` | the built-in rule sets, and one of them as text to edit |
 
 The `render_*` functions are module-level rather than methods on `Map`, because they
 read the **file** and not the map. Drawing the IR would agree with the IR by
@@ -374,6 +392,209 @@ written as the German catalogue's three-colour light (`1000001`) — the value O
 tooling expects in a generated map, and one a caller with another catalogue can rewrite
 after export.
 
+## Buildings
+
+Off by default. Switched on, every road grows two frontages of lots and a **CGA shape
+grammar** — the CityEngine formalism, derived by
+[`symbios-shape`](https://crates.io/crates/symbios-shape) — decides what stands on
+each one.
+
+```python
+m.generate_buildings()                        # on, a mixed town street
+m.generate_buildings(rules="downtown")        # on, one of the built-in sets
+m.generate_buildings(rules=text, seed=7)      # on, rules of your own
+m.generate_buildings(False)                   # off
+```
+
+That is the whole of the Python surface: whether to, and by what rules. Everything
+else — how wide a lot is, how far back from the kerb, how many storeys — is *in* the
+rules, because the alternative is a dozen keyword arguments that mean nothing without
+the grammar they go with.
+
+### The division of labour
+
+Two questions have to be answered to put a building somewhere, and they are different
+questions.
+
+**Where may a building stand?** That one is about the road network, so roadgen answers
+it. The road surface is taken from the generated cross-section — the real one, lane by
+lane, sampled along the reference line, so a road that tapers or gains a lane is
+measured where it actually is — widened by the setback, and cut into lots along each
+frontage. Nothing is placed in the middle of a block: the middle of a block is gardens,
+yards and the backs of the buildings on the next street, and inventing masses there
+would be inventing a land-use map rather than deriving one.
+
+**What stands there?** That one is architecture, so the grammar answers it. Each lot
+arrives as a rectangle on the ground — local **X** along the frontage, **Y** up, **Z**
+away from the road, so the face `Comp(Faces)` calls `Front` is the one looking at the
+street — and what comes back is a set of oriented boxes.
+
+Then roadgen has the last word: a lot whose buildings would reach into a road or onto
+a neighbour is dropped whole, so a gap in a street is a gap and never half a house.
+
+### The rules
+
+One piece of text. Derivation starts at the rule called `Lot`, and the word a mass is
+emitted with becomes the building's kind:
+
+```text
+attr Setback = 5             // kerb to lot, metres
+attr LotWidth = 15           // frontage per lot
+attr LotDepth = 18           // how far back a lot reaches
+attr LotGap = 4              // left clear between neighbours
+attr CornerClearance = 12    // left clear at each end of a frontage
+attr FloorHeight = 3.2       // what a storey is, for the storey count
+
+Lot     --> Size(scope.x - 2, 0, scope.z - 2) Center(XZ) Plot
+Plot    --> 45% House | 30% Terrace | 15% Shop | else: Block
+
+// A pitched roof is the top of the mass, split off and given a shape.
+House   --> Extrude(rand(6, 9)) Split(Y) { ~1: Walls | 2.5: Gable }
+Walls   --> I("house")
+Gable   --> Roof(Gable, height=scope.y) { Slope: Tiles | GableEnd: Wall }
+Terrace --> Split(X) { ~1: Unit | ~1: Unit }
+Unit    --> Extrude(rand(6.5, 8.5)) Split(Y) { ~1: Party | 2: Gable }
+Party   --> I("terrace")
+Shop    --> Extrude(FloorHeight * 2) I("retail")
+Block   --> Extrude(FloorHeight * rand(3, 5)) I("apartments")
+```
+
+`//` is CGA's line comment, and `#` is accepted beside it because rules are usually
+written inside a Python string and `#` is what the hand reaches for there.
+
+Those six `attr` declarations are the numbers roadgen needs, read back out of the
+grammar rather than passed beside it — so there is one thing to edit, and a rule can
+read `LotDepth` and set a footprint against it. Undeclared ones keep their defaults,
+and every one of them is readable from the grammar either way: a knob that only
+worked once you had declared it would be a knob with a trap in it.
+
+Everything else is ordinary CGA: `Extrude`, `Split`, `Repeat`, `Comp(Faces)`,
+`ShapeL`, `Roof`, weighted and guarded variants, `rand()` and `scope.x` in any
+numeric position. [`symbios-shape`'s
+README](https://github.com/TheJanusStream/symbios-shape) is the reference.
+
+One idiom is worth knowing, because a lot arrives flat: `Size(scope.x - 2, 0,
+scope.z - 2) Center(XZ)` is how you leave a margin round the edge of a plot.
+`Offset(-2)` is CGA's inset, and it wants a scope with height — on a footprint,
+whose `Y` extent is zero until `Extrude` runs, it refuses.
+
+`building_presets()` lists the four built-in sets — `town`, `suburban`, `downtown`,
+`industrial` — and `building_rules(name)` hands one back as text, so rules of your own
+start as a preset with a line changed rather than as a blank page.
+
+### The model
+
+A building is not a shape. It is a **complex feature**: a set of **parts**, what they
+are for, and what they stand beside. That is the same relationship a road has to its
+lanes, and it is kept the same way — the building lists its parts, each part names its
+building, and both live in arenas keyed by identifier.
+
+```
+Building        parts, kind, frontage
+  └── Part      solid, kind, levels
+        └── Solid    footprint, wall_height, roof
+              └── Roof   shape, height, direction
+```
+
+Each part is a **solid**, not an outline with a number bolted on:
+
+- its **footprint** is a ring whose vertices carry their own heights, so a part that
+  starts partway up a building says so with nothing extra, and one on sloping ground
+  is on sloping ground;
+- its **walls** rise from that ring;
+- its **roof** is flat, skillion, gabled, hipped or pyramidal, with a rise and — where
+  the shape has a ridge — the direction it runs in.
+
+A part carries a `kind` of its own where it has one: a tower of offices standing on a
+shopping podium is one building, and neither word describes both halves of it.
+
+`Solid::shell()` hands back the faces that bound it: the base, one quad per wall, and
+the roof. Every edge of that surface is used by exactly two faces, which is what makes
+it a solid rather than a pile of panels, and `Solid::is_closed()` is that property
+written down where it can be checked. The compact form is what the IR stores because it
+is what every format asks for; the shell is what it means. In Python,
+`building_shell(part)` returns it.
+
+**Frontage** is the third piece, and it is a *relationship* rather than a coordinate:
+which road the building faces, which side of it, and how far along. It says nothing
+about where the building is — the geometry does that, completely — and everything about
+what it belongs to. The OpenDRIVE export reads it instead of searching for the nearest
+road, and a caller who wants the buildings of one street has a way to ask.
+
+### What counts as one building
+
+A derivation is a flat list of boxes and panels, and most grammars produce more of them
+than there are buildings. Three rules turn one into the other, and each is about what a
+box *is* rather than what it was called:
+
+- a box with extent on all three axes is a **mass**: one on the lot's ground starts a
+  building, one standing on another mass is a further **part** of that building. So a
+  stack of floors, a tower on a podium and a wing behind a house come out as one
+  building of several parts — and two masses side by side on the ground come out as
+  two buildings, which is what a terrace is;
+- a box with no thickness is a **panel**. Panels sitting on a part's eaves are its
+  **roof**;
+- anything standing over nothing is dropped, because there is no part to give it.
+
+A facade's windows fall out of this on their own: `Comp(Faces)` produces scopes with no
+thickness, and a window stands against a wall rather than on the eaves, so it is
+neither a part nor a roof.
+
+### Reading a roof
+
+The grammar knows fifteen roof types; the IR has words for five, because those are the
+five a consumer can be told about — they are OSM's `roof:shape` values. What is read
+back is **geometry**, not the grammar's vocabulary: the ridge is where the roof is
+highest, and the shape follows from where that ridge lies over the part it covers.
+
+| The highest points of the roof | The shape |
+| --- | --- |
+| one point | `pyramidal` |
+| a line down the middle, spanning the part | `gabled` |
+| a line down the middle, stopping short of the ends | `hipped` |
+| a line along one side | `skillion` |
+
+So `Roof(Pyramid, …)` over an oblong reads back as **hipped**, because what the engine
+draws there has a ridge and what has a ridge is a hip. That is the point of reading
+geometry: the word follows the shape rather than the other way round.
+
+A roof that is none of the five — an M-shape has two ridges, a mansard a flat top —
+is not called the nearest one. It becomes the flat top of the volume that contains it:
+the massing stays right, and only the word for the shape is missing.
+
+### A town is a pure function
+
+The rules, the map and the seed decide the town, every time. Each lot is seeded from
+its **own identity** rather than from a running counter, so adding a street changes
+that street's buildings and leaves every other one exactly as it was — the same
+property the [identifiers](#identifiers) have, for the same reason:
+
+```
+building/high_street/left/3/0
+part/high_street/left/3/0/0        ← the part that meets the ground
+part/high_street/left/3/0/1        ← the one standing on it
+```
+
+### Where they end up
+
+| Format | What it does with a building |
+| --- | --- |
+| **OpenStreetMap** | [Simple 3D Buildings](https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings): the outline as a closed `building=<kind>` way, a `building:part=yes` way per part where there is more than one, with `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and `roof:direction`. The solid survives; the frontage, a sloping base and the union of several parts' outlines do not, and `check` says so. |
+| **OpenDRIVE** | one `<object type="building">` carrying an `<outline>` per part, corners as `<cornerLocal>`. The massing survives; the roof shape does not, and `format_warnings()` says how many were flattened. |
+| Lanelet2, SUMO, ClipGT, GPUDrive | nothing; each one's warnings say how many were dropped. |
+
+OSM measures a roof's direction clockwise from north, as a bearing; the IR measures it
+anticlockwise from east, as an angle. That conversion is the whole of the difference
+between them, and it happens in the exporter where it belongs.
+
+The OpenDRIVE outline is `cornerLocal` rather than `cornerRoad` on purpose. Both would
+place the corners; only the first keeps them rigid. A `cornerRoad` corner is its own
+`(s, t)` pair, so beside a bend a straight wall is written as a curved one and a
+consumer evaluating the file back gets a banana. `cornerLocal` measures every corner in
+one frame — the road's, at the building's own station — so the shape that comes back is
+the shape that went in. The [viewer](#which-viewer-draws-what) draws every part from
+those outlines, which is why a town shows up in the OpenDRIVE picture and in no other.
+
 ## Coordinates
 
 A map's own x and y are always metres about its origin — that is what makes a generated
@@ -428,6 +649,14 @@ OSM describes a road as **one way down the centreline** with the lanes as a *cou
 or **`-1`** — the last for a road whose every lane runs against the reference line,
 which is why the way's node order follows that line rather than being reversed for
 convenience.
+
+[Buildings](#buildings) go out as **Simple 3D Buildings**: the outline as a closed
+`building=<kind>` way, a `building:part=yes` way per part where there is more than one,
+and `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and
+`roof:direction` saying what each occupies. This is the one part of the export that
+loses nothing, because OSM has a model for a building of several parts and the IR has
+the same one. Terraced buildings share their corner nodes, which is welding doing for a
+terrace what it does for two roads meeting at a junction.
 
 Furniture goes on the way's own nodes, which is where OSM puts it:
 `highway=traffic_signals`, `highway=stop`, `highway=crossing` and `traffic_sign=<the
@@ -843,6 +1072,12 @@ holds a reference line as a chain of lines, arcs and clothoids, and every lane a
 polynomial width measured sideways from it. So the picture is *evaluated* rather than
 read, which means it goes wrong in exactly the ways the geometry can — and a lane
 that lands in the wrong place on the page is a lane in the wrong place in the file.
+It is also the only one of the four that draws [buildings](#buildings), because it is
+the only one of the four whose format has anywhere to put them. Every *part* is drawn,
+not just the outline: a wing behind a house and a tower set back on a podium are both
+things you would see from above. An object with no outline is not drawn at all —
+OpenDRIVE lets one say "a building, this wide and this long", and a box inferred from
+two numbers is a guess rather than a footprint.
 
 Everything is a plan view. The heights, the grades and the superelevation are in the
 files and not on the screen, and every drawing says so in its own description — one
@@ -929,8 +1164,10 @@ roadgen/
 │   │   ├── topology/        connectivity
 │   │   ├── geometry/        3D curves, alignments, frames, profiles, sampling
 │   │   ├── semantics/       lane types, rules, markings, objects
+│   │   ├── buildings/       footprints, heights, storeys
 │   │   ├── id/              typed identifiers
 │   │   └── validation/      UnvalidatedMap → ValidatedMap
+│   ├── roadgen-buildings/   a town beside the roads, from a CGA shape grammar
 │   ├── roadgen-opendrive/   lowering onto the `opendrive` crate
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers

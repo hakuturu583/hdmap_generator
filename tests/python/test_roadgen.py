@@ -5,8 +5,10 @@ every result comes from the Rust core, and there is no second model of the map o
 this side.
 """
 
+import collections
 import itertools
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -1182,3 +1184,256 @@ def test_drawing_a_file_that_is_not_the_format_says_so(tmp_path):
     path.write_text("<not-opendrive/>")
     with pytest.raises(RuntimeError):
         roadgen.render_opendrive(str(path))
+
+
+# --------------------------------------------------------------------------- #
+# Buildings
+# --------------------------------------------------------------------------- #
+
+
+def street(name="high", length=400.0):
+    m = roadgen.Map(name="town", origin=(35.6586, 139.7454, 0.0))
+    m.add_road(
+        start=(0.0, 0.0, 0.0), end=(length, 0.0, 0.0), lanes=two_way(), name=name,
+    )
+    return m
+
+
+def test_buildings_are_off_until_they_are_asked_for():
+    m = street()
+    assert m.building_ids() == []
+    m.generate_buildings()
+    assert len(m.building_ids()) > 0
+
+
+def test_buildings_can_be_switched_back_off():
+    m = street()
+    m.generate_buildings()
+    assert m.building_ids()
+    m.generate_buildings(False)
+    assert m.building_ids() == []
+
+
+def test_every_preset_can_be_named_and_its_text_read_back():
+    presets = roadgen.building_presets()
+    assert "town" in presets and "downtown" in presets
+    for name in presets:
+        text = roadgen.building_rules(name)
+        assert "Lot" in text and "-->" in text
+        m = street()
+        m.generate_buildings(rules=name)
+        assert m.building_ids(), name
+        # The text a preset hands back is the preset: generating from either
+        # names the same buildings.
+        by_text = street()
+        by_text.generate_buildings(rules=text)
+        assert by_text.building_ids() == m.building_ids()
+    # With no name, the set `generate_buildings()` uses when none is given.
+    assert roadgen.building_rules() == roadgen.building_rules("town")
+
+
+def test_rules_of_your_own_decide_what_gets_built():
+    m = street()
+    m.generate_buildings(rules="""
+attr LotWidth = 20
+attr LotDepth = 12
+attr LotGap = 5
+Lot --> Extrude(FloorHeight * 4) I("library")
+""")
+    ids = m.building_ids()
+    assert ids
+    for identifier in ids:
+        assert m.building_kind(identifier) == "library"
+        parts = m.building_parts(identifier)
+        assert len(parts) == 1
+
+        base, wall, roof, roof_height, _, levels = m.building_part_shape(parts[0])
+        # FloorHeight was not declared, so it is the default 3.2.
+        assert wall == pytest.approx(12.8)
+        assert levels == 4
+        # Nothing asked for a roof, so there is none and the walls are the whole of it.
+        assert roof == "flat"
+        assert roof_height == 0.0
+        # A 20 x 12 lot, whichever way round the frontage runs.
+        footprint = m.building_footprint(parts[0])
+        assert len(footprint) == 4
+        sides = sorted(
+            round(math.dist(footprint[i][:2], footprint[(i + 1) % 4][:2]), 3)
+            for i in range(4)
+        )
+        assert sides == pytest.approx([12.0, 12.0, 20.0, 20.0])
+
+
+def test_a_building_is_a_solid_and_says_which_road_it_faces():
+    m = street()
+    m.generate_buildings()
+    for identifier in m.building_ids():
+        road, side, station = m.building_frontage(identifier)
+        assert road == "road/high"
+        assert side in ("left", "right")
+        assert 0.0 <= station <= 400.0
+
+        for part in m.building_parts(identifier):
+            base, wall, _, roof_height, _, levels = m.building_part_shape(part)
+            assert wall > 0.0 and levels >= 1
+
+            shell = m.building_shell(part)
+            outline = m.building_footprint(part)
+            # A base, a wall per side, and at least one roof face.
+            assert len(shell) >= len(outline) + 2, shell
+
+            # The solid closes: every edge is shared by exactly two faces. This is
+            # the whole difference between a building and a pile of panels.
+            edges = collections.Counter()
+            for face in shell:
+                assert len(face) >= 3
+                for i in range(len(face)):
+                    a = tuple(round(v, 6) for v in face[i])
+                    b = tuple(round(v, 6) for v in face[(i + 1) % len(face)])
+                    edges[tuple(sorted((a, b)))] += 1
+            assert set(edges.values()) == {2}, edges.most_common(3)
+
+            zs = [pt[2] for face in shell for pt in face]
+            assert min(zs) == pytest.approx(base)
+            assert max(zs) == pytest.approx(base + wall + roof_height)
+
+
+def test_a_pitched_roof_says_its_shape_its_rise_and_its_ridge():
+    m = street()
+    m.generate_buildings()
+    pitched = [
+        (b, p)
+        for b in m.building_ids()
+        for p in m.building_parts(b)
+        if m.building_part_shape(p)[2] != "flat"
+    ]
+    assert pitched, "the default rules should pitch some roofs"
+
+    for _, part in pitched:
+        _, _, shape, roof_height, direction, _ = m.building_part_shape(part)
+        assert shape in ("skillion", "gabled", "hipped", "pyramidal")
+        assert roof_height > 0.0
+        # A ridge has no front and no back, so it is folded into half a turn.
+        assert 0.0 <= direction < math.pi
+
+
+def test_a_building_of_several_parts_stacks_them():
+    m = roadgen.Map(name="town", origin=(35.6586, 139.7454, 0.0))
+    m.add_road(
+        start=(0.0, 0.0, 0.0), end=(600.0, 0.0, 0.0), lanes=two_way(), name="high",
+    )
+    m.generate_buildings(rules="downtown", seed=2)
+
+    stacked = [b for b in m.building_ids() if len(m.building_parts(b)) > 1]
+    assert stacked, "downtown should stack something"
+    for identifier in stacked:
+        parts = m.building_parts(identifier)
+        shapes = [m.building_part_shape(p) for p in parts]
+        # Each part starts where the one below it stops.
+        for below, above in zip(shapes, shapes[1:]):
+            assert above[0] == pytest.approx(below[0] + below[1] + below[3], abs=0.5)
+        # The tower is something the podium is not, and says so.
+        assert m.building_part_kind(parts[0]) is None
+        assert m.building_part_kind(parts[1]) == "office"
+
+
+def test_a_grammar_that_does_not_parse_is_refused_where_it_is_written():
+    m = street()
+    with pytest.raises(ValueError) as raised:
+        m.generate_buildings(rules="Lot --> Extrude(")
+    assert "line 1" in str(raised.value)
+    # And a misspelt preset is not silently taken for an empty grammar.
+    with pytest.raises(ValueError) as raised:
+        m.generate_buildings(rules="dowtnown")
+    assert "downtown" in str(raised.value)
+    # Nothing was switched on by either attempt.
+    assert m.building_ids() == []
+
+
+def test_the_same_seed_builds_the_same_town():
+    def build(seed):
+        m = street()
+        m.generate_buildings(seed=seed)
+        return [
+            (i, m.building_kind(i), [m.building_part_shape(p) for p in m.building_parts(i)])
+            for i in m.building_ids()
+        ]
+
+    assert build(5) == build(5)
+    assert build(5) != build(6)
+
+
+def test_no_building_stands_in_the_road():
+    m = street()
+    m.generate_buildings()
+    # Two 3.5 m lanes and the default 5 m setback: nothing may come nearer the
+    # reference line than 8.5 m — and every part is checked, not just the one on
+    # the ground.
+    for identifier in m.building_ids():
+        for part in m.building_parts(identifier):
+            for x, y, z in m.building_footprint(part):
+                assert abs(y) >= 8.5 - 1e-6
+
+
+def test_buildings_reach_openstreetmap_and_opendrive(tmp_path):
+    m = street()
+    m.generate_buildings()
+    count = len(m.building_ids())
+
+    osm = ET.fromstring(m.to_osm_xml())
+
+    def tagged(key):
+        return [
+            way
+            for way in osm.findall("way")
+            if any(tag.get("k") == key for tag in way.findall("tag"))
+        ]
+
+    ways = tagged("building")
+    assert len(ways) == count
+    for way in ways:
+        refs = [node.get("ref") for node in way.findall("nd")]
+        # A closed way: the first node is also the last.
+        assert refs[0] == refs[-1]
+        tags = {tag.get("k"): tag.get("v") for tag in way.findall("tag")}
+        assert float(tags["height"]) > 0.0
+        assert int(tags["building:levels"]) >= 1
+        if "roof:shape" in tags:
+            assert float(tags["roof:height"]) > 0.0
+
+    xodr = ET.fromstring(m.to_opendrive_xml())
+    objects = [
+        obj
+        for road in xodr.findall("road")
+        for obj in road.findall("objects/object")
+        if obj.get("type") == "building"
+    ]
+    assert len(objects) == count
+    for obj, identifier in zip(objects, m.building_ids()):
+        # One outline per part, each a ring of local corners.
+        outlines = obj.findall("outlines/outline")
+        assert len(outlines) == len(m.building_parts(obj.get("name")))
+        for outline in outlines:
+            assert len(outline.findall("cornerLocal")) >= 3
+
+
+def test_a_format_that_cannot_hold_a_building_says_so():
+    m = street()
+    m.generate_buildings()
+    for warnings in (m.sumo_warnings(), m.clipgt_warnings(), m.gpudrive_warnings(),
+                     m.format_warnings()):
+        assert any("buildings" in warning for warning in warnings)
+    # And a map without them is not told they were dropped.
+    plain = street()
+    assert not any("buildings" in warning for warning in plain.sumo_warnings())
+
+
+def test_the_opendrive_picture_shows_the_town(tmp_path):
+    m = street()
+    m.generate_buildings()
+    m.export_opendrive(tmp_path / "map.xodr")
+    svg = roadgen.render_opendrive(str(tmp_path / "map.xodr"))
+    assert "rg-building" in svg
+    # A plan view draws every part, so the count is of parts and not of buildings.
+    parts = sum(len(m.building_parts(b)) for b in m.building_ids())
+    assert f"{parts} building parts, drawn from the outlines" in svg

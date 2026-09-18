@@ -289,6 +289,15 @@ pub fn check(map: &ValidatedMap, config: Option<&SceneConfig>) -> Vec<String> {
             .to_owned(),
     ];
 
+    if !map.buildings.is_empty() {
+        problems.push(format!(
+            "a GPUDrive scene is roads and agents, so the map's {} buildings ({} parts) \
+             are not written",
+            map.buildings.len(),
+            map.building_parts.len()
+        ));
+    }
+
     if !map.connections.is_empty() {
         problems.push(format!(
             "a GPUDrive scene holds no lane topology, so the map's {} lane connections \

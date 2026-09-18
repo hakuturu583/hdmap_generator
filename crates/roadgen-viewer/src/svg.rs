@@ -234,7 +234,8 @@ fn legend(svg: &mut String, kinds: &[Kind], columns: usize, top: f64, width: f64
         match kind {
             // A swatch for something drawn as an area or a point is that shape, not a
             // line of it: a legend that lied about the shape would be worse than none.
-            Kind::Junction
+            Kind::Building
+            | Kind::Junction
             | Kind::Surface
             | Kind::Crosswalk
             | Kind::Agent
@@ -282,6 +283,7 @@ fn legend(svg: &mut String, kinds: &[Kind], columns: usize, top: f64, width: f64
 /// a page that wants to hide the markings or highlight the tracks can.
 fn class(kind: Kind) -> String {
     match kind {
+        Kind::Building => "rg-building".into(),
         Kind::Junction => "rg-junction".into(),
         Kind::Surface => "rg-surface".into(),
         Kind::Boundary => "rg-boundary".into(),
@@ -311,6 +313,7 @@ fn class(kind: Kind) -> String {
 
 fn label(kind: Kind) -> &'static str {
     match kind {
+        Kind::Building => "building",
         Kind::Junction => "junction",
         Kind::Surface => "lane surface",
         Kind::Boundary => "road boundary",
@@ -350,6 +353,8 @@ const STYLE: &str = "<style>\
 .roadgen-view{font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif}\
 .roadgen-view :where(polyline,polygon,line,rect)\
 {stroke-linejoin:round;stroke-linecap:round}\
+.rg-building{fill:var(--rg-building-fill,rgba(120,113,108,.22));\
+stroke:var(--rg-building,#78716c);stroke-width:.6}\
 .rg-junction{fill:var(--rg-junction-fill,rgba(37,99,235,.10));\
 stroke:var(--rg-junction,#60a5fa);stroke-width:1}\
 .rg-surface{fill:var(--rg-surface,rgba(100,116,139,.16));\

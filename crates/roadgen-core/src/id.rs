@@ -80,6 +80,12 @@ define_id!(
 define_id!(
     /// Identifies a map object such as a traffic light or a stop line.
     ObjectId, "object");
+define_id!(
+    /// Identifies a building, e.g. `building/north/left/3`.
+    BuildingId, "building");
+define_id!(
+    /// Identifies one massing part of a building, e.g. `part/north/left/3/0`.
+    BuildingPartId, "part");
 
 impl LaneId {
     /// The identifier of lane number `index` of `road`.
@@ -108,6 +114,22 @@ impl LaneId {
             .strip_prefix("lane/")
             .unwrap_or_else(|| self.as_str())
             .replace('/', "_")
+    }
+}
+
+impl BuildingId {
+    /// The part after the `building/` prefix.
+    pub fn local_name(&self) -> &str {
+        self.as_str()
+            .strip_prefix("building/")
+            .unwrap_or_else(|| self.as_str())
+    }
+}
+
+impl BuildingPartId {
+    /// The identifier of part number `index` of `building`.
+    pub fn of_building(building: &BuildingId, index: usize) -> Self {
+        BuildingPartId::new(format!("{}/{}", building.local_name(), index))
     }
 }
 
@@ -154,6 +176,16 @@ mod tests {
         assert_eq!(
             ConnectionId::between(Some(&junction), &from, &to).to_string(),
             "connection/j0/north_0/east_0"
+        );
+    }
+
+    #[test]
+    fn a_buildings_parts_are_named_after_it() {
+        let building = BuildingId::new("high_street/left/3");
+        assert_eq!(building.to_string(), "building/high_street/left/3");
+        assert_eq!(
+            BuildingPartId::of_building(&building, 1).to_string(),
+            "part/high_street/left/3/1"
         );
     }
 

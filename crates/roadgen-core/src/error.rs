@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::id::{ConnectionId, JunctionId, LaneId, RoadId};
+use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, RoadId};
 
 /// Something that cannot be expressed as geometry.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +21,8 @@ pub enum GeometryError {
     DisjointSegments { gap: f64 },
     /// The sampling step has to be a positive, finite number of metres.
     InvalidSampling { max_segment_length: f64 },
+    /// A closed ring encloses no area, so it is a line rather than a polygon.
+    ZeroArea,
 }
 
 impl fmt::Display for GeometryError {
@@ -48,6 +50,9 @@ impl fmt::Display for GeometryError {
                 f,
                 "the maximum segment length must be positive and finite, got {max_segment_length}"
             ),
+            GeometryError::ZeroArea => {
+                f.write_str("the ring encloses no area, so it is a line and not a polygon")
+            }
         }
     }
 }
@@ -221,6 +226,21 @@ pub enum ValidationIssue {
         road: RoadId,
         radians: f64,
     },
+    /// A building names a part that is not on the map.
+    DanglingBuildingPartReference {
+        referrer: String,
+        part: BuildingPartId,
+    },
+    /// A building is not composed of what a building is composed of.
+    ImplausibleBuilding {
+        building: BuildingId,
+        detail: String,
+    },
+    /// A part's solid is not one a building could be made of.
+    ImplausibleBuildingPart {
+        part: BuildingPartId,
+        detail: String,
+    },
     Geometry {
         detail: String,
     },
@@ -272,6 +292,15 @@ impl fmt::Display for ValidationIssue {
                 "road {road} is banked by {:.1} degrees; beyond 45 the cross-section                  is no longer a road surface",
                 radians.to_degrees()
             ),
+            ValidationIssue::DanglingBuildingPartReference { referrer, part } => {
+                write!(f, "{referrer} refers to missing building part {part}")
+            }
+            ValidationIssue::ImplausibleBuilding { building, detail } => {
+                write!(f, "building {building}: {detail}")
+            }
+            ValidationIssue::ImplausibleBuildingPart { part, detail } => {
+                write!(f, "building part {part}: {detail}")
+            }
             ValidationIssue::Geometry { detail } => write!(f, "geometry error: {detail}"),
         }
     }

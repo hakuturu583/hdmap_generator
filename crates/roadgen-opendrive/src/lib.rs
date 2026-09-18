@@ -15,8 +15,33 @@
 //!   traffic sign      → <signals>/<signal> with <validity>
 //!   Stop line,
 //!   crosswalk         → <objects>/<object>
+//!   Building          → <objects>/<object type="building"> with an <outline> per part
 //!   Right of way      → <junction>/<priority>
 //! ```
+//!
+//! # Buildings, which belong to no road
+//!
+//! Every OpenDRIVE object hangs off a `<road>` and is placed in that road's own
+//! `(s, t)` coordinates. A building hangs off nothing: it stands on the ground, and
+//! the road it happens to be beside is a fact about the map rather than about the
+//! building. The IR records that fact as a
+//! [`Frontage`](roadgen_core::buildings::Frontage), so the exporter reads which road
+//! a building faces instead of searching for the nearest one — and falls back to
+//! searching only for a building that was put on the map without one.
+//!
+//! A building of several parts becomes one object with an `<outlines>` of several
+//! `<outline>`s, one per part, each corner carrying its own `z` for where the part
+//! starts and its own `height` for how far the walls rise. That is the whole of the
+//! IR's massing. What OpenDRIVE has no way to say is the *roof*: there is no ridge
+//! in an outline, so a pitched roof is written as the height it reaches and nothing
+//! more, and [`check`] says how many were flattened that way.
+//!
+//! The outline is written as `<cornerLocal>`, not `<cornerRoad>`. Both would place
+//! the corners; only the first keeps them rigid. A `cornerRoad` corner is its own
+//! `(s, t)` pair, so beside a bend a straight wall is written as a curved one, and a
+//! consumer evaluating the file back gets a banana. `cornerLocal` measures every
+//! corner in one frame — the road's, at the building's own station — so the shape
+//! that comes back is the shape that went in.
 //!
 //! Format-specific decisions stay on this side of the boundary. OpenDRIVE's numeric
 //! ids, its insistence that `s` be measured in the xy-plane, and its rule that a
@@ -55,11 +80,13 @@ use opendrive::lane::speed::Speed as LaneSpeed;
 use opendrive::lane::width::Width;
 use opendrive::lane::Lane as OdLane;
 use opendrive::object::corner::Corner;
+use opendrive::object::corner_local::CornerLocal;
 use opendrive::object::corner_road::CornerRoad;
 use opendrive::object::lane_validity::LaneValidity;
 use opendrive::object::objects::Objects;
 use opendrive::object::orientation::{ObjectType, Orientation};
 use opendrive::object::outline::Outline;
+use opendrive::object::outlines::Outlines;
 use opendrive::object::Object;
 use opendrive::road::element_type::ElementType;
 use opendrive::road::geometry::arc::Arc as OdArc;
@@ -88,9 +115,10 @@ use uom::si::f64::{Angle, Curvature, Length};
 use uom::si::length::meter;
 use vec1::Vec1;
 
+use roadgen_core::buildings::{Building, BuildingPart};
 use roadgen_core::geometry::{Curve3, Point3, Sample};
 use roadgen_core::id::ObjectId;
-use roadgen_core::id::{JunctionId, LaneId, RoadId};
+use roadgen_core::id::{BuildingId, JunctionId, LaneId, RoadId};
 use roadgen_core::map::{Lane, Map, Projection, Road, TrafficHandedness};
 use roadgen_core::semantics::{
     LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType,
@@ -150,6 +178,23 @@ pub fn write(map: &ValidatedMap, path: impl AsRef<Path>) -> Result<(), ExportErr
 /// the boundary.
 pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = Vec::new();
+
+    // An `<outline>` is a ring of corners with a height each. There is no ridge in
+    // it, so a roof that has one cannot be written and the volume it encloses is all
+    // that survives.
+    let pitched = map
+        .building_parts
+        .iter()
+        .filter(|part| part.solid.roof.height > 0.0)
+        .count();
+    if pitched > 0 {
+        problems.push(format!(
+            "an object outline is a ring of corner heights and has no ridge in it, so \
+             the {pitched} pitched roofs are written as the height they reach and not \
+             as the shape they are"
+        ));
+    }
+
     for lane in map.lanes.iter() {
         let in_junction = map
             .road(&lane.road)
@@ -185,6 +230,8 @@ struct Numbering {
     junctions: HashMap<JunctionId, String>,
     lanes: HashMap<LaneId, i64>,
     objects: HashMap<ObjectId, String>,
+    /// Buildings share the object id space, numbered after the furniture.
+    buildings: HashMap<BuildingId, String>,
 }
 
 impl Numbering {
@@ -211,11 +258,16 @@ impl Numbering {
         for (index, object) in map.objects.iter().enumerate() {
             objects.insert(object.id.clone(), index.to_string());
         }
+        let mut buildings = HashMap::new();
+        for (index, building) in map.buildings.iter().enumerate() {
+            buildings.insert(building.id.clone(), (map.objects.len() + index).to_string());
+        }
         Numbering {
             roads,
             junctions,
             lanes,
             objects,
+            buildings,
         }
     }
 }
@@ -223,13 +275,26 @@ impl Numbering {
 struct Exporter<'a> {
     map: &'a Map,
     numbering: Numbering,
+    /// The buildings each road is written against, in the map's own order.
+    ///
+    /// Resolving one is a search when it names no frontage, so every building is
+    /// resolved once for the whole map rather than once for every road it is not on.
+    buildings: HashMap<RoadId, Vec<&'a Building>>,
 }
 
 impl<'a> Exporter<'a> {
     fn new(map: &'a ValidatedMap) -> Self {
+        let map = map.as_map();
+        let mut buildings: HashMap<RoadId, Vec<&Building>> = HashMap::new();
+        for building in map.buildings.iter() {
+            if let Some(road) = owning_road_of(map, building) {
+                buildings.entry(road.id.clone()).or_default().push(building);
+            }
+        }
         Exporter {
-            numbering: Numbering::new(map.as_map()),
-            map: map.as_map(),
+            numbering: Numbering::new(map),
+            buildings,
+            map,
         }
     }
 
@@ -1054,6 +1119,11 @@ impl<'a> Exporter<'a> {
             };
             objects.push(entry);
         }
+        for building in self.buildings.get(&road.id).into_iter().flatten() {
+            if let Some(entry) = self.building_object(road, building)? {
+                objects.push(entry);
+            }
+        }
         if objects.is_empty() {
             return Ok(None);
         }
@@ -1114,6 +1184,148 @@ impl<'a> Exporter<'a> {
             }
         }
         Ok(priorities)
+    }
+
+    /// One building, as an object carrying an outline per part.
+    ///
+    /// `None` when the road has no geometry to measure against, which leaves the
+    /// building out of the file rather than putting it in the wrong place.
+    fn building_object(
+        &self,
+        road: &Road,
+        building: &Building,
+    ) -> Result<Option<Object>, ExportError> {
+        let parts = self.map.parts_of(&building.id);
+        let Some(centre) = building_centre(&parts) else {
+            return Ok(None);
+        };
+        let Some(position) = road_coordinates::locate(self.map, road, centre) else {
+            return Ok(None);
+        };
+        // One frame for the whole building, taken at its own station: that is what
+        // makes the corners rigid and keeps its parts in line with each other, and it
+        // is why `hdg` below is zero.
+        //
+        // The plan view's frame, not the road surface's. OpenDRIVE's `s` is measured
+        // in the xy-plane and a `u`/`v` pair lives in that plane too, so the heading
+        // here is the reference line's *horizontal* heading and the banking is left
+        // out of it: a building is not on the road surface, and measuring it along a
+        // surface tilted for a bend would put the wall somewhere the wall is not.
+        let Ok(sample) = road
+            .reference_line
+            .sample_at(position.s, self.map.metadata.sampling)
+        else {
+            return Ok(None);
+        };
+        let origin = sample.point;
+        let heading = sample.tangent.heading();
+        let (cos, sin) = (heading.cos(), heading.sin());
+        let plan = |point: Point3| -> [f64; 3] {
+            let (dx, dy) = (point.x - origin.x, point.y - origin.y);
+            [
+                dx * cos + dy * sin,
+                -dx * sin + dy * cos,
+                point.z - origin.z,
+            ]
+        };
+        let pivot = plan(centre);
+
+        let mut outlines = Vec::with_capacity(parts.len());
+        for (index, part) in parts.iter().enumerate() {
+            let corners: Vec<Corner> = part
+                .solid
+                .footprint
+                .points()
+                .iter()
+                .enumerate()
+                .map(|(corner, point)| {
+                    let local = plan(*point);
+                    Corner::Local(CornerLocal {
+                        // The walls, and then whatever the roof adds on top of them:
+                        // OpenDRIVE has one number for how tall a corner is, so the
+                        // shape of the roof goes and its height stays.
+                        height: Length::new::<meter>(
+                            part.solid.wall_height + part.solid.roof.height,
+                        ),
+                        id: Some(corner as u64),
+                        u: Length::new::<meter>(local[0] - pivot[0]),
+                        v: Length::new::<meter>(local[1] - pivot[1]),
+                        z: Length::new::<meter>(local[2] - pivot[2]),
+                    })
+                })
+                .collect();
+            let Ok(choice) = Vec1::try_from_vec(corners) else {
+                continue;
+            };
+            outlines.push(Outline {
+                closed: Some(true),
+                fill_type: None,
+                id: Some(index as u64),
+                lane_type: None,
+                outer: Some(true),
+                choice,
+                additional_data: AdditionalData::default(),
+            });
+        }
+        let Ok(outline) = Vec1::try_from_vec(outlines) else {
+            return Ok(None);
+        };
+
+        let top = parts
+            .iter()
+            .map(|part| part.solid.top_height())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let ground = parts
+            .iter()
+            .map(|part| part.solid.base_height())
+            .fold(f64::INFINITY, f64::min);
+
+        Ok(Some(Object {
+            dynamic: Some(false),
+            hdg: Some(Angle::new::<radian>(0.0)),
+            height: Some(Length::new::<meter>(top - ground)),
+            id: self.building_id(&building.id)?.to_owned(),
+            length: None,
+            name: Some(building.id.to_string()),
+            orientation: Some(Orientation::None),
+            perp_to_road: None,
+            pitch: None,
+            radius: None,
+            roll: None,
+            s: Length::new::<meter>(position.s),
+            // The word the generator used, which OpenDRIVE's `subtype` is exactly as
+            // free-form as OSM's `building` value.
+            subtype: Some(building.kind.clone()),
+            t: Length::new::<meter>(pivot[1]),
+            r#type: Some(ObjectType::Building),
+            valid_length: None,
+            width: None,
+            z_offset: Length::new::<meter>(pivot[2]),
+            repeat: Vec::new(),
+            // `<outlines>` rather than `<outline>`, because a building is what its
+            // parts add up to and the plural is where the standard puts them.
+            outline: None,
+            outlines: Some(Outlines {
+                outline,
+                additional_data: AdditionalData::default(),
+            }),
+            material: Vec::new(),
+            // A building governs no lanes, so there is nothing for a validity to say.
+            validity: Vec::new(),
+            parking_space: None,
+            markings: None,
+            borders: None,
+            surface: None,
+            additional_data: AdditionalData::default(),
+        }))
+    }
+
+    fn building_id(&self, building: &BuildingId) -> Result<&str, ExportError> {
+        self.numbering
+            .buildings
+            .get(building)
+            .map(String::as_str)
+            .ok_or_else(|| ExportError::Unknown(building.to_string()))
     }
 
     fn object_id(&self, object: &ObjectId) -> Result<&str, ExportError> {
@@ -1231,4 +1443,47 @@ fn lane_type(lane_type: LaneType) -> OdLaneType {
         LaneType::Restricted => OdLaneType::Restricted,
         LaneType::None => OdLaneType::None,
     }
+}
+
+/// The road a building is written against.
+///
+/// The one its frontage names, which is where the generator put it. A building that
+/// came from somewhere else and names no road falls back to the nearest by the
+/// horizontal distance from its centre to a reference line — never a junction
+/// connector, because a connector is one movement through a junction and measuring a
+/// building from it would move the building depending on which turn happened to be
+/// closest.
+fn owning_road_of<'m>(map: &'m Map, building: &Building) -> Option<&'m Road> {
+    if let Some(frontage) = &building.frontage {
+        if let Some(road) = map.roads.get(&frontage.road) {
+            return Some(road);
+        }
+    }
+    let centre = building_centre(&map.parts_of(&building.id))?;
+    let mut best: Option<(&Road, f64)> = None;
+    for road in map.roads.iter() {
+        if road.is_connector() {
+            continue;
+        }
+        let Ok(line) = road.reference_line.to_polyline(map.metadata.sampling) else {
+            continue;
+        };
+        let distance = line
+            .points()
+            .iter()
+            .map(|point| point.horizontal_distance_to(centre))
+            .fold(f64::INFINITY, f64::min);
+        if best.is_none_or(|(_, previous)| distance < previous) {
+            best = Some((road, distance));
+        }
+    }
+    best.map(|(road, _)| road)
+}
+
+/// The middle of the part of a building that meets the ground.
+fn building_centre(parts: &[&BuildingPart]) -> Option<Point3> {
+    parts
+        .iter()
+        .min_by(|a, b| a.solid.base_height().total_cmp(&b.solid.base_height()))
+        .map(|part| part.solid.footprint.centroid())
 }

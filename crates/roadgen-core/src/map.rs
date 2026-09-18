@@ -9,9 +9,10 @@
 use std::collections::HashSet;
 
 use crate::arena::Arena;
+use crate::buildings::{Building, BuildingPart};
 use crate::error::GeometryError;
 use crate::geometry::{Curve3, Point3, Poly3Profile, Polyline3, SamplingConfig, WidthProfile};
-use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
+use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLink, RoadLinkTarget,
@@ -381,6 +382,12 @@ pub struct Map {
     pub connections: Arena<ConnectionId, LaneConnection>,
     pub objects: Arena<ObjectId, MapObject>,
     pub rules: Vec<TrafficRule>,
+    /// What stands beside the road. Empty unless a generator filled it; nothing in
+    /// this crate does.
+    pub buildings: Arena<BuildingId, Building>,
+    /// The massing parts those buildings are made of, held beside them the way lanes
+    /// are held beside roads rather than inside them.
+    pub building_parts: Arena<BuildingPartId, BuildingPart>,
 }
 
 impl Map {
@@ -393,6 +400,8 @@ impl Map {
             connections: Arena::new(),
             objects: Arena::new(),
             rules: Vec::new(),
+            buildings: Arena::new(),
+            building_parts: Arena::new(),
         }
     }
 
@@ -406,6 +415,26 @@ impl Map {
 
     pub fn junction(&self, id: &JunctionId) -> Option<&Junction> {
         self.junctions.get(id)
+    }
+
+    pub fn building(&self, id: &BuildingId) -> Option<&Building> {
+        self.buildings.get(id)
+    }
+
+    pub fn building_part(&self, id: &BuildingPartId) -> Option<&BuildingPart> {
+        self.building_parts.get(id)
+    }
+
+    /// The parts of one building, in the order it lists them.
+    pub fn parts_of(&self, building: &BuildingId) -> Vec<&BuildingPart> {
+        let Some(entry) = self.buildings.get(building) else {
+            return Vec::new();
+        };
+        entry
+            .parts
+            .iter()
+            .filter_map(|part| self.building_parts.get(part))
+            .collect()
     }
 
     /// The stations at which a road's geometry was generated — the stations of the

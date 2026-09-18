@@ -24,6 +24,17 @@ pub fn reparse_opendrive(map: &ValidatedMap) -> OpenDrive {
     OpenDrive::from_xml_str(&xml).expect("an OpenDRIVE parser should accept the export")
 }
 
+/// Exports to OpenDRIVE as a file and draws it, which is what the viewer is for.
+///
+/// The file is written into a temporary directory that lives only as long as the
+/// call: what comes back is the drawing, not the path.
+pub fn redraw_opendrive(map: &ValidatedMap) -> roadgen_viewer::Drawing {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("map.xodr");
+    roadgen_opendrive::write(map, &path).expect("the map should export");
+    roadgen_viewer::opendrive_file(&path).expect("the export should draw")
+}
+
 /// Exports to Lanelet2 and reads the result back with `simple_lanelet2`'s loader.
 pub fn reload_lanelet2(map: &ValidatedMap) -> Arc<LaneletMap> {
     let xml = roadgen_lanelet2::to_osm_xml(map).expect("the map should export as Lanelet2");

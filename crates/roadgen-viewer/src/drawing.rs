@@ -56,6 +56,9 @@ impl Mark {
 /// so an area lands under the lines that bound it and a device on top of everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
+    /// A building's footprint, as an area. First, so that everything the road
+    /// network is made of is drawn over the town rather than under it.
+    Building,
     /// A junction's extent, as an area.
     Junction,
     /// The ground a lane covers. Drawn where the format says how wide a lane is —

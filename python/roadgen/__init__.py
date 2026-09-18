@@ -30,6 +30,22 @@ the Rust core owns, so there is one model of the map and not two.
     m.export_clipgt("clip/")
     m.export_gpudrive("scene.json")
 
+A town can be generated beside the roads, and the only two things to say about
+it are whether to and by what rules:
+
+    m.generate_buildings()                     # on, a mixed town street
+    m.generate_buildings(rules="downtown")     # on, one of the built-in rule sets
+    m.generate_buildings(rules=text, seed=7)   # on, a CGA grammar of your own
+
+`roadgen.building_presets()` lists the built-in sets and `roadgen.building_rules(name)`
+hands one back as text, so rules of your own start as a preset with a line changed.
+
+What comes out is solid rather than flat: a building is made of parts, each with an
+outline, walls that rise from it and a roof, and `building_shell(part)` hands back the
+faces that bound one. They go out with every export whose format has somewhere to put
+them — OpenStreetMap ways and OpenDRIVE objects — and the others say what they
+dropped.
+
 Every export can be drawn back:
 
     svg = roadgen.render_opendrive("map.xodr")
@@ -47,6 +63,8 @@ from ._roadgen import (
     Map,
     Road,
     __version__,
+    building_presets,
+    building_rules,
     render_clipgt,
     render_gpudrive,
     render_opendrive,
@@ -61,6 +79,8 @@ __all__ = [
     "Map",
     "Road",
     "__version__",
+    "building_presets",
+    "building_rules",
     "render_clipgt",
     "render_gpudrive",
     "render_opendrive",

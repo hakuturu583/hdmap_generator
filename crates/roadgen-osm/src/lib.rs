@@ -31,6 +31,24 @@
 //! them becomes a restriction. Extending the arms is the one place this exporter
 //! moves geometry, and it is what makes the result routable: four ways that stop
 //! short of each other are four dead ends.
+//!
+//! # Buildings
+//!
+//! The one thing OSM holds better than any other format here, because OSM has a model
+//! for a building of several parts and the IR has the same one. **Simple 3D
+//! Buildings** is the scheme: the building's outline is a closed way tagged
+//! `building`, each of its parts is a closed way tagged `building:part=yes` inside it,
+//! and `height`, `min_height`, `roof:shape`, `roof:height` and `roof:direction` say
+//! what each one occupies. A building of a single part writes one way and puts all of
+//! that on it, because a reader of a simple building expects to find it there.
+//!
+//! So nearly the whole of the IR's solid survives: the parts, the heights they span,
+//! the roofs and which way their ridges run. What does not is the little the scheme
+//! has no room for — a part standing on sloping ground becomes one `height` above one
+//! ground level, a building of several parts is surrounded by the outline of the part
+//! that meets the ground rather than by their union, and the frontage that says which
+//! street a building faces has no tag at all. [`check`] says each of those rather
+//! than letting the file look like a round trip.
 
 pub mod error;
 pub mod tags;
@@ -139,6 +157,50 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             heights.1 - heights.0
         ));
     }
+    problems.extend(building_losses(map));
+    problems
+}
+
+/// What a building loses, which is only what Simple 3D Buildings has no room for.
+fn building_losses(map: &ValidatedMap) -> Vec<String> {
+    if map.buildings.is_empty() {
+        return Vec::new();
+    }
+    let mut problems = Vec::new();
+    if map
+        .buildings
+        .iter()
+        .any(|building| building.frontage.is_some())
+    {
+        problems.push(
+            "OSM has no tag for which street a building faces, so the frontages are \
+             dropped: the geometry still stands beside the way"
+                .to_owned(),
+        );
+    }
+    let sloping = map
+        .building_parts
+        .iter()
+        .filter(|part| part.solid.footprint.highest() - part.solid.footprint.lowest() > 0.05)
+        .count();
+    if sloping > 0 {
+        problems.push(format!(
+            "`height` and `min_height` are single numbers above one ground level, so \
+             the sloping base of {sloping} parts is written level"
+        ));
+    }
+    let compound = map
+        .buildings
+        .iter()
+        .filter(|building| building.parts.len() > 1)
+        .count();
+    if compound > 0 {
+        problems.push(format!(
+            "a building's outline is one way, so the {compound} buildings of several \
+             parts are surrounded by the outline of the part that meets the ground \
+             rather than by the union of them all"
+        ));
+    }
     problems
 }
 
@@ -230,6 +292,61 @@ impl<'a> Exporter<'a> {
 
         self.add_furniture()?;
         self.add_restrictions();
+        self.add_buildings()?;
+        Ok(())
+    }
+
+    /// Every building, as a closed way, with a way per part where there is more than
+    /// one.
+    ///
+    /// The outline goes down as it stands: OSM wants the ring anticlockwise and
+    /// closed by repeating its first node, and a [`Footprint`](roadgen_core::Footprint)
+    /// is already the first of those and one node short of the second.
+    fn add_buildings(&mut self) -> Result<(), ExportError> {
+        for building in self.map.buildings.iter() {
+            let parts = self.map.parts_of(&building.id);
+            // The building's own outline is the outline of the part that meets the
+            // ground: OSM wants one way around the whole thing, and for a massing
+            // built upwards from a footprint that is the footprint.
+            let Some(lowest) = parts
+                .iter()
+                .min_by(|a, b| a.solid.base_height().total_cmp(&b.solid.base_height()))
+            else {
+                continue;
+            };
+            let ground = lowest.solid.base_height();
+
+            let outline = lowest.solid.footprint.points().to_vec();
+            self.add_closed_way(&outline, tags::building_tags(building, &parts, ground))?;
+            if parts.len() == 1 {
+                continue;
+            }
+            for part in &parts {
+                let ring = part.solid.footprint.points().to_vec();
+                self.add_closed_way(&ring, tags::building_part_tags(part, ground))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A closed way through `ring`, or nothing when too few of its nodes are distinct.
+    ///
+    /// Two buildings in a terrace share the corner nodes between them, which is
+    /// welding doing what it does for roads and is what OSM expects of a terrace.
+    fn add_closed_way(&mut self, ring: &[Point3], tags: Tags) -> Result<(), ExportError> {
+        let mut nodes = Vec::with_capacity(ring.len() + 1);
+        for point in ring {
+            nodes.push(self.node_at(*point)?);
+        }
+        nodes.dedup();
+        if nodes.len() < 3 {
+            return Ok(());
+        }
+        // A closed way is one whose first node is also its last.
+        nodes.push(nodes[0]);
+
+        let id = self.take_id();
+        self.document.ways.insert(id, Way { id, nodes, tags });
         Ok(())
     }
 

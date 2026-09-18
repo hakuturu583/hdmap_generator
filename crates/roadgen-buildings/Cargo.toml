@@ -1,0 +1,13 @@
+[package]
+name = "roadgen-buildings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Generates building footprints beside a roadgen road network, from a CGA shape grammar"
+
+[dependencies]
+roadgen-core.workspace = true
+symbios-shape.workspace = true
