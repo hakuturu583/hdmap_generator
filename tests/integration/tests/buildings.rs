@@ -103,6 +103,14 @@ fn every_building_is_a_solid_made_of_parts() {
             let solid = &part.solid;
             assert!(solid.wall_height > 0.0, "{}", part.id);
             assert!(part.levels >= 1, "{}", part.id);
+            // Storeys are counted in the walls: a gable is not somewhere to stand,
+            // and a part whose roof was counted would say it has one floor too many.
+            let storeys = (solid.wall_height / 3.2).round().max(1.0) as u32;
+            assert_eq!(
+                part.levels, storeys,
+                "{} is {} m of wall under a {} m roof",
+                part.id, solid.wall_height, solid.roof.height
+            );
             // The compact form means a closed surface, and this is it.
             assert!(solid.is_closed(), "{} does not close", part.id);
             let shell = solid.shell();

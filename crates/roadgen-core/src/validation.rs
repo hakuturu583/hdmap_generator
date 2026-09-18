@@ -161,11 +161,24 @@ fn check_buildings(map: &Map, issues: &mut Vec<ValidationIssue>) {
     }
 
     for part in map.building_parts.iter() {
-        if !map.buildings.contains(&part.building) {
-            issues.push(ValidationIssue::ImplausibleBuilding {
+        // Named from both ends or not at all: every consumer reads a building's parts
+        // through its own list, so a part the list leaves out is a part that is on the
+        // map and in none of the files written from it.
+        match map.buildings.get(&part.building) {
+            None => issues.push(ValidationIssue::ImplausibleBuilding {
                 building: part.building.clone(),
                 detail: format!("part {} belongs to no building on this map", part.id),
-            });
+            }),
+            Some(building) if !building.parts.contains(&part.id) => {
+                issues.push(ValidationIssue::ImplausibleBuilding {
+                    building: part.building.clone(),
+                    detail: format!(
+                        "part {} names this building, which does not list it",
+                        part.id
+                    ),
+                })
+            }
+            Some(_) => {}
         }
         let solid = &part.solid;
         if !solid.wall_height.is_finite() || solid.wall_height <= 0.0 {
@@ -193,6 +206,18 @@ fn check_buildings(map: &Map, issues: &mut Vec<ValidationIssue>) {
                      rises is not flat",
                     solid.roof.shape.as_str(),
                     solid.roof.height
+                ),
+            });
+        }
+        // A ridge that runs nowhere: `sin` and `cos` of one turn every vertex of the
+        // roof into a non-finite number, and the exporters write what they are given.
+        if solid.roof.shape.is_directed() && !solid.roof.direction.is_finite() {
+            issues.push(ValidationIssue::ImplausibleBuildingPart {
+                part: part.id.clone(),
+                detail: format!(
+                    "a {} roof pointing {}: a ridge runs in some direction",
+                    solid.roof.shape.as_str(),
+                    solid.roof.direction
                 ),
             });
         }
@@ -655,6 +680,7 @@ mod tests {
     use super::*;
     use crate::builder::{LaneSpec, MapBuilder, RoadSpec};
     use crate::geometry::Point3;
+    use crate::id::{BuildingId, BuildingPartId};
     use crate::topology::Direction;
     use crate::units::PositiveWidth;
 
@@ -909,5 +935,113 @@ mod tests {
         assert!(error.issues.iter().any(
             |issue| matches!(issue, ValidationIssue::RoadEndpointGap { gap, .. } if *gap > 4.0)
         ));
+    }
+
+    /// A map with one road and one building of `parts` parts on it, before validation,
+    /// so a test can break one thing about the building and see what is said.
+    fn map_with_a_building() -> (UnvalidatedMap, BuildingId) {
+        use crate::buildings::{Building, BuildingPart, Footprint, Solid};
+
+        let mut builder = MapBuilder::default();
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    lanes(),
+                )
+                .unwrap()
+                .with_name("a"),
+            )
+            .unwrap();
+        let mut map = builder.finish().unwrap();
+
+        let id = BuildingId::new("high_street/left/0");
+        let part = BuildingPartId::of_building(&id, 0);
+        let footprint = Footprint::new(vec![
+            Point3::new(10.0, 10.0, 0.0),
+            Point3::new(20.0, 10.0, 0.0),
+            Point3::new(20.0, 18.0, 0.0),
+            Point3::new(10.0, 18.0, 0.0),
+        ])
+        .unwrap();
+        map.as_map_mut()
+            .buildings
+            .insert(
+                id.clone(),
+                Building {
+                    id: id.clone(),
+                    parts: vec![part.clone()],
+                    kind: "house".to_owned(),
+                    frontage: None,
+                },
+            )
+            .unwrap();
+        map.as_map_mut()
+            .building_parts
+            .insert(
+                part.clone(),
+                BuildingPart {
+                    id: part,
+                    building: id.clone(),
+                    solid: Solid::prism(footprint, 6.0),
+                    kind: None,
+                    levels: 2,
+                },
+            )
+            .unwrap();
+        (map, id)
+    }
+
+    #[test]
+    fn a_part_its_building_does_not_list_is_a_part_no_file_would_carry() {
+        let (mut map, id) = map_with_a_building();
+        map.as_map_mut()
+            .buildings
+            .get_mut(&id)
+            .unwrap()
+            .parts
+            .clear();
+
+        let error = map.validate().unwrap_err();
+        assert!(
+            error.issues.iter().any(|issue| matches!(
+                issue,
+                ValidationIssue::ImplausibleBuilding { detail, .. }
+                    if detail.contains("does not list it")
+            )),
+            "{:?}",
+            error.issues
+        );
+    }
+
+    #[test]
+    fn a_ridge_has_to_run_somewhere() {
+        use crate::buildings::{Roof, RoofShape};
+
+        let (mut map, id) = map_with_a_building();
+        let part = BuildingPartId::of_building(&id, 0);
+        let solid = &mut map
+            .as_map_mut()
+            .building_parts
+            .get_mut(&part)
+            .unwrap()
+            .solid;
+        solid.roof = Roof {
+            shape: RoofShape::Gabled,
+            height: 2.5,
+            direction: f64::NAN,
+        };
+
+        let error = map.validate().unwrap_err();
+        assert!(
+            error.issues.iter().any(|issue| matches!(
+                issue,
+                ValidationIssue::ImplausibleBuildingPart { detail, .. }
+                    if detail.contains("pointing NaN")
+            )),
+            "{:?}",
+            error.issues
+        );
     }
 }

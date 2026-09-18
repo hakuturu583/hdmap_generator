@@ -150,7 +150,10 @@ impl Massing {
             let Some(solid) = part.solid() else {
                 continue;
             };
-            let levels = ((solid.height() / floor_height).round() as i64).max(1) as u32;
+            // The walls, not the whole part: a storey is somewhere to stand, and
+            // neither the rise of a gable nor the fall of the ground under the
+            // outline is one.
+            let levels = ((solid.wall_height / floor_height).round() as i64).max(1) as u32;
             parts.push(BuildingPart {
                 id: BuildingPartId::of_building(&id, parts.len()),
                 building: id.clone(),
