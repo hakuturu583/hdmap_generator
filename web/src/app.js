@@ -33,7 +33,11 @@ let maps = []
 // exports of one format, and then the format alone does not say which.
 let showing = null
 
-boot()
+// A vendor script that did not arrive leaves its global undefined, and the first line
+// of `boot` then throws before there is anywhere to say so: the page would sit there
+// with the console still reading "Starting Python…" and the Run button disabled, which
+// looks like the page being broken rather than telling you what broke.
+boot().catch((error) => say(`The page would not start: ${error}`, true))
 
 async function boot() {
   editor = CodeMirror(ui.editor, {
