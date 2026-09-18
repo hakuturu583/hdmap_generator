@@ -138,12 +138,27 @@ impl Shape {
     }
 
     /// The points the shape's extent is measured over. A box is measured over its
-    /// four corners, so a long vehicle near the edge is not half outside the picture.
+    /// four corners, and a band over the width it is drawn with, so neither a long
+    /// vehicle nor a wide lane near the edge ends up half outside the picture.
     pub fn extent(&self) -> Vec<Point> {
         match self {
-            Shape::Path { points, .. }
-            | Shape::Area { points, .. }
-            | Shape::Band { points, .. } => points.clone(),
+            Shape::Path { points, .. } | Shape::Area { points, .. } => points.clone(),
+            // A band is a stroked line: it reaches half its width to either side of
+            // the centreline, whichever way the centreline runs. Two opposite corners
+            // of that square per vertex is all an extent has to say — the reach is the
+            // same in x and y, and nothing here needs it tighter than that.
+            Shape::Band { points, width, .. } => {
+                let half = width / 2.0;
+                points
+                    .iter()
+                    .flat_map(|point| {
+                        [
+                            Point::new(point.x - half, point.y - half),
+                            Point::new(point.x + half, point.y + half),
+                        ]
+                    })
+                    .collect()
+            }
             Shape::Dot { at, .. } => vec![*at],
             Shape::Box { .. } => self.corners().unwrap_or_default(),
         }
@@ -309,6 +324,21 @@ mod tests {
         let bounds = drawing.bounds().unwrap();
         assert_eq!(bounds.min, Point::new(-5.0, 0.0));
         assert_eq!(bounds.max, Point::new(10.0, 20.0));
+    }
+
+    #[test]
+    fn a_band_is_measured_over_the_width_it_is_drawn_with() {
+        // A band is a stroked line, so a picture fitted to its centreline alone clips
+        // half the lane off either side of it.
+        let mut drawing = Drawing::new("test");
+        drawing.push(Shape::Band {
+            kind: Kind::Surface,
+            points: vec![Point::new(0.0, 0.0), Point::new(10.0, 0.0)],
+            width: 4.0,
+        });
+        let bounds = drawing.bounds().unwrap();
+        assert_eq!(bounds.min, Point::new(-2.0, -2.0));
+        assert_eq!(bounds.max, Point::new(12.0, 2.0));
     }
 
     #[test]

@@ -59,19 +59,21 @@ pub fn draw(json: &str) -> Result<Drawing, ViewError> {
         }
         drawing.path(Kind::Track, run);
 
+        // Where the agent first exists, facing the way it faced *then*: a track that
+        // begins later in the episode has no heading at timestep zero either, and a
+        // box drawn from two different timesteps is a box pointing the wrong way.
         let start = object
-            .position
+            .valid
             .iter()
-            .zip(object.valid.iter())
-            .find(|(_, valid)| **valid)
-            .map(|(position, _)| point(position));
-        if let Some(at) = start {
+            .position(|valid| *valid)
+            .filter(|step| *step < object.position.len());
+        if let Some(step) = start {
             drawing.push(Shape::Box {
                 kind: Kind::Agent,
-                at,
+                at: point(&object.position[step]),
                 length: object.length,
                 width: object.width,
-                heading: object.heading.first().copied().unwrap_or(0.0),
+                heading: object.heading.get(step).copied().unwrap_or(0.0),
             });
         }
     }
@@ -185,6 +187,33 @@ mod tests {
         };
         assert_eq!(*at, Point::new(0.0, 0.0));
         assert_eq!(*length, 4.6);
+    }
+
+    #[test]
+    fn an_agent_that_arrives_late_faces_the_way_it_faced_then() {
+        // Invalid at step 0 and turned a quarter circle by the time it exists: taking
+        // the position from one step and the heading from another points it wrong.
+        let late = SCENE
+            .replace(
+                r#""heading": [0.0, 0.0, 0.0]"#,
+                r#""heading": [0.0, 0.0, 1.5707963267948966]"#,
+            )
+            .replace(
+                r#""valid": [true, false, true]"#,
+                r#""valid": [false, false, true]"#,
+            );
+
+        let drawing = draw(&late).unwrap();
+        let agent = drawing
+            .shapes
+            .iter()
+            .find(|shape| shape.kind() == Kind::Agent)
+            .unwrap();
+        let Shape::Box { at, heading, .. } = agent else {
+            panic!("an agent is a box");
+        };
+        assert_eq!(*at, Point::new(2.0, 0.0));
+        assert!((heading - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
     }
 
     #[test]

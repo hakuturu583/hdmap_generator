@@ -97,6 +97,16 @@ async function check(example) {
     if (!offered.includes(format)) fail(`${example}: no ${format} tab`)
   }
 
+  // A tab per thing written, each with an identity of its own: two exports of one
+  // format are two tabs, and a shared id would show both panels at once.
+  const paired = await page.evaluate(() => {
+    const tabs = [...document.querySelectorAll('[role="tab"]')]
+    const panels = document.querySelectorAll('[role="tabpanel"]')
+    const ids = new Set(tabs.map((tab) => tab.id))
+    return tabs.length === panels.length && ids.size === tabs.length
+  })
+  if (!paired) fail(`${example}: the tabs and panels do not pair up one to one`)
+
   for (const format of offered) {
     await page.click(`[role="tab"]:text-is("${format}")`)
     // Leaflet builds and refits its map when the panel is shown, a frame later, so
@@ -143,13 +153,20 @@ async function check(example) {
 
 /// The chosen format's panel is the only one showing, and it has something in it.
 ///
+/// The panel is found through the tab that is selected rather than through an id
+/// built out of the format: a tab's identity is its own, because a script can write
+/// two exports of one format.
+///
 /// A Leaflet map draws its features into an overlay pane; a viewer panel is an SVG of
 /// its own. Either way, an empty one is the thing worth failing on.
 function drawn(format) {
+  const selected = document.querySelectorAll('[role="tab"][aria-selected="true"]')
+  if (selected.length !== 1 || selected[0].textContent !== format) return false
+
   const showing = document.querySelectorAll('[role="tabpanel"]:not([hidden])')
   if (showing.length !== 1) return false
   const panel = showing[0]
-  if (panel.getAttribute('aria-labelledby') !== `tab-${format}`) return false
+  if (panel.getAttribute('aria-labelledby') !== selected[0].id) return false
   return (
     panel.querySelectorAll('.figure svg polyline, .figure svg polygon').length +
       panel.querySelectorAll('.leaflet-overlay-pane path').length >

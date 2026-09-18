@@ -26,9 +26,11 @@ let work = null
 // be taken down before its panel is thrown away — otherwise it goes on listening to a
 // window it is no longer in.
 let maps = []
-// Which format the viewer is showing. It outlives a run: change the script, press Run
-// again, and you are still looking at the format you were looking at before, which is
-// the whole point of being able to compare them.
+// Which view the viewer is showing, as its format and the file it was drawn from. It
+// outlives a run: change the script, press Run again, and you are still looking at
+// what you were looking at before, which is the whole point of being able to compare
+// them. The file is remembered as well as the format because a script may write two
+// exports of one format, and then the format alone does not say which.
 let showing = null
 
 boot()
@@ -150,24 +152,40 @@ function show({ views, work: directory, error }) {
   // again. The one thing worth deferring — a Leaflet map, which cannot measure a
   // hidden element anyway — waits until its panel is shown.
   ui.results.replaceChildren(bar, ...viewers.map((entry) => entry.node))
-  select(viewers, viewers.some((entry) => entry.format === showing) ? showing : views[0].format)
+
+  // The same file if it is still there, else the same format, else the first thing
+  // written.
+  const wanted =
+    viewers.find((entry) => same(entry, showing)) ??
+    viewers.find((entry) => entry.format === showing?.format) ??
+    viewers[0]
+  select(viewers, wanted.key)
 }
 
-/// One format: the button that chooses it and the panel it shows.
-function viewer(view) {
+function same(entry, showing) {
+  return entry.format === showing?.format && entry.title === showing?.title
+}
+
+/// One view: the button that chooses it and the panel it shows.
+///
+/// The key is the view's position in the answer rather than its format, because two
+/// exports of one format are two views — and a format used as an identity would make
+/// them one tab that shows two panels.
+function viewer(view, index) {
   const body = view.error
     ? { node: element('p', { class: 'bad' }, `${view.format} would not draw: ${view.error}`) }
     : view.svg
       ? figure(view.svg)
       : mapOf(view.title)
 
+  const key = String(index)
   const node = element(
     'section',
     {
       class: 'panel',
-      id: `panel-${view.format}`,
+      id: `panel-${key}`,
       role: 'tabpanel',
-      'aria-labelledby': `tab-${view.format}`,
+      'aria-labelledby': `tab-${key}`,
       tabindex: '0',
     },
     [
@@ -188,17 +206,20 @@ function viewer(view) {
       class: 'tab',
       type: 'button',
       role: 'tab',
-      id: `tab-${view.format}`,
-      'aria-controls': `panel-${view.format}`,
+      id: `tab-${key}`,
+      'aria-controls': `panel-${key}`,
+      // Two exports of one format are two tabs with one label; the file each was
+      // drawn from is what tells them apart.
+      title: view.title,
     },
     view.format,
   )
-  return { format: view.format, tab, node, shown: body.shown }
+  return { key, format: view.format, title: view.title, tab, node, shown: body.shown }
 }
 
 function listen(viewers) {
   for (const [index, entry] of viewers.entries()) {
-    entry.tab.addEventListener('click', () => select(viewers, entry.format))
+    entry.tab.addEventListener('click', () => select(viewers, entry.key))
     // A tab strip is one stop in the tab order and the arrow keys move within it,
     // which is what a screen reader and a keyboard both expect of one.
     entry.tab.addEventListener('keydown', (event) => {
@@ -211,17 +232,17 @@ function listen(viewers) {
       if (wanted === undefined) return
       event.preventDefault()
       const next = viewers[Math.min(viewers.length - 1, Math.max(0, wanted))]
-      select(viewers, next.format)
+      select(viewers, next.key)
       next.tab.focus()
     })
   }
 }
 
-/// Shows one format and hides the rest. The only writer of "which one is showing".
-function select(viewers, format) {
-  showing = format
+/// Shows one view and hides the rest. The only writer of "which one is showing".
+function select(viewers, key) {
   for (const entry of viewers) {
-    const chosen = entry.format === format
+    const chosen = entry.key === key
+    if (chosen) showing = { format: entry.format, title: entry.title }
     entry.tab.setAttribute('aria-selected', String(chosen))
     entry.tab.tabIndex = chosen ? 0 : -1
     entry.node.hidden = !chosen

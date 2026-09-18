@@ -96,7 +96,7 @@ pub fn draw(xml: &str) -> Result<Drawing, ViewError> {
                     let outer_offset: Vec<f64> = stations
                         .iter()
                         .zip(inner_offset.iter())
-                        .map(|(s, offset)| offset + lane.border(*s, section.s))
+                        .map(|(s, offset)| lane.edge(*s, section.s).outer(*offset))
                         .collect();
                     let outer: Vec<Point> = stations
                         .iter()
@@ -190,6 +190,29 @@ struct SideLane<'a> {
     base: &'a Lane,
 }
 
+/// Where a lane's outer edge is, in the terms the file put it in.
+enum Edge {
+    /// Metres beyond the lane inside this one: OpenDRIVE's `<width>`.
+    Width(f64),
+    /// Metres from the reference line: OpenDRIVE's `<border>`.
+    Border(f64),
+}
+
+impl Edge {
+    /// The offset from the reference line, given where the lane inside ends.
+    ///
+    /// A border that falls inside its neighbour would turn the lane inside out, so it
+    /// is held to the inner edge: a cross-section cannot be drawn from a file that
+    /// says a lane reaches back past the one beside it, and stopping at zero width
+    /// says so more usefully than a crossed ring.
+    fn outer(&self, inner: f64) -> f64 {
+        match self {
+            Edge::Width(width) => inner + width.max(0.0),
+            Edge::Border(border) => border.max(inner),
+        }
+    }
+}
+
 impl SideLane<'_> {
     /// Whether traffic runs down this lane, which is what decides if it is drawn with
     /// a centre line. A verge or a kerb is part of the cross-section and has no
@@ -211,40 +234,46 @@ impl SideLane<'_> {
         )
     }
 
-    /// How far this lane reaches beyond the one inside it at station `s`, metres.
+    /// Where this lane's outer edge is at station `s`.
     ///
-    /// `section_start` is where the lane section begins, because a `<width>` measures
-    /// its `sOffset` from there rather than from the start of the road.
-    fn border(&self, s: f64, section_start: f64) -> f64 {
+    /// OpenDRIVE says it two ways and they are not the same measurement: a `<width>`
+    /// is how far the lane reaches beyond the one inside it, and a `<border>` is where
+    /// the edge is, measured from the reference line. Which one the file used has to
+    /// travel with the number, or a border gets added to the inner lane's offset and
+    /// the lane lands twice as far out as it belongs.
+    ///
+    /// `section_start` is where the lane section begins, because an `sOffset` is
+    /// measured from there rather than from the start of the road.
+    fn edge(&self, s: f64, section_start: f64) -> Edge {
         let ds = s - section_start;
-        let mut value = 0.0;
+        let mut edge = Edge::Width(0.0);
         for choice in &self.base.choice {
             match choice {
                 LaneChoice::Width(width) => {
                     if width.s_offset.get::<meter>() <= ds + 1e-9 {
-                        value = poly(
+                        edge = Edge::Width(poly(
                             width.a,
                             width.b,
                             width.c,
                             width.d,
                             ds - width.s_offset.get::<meter>(),
-                        );
+                        ));
                     }
                 }
                 LaneChoice::Border(border) => {
                     if border.s_offset.get::<meter>() <= ds + 1e-9 {
-                        value = poly(
+                        edge = Edge::Border(poly(
                             border.a,
                             border.b,
                             border.c,
                             border.d,
                             ds - border.s_offset.get::<meter>(),
-                        );
+                        ));
                     }
                 }
             }
         }
-        value.max(0.0)
+        edge
     }
 }
 
@@ -494,6 +523,34 @@ mod tests {
       </road>
     </OpenDRIVE>"#;
 
+    /// The same road, with a second lane on the left given by a `<border>` — an
+    /// absolute offset from the reference line — rather than by a `<width>`.
+    const BORDERED: &str = r#"<?xml version="1.0"?>
+    <OpenDRIVE>
+      <header revMajor="1" revMinor="7" name="t" version="1.00" date="now"
+              north="0" south="0" east="0" west="0"/>
+      <road id="1" junction="-1" length="100" name="bordered">
+        <planView>
+          <geometry s="0" x="0" y="0" hdg="0" length="100"><line/></geometry>
+        </planView>
+        <lanes>
+          <laneSection s="0">
+            <left>
+              <lane id="1" type="driving" level="false">
+                <width sOffset="0" a="3.5" b="0" c="0" d="0"/>
+              </lane>
+              <lane id="2" type="driving" level="false">
+                <border sOffset="0" a="7" b="0" c="0" d="0"/>
+              </lane>
+            </left>
+            <center>
+              <lane id="0" type="none" level="false"/>
+            </center>
+          </laneSection>
+        </lanes>
+      </road>
+    </OpenDRIVE>"#;
+
     fn drawing() -> Drawing {
         draw(STRAIGHT).unwrap()
     }
@@ -516,6 +573,28 @@ mod tests {
         assert!(
             offsets.iter().any(|y| (y + 1.75).abs() < 1e-6),
             "{offsets:?}"
+        );
+    }
+
+    #[test]
+    fn a_border_says_where_the_edge_is_rather_than_how_wide_the_lane_is() {
+        // Two 3.5 m lanes: the first by width, the second by a border at 7 m. Adding
+        // the border to the inner lane's offset would draw the road half again as
+        // wide as the file says it is.
+        let drawing = draw(BORDERED).unwrap();
+        let bounds = drawing.bounds().unwrap();
+        assert!((bounds.max.y - 7.0).abs() < 1e-6, "{bounds:?}");
+
+        // And the outer lane's middle sits between the two edges, not beyond them.
+        let middles: Vec<f64> = drawing
+            .shapes
+            .iter()
+            .filter(|shape| shape.kind() == Kind::Center)
+            .map(|shape| shape.extent()[0].y)
+            .collect();
+        assert!(
+            middles.iter().any(|y| (y - 5.25).abs() < 1e-6),
+            "{middles:?}"
         );
     }
 
