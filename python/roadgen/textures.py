@@ -44,6 +44,11 @@ MANIFEST = os.path.join("Textures", "polyhaven.json")
 #: fetcher that hangs on a dead connection is worse than one that fails.
 TIMEOUT = 60
 
+#: Sent with every request. Poly Haven's API and CDN answer `Python-urllib/3.x`, the
+#: agent urllib sends when none is given, with 403 for every asset — so a fetcher
+#: that does not say who it is fetches nothing.
+USER_AGENT = "roadgen/0.1 (+https://github.com/hakuturu583/hdmap_generator)"
+
 
 class TextureError(RuntimeError):
     """A texture could not be fetched, with what was wrong and for which asset."""
@@ -141,11 +146,16 @@ def fetch_textures(package, *, overwrite=False, resolution=None, on_progress=Non
     return written
 
 
+def _request(url):
+    """A request that identifies itself; see `USER_AGENT`."""
+    return urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
+
 def _listing(api, slug):
     """What Poly Haven has for one asset: maps, resolutions and formats."""
     url = "%s/files/%s" % (api, slug)
     try:
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
+        with urllib.request.urlopen(_request(url), timeout=TIMEOUT) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         if error.code == 404:
@@ -202,7 +212,7 @@ def _download(url, target):
     """
     os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
     partial = target + ".part"
-    with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
+    with urllib.request.urlopen(_request(url), timeout=TIMEOUT) as response:
         with open(partial, "wb") as file:
             while True:
                 chunk = response.read(1 << 16)
