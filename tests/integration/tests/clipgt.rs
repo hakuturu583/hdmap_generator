@@ -34,6 +34,29 @@ fn nearest(points: &[Point3], to: Point3) -> f64 {
 }
 
 #[test]
+fn the_tables_can_be_built_without_writing_a_clip() {
+    // The other exporters each hand back the document they built; this is ClipGT's,
+    // and a caller that only wants to look at a clip should not have to make files to
+    // do it.
+    let map = scenarios::controlled_crossroads();
+    let layers =
+        roadgen_clipgt::to_layers(&map, &ClipConfig::new("x")).expect("the map should render");
+
+    let names: Vec<&str> = layers.iter().map(|layer| layer.name).collect();
+    assert_eq!(
+        names, LAYERS,
+        "the same layers, in the order they are written"
+    );
+
+    for layer in &layers {
+        // Every layer a reader refuses a clip without has to carry its row here too.
+        if ["calibration_estimate", "egomotion_estimate", "lane"].contains(&layer.name) {
+            assert!(layer.batch.num_rows() > 0, "{} is empty", layer.name);
+        }
+    }
+}
+
+#[test]
 fn a_clip_holds_every_layer_a_reader_looks_for() {
     let map = scenarios::controlled_crossroads();
     let (directory, clip) = write_clip(&map, &ClipConfig::new("x"));
