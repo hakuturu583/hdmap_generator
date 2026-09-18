@@ -11,7 +11,6 @@
 //! that is in the IR as such; it is read back out of the geometry the IR already has.
 
 use roadgen_core::geometry::{Frame3, Point3, UnitVector3, Vector3};
-use roadgen_core::map::Map;
 use roadgen_core::topology::Direction;
 use roadgen_core::{LaneId, ValidatedMap};
 
@@ -33,39 +32,6 @@ pub struct Pose {
 struct Node {
     point: Point3,
     roll: f64,
-}
-
-/// The lanes a vehicle can drive in one run, starting from `start`.
-///
-/// Follows the first successor at every branch and stops when the route would
-/// repeat a lane, so a ring road terminates rather than looping forever.
-pub fn route_from(map: &Map, start: &LaneId) -> Vec<LaneId> {
-    let mut route = vec![start.clone()];
-    while let Some(next) = map
-        .successors(route.last().expect("non-empty"))
-        .first()
-        .cloned()
-    {
-        if route.contains(&next) {
-            break;
-        }
-        route.push(next);
-    }
-    route
-}
-
-/// A lane to set off from: the first drivable lane of a road that is not a junction
-/// connector, in the order the caller added them.
-pub fn default_start(map: &Map) -> Option<LaneId> {
-    map.lanes
-        .iter()
-        .find(|lane| {
-            lane.lane_type.is_drivable()
-                && map
-                    .road(&lane.road)
-                    .is_some_and(|road| !road.is_connector())
-        })
-        .map(|lane| lane.id.clone())
 }
 
 /// Drives `route` at `speed` metres per second, sampling at `frame_rate` hertz.

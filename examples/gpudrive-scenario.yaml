@@ -1,0 +1,38 @@
+# A GPUDrive scenario: who drives the map, and where.
+#
+# The traffic is not a property of the road network, so it lives here rather than in
+# the code that builds the roads. Pass it with:
+#
+#     m.export_gpudrive("scene.json", scenario="examples/gpudrive-scenario.yaml")
+#
+# Every key is optional; anything left out keeps the value it already had. An
+# unknown key is an error rather than being ignored.
+
+name: town                 # the reader keeps 31 characters of this, and of the id
+scenario_id: town-0001
+steps: 91                  # timesteps; 91 is GPUDrive's episode length and its maximum
+time_step: 0.1             # seconds between them, as in the datasets it was built on
+
+agents:
+  # The first agent is the scene's self-driving car: `sdc_track_index` is 0.
+  - type: vehicle          # vehicle, pedestrian or cyclist
+    speed: 12.0            # metres per second, held for the whole route
+    route:
+      # Set off in this lane and follow the first successor at every branch. Lane
+      # names are the ones `Map.lane_ids()` prints; the `lane/` prefix may be left off.
+      start: lane/north/0
+      # Or drive exactly these, in this order:
+      # lanes: [lane/north/0, lane/x/north_0_east_1/0, lane/east/1]
+    # Metres. Left out, an agent is the ordinary size of its kind.
+    length: 4.6
+    width: 2.0
+    height: 1.6
+    track_to_predict: true   # listed in the scene's tracks_to_predict; the default
+    difficulty: 0
+
+  - type: cyclist
+    speed: 4.5
+    route:
+      start: lane/east/0
+    mark_as_expert: true     # replayed from the track rather than handed to a policy
+    of_interest: true        # listed in the scene's objects_of_interest

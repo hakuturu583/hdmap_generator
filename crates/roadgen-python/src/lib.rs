@@ -761,6 +761,29 @@ impl PyMap {
         Ok(roadgen_clipgt::check(map, config.as_ref()))
     }
 
+    /// What a GPUDrive export loses, and what its scene runs up against.
+    ///
+    /// Kept apart from `format_warnings` for the same reason as the ClipGT ones:
+    /// these are properties of the format — GPUDrive is a plane, and carries no
+    /// topology — so every map reports them, and folding them into the general
+    /// warnings would make them noise for a caller who never touches GPUDrive. Pass
+    /// the scenario to have the agents, their routes and the simulator's own limits
+    /// checked too.
+    #[pyo3(signature = (scenario = None))]
+    fn gpudrive_warnings(&mut self, scenario: Option<PathBuf>) -> PyResult<Vec<String>> {
+        let config = match scenario {
+            Some(path) => {
+                Some(self.gpudrive_config(Some(path), None, None, None, None, None, None)?)
+            }
+            None => {
+                self.ensure_built()?;
+                None
+            }
+        };
+        let map = self.built.as_ref().expect("just built");
+        Ok(roadgen_gpudrive::check(map, config.as_ref()))
+    }
+
     /// Writes the map as OpenDRIVE.
     fn export_opendrive(&mut self, path: PathBuf) -> PyResult<()> {
         self.ensure_built()?;
@@ -894,6 +917,70 @@ impl PyMap {
         roadgen_clipgt::write(map, directory, &config).map_err(runtime_error)
     }
 
+    /// Writes the map as a GPUDrive scene: one JSON file holding the map as
+    /// polylines and the agents driving it as tracks.
+    ///
+    /// `scenario` is the path to a YAML file naming the agents — the part of a scene
+    /// that is not the map. Everything after it overrides what the file says, and
+    /// everything left as `None` keeps it, so a scenario can be used as written or
+    /// nudged in one place. `speed` and `route` apply to the first agent, which is
+    /// the scene's self-driving car.
+    #[pyo3(signature = (
+        path,
+        scenario = None,
+        name = None,
+        scenario_id = None,
+        steps = None,
+        time_step = None,
+        speed = None,
+        route = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn export_gpudrive(
+        &mut self,
+        path: PathBuf,
+        scenario: Option<PathBuf>,
+        name: Option<&str>,
+        scenario_id: Option<&str>,
+        steps: Option<usize>,
+        time_step: Option<f64>,
+        speed: Option<f64>,
+        route: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let config =
+            self.gpudrive_config(scenario, name, scenario_id, steps, time_step, speed, route)?;
+        let map = self.built.as_ref().expect("just built");
+        roadgen_gpudrive::write(map, path, &config).map_err(runtime_error)
+    }
+
+    /// The GPUDrive scene as a JSON string, with the same arguments as
+    /// `export_gpudrive`.
+    #[pyo3(signature = (
+        scenario = None,
+        name = None,
+        scenario_id = None,
+        steps = None,
+        time_step = None,
+        speed = None,
+        route = None,
+    ))]
+    #[allow(clippy::wrong_self_convention, clippy::too_many_arguments)]
+    fn to_gpudrive_json(
+        &mut self,
+        scenario: Option<PathBuf>,
+        name: Option<&str>,
+        scenario_id: Option<&str>,
+        steps: Option<usize>,
+        time_step: Option<f64>,
+        speed: Option<f64>,
+        route: Option<Vec<String>>,
+    ) -> PyResult<String> {
+        let config =
+            self.gpudrive_config(scenario, name, scenario_id, steps, time_step, speed, route)?;
+        let map = self.built.as_ref().expect("just built");
+        roadgen_gpudrive::to_json(map, &config).map_err(runtime_error)
+    }
+
     // `&mut self` because the map builds itself on demand; the name is the one the
     // Python API exposes, so it stays as it reads from Python.
     /// The OpenDRIVE document as a string.
@@ -1019,6 +1106,49 @@ impl PyMap {
             self.built = Some(self.build()?.validate().map_err(value_error)?);
         }
         Ok(())
+    }
+
+    /// The scene configuration the GPUDrive methods share: the map's own defaults, the
+    /// scenario file over them, and the arguments over that.
+    #[allow(clippy::too_many_arguments)]
+    fn gpudrive_config(
+        &mut self,
+        scenario: Option<PathBuf>,
+        name: Option<&str>,
+        scenario_id: Option<&str>,
+        steps: Option<usize>,
+        time_step: Option<f64>,
+        speed: Option<f64>,
+        route: Option<Vec<String>>,
+    ) -> PyResult<roadgen_gpudrive::SceneConfig> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let mut config = roadgen_gpudrive::SceneConfig::for_map(map);
+        if let Some(path) = scenario {
+            config = config.with_scenario_file(path).map_err(value_error)?;
+        }
+        if let Some(name) = name {
+            config.name = name.to_owned();
+        }
+        if let Some(scenario_id) = scenario_id {
+            config.scenario_id = scenario_id.to_owned();
+        }
+        if let Some(steps) = steps {
+            config.steps = steps;
+        }
+        if let Some(time_step) = time_step {
+            config.time_step = time_step;
+        }
+        // Both nudge the scene's own vehicle, which the exporter knows how to find.
+        if let Some(speed) = speed {
+            config.sdc_mut().speed = speed;
+        }
+        if let Some(route) = route {
+            config.sdc_mut().route = Some(roadgen_gpudrive::Route::Lanes(
+                route.iter().map(LaneId::parse_printed).collect(),
+            ));
+        }
+        Ok(config)
     }
 }
 

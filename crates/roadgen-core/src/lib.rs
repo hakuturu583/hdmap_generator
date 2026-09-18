@@ -75,7 +75,7 @@ pub use geometry::{
     SamplingConfig, Taper, Vector3, WidthProfile,
 };
 pub use id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
-pub use map::{CrossSection, Lane, Map, MapMetadata, Projection, Road, TrafficHandedness};
+pub use map::{CrossSection, Lane, Map, MapMetadata, Projection, Road, Route, TrafficHandedness};
 pub use semantics::{
     BoundaryMarking, LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
     RoadType, TrafficRule,
@@ -95,7 +95,7 @@ pub mod prelude {
         Taper, WidthProfile,
     };
     pub use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
-    pub use crate::map::{Map, MapMetadata, Projection, TrafficHandedness};
+    pub use crate::map::{Map, MapMetadata, Projection, Route, TrafficHandedness};
     pub use crate::semantics::{
         BoundaryMarking, LaneType, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
         RoadType, TrafficRule,

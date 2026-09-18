@@ -40,16 +40,10 @@ use roadgen_core::{LaneId, ValidatedMap};
 
 pub use ego::Pose;
 pub use error::ExportError;
+// The route is the IR's own: `Route::From` names a lane of the map and the
+// successors are the map's, so both exporters that drive a map say it the same way.
+pub use roadgen_core::Route;
 pub use scenario::{PolynomialType, Sensor};
-
-/// Which lanes the ego vehicle drives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Route {
-    /// Set off here and follow the first successor at every branch.
-    From(LaneId),
-    /// Drive exactly these lanes, in this order.
-    Lanes(Vec<LaneId>),
-}
 
 /// How a map is turned into a clip.
 #[derive(Debug, Clone, PartialEq)]

@@ -42,6 +42,28 @@ pub fn write_clip(
     (directory, clip)
 }
 
+/// Exports a GPUDrive scene and reads it back through the data model, which is how a
+/// consumer that knows the format reads it.
+pub fn read_scene(
+    map: &ValidatedMap,
+    config: &roadgen_gpudrive::SceneConfig,
+) -> roadgen_gpudrive::Scene {
+    serde_json::from_str(&scene_text(map, config)).expect("the scene should read back")
+}
+
+/// The same export as raw JSON, for the checks that are about the shape of the
+/// document rather than what is in it.
+pub fn read_scene_json(
+    map: &ValidatedMap,
+    config: &roadgen_gpudrive::SceneConfig,
+) -> serde_json::Value {
+    serde_json::from_str(&scene_text(map, config)).expect("the scene should be JSON")
+}
+
+fn scene_text(map: &ValidatedMap, config: &roadgen_gpudrive::SceneConfig) -> String {
+    roadgen_gpudrive::to_json(map, config).expect("the map should export as a scene")
+}
+
 /// Exports to plain OpenStreetMap and reads the result back with the same document
 /// model a consumer would, along with a way of turning its nodes back into metres.
 pub fn reload_osm(map: &ValidatedMap) -> OsmReading {

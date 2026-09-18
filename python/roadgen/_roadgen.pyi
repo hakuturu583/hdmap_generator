@@ -136,6 +136,7 @@ class Map:
     def mgrs_grid(self) -> Optional[str]: ...
     def format_warnings(self) -> list[str]: ...
     def clipgt_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
+    def gpudrive_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def osm_warnings(self) -> list[str]: ...
     def sumo_warnings(self) -> list[str]: ...
     def sumo_lane_ids(self) -> list[tuple[str, str]]: ...
@@ -149,6 +150,27 @@ class Map:
         scenario: Optional[str] = None,
         clip_id: Optional[str] = None,
         frame_rate: Optional[float] = None,
+        speed: Optional[float] = None,
+        route: Optional[Sequence[str]] = None,
+    ) -> str: ...
+    def export_gpudrive(
+        self,
+        path: str,
+        scenario: Optional[str] = None,
+        name: Optional[str] = None,
+        scenario_id: Optional[str] = None,
+        steps: Optional[int] = None,
+        time_step: Optional[float] = None,
+        speed: Optional[float] = None,
+        route: Optional[Sequence[str]] = None,
+    ) -> None: ...
+    def to_gpudrive_json(
+        self,
+        scenario: Optional[str] = None,
+        name: Optional[str] = None,
+        scenario_id: Optional[str] = None,
+        steps: Optional[int] = None,
+        time_step: Optional[float] = None,
         speed: Optional[float] = None,
         route: Optional[Sequence[str]] = None,
     ) -> str: ...

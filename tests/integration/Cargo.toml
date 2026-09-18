@@ -12,6 +12,7 @@ roadgen-core.workspace = true
 roadgen-opendrive.workspace = true
 roadgen-lanelet2.workspace = true
 roadgen-clipgt.workspace = true
+roadgen-gpudrive.workspace = true
 roadgen-osm.workspace = true
 roadgen-sumo.workspace = true
 opendrive.workspace = true
@@ -24,4 +25,9 @@ quick-xml.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 tempfile.workspace = true
-serde_json.workspace = true
+# `float_roundtrip` so that a scene read back here is the one that was written:
+# serde_json's default parser is fast rather than exact, while the writer already
+# emits the shortest text that round-trips an f64 — and GPUDrive's own reader, strtod
+# through nlohmann, is exact. Without it these tests would compare against a number
+# the simulator never sees.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
