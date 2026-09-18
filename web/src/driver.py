@@ -52,6 +52,9 @@ def run(code):
             "stdout": output.getvalue(),
             "error": error,
             "seconds": round(elapsed, 3),
+            # Where the files are, so that the page can read one back without
+            # spelling this directory a second time on its own side.
+            "work": WORK,
             "files": _files(),
             "views": sorted(
                 views,
@@ -82,26 +85,38 @@ def _traceback():
 
 
 def _files():
-    found = []
-    for root, _, names in os.walk(WORK):
-        for name in sorted(names):
-            path = os.path.join(root, name)
-            found.append(
-                {
-                    "path": os.path.relpath(path, WORK),
-                    "size": os.path.getsize(path),
-                }
-            )
+    found = [
+        _entry(os.path.join(root, name))
+        for root, _, names in os.walk(WORK)
+        for name in names
+    ]
     return sorted(found, key=lambda entry: entry["path"])
+
+
+def _entry(path):
+    """One written file, as the page lists it.
+
+    Whether it can be shown as text is decided here rather than in the page: a NUL
+    byte in the first kilobyte is crude, and right about every file roadgen writes —
+    the text formats have none, and Parquet is full of them.
+    """
+    with open(path, "rb") as file:
+        head = file.read(1024)
+    return {
+        "path": os.path.relpath(path, WORK),
+        "size": os.path.getsize(path),
+        "text": b"\0" not in head,
+    }
 
 
 def _views():
     """One panel per thing that was written, whatever it turned out to be."""
+    # `run` sorts what comes back, so nothing here has to be in any order.
     views = []
     for root, directories, names in os.walk(WORK):
-        for directory in sorted(directories):
+        for directory in directories:
             views.extend(_directory(os.path.join(root, directory)))
-        for name in sorted(names):
+        for name in names:
             views.extend(_file(os.path.join(root, name)))
     return views
 
@@ -145,25 +160,40 @@ def _osm(path):
 
     Which one this is comes off the `generator` attribute, which is the writer saying
     so — a Lanelet2 map and a plain one differ in what the ways *mean*, not in
-    anything a reader could infer from the geometry.
+    anything a reader could infer from the geometry. The file itself is not read in
+    here: the page reads it out of the working directory, as it does for the `source`
+    and `save` buttons.
     """
     with open(path, encoding="utf-8") as file:
-        xml = file.read()
-    lanelet2 = 'generator="lanelet2"' in xml[:512]
+        head = file.read(512)
+    lanelet2 = 'generator="lanelet2"' in head
     return _view(
         "Lanelet2" if lanelet2 else "OpenStreetMap",
         path,
-        xml=xml,
+        note=(
+            "Drawn by Leaflet, over OpenStreetMap tiles: this export carries latitudes "
+            "and longitudes, so it has a place on Earth rather than only a shape."
+        ),
     )
 
 
-def _view(format_, path, **rest):
+def _view(format_, path, svg=None, note=None, error=None):
+    """One panel's worth of answer.
+
+    The picture is either an SVG the viewer drew, or nothing — in which case the page
+    draws the file itself and `note` is what there is to say about it.
+    """
     relative = os.path.relpath(path, WORK)
-    contents = [relative]
     if os.path.isdir(path):
         contents = sorted(
-            os.path.join(relative, name) for name in os.listdir(path)
+            (_entry(os.path.join(path, name)) for name in os.listdir(path)),
+            key=lambda entry: entry["path"],
         )
+    else:
+        contents = [_entry(path)]
+
     view = {"format": format_, "title": relative, "files": contents}
-    view.update(rest)
+    for key, value in (("svg", svg), ("note", note), ("error", error)):
+        if value is not None:
+            view[key] = value
     return view

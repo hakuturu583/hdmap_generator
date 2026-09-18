@@ -815,9 +815,10 @@ loaded.
 
 The script is run in a directory of its own and then the directory is *looked at*.
 The tabs are not a fixed set — they are whatever turned up — so a script that exports
-one format gets one tab, and a format added to roadgen gets a tab without the page
-being changed. The format you were looking at survives a re-run, which is what makes
-it possible to change one line and watch one format.
+one format gets one tab. Neither the page's code nor its stylesheet names a format:
+recognising a *new* one is a line in `driver.py`, the file that already knows which
+reader to hand a written export to. The format you were looking at survives a re-run,
+which is what makes it possible to change one line and watch one format.
 
 ### Which viewer draws what
 
@@ -844,8 +845,9 @@ read, which means it goes wrong in exactly the ways the geometry can — and a l
 that lands in the wrong place on the page is a lane in the wrong place in the file.
 
 Everything is a plan view. The heights, the grades and the superelevation are in the
-files and not on the screen, and each picture says so under itself rather than leaving
-a reader to assume the map is flat.
+files and not on the screen, and every drawing says so in its own description — one
+clause, written once where the SVG is written — rather than leaving a reader to assume
+the map is flat.
 
 ### Building it
 

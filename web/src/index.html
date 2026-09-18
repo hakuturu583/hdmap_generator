@@ -42,7 +42,7 @@
         </div>
         <div class="editor" id="editor"></div>
         <div class="console" id="console" aria-live="polite">
-          <div class="status" id="status">Starting Python…</div>
+          <div class="status">Starting Python…</div>
         </div>
       </section>
 
@@ -69,11 +69,13 @@
       <p id="build-line"></p>
     </footer>
 
-    <script src="./vendor/codemirror.js"></script>
-    <script src="./vendor/codemirror-python.js"></script>
-    <script src="./vendor/leaflet.js"></script>
-    <script src="./vendor/osmtogeojson.js"></script>
-    <script src="./pyodide/pyodide.js"></script>
+    <!-- Deferred, in this order: none of them has anything to do while the page is
+         still being parsed, and the module below runs after all of them either way. -->
+    <script defer src="./vendor/codemirror.js"></script>
+    <script defer src="./vendor/codemirror-python.js"></script>
+    <script defer src="./vendor/leaflet.js"></script>
+    <script defer src="./vendor/osmtogeojson.js"></script>
+    <script defer src="./pyodide/pyodide.js"></script>
     <script type="module" src="./app.js"></script>
   </body>
 </html>

@@ -23,6 +23,11 @@
 
   /* What roadgen-viewer's SVGs read. */
   --rg-text: #5b6472;
+
+  /* The frame every viewer gets. One number, so that switching format changes the
+     picture and not its place on the page: tall enough for a map to be a map, short
+     enough that the switch above it stays on screen. */
+  --viewer-height: min(60vh, 600px);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -289,10 +294,6 @@ button:disabled {
   overflow: hidden;
 }
 
-.panel[hidden] {
-  display: none;
-}
-
 .panel:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -361,20 +362,17 @@ button:disabled {
   color: var(--ink-dim);
 }
 
-.chip button,
-.chip a {
+.chip button {
   border: 0;
   background: transparent;
   color: var(--ink-dim);
   padding: 2px 6px;
   border-radius: 999px;
   font-size: 11.5px;
-  text-decoration: none;
   cursor: pointer;
 }
 
-.chip button:hover,
-.chip a:hover {
+.chip button:hover {
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 14%, transparent);
 }
@@ -384,12 +382,12 @@ button:disabled {
 }
 
 .figure {
-  /* Roughly the height a map panel gets, so that flipping between a drawn format and
-     a Leaflet one moves the picture rather than the page. */
+  /* The same frame a map panel gets — one number, so that flipping between a drawn
+     format and a Leaflet one moves the picture and nothing else. */
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: min(56vh, 560px);
+  min-height: var(--viewer-height);
   padding: 10px 14px 16px;
   overflow: auto;
 }
@@ -416,9 +414,7 @@ button:disabled {
 }
 
 .map {
-  /* Tall enough to be a map rather than a strip, and short enough that the switch
-     above it stays on screen. */
-  height: min(62vh, 620px);
+  height: var(--viewer-height);
   min-height: 320px;
 }
 

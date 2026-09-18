@@ -12,7 +12,6 @@ const ui = {
   run: document.querySelector('#run'),
   editor: document.querySelector('#editor'),
   console: document.querySelector('#console'),
-  status: document.querySelector('#status'),
   results: document.querySelector('#results'),
   build: document.querySelector('#build-line'),
 }
@@ -20,6 +19,9 @@ const ui = {
 let pyodide = null
 let driver = null
 let editor = null
+// Where the driver ran the script. It says so with every answer rather than the page
+// spelling the directory a second time.
+let work = null
 // Leaflet keeps hold of the element it was given, so a map from a previous run has to
 // be taken down before its panel is thrown away — otherwise it goes on listening to a
 // window it is no longer in.
@@ -57,20 +59,25 @@ async function boot() {
   ui.run.addEventListener('click', run)
 
   try {
-    const build = await (await fetch('./build.json')).json()
-    ui.build.textContent =
-      `Built from ${build.wheel}, on Pyodide ${build.pyodide}.`
+    // The runtime is megabytes and the two files beside it are a few hundred bytes;
+    // asking for them in front of it, one after the other, would add two round trips
+    // to the slowest part of the page. Nothing here needs the answers yet.
+    const described = fetch('./build.json').then((answer) => answer.json())
+    // The driver is a file rather than a string in here so that it is Python being
+    // edited when it is edited, with everything that comes with that.
+    const source = fetch('./driver.py').then((answer) => answer.text())
 
     say('Starting Python…')
-    pyodide = await loadPyodide({ indexURL: './pyodide/' })
+    const starting = loadPyodide({ indexURL: './pyodide/' })
+
+    const build = await described
+    ui.build.textContent = `Built from ${build.wheel}, on Pyodide ${build.pyodide}.`
+    pyodide = await starting
 
     say(`Loading ${build.wheel}…`)
     await pyodide.loadPackage(`./${build.wheel}`)
 
-    // The driver is a file rather than a string in here so that it is Python being
-    // edited when it is edited, with everything that comes with that.
-    const source = await (await fetch('./driver.py')).text()
-    pyodide.FS.writeFile('/driver.py', source)
+    pyodide.FS.writeFile('/driver.py', await source)
     // The script the driver runs chdirs into its own directory, so the driver cannot
     // be imported from the working directory: it is put at the root and the root is
     // put on the path.
@@ -108,21 +115,15 @@ function say(message, bad = false) {
 /// What the script printed, what it raised, and how long it took.
 function report({ stdout, error, seconds, files }) {
   const written = files.length
-  const lines = [
-    element(
-      'div',
-      { class: 'status' },
-      `${written} file${written === 1 ? '' : 's'} written in ${seconds}s`,
-    ),
-  ]
-  if (stdout.trim()) lines.push(element('div', {}, stdout.trimEnd()))
-  if (error) lines.push(element('div', { class: 'bad' }, error.trimEnd()))
-  ui.console.replaceChildren(...lines)
+  say(`${written} file${written === 1 ? '' : 's'} written in ${seconds}s`)
+  if (stdout.trim()) ui.console.append(element('div', {}, stdout.trimEnd()))
+  if (error) ui.console.append(element('div', { class: 'bad' }, error.trimEnd()))
 }
 
-function show({ views, files, error }) {
+function show({ views, work: directory, error }) {
   for (const map of maps) map.remove()
   maps = []
+  work = directory
 
   if (views.length === 0) {
     ui.results.replaceChildren(
@@ -137,85 +138,28 @@ function show({ views, files, error }) {
     return
   }
 
-  if (!views.some((view) => view.format === showing)) showing = views[0].format
-
-  const sizes = new Map(files.map((file) => [file.path, file.size]))
-  // Every panel is built now and all but one is hidden. Building them on demand would
-  // save the work of drawing five pictures nobody has asked for yet; it would also
-  // make every first click on a tab cost a Parquet read, and the whole run took less
-  // time than that hesitation would.
-  const panels = views.map((view) => panel(view, sizes))
-  const bar = tabs(views, panels)
-
-  ui.results.replaceChildren(bar, ...panels.map((panel) => panel.node))
-  select(showing, views, panels)
-}
-
-/// The format switch: one button per thing that was written.
-function tabs(views, panels) {
+  // A tab and a panel per thing that was written, kept together: everything that
+  // selects one of them works off this list rather than going back to the document.
+  const viewers = views.map(viewer)
   const bar = element('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Format' })
-  for (const view of views) {
-    const tab = element(
-      'button',
-      {
-        class: 'tab',
-        type: 'button',
-        role: 'tab',
-        id: `tab-${view.format}`,
-        'aria-controls': `panel-${view.format}`,
-        'aria-selected': 'false',
-        tabindex: '-1',
-      },
-      view.format,
-    )
-    tab.addEventListener('click', () => select(view.format, views, panels))
-    // A tab strip is one stop in the tab order and the arrow keys move within it,
-    // which is what a screen reader and a keyboard both expect of one.
-    tab.addEventListener('keydown', (event) => {
-      const step = { ArrowRight: 1, ArrowLeft: -1, Home: -Infinity, End: Infinity }[event.key]
-      if (step === undefined) return
-      event.preventDefault()
-      const at = views.findIndex((candidate) => candidate.format === showing)
-      const next = Math.min(
-        views.length - 1,
-        Math.max(0, step === Infinity ? views.length - 1 : step === -Infinity ? 0 : at + step),
-      )
-      select(views[next].format, views, panels)
-      bar.querySelector('[aria-selected="true"]').focus()
-    })
-    bar.append(tab)
-  }
-  return bar
+  bar.append(...viewers.map((entry) => entry.tab))
+  listen(viewers)
+
+  // Every panel is built now and all but one is hidden; the pictures are already in
+  // the answer, so this is an SVG becoming elements rather than any file being read
+  // again. The one thing worth deferring — a Leaflet map, which cannot measure a
+  // hidden element anyway — waits until its panel is shown.
+  ui.results.replaceChildren(bar, ...viewers.map((entry) => entry.node))
+  select(viewers, viewers.some((entry) => entry.format === showing) ? showing : views[0].format)
 }
 
-function select(format, views, panels) {
-  showing = format
-  for (const [index, view] of views.entries()) {
-    const chosen = view.format === format
-    const tab = document.querySelector(`#tab-${CSS.escape(view.format)}`)
-    if (tab) {
-      tab.setAttribute('aria-selected', String(chosen))
-      tab.tabIndex = chosen ? 0 : -1
-    }
-    panels[index].node.hidden = !chosen
-    // Leaflet measured a hidden element as nothing at all, so a map only finds out
-    // how big it is once its panel is shown.
-    if (chosen) panels[index].shown?.()
-  }
-}
-
-function panel(view, sizes) {
-  let shown
-  let body
-  if (view.error) {
-    body = element('p', { class: 'bad' }, `${view.format} would not draw: ${view.error}`)
-  } else if (view.svg) {
-    body = figure(view.svg)
-  } else {
-    const drawn = mapOf(view.xml)
-    body = drawn.node
-    shown = drawn.shown
-  }
+/// One format: the button that chooses it and the panel it shows.
+function viewer(view) {
+  const body = view.error
+    ? { node: element('p', { class: 'bad' }, `${view.format} would not draw: ${view.error}`) }
+    : view.svg
+      ? figure(view.svg)
+      : mapOf(view.title)
 
   const node = element(
     'section',
@@ -225,86 +169,131 @@ function panel(view, sizes) {
       role: 'tabpanel',
       'aria-labelledby': `tab-${view.format}`,
       tabindex: '0',
-      hidden: 'hidden',
     },
     [
-      element('header', {}, [element('h2', {}, view.title), note(view)]),
-      element('div', { class: 'chips' }, view.files.map((path) => chip(path, sizes))),
-      body,
+      element('header', {}, [
+        element('h2', {}, view.title),
+        // Whatever the picture or the driver says about this export. The page has no
+        // opinion of its own about any format, so there is nothing to write here.
+        element('p', { class: 'note' }, body.note ?? view.note ?? ''),
+      ]),
+      element('div', { class: 'chips' }, view.files.map(chip)),
+      body.node,
     ],
   )
-  return { node, shown }
+
+  const tab = element(
+    'button',
+    {
+      class: 'tab',
+      type: 'button',
+      role: 'tab',
+      id: `tab-${view.format}`,
+      'aria-controls': `panel-${view.format}`,
+    },
+    view.format,
+  )
+  return { format: view.format, tab, node, shown: body.shown }
 }
 
-/// The picture's own `<desc>`: what the reader found in the file, and what the format
-/// could not carry. It is written by the crate that drew the picture, so it says the
-/// same thing on the page as it does in a notebook.
-function note(view) {
-  if (!view.svg) {
-    return element(
-      'p',
-      { class: 'note' },
-      'Drawn by Leaflet, over OpenStreetMap tiles: this export carries latitudes and ' +
-        'longitudes, so it has a place on Earth rather than only a shape.',
-    )
+function listen(viewers) {
+  for (const [index, entry] of viewers.entries()) {
+    entry.tab.addEventListener('click', () => select(viewers, entry.format))
+    // A tab strip is one stop in the tab order and the arrow keys move within it,
+    // which is what a screen reader and a keyboard both expect of one.
+    entry.tab.addEventListener('keydown', (event) => {
+      const wanted = {
+        ArrowRight: index + 1,
+        ArrowLeft: index - 1,
+        Home: 0,
+        End: viewers.length - 1,
+      }[event.key]
+      if (wanted === undefined) return
+      event.preventDefault()
+      const next = viewers[Math.min(viewers.length - 1, Math.max(0, wanted))]
+      select(viewers, next.format)
+      next.tab.focus()
+    })
   }
-  const description = new DOMParser()
-    .parseFromString(view.svg, 'image/svg+xml')
-    .querySelector('desc')
-  return element('p', { class: 'note' }, description ? description.textContent : '')
 }
 
+/// Shows one format and hides the rest. The only writer of "which one is showing".
+function select(viewers, format) {
+  showing = format
+  for (const entry of viewers) {
+    const chosen = entry.format === format
+    entry.tab.setAttribute('aria-selected', String(chosen))
+    entry.tab.tabIndex = chosen ? 0 : -1
+    entry.node.hidden = !chosen
+    // Leaflet measured a hidden element as nothing at all, so a map is built and
+    // refitted the first time its panel is shown.
+    if (chosen) entry.shown?.()
+  }
+}
+
+/// The drawing, and the `<desc>` it carries: what the reader found in the file, and
+/// what the format could not hold. Both are written by the crate that drew the
+/// picture, so the page says what a notebook says.
 function figure(svg) {
   const holder = element('div', { class: 'figure' })
   // The SVG comes from the wheel this page shipped with, not from anything a visitor
   // supplied, and it has to become live elements to be styled by the page's custom
   // properties.
   holder.innerHTML = svg
-  return holder
+  const description = holder.querySelector('desc')
+  return { node: holder, note: description ? description.textContent : '' }
 }
 
-function mapOf(xml) {
+/// An OSM export, drawn by Leaflet from the file itself.
+///
+/// The map is built the first time its panel is shown, which is also the first time
+/// Leaflet can measure the element it is given.
+function mapOf(path) {
   const holder = element('div', { class: 'map' })
-  let fit = () => {}
-  // Leaflet measures the element it is given, so it can only be set up once the
-  // element is in the document.
-  queueMicrotask(() => {
-    const document_ = new DOMParser().parseFromString(xml, 'text/xml')
-    const geojson = onlyWays(osmtogeojson(document_))
+  let fit = null
+  return {
+    node: holder,
+    shown: () => {
+      if (!fit) fit = draw(holder, path)
+      fit()
+    },
+  }
+}
 
-    const map = L.map(holder, { scrollWheelZoom: false })
-    maps.push(map)
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 20,
-      attribution:
-        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-    }).addTo(map)
+function draw(holder, path) {
+  const xml = new TextDecoder().decode(read(path))
+  const geojson = onlyWays(osmtogeojson(new DOMParser().parseFromString(xml, 'text/xml')))
 
-    const layer = L.geoJSON(geojson, {
-      style: { color: '#2563eb', weight: 2 },
-      pointToLayer: (_, at) => L.circleMarker(at, { radius: 3, color: '#f97316' }),
-      onEachFeature: (feature, target) => {
-        const tags = Object.entries(feature.properties ?? {})
-          .filter(([key]) => !key.startsWith('@'))
-          .map(([key, value]) => `${key} = ${value}`)
-        if (tags.length) target.bindPopup(tags.join('<br>'))
-      },
-    }).addTo(map)
+  const map = L.map(holder, { scrollWheelZoom: false })
+  maps.push(map)
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 20,
+    attribution:
+      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  }).addTo(map)
 
-    fit = () => {
-      map.invalidateSize()
-      const bounds = layer.getBounds()
-      if (bounds.isValid()) {
-        map.fitBounds(bounds, { padding: [24, 24] })
-      } else {
-        map.setView([0, 0], 2)
-      }
+  const layer = L.geoJSON(geojson, {
+    style: { color: '#2563eb', weight: 2 },
+    pointToLayer: (_, at) => L.circleMarker(at, { radius: 3, color: '#f97316' }),
+    onEachFeature: (feature, target) => {
+      const tags = Object.entries(feature.properties ?? {})
+        .filter(([key]) => !key.startsWith('@'))
+        .map(([key, value]) => `${key} = ${value}`)
+      if (tags.length) target.bindPopup(tags.join('<br>'))
+    },
+  }).addTo(map)
+
+  // Called again every time the panel is shown: until then the map has been measuring
+  // an element of no size.
+  return () => {
+    map.invalidateSize()
+    const bounds = layer.getBounds()
+    if (bounds.isValid()) {
+      map.fitBounds(bounds, { padding: [24, 24] })
+    } else {
+      map.setView([0, 0], 2)
     }
-    fit()
-  })
-  // `fit` is called again every time the panel is shown, because until then the map
-  // has been measuring an element of no size.
-  return { node: holder, shown: () => fit() }
+  }
 }
 
 /// Ways, and the nodes that say something on their own.
@@ -324,46 +313,56 @@ function onlyWays(geojson) {
   }
 }
 
-function chip(path, sizes) {
-  const size = sizes.get(path)
-  const view = element('button', { type: 'button', 'aria-pressed': 'false' }, 'source')
-  view.addEventListener('click', () => toggleSource(view, path))
+/// One written file: what it is called, how big it is, and the two things you can do
+/// with it.
+function chip({ path, size, text }) {
+  // Read and decoded once. A multi-megabyte export re-read on every click is a hitch
+  // on a button that should feel instant.
+  let source = null
 
-  const save = element('a', { href: '#', download: path.split('/').pop() }, 'save')
-  save.addEventListener('click', (event) => {
-    event.preventDefault()
-    download(path)
+  const show = element('button', { type: 'button', 'aria-pressed': 'false' }, 'source')
+  show.addEventListener('click', () => {
+    const panel = show.closest('.panel')
+    const open = show.getAttribute('aria-pressed') === 'true'
+    // One source at a time: the panel has room for one, and two would be a pile.
+    for (const other of panel.querySelectorAll('.chip button[aria-pressed="true"]')) {
+      other.setAttribute('aria-pressed', 'false')
+    }
+    for (const shown of panel.querySelectorAll('.source')) shown.hidden = true
+    if (open) return
+
+    if (!source) {
+      source = element(
+        'pre',
+        { class: 'source' },
+        text
+          ? new TextDecoder().decode(read(path))
+          : `${path} is ${bytes(size)} of binary. Save it and open it with a reader for ` +
+              'the format.',
+      )
+      panel.append(source)
+    }
+    source.hidden = false
+    show.setAttribute('aria-pressed', 'true')
   })
+
+  const save = element('button', { type: 'button' }, 'save')
+  save.addEventListener('click', () => download(path))
 
   return element('span', { class: 'chip' }, [
     element('span', {}, path),
     element('span', { class: 'size' }, size === undefined ? '' : bytes(size)),
-    view,
+    show,
     save,
   ])
 }
 
-function toggleSource(button, path) {
-  const card = button.closest('.panel')
-  const open = card.querySelector(`.source[data-path="${cssEscape(path)}"]`)
-  for (const shown of card.querySelectorAll('.source')) shown.remove()
-  for (const other of card.querySelectorAll('.chip button')) {
-    other.setAttribute('aria-pressed', 'false')
-  }
-  if (open) return
-
-  button.setAttribute('aria-pressed', 'true')
-  const raw = pyodide.FS.readFile(`/work/${path}`)
-  const text = looksBinary(raw)
-    ? `${path} is ${bytes(raw.length)} of binary — Parquet, in this case. Save it and ` +
-      'open it with pyarrow or pandas.'
-    : new TextDecoder().decode(raw)
-  card.append(element('pre', { class: 'source', 'data-path': path }, text))
+function read(path) {
+  return pyodide.FS.readFile(`${work}/${path}`)
 }
 
 function download(path) {
-  const raw = pyodide.FS.readFile(`/work/${path}`)
-  const url = URL.createObjectURL(new Blob([raw], { type: 'application/octet-stream' }))
+  const url = URL.createObjectURL(new Blob([read(path)], { type: 'application/octet-stream' }))
   const link = element('a', { href: url, download: path.split('/').pop() })
   document.body.append(link)
   link.click()
@@ -371,21 +370,10 @@ function download(path) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-/// A NUL byte in the first kilobyte. Crude, and right about every file roadgen
-/// writes: five of the six formats are text and the sixth is Parquet, which opens
-/// with `PAR1` and is full of them.
-function looksBinary(raw) {
-  return raw.subarray(0, 1024).includes(0)
-}
-
 function bytes(count) {
   if (count < 1024) return `${count} B`
   if (count < 1024 * 1024) return `${(count / 1024).toFixed(1)} kB`
   return `${(count / 1024 / 1024).toFixed(1)} MB`
-}
-
-function cssEscape(value) {
-  return window.CSS && CSS.escape ? CSS.escape(value) : value.replace(/["\\]/g, '\\$&')
 }
 
 function element(tag, attributes = {}, children = []) {

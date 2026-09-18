@@ -28,7 +28,6 @@ const FORMATS = ['OpenDRIVE', 'Lanelet2', 'OpenStreetMap', 'SUMO', 'ClipGT', 'GP
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json',
   '.py': 'text/plain; charset=utf-8',
@@ -61,7 +60,7 @@ page.on('console', (message) => {
 
 await page.goto(`${origin}/index.html`)
 // The wheel and the Pyodide runtime are megabytes; a slow runner is not a failure.
-await page.waitForSelector('.tab', { timeout: 300_000 })
+await page.waitForSelector('[role="tab"]', { timeout: 300_000 })
 
 const examples = await page.$$eval('#example option', (options) =>
   options.map((option) => option.textContent),
@@ -71,8 +70,17 @@ if (examples.length === 0) fail('the page offers no examples')
 for (const [index, name] of examples.entries()) {
   if (index > 0) {
     await page.selectOption('#example', String(index))
+    // The console is emptied so that the line the run writes when it finishes is a
+    // condition to wait for rather than a duration to guess at.
+    await page.evaluate(() => {
+      document.querySelector('#console').textContent = ''
+    })
     await page.click('#run')
-    await page.waitForTimeout(1500)
+    await page.waitForFunction(
+      () => /written in/.test(document.querySelector('#console').textContent),
+      null,
+      { timeout: 300_000 },
+    )
   }
   await check(name)
 }
@@ -82,42 +90,46 @@ await browser.close()
 server.close()
 
 async function check(example) {
-  const offered = await page.$$eval('.tab', (tabs) => tabs.map((tab) => tab.textContent))
+  // Queried by role rather than by class: the roles are the contract the tab strip
+  // makes to a screen reader, and a stylesheet hook is not.
+  const offered = await page.$$eval('[role="tab"]', (tabs) => tabs.map((tab) => tab.textContent))
   for (const format of FORMATS) {
     if (!offered.includes(format)) fail(`${example}: no ${format} tab`)
   }
 
   for (const format of offered) {
-    await page.click(`.tab:text-is("${format}")`)
-    // Leaflet resizes itself when its panel is shown, and refitting takes a frame.
-    await page.waitForTimeout(250)
+    await page.click(`[role="tab"]:text-is("${format}")`)
+    // Leaflet builds and refits its map when the panel is shown, a frame later, so
+    // what is waited for is the drawing rather than a duration.
+    try {
+      await page.waitForFunction(drawn, format, { timeout: 60_000 })
+    } catch {
+      fail(`${example}: choosing ${format} drew nothing`)
+    }
 
-    const panel = await page.$$eval(
-      '.panel:not([hidden])',
-      (nodes) => {
-        const node = nodes[0]
-        if (!node) return null
-        return {
-          title: node.querySelector('h2')?.textContent ?? '',
-          bad: node.querySelector('.bad')?.textContent ?? '',
-          // A Leaflet map draws its features into an overlay pane; a viewer panel is
-          // an SVG of its own. Either way, an empty one is the thing worth failing on.
-          drawn:
-            node.querySelectorAll('.figure svg polyline, .figure svg polygon').length +
-            node.querySelectorAll('.leaflet-overlay-pane path').length,
-          files: node.querySelectorAll('.chip').length,
-        }
-      },
-    )
+    const panel = await page.$$eval('[role="tabpanel"]:not([hidden])', (nodes) => ({
+      showing: nodes.length,
+      bad: nodes[0]?.querySelector('.bad')?.textContent ?? '',
+      files: nodes[0]?.querySelectorAll('.chip').length ?? 0,
+    }))
 
-    if (!panel) fail(`${example}: choosing ${format} showed nothing`)
+    if (panel.showing !== 1) {
+      fail(`${example}: ${panel.showing} panels are visible at once, not 1`)
+    }
     if (panel.bad) fail(`${example}: ${format} said "${panel.bad}"`)
-    if (panel.drawn === 0) fail(`${example}: the ${format} panel is empty`)
     if (panel.files === 0) fail(`${example}: the ${format} panel lists no files`)
-
-    const shown = await page.$$eval('.panel:not([hidden])', (nodes) => nodes.length)
-    if (shown !== 1) fail(`${example}: ${shown} panels are visible at once, not 1`)
   }
+
+  // The `source` toggle is the one control the loop above does not touch, and the
+  // only place the page reads a written file back out of the working directory.
+  const showing = '[role="tabpanel"]:not([hidden])'
+  await page.click(`${showing} .chip button[aria-pressed]`)
+  await page.waitForSelector(`${showing} .source:not([hidden])`)
+  await page.click(`${showing} .chip button[aria-pressed="true"]`)
+  await page.waitForFunction(
+    (selector) => !document.querySelector(`${selector} .source:not([hidden])`),
+    showing,
+  )
 
   const console_ = await page.$eval('#console', (node) => node.textContent)
   if (/Traceback/.test(console_)) {
@@ -127,6 +139,22 @@ async function check(example) {
     fail(`${example}: the page threw\n  ${thrown.join('\n  ')}`)
   }
   console.log(`  ${example}: ${offered.length} tabs`)
+}
+
+/// The chosen format's panel is the only one showing, and it has something in it.
+///
+/// A Leaflet map draws its features into an overlay pane; a viewer panel is an SVG of
+/// its own. Either way, an empty one is the thing worth failing on.
+function drawn(format) {
+  const showing = document.querySelectorAll('[role="tabpanel"]:not([hidden])')
+  if (showing.length !== 1) return false
+  const panel = showing[0]
+  if (panel.getAttribute('aria-labelledby') !== `tab-${format}`) return false
+  return (
+    panel.querySelectorAll('.figure svg polyline, .figure svg polygon').length +
+      panel.querySelectorAll('.leaflet-overlay-pane path').length >
+    0
+  )
 }
 
 function serve(request, response) {

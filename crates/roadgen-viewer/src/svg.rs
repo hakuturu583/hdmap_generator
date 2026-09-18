@@ -37,6 +37,13 @@ const MAP_MAX: (f64, f64) = (760.0, 500.0);
 const MAP_MIN: (f64, f64) = (320.0, 180.0);
 const MARGIN: f64 = 16.0;
 
+/// The one thing true of every drawing here, said by every drawing here.
+///
+/// A [`Drawing`] is plan view: the heights the files carry have nowhere to go in it.
+/// Saying so in the description costs a clause and saves a reader the assumption.
+const PLAN_VIEW: &str = "A plan view: the heights, grades and cross-fall in the file \
+                         are not in this drawing.";
+
 const LEGEND_ROW: f64 = 21.0;
 const LEGEND_SWATCH: f64 = 26.0;
 const LEGEND_GAP: f64 = 8.0;
@@ -75,9 +82,13 @@ pub fn render(drawing: &Drawing) -> String {
         number(height),
     );
     let _ = write!(svg, "<title>{}</title>", escape(&drawing.title));
-    if !drawing.notes.is_empty() {
-        let _ = write!(svg, "<desc>{}</desc>", escape(&drawing.notes.join(" · ")));
-    }
+    // Every drawing says it is a plan view, in the one place a description is
+    // written, rather than each reader remembering to mention it: a `Drawing` has no
+    // third dimension by construction, so a picture that left it unsaid would be
+    // inviting the reader to take a flat road for a flat road surface.
+    let mut notes = drawing.notes.clone();
+    notes.push(PLAN_VIEW.to_owned());
+    let _ = write!(svg, "<desc>{}</desc>", escape(&notes.join(" · ")));
     svg.push_str(STYLE);
 
     if bounds.is_none() {
@@ -483,7 +494,7 @@ mod tests {
         drawing.note("<not markup>");
         let svg = drawing.to_svg();
         assert!(svg.contains("<title>a &amp; b</title>"));
-        assert!(svg.contains("<desc>&lt;not markup&gt;</desc>"));
+        assert!(svg.contains("<desc>&lt;not markup&gt; · "));
     }
 
     #[test]
