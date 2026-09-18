@@ -162,8 +162,9 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
     if !map.buildings.is_empty() {
         problems.push(format!(
             "a SUMO network is a traffic network and holds no scenery, so the map's \
-             {} buildings are not written",
-            map.buildings.len()
+             {} buildings ({} parts) are not written",
+            map.buildings.len(),
+            map.building_parts.len()
         ));
     }
 

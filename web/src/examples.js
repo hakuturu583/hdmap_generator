@@ -213,9 +213,14 @@ attr FloorHeight = 3.2
 Lot     --> Size(scope.x - 2, 0, scope.z - 6) Center(XZ) Plot
 Plot    --> 40% House | 35% Terrace | else: Block
 
-House   --> Extrude(rand(6, 9)) I("house")
+# The top of the mass, split off and given a shape: what the IR keeps of
+# it is the shape, the rise and which way the ridge runs.
+House   --> Extrude(rand(6, 9)) Split(Y) { ~1: Walls | 2.5: Cap }
+Walls   --> I("house")
+Cap     --> Roof(Gable, height=scope.y) { Slope: Tiles | GableEnd: Wall }
 Terrace --> Split(X) { ~1: Unit | ~1: Unit }
-Unit    --> Extrude(rand(6.5, 8.5)) I("terrace")
+Unit    --> Extrude(rand(6.5, 8.5)) Split(Y) { ~1: Party | 2: Cap }
+Party   --> I("terrace")
 Block   --> Extrude(FloorHeight * rand(3, 6)) I("apartments")
 """, seed=4)
 
@@ -228,10 +233,21 @@ m.export_sumo("sumo/")
 m.export_clipgt("clip/")
 m.export_gpudrive("scene.json")
 
-# Only two of the six have anywhere to put a footprint: OpenStreetMap, as
-# closed building ways, and OpenDRIVE, as objects with an outline. The
-# OpenDRIVE panel is the one that draws them.
-print(len(m.building_ids()), "buildings")
+# What came out is solid, not flat: a building is made of parts, and each
+# part has an outline, walls and a roof. building_shell() hands back the
+# faces that bound one.
+parts = [p for b in m.building_ids() for p in m.building_parts(b)]
+print(len(m.building_ids()), "buildings,", len(parts), "parts")
+roofs = {}
+for part in parts:
+    base, wall, shape, rise, direction, levels = m.building_part_shape(part)
+    roofs[shape] = roofs.get(shape, 0) + 1
+print("roofs:", roofs)
+print("the first part is bounded by", len(m.building_shell(parts[0])), "faces")
+
+# Only two of the six have anywhere to put a building: OpenStreetMap, as
+# Simple 3D Buildings ways, and OpenDRIVE, as objects with an outline per
+# part. The OpenDRIVE panel is the one that draws them.
 for warning in m.sumo_warnings():
     if "buildings" in warning:
         print("note:", warning)

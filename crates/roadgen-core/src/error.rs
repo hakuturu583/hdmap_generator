@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::id::{BuildingId, ConnectionId, JunctionId, LaneId, RoadId};
+use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, RoadId};
 
 /// Something that cannot be expressed as geometry.
 #[derive(Debug, Clone, PartialEq)]
@@ -226,9 +226,19 @@ pub enum ValidationIssue {
         road: RoadId,
         radians: f64,
     },
-    /// A building's height or storey count is not a building's.
+    /// A building names a part that is not on the map.
+    DanglingBuildingPartReference {
+        referrer: String,
+        part: BuildingPartId,
+    },
+    /// A building is not composed of what a building is composed of.
     ImplausibleBuilding {
         building: BuildingId,
+        detail: String,
+    },
+    /// A part's solid is not one a building could be made of.
+    ImplausibleBuildingPart {
+        part: BuildingPartId,
         detail: String,
     },
     Geometry {
@@ -282,8 +292,14 @@ impl fmt::Display for ValidationIssue {
                 "road {road} is banked by {:.1} degrees; beyond 45 the cross-section                  is no longer a road surface",
                 radians.to_degrees()
             ),
+            ValidationIssue::DanglingBuildingPartReference { referrer, part } => {
+                write!(f, "{referrer} refers to missing building part {part}")
+            }
             ValidationIssue::ImplausibleBuilding { building, detail } => {
                 write!(f, "building {building}: {detail}")
+            }
+            ValidationIssue::ImplausibleBuildingPart { part, detail } => {
+                write!(f, "building part {part}: {detail}")
             }
             ValidationIssue::Geometry { detail } => write!(f, "geometry error: {detail}"),
         }

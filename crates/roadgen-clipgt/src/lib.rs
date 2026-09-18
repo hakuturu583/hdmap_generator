@@ -211,8 +211,9 @@ pub fn check(map: &ValidatedMap, config: Option<&ClipConfig>) -> Vec<String> {
     if !map.buildings.is_empty() {
         problems.push(format!(
             "ClipGT's layers describe the road surface and its markings, so the map's \
-             {} buildings are not written",
-            map.buildings.len()
+             {} buildings ({} parts) are not written",
+            map.buildings.len(),
+            map.building_parts.len()
         ));
     }
     if !map.connections.is_empty() {

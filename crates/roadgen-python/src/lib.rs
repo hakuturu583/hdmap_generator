@@ -16,7 +16,7 @@ use roadgen_core::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
 use roadgen_core::geometry::{
     Alignment, Curve3, Point3, Poly3Profile, SamplingConfig, Taper, WidthProfile,
 };
-use roadgen_core::id::{BuildingId, JunctionId, LaneId, ObjectId, RoadId};
+use roadgen_core::id::{BuildingId, BuildingPartId, JunctionId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::{MapMetadata, Projection, TrafficHandedness};
 use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking, RoadType};
 use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd};
@@ -767,15 +767,47 @@ impl PyMap {
             .collect())
     }
 
-    /// One building's outline, as `(x, y, z)` metres, anticlockwise and not closed.
-    fn building_footprint(&mut self, building: String) -> PyResult<Vec<(f64, f64, f64)>> {
-        self.ensure_built()?;
-        let map = self.built.as_ref().expect("just built");
-        let id = BuildingId::parse_printed(&building);
-        let entry = map
-            .building(&id)
-            .ok_or_else(|| PyValueError::new_err(format!("no such building: {building}")))?;
-        Ok(entry
+    /// Which road a building faces, as `(road, side, station_metres)`.
+    ///
+    /// `None` for a building that was put on the map without one, which a generated
+    /// town never is.
+    fn building_frontage(&mut self, building: String) -> PyResult<Option<(String, String, f64)>> {
+        let entry = self.find_building(&building)?;
+        Ok(entry.frontage.as_ref().map(|frontage| {
+            (
+                frontage.road.to_string(),
+                frontage.side.as_str().to_owned(),
+                frontage.station,
+            )
+        }))
+    }
+
+    /// What a building is, as the word the rules emitted it with.
+    fn building_kind(&mut self, building: String) -> PyResult<String> {
+        Ok(self.find_building(&building)?.kind.clone())
+    }
+
+    /// The parts a building is made of, lowest first.
+    ///
+    /// A building is not a shape; its parts are. One with a single part is the common
+    /// case and not a special one.
+    fn building_parts(&mut self, building: String) -> PyResult<Vec<String>> {
+        Ok(self
+            .find_building(&building)?
+            .parts
+            .iter()
+            .map(|part| part.to_string())
+            .collect())
+    }
+
+    /// One part's outline, as `(x, y, z)` metres, anticlockwise and not closed.
+    ///
+    /// The vertices carry their own heights: a part that starts partway up a building
+    /// has an outline that starts there, and one on sloping ground is not level.
+    fn building_footprint(&mut self, part: String) -> PyResult<Vec<(f64, f64, f64)>> {
+        Ok(self
+            .find_part(&part)?
+            .solid
             .footprint
             .points()
             .iter()
@@ -783,17 +815,46 @@ impl PyMap {
             .collect())
     }
 
-    /// One building's `(kind, height_metres, levels)`.
-    fn building_shape(&mut self, building: String) -> PyResult<(String, f64, u32)> {
-        self.ensure_built()?;
-        let map = self.built.as_ref().expect("just built");
-        let id = BuildingId::parse_printed(&building);
-        let entry = map
-            .building(&id)
-            .ok_or_else(|| PyValueError::new_err(format!("no such building: {building}")))?;
-        Ok((entry.kind.clone(), entry.height, entry.levels))
+    /// One part's `(base_height, wall_height, roof_shape, roof_height,
+    /// roof_direction_radians, levels)`. Every length is in metres.
+    fn building_part_shape(&mut self, part: String) -> PyResult<(f64, f64, String, f64, f64, u32)> {
+        let entry = self.find_part(&part)?;
+        Ok((
+            entry.solid.base_height(),
+            entry.solid.wall_height,
+            entry.solid.roof.shape.as_str().to_owned(),
+            entry.solid.roof.height,
+            entry.solid.roof.direction,
+            entry.levels,
+        ))
     }
 
+    /// What one part is, when it is something its building as a whole is not — the
+    /// offices above a shopping podium. `None` when it is simply part of it.
+    fn building_part_kind(&mut self, part: String) -> PyResult<Option<String>> {
+        Ok(self.find_part(&part)?.kind.clone())
+    }
+
+    /// The faces bounding one part, each a list of `(x, y, z)` metres anticlockwise
+    /// seen from outside: the base, one per wall, and the roof.
+    ///
+    /// This is the solid itself rather than a description of it — the outline and the
+    /// heights are the compact form, and this is what they mean.
+    fn building_shell(&mut self, part: String) -> PyResult<Vec<Vec<(f64, f64, f64)>>> {
+        Ok(self
+            .find_part(&part)?
+            .solid
+            .shell()
+            .into_iter()
+            .map(|face| {
+                face.into_iter()
+                    .map(|point| (point.x, point.y, point.z))
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// Builds and validates the map, raising if anything is wrong.
     /// Builds and validates the map, raising if anything is wrong.
     fn validate(&mut self) -> PyResult<()> {
         self.ensure_built()
@@ -1163,6 +1224,26 @@ impl PyMap {
 impl PyMap {
     fn invalidate(&mut self) {
         self.built = None;
+    }
+
+    fn find_building(&mut self, building: &str) -> PyResult<&roadgen_core::Building> {
+        self.ensure_built()?;
+        let id = BuildingId::parse_printed(building);
+        self.built
+            .as_ref()
+            .expect("just built")
+            .building(&id)
+            .ok_or_else(|| PyValueError::new_err(format!("no such building: {building}")))
+    }
+
+    fn find_part(&mut self, part: &str) -> PyResult<&roadgen_core::BuildingPart> {
+        self.ensure_built()?;
+        let id = BuildingPartId::parse_printed(part);
+        self.built
+            .as_ref()
+            .expect("just built")
+            .building_part(&id)
+            .ok_or_else(|| PyValueError::new_err(format!("no such building part: {part}")))
     }
 
     fn build(&self) -> PyResult<UnvalidatedMap> {

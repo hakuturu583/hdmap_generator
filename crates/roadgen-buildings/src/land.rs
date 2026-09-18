@@ -41,6 +41,9 @@ pub struct Lot {
     pub side: LateralSide,
     /// Position along the frontage, counting from the road's start.
     pub index: usize,
+    /// Where the middle of the lot faces the road, metres along its reference line.
+    /// What the building's [`Frontage`](roadgen_core::buildings::Frontage) records.
+    pub station: f64,
     /// The scope's `(0, 0, 0)` corner: on the ground, on the frontage line.
     pub origin: Point3,
     /// Local +X in the horizontal plane, unit length.
@@ -303,6 +306,7 @@ fn frontage_lot(
         road: road.id.clone(),
         side,
         index,
+        station: (from + to) / 2.0,
         origin: Point3::new(origin.x, origin.y, ground),
         along,
         away,

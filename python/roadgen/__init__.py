@@ -39,8 +39,12 @@ it are whether to and by what rules:
 
 `roadgen.building_presets()` lists the built-in sets and `roadgen.building_rules(name)`
 hands one back as text, so rules of your own start as a preset with a line changed.
-The footprints go out with every export whose format has somewhere to put them —
-OpenStreetMap ways and OpenDRIVE objects — and the others say what they dropped.
+
+What comes out is solid rather than flat: a building is made of parts, each with an
+outline, walls that rise from it and a roof, and `building_shell(part)` hands back the
+faces that bound one. They go out with every export whose format has somewhere to put
+them — OpenStreetMap ways and OpenDRIVE objects — and the others say what they
+dropped.
 
 Every export can be drawn back:
 

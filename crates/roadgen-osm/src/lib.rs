@@ -34,10 +34,17 @@
 //!
 //! # Buildings
 //!
-//! The one thing OSM holds better than any other format here. A building is a closed
-//! way tagged `building`, which is exactly what the IR has — an outline on the ground
-//! — so nothing is lost and nothing has to be invented. It is the only part of this
-//! export that [`check`] has no complaint about.
+//! The one thing OSM holds better than any other format here, because OSM has a model
+//! for a building of several parts and the IR has the same one. **Simple 3D
+//! Buildings** is the scheme: the building's outline is a closed way tagged
+//! `building`, each of its parts is a closed way tagged `building:part=yes` inside it,
+//! and `height`, `min_height`, `roof:shape`, `roof:height` and `roof:direction` say
+//! what each one occupies. A building of a single part writes one way and puts all of
+//! that on it, because a reader of a simple building expects to find it there.
+//!
+//! So the whole of the IR's solid survives: the parts, the heights they span, the
+//! roofs and which way their ridges run. Nothing here is approximated and [`check`]
+//! has no complaint to make about it.
 
 pub mod error;
 pub mod tags;
@@ -241,36 +248,64 @@ impl<'a> Exporter<'a> {
         Ok(())
     }
 
-    /// Every building, as a closed way.
+    /// Every building, as a closed way, with a way per part where there is more than
+    /// one.
     ///
     /// The outline goes down as it stands: OSM wants the ring anticlockwise and
     /// closed by repeating its first node, and a [`Footprint`](roadgen_core::Footprint)
     /// is already the first of those and one node short of the second.
     fn add_buildings(&mut self) -> Result<(), ExportError> {
         for building in self.map.buildings.iter() {
-            let mut nodes = Vec::with_capacity(building.footprint.len() + 1);
-            for point in building.footprint.points() {
-                nodes.push(self.node_at(*point)?);
-            }
-            nodes.dedup();
-            if nodes.len() < 3 {
+            let parts = self.map.parts_of(&building.id);
+            let Some(ground) = parts
+                .iter()
+                .map(|part| part.solid.base_height())
+                .reduce(f64::min)
+            else {
+                continue;
+            };
+            // The building's own outline is the outline of the part that meets the
+            // ground: OSM wants one way around the whole thing, and for a massing
+            // built upwards from a footprint that is the footprint.
+            let Some(lowest) = parts
+                .iter()
+                .find(|part| part.solid.base_height() <= ground + 1e-9)
+            else {
+                continue;
+            };
+
+            let single = (parts.len() == 1).then_some(*lowest);
+            let outline = lowest.solid.footprint.points().to_vec();
+            self.add_closed_way(&outline, tags::building_tags(building, single, ground))?;
+            if single.is_some() {
                 continue;
             }
-            // A closed way is one whose first node is also its last. Two buildings
-            // in a terrace share the corner nodes between them, which is welding
-            // doing what it does for roads and is what OSM expects of a terrace.
-            nodes.push(nodes[0]);
-
-            let id = self.take_id();
-            self.document.ways.insert(
-                id,
-                Way {
-                    id,
-                    nodes,
-                    tags: tags::building_tags(building),
-                },
-            );
+            for part in &parts {
+                let ring = part.solid.footprint.points().to_vec();
+                self.add_closed_way(&ring, tags::building_part_tags(part, ground))?;
+            }
         }
+        Ok(())
+    }
+
+    /// A closed way through `ring`, or nothing when too few of its nodes are distinct.
+    ///
+    /// Two buildings in a terrace share the corner nodes between them, which is
+    /// welding doing what it does for roads and is what OSM expects of a terrace.
+    fn add_closed_way(&mut self, ring: &[Point3], tags: Tags) -> Result<(), ExportError> {
+        let mut nodes = Vec::with_capacity(ring.len() + 1);
+        for point in ring {
+            nodes.push(self.node_at(*point)?);
+        }
+        nodes.dedup();
+        if nodes.len() < 3 {
+            return Ok(());
+        }
+        // A closed way is one whose first node is also its last.
+        nodes.push(nodes[0]);
+
+        let id = self.take_id();
+        self.document.ways.insert(id, Way { id, nodes, tags });
         Ok(())
     }
 

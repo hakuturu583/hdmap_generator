@@ -291,9 +291,10 @@ pub fn check(map: &ValidatedMap, config: Option<&SceneConfig>) -> Vec<String> {
 
     if !map.buildings.is_empty() {
         problems.push(format!(
-            "a GPUDrive scene is roads and agents, so the map's {} buildings are not \
-             written",
-            map.buildings.len()
+            "a GPUDrive scene is roads and agents, so the map's {} buildings ({} parts) \
+             are not written",
+            map.buildings.len(),
+            map.building_parts.len()
         ));
     }
 

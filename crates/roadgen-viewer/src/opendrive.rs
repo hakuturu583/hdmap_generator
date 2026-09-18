@@ -23,11 +23,16 @@
 //!
 //! # Buildings
 //!
-//! An `<object type="building">` carries an `<outline>`, and the outline is where the
-//! footprint is. Its corners are `<cornerLocal>` — measured from the object's pivot,
-//! in the road frame at the object's own station — so drawing one means evaluating
-//! the reference line once and laying the corners out against it, which is the same
-//! `(s, t)` walk every lane edge in this file goes through.
+//! An `<object type="building">` carries an outline per part of the building, and
+//! each outline is where that part stands. Their corners are `<cornerLocal>` —
+//! measured from the object's pivot, in the road frame at the object's own station —
+//! so drawing one means evaluating the reference line once and laying the corners out
+//! against it, which is the same `(s, t)` walk every lane edge in this file goes
+//! through.
+//!
+//! A plan view draws every part, not only the one on the ground: a wing behind a
+//! house and a tower set back on a podium are both things you would see from above,
+//! and drawing the building's outline alone would hide the massing the file holds.
 
 use std::f64::consts::PI;
 
@@ -148,7 +153,7 @@ pub fn draw(xml: &str) -> Result<Drawing, ViewError> {
     ));
     if buildings > 0 {
         drawing.note(format!(
-            "{buildings} buildings, drawn from the outline each object carries"
+            "{buildings} building parts, drawn from the outlines each object carries"
         ));
     }
     drawing.note(
@@ -159,7 +164,8 @@ pub fn draw(xml: &str) -> Result<Drawing, ViewError> {
     Ok(drawing)
 }
 
-/// Draws every building object of one road, and says how many there were.
+/// Draws every outline of every building object of one road, and says how many there
+/// were.
 ///
 /// An object with no outline is not drawn. OpenDRIVE lets one say "a building, this
 /// wide and this long, at this point", and a box inferred from two numbers is not a
@@ -174,9 +180,17 @@ fn draw_buildings(drawing: &mut Drawing, road: &Road, reference: &ReferenceLine)
         if object.r#type != Some(ObjectType::Building) {
             continue;
         }
-        let Some(outline) = &object.outline else {
+        // A building of several parts carries an outline each, in `<outlines>`; the
+        // singular is what the standard's other objects use, and both are read.
+        let rings: Vec<&opendrive::object::outline::Outline> = object
+            .outlines
+            .iter()
+            .flat_map(|outlines| outlines.outline.iter())
+            .chain(object.outline.iter())
+            .collect();
+        if rings.is_empty() {
             continue;
-        };
+        }
         let pivot_s = object.s.get::<meter>();
         let pivot_t = object.t.get::<meter>();
         let pivot = reference.at(pivot_s, pivot_t);
@@ -185,34 +199,36 @@ fn draw_buildings(drawing: &mut Drawing, road: &Road, reference: &ReferenceLine)
         let heading = reference.heading_at(pivot_s)
             + object.hdg.map(|hdg| hdg.get::<radian>()).unwrap_or(0.0);
 
-        let mut ring = Vec::with_capacity(outline.choice.len());
-        for corner in outline.choice.iter() {
-            ring.push(match corner {
-                // `u` and `v` are a *Cartesian* frame anchored at the pivot, not a
-                // walk along the reference line: the corner is the pivot plus that
-                // offset, turned into the world. Reading them as `(s, t)` instead is
-                // the classic way to fan a building out along the inside of a bend —
-                // and it is why the exporter writes them this way in the first place,
-                // so that the shape survives.
-                Corner::Local(local) => {
-                    let (u, v) = (local.u.get::<meter>(), local.v.get::<meter>());
-                    Point::new(
-                        pivot.x + u * heading.cos() - v * heading.sin(),
-                        pivot.y + u * heading.sin() + v * heading.cos(),
-                    )
-                }
-                // A corner of its own `(s, t)`, which is how the standard's other
-                // outline form says it — and which does follow the reference line.
-                Corner::Road(on_road) => {
-                    reference.at(on_road.s.get::<meter>(), on_road.t.get::<meter>())
-                }
-            });
+        for outline in rings {
+            let mut ring = Vec::with_capacity(outline.choice.len());
+            for corner in outline.choice.iter() {
+                ring.push(match corner {
+                    // `u` and `v` are a *Cartesian* frame anchored at the pivot, not a
+                    // walk along the reference line: the corner is the pivot plus that
+                    // offset, turned into the world. Reading them as `(s, t)` instead is
+                    // the classic way to fan a building out along the inside of a bend —
+                    // and it is why the exporter writes them this way in the first place,
+                    // so that the shape survives.
+                    Corner::Local(local) => {
+                        let (u, v) = (local.u.get::<meter>(), local.v.get::<meter>());
+                        Point::new(
+                            pivot.x + u * heading.cos() - v * heading.sin(),
+                            pivot.y + u * heading.sin() + v * heading.cos(),
+                        )
+                    }
+                    // A corner of its own `(s, t)`, which is how the standard's other
+                    // outline form says it — and which does follow the reference line.
+                    Corner::Road(on_road) => {
+                        reference.at(on_road.s.get::<meter>(), on_road.t.get::<meter>())
+                    }
+                });
+            }
+            if ring.len() < 3 || ring.iter().any(|point| !point.x.is_finite()) {
+                continue;
+            }
+            drawing.area(Kind::Building, ring);
+            drawn += 1;
         }
-        if ring.len() < 3 || ring.iter().any(|point| !point.x.is_finite()) {
-            continue;
-        }
-        drawing.area(Kind::Building, ring);
-        drawn += 1;
     }
     drawn
 }

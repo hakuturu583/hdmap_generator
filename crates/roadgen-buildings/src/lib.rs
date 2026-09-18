@@ -17,7 +17,7 @@
 //!                │      symbios-shape derivation   (one per lot, one seed each)
 //!                │             │
 //!                │             ▼
-//!                │        masses ──▶ footprints
+//!                │        boxes and panels ──▶ parts, roofs, solids
 //!                │             │
 //!                ◀─────────────┘  buildings
 //!                │
@@ -102,6 +102,8 @@ pub struct Report {
     pub lots: usize,
     /// Buildings placed.
     pub buildings: usize,
+    /// Massing parts those buildings are made of. Never fewer than `buildings`.
+    pub parts: usize,
     /// Lots whose derivation produced no mass at all.
     pub empty_lots: usize,
     /// Lots the rules could not be derived on at all. A handful is a grammar meeting
@@ -139,10 +141,12 @@ pub fn generate(map: &mut UnvalidatedMap, rules: &Rules) -> Result<Report, Error
     let mut buildings = Vec::new();
     let mut first_failure: Option<String> = None;
 
+    let mut parts = Vec::new();
+
     for lot in &lots {
         let seed = rules.seed() ^ lot_seed(lot);
         let derived = match masses::derive(&mut interpreter, lot, ROOT, seed) {
-            Ok(masses) => masses,
+            Ok(massings) => massings,
             // A grammar that cannot derive *this* lot — a split that overflows a
             // short frontage, a depth limit on a recursive rule — is a gap in the
             // street rather than a broken grammar: the rules compiled, and the next
@@ -162,23 +166,40 @@ pub fn generate(map: &mut UnvalidatedMap, rules: &Rules) -> Result<Report, Error
 
         // A lot is placed whole or not at all. Within one lot the grammar is the
         // authority — an L plan's two wings meet along an edge and neither is in the
-        // other's way — so the masses of one lot are never tested against each other,
-        // and a lot that cannot fit does not leave half a building behind.
-        let plans: Vec<_> = derived.iter().map(|mass| mass.plan.clone()).collect();
+        // other's way — so the massings of one lot are never tested against each
+        // other, and a lot that cannot fit does not leave half a building behind.
+        //
+        // Every part is tested, not just the one on the ground: a wing that oversails
+        // the pavement is as much in the road as a wall would be.
+        let plans: Vec<Vec<_>> = derived
+            .iter()
+            .map(|massing| {
+                massing
+                    .plans()
+                    .into_iter()
+                    .map(<[_]>::to_vec)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         if plans
             .iter()
+            .flatten()
             .any(|plan| blocked.hits(plan) || placed.hits(plan))
         {
             report.clashes += 1;
             continue;
         }
 
-        for (part, mass) in derived.into_iter().enumerate() {
-            let Some(building) = mass.into_building(lot, part, floor_height) else {
+        for (index, massing) in derived.into_iter().enumerate() {
+            let Some((building, massing_parts)) = massing.into_building(lot, index, floor_height)
+            else {
                 continue;
             };
-            placed.insert(plans[part].clone());
+            for plan in &plans[index] {
+                placed.insert(plan.clone());
+            }
             buildings.push(building);
+            parts.extend(massing_parts);
         }
     }
 
@@ -193,12 +214,19 @@ pub fn generate(map: &mut UnvalidatedMap, rules: &Rules) -> Result<Report, Error
 
     let map = map.as_map_mut();
     map.buildings = roadgen_core::Arena::new();
+    map.building_parts = roadgen_core::Arena::new();
     for building in buildings {
         let id = building.id.clone();
         // Identifiers are derived from the road, the side and the position along it,
         // so a duplicate would mean two lots claiming one place on one frontage.
         if map.buildings.insert(id, building).is_ok() {
             report.buildings += 1;
+        }
+    }
+    for part in parts {
+        let id = part.id.clone();
+        if map.building_parts.insert(id, part).is_ok() {
+            report.parts += 1;
         }
     }
     Ok(report)
@@ -225,6 +253,32 @@ mod tests {
     use roadgen_core::units::PositiveWidth;
 
     use super::*;
+
+    /// Every building as its identifier, kind and the shape of each of its parts —
+    /// which is what "the same town" has to mean for these tests.
+    fn summarise(map: &roadgen_core::map::Map) -> Vec<(String, String, Vec<String>)> {
+        map.buildings
+            .iter()
+            .map(|building| {
+                (
+                    building.id.to_string(),
+                    building.kind.clone(),
+                    map.parts_of(&building.id)
+                        .iter()
+                        .map(|part| {
+                            format!(
+                                "{:.3}..{:.3} {} {:.3}",
+                                part.solid.base_height(),
+                                part.solid.top_height(),
+                                part.solid.roof.shape.as_str(),
+                                part.solid.footprint.area(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
 
     fn lanes() -> Vec<LaneSpec> {
         vec![
@@ -254,8 +308,20 @@ mod tests {
         assert!(report.buildings > 0, "{report:?}");
         let map = map.as_map();
         assert_eq!(map.buildings.len(), report.buildings);
-        assert!(map.buildings.iter().any(|b| b.footprint.centroid().y > 0.0));
-        assert!(map.buildings.iter().any(|b| b.footprint.centroid().y < 0.0));
+        assert_eq!(map.building_parts.len(), report.parts);
+        assert!(report.parts >= report.buildings, "{report:?}");
+
+        // Both sides of the street, and every building is a solid standing on the
+        // ground the road runs over.
+        let middle = |building: &roadgen_core::Building| {
+            map.parts_of(&building.id)[0].solid.footprint.centroid()
+        };
+        assert!(map.buildings.iter().any(|b| middle(b).y > 0.0));
+        assert!(map.buildings.iter().any(|b| middle(b).y < 0.0));
+        for part in map.building_parts.iter() {
+            assert!(part.solid.is_closed(), "{} is not closed", part.id);
+            assert!(part.solid.height() > 0.0, "{}", part.id);
+        }
     }
 
     #[test]
@@ -270,12 +336,12 @@ mod tests {
         // The road is 3.5 m of lane each side, so every footprint vertex has to be
         // clear of that — and of the setback the rules asked for.
         let setback = Rules::default().compile().unwrap().layout.setback;
-        for building in map.as_map().buildings.iter() {
-            for point in building.footprint.points() {
+        for part in map.as_map().building_parts.iter() {
+            for point in part.solid.footprint.points() {
                 assert!(
                     point.y.abs() >= 3.5 + setback - 1e-6,
                     "{} reaches the road at {point:?}",
-                    building.id
+                    part.id
                 );
             }
         }
@@ -335,11 +401,16 @@ mod tests {
             let mut map = builder.finish().unwrap();
             generate(&mut map, &Rules::preset(name).unwrap()).unwrap();
 
+            let map = map.as_map();
             let built: Vec<String> = map
-                .as_map()
                 .buildings
                 .iter()
                 .map(|building| building.kind.clone())
+                .chain(
+                    map.building_parts
+                        .iter()
+                        .filter_map(|part| part.kind.clone()),
+                )
                 .collect();
             for kind in kinds_named_by(grammar) {
                 assert!(
@@ -388,6 +459,45 @@ mod tests {
     }
 
     #[test]
+    fn a_building_of_several_parts_is_something_a_preset_actually_builds() {
+        // The whole composite model would be dead weight if no rules ever used it,
+        // and an exporter's handling of it would be tested only by its own tests.
+        let mut map = street(
+            "high",
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(600.0, 0.0, 0.0),
+        );
+        generate(&mut map, &Rules::preset("downtown").unwrap()).unwrap();
+
+        let map = map.as_map();
+        let stacked: Vec<_> = map
+            .buildings
+            .iter()
+            .filter(|building| building.parts.len() > 1)
+            .collect();
+        assert!(!stacked.is_empty(), "downtown should stack something");
+
+        for building in stacked {
+            let parts = map.parts_of(&building.id);
+            // Each part starts where the one below it stops, and reaches further up.
+            for pair in parts.windows(2) {
+                assert!(
+                    (pair[1].solid.base_height() - pair[0].solid.top_height()).abs() < 0.5,
+                    "{} does not stand on {}",
+                    pair[1].id,
+                    pair[0].id
+                );
+            }
+            // And the one on top covers less ground than the one it stands on.
+            assert!(
+                parts[1].solid.footprint.area() < parts[0].solid.footprint.area(),
+                "{}: the tower should be set back",
+                building.id
+            );
+        }
+    }
+
+    #[test]
     fn the_same_rules_and_seed_build_the_same_town() {
         let build = || {
             let mut map = street(
@@ -396,11 +506,7 @@ mod tests {
                 Point3::new(300.0, 0.0, 0.0),
             );
             generate(&mut map, &Rules::default().with_seed(7)).unwrap();
-            map.into_map()
-                .buildings
-                .iter()
-                .map(|b| (b.id.to_string(), b.kind.clone(), b.height))
-                .collect::<Vec<_>>()
+            summarise(&map.into_map())
         };
         assert_eq!(build(), build());
     }
@@ -414,11 +520,7 @@ mod tests {
                 Point3::new(300.0, 0.0, 0.0),
             );
             generate(&mut map, &Rules::default().with_seed(seed)).unwrap();
-            map.into_map()
-                .buildings
-                .iter()
-                .map(|b| (b.kind.clone(), b.height))
-                .collect::<Vec<_>>()
+            summarise(&map.into_map())
         };
         assert_ne!(build(1), build(2));
     }
@@ -432,11 +534,7 @@ mod tests {
                 Point3::new(300.0, 0.0, 0.0),
             );
             generate(&mut map, &Rules::default()).unwrap();
-            map.into_map()
-                .buildings
-                .iter()
-                .map(|b| (b.id.to_string(), b.kind.clone(), b.height))
-                .collect::<Vec<_>>()
+            summarise(&map.into_map())
         };
 
         let two = {
@@ -465,11 +563,9 @@ mod tests {
                 .unwrap();
             let mut map = builder.finish().unwrap();
             generate(&mut map, &Rules::default()).unwrap();
-            map.into_map()
-                .buildings
-                .iter()
-                .filter(|b| b.id.as_str().starts_with("building/high/"))
-                .map(|b| (b.id.to_string(), b.kind.clone(), b.height))
+            summarise(&map.into_map())
+                .into_iter()
+                .filter(|(id, ..)| id.starts_with("building/high/"))
                 .collect::<Vec<_>>()
         };
 
@@ -522,10 +618,10 @@ mod tests {
         // Nothing placed overlaps anything else placed.
         let buildings: Vec<Vec<_>> = map
             .as_map()
-            .buildings
+            .building_parts
             .iter()
-            .map(|building| {
-                building
+            .map(|part| {
+                part.solid
                     .footprint
                     .points()
                     .iter()

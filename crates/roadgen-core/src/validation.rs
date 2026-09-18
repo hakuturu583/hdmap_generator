@@ -111,11 +111,13 @@ impl Deref for ValidatedMap {
     }
 }
 
-/// Buildings are checked for the two things a [`Footprint`](crate::buildings::Footprint)
-/// cannot already rule out: that the building rises, and that its storey count is one
-/// a building could have. The outline itself needs no check — a `Footprint` cannot be
-/// built from fewer than three vertices, from a non-finite coordinate or from a ring
-/// that encloses no area.
+/// Buildings are checked for what only becomes wrong once the pieces are put
+/// together: the composition, the references, and the heights.
+///
+/// What a type already rules out is not rechecked. A
+/// [`Footprint`](crate::buildings::Footprint) cannot be built from fewer than three
+/// vertices, from a non-finite coordinate or from a ring that encloses no area, and a
+/// [`Solid`](crate::buildings::Solid)'s shell closes by construction.
 ///
 /// Whether a building stands clear of the road is deliberately *not* checked. A map
 /// may perfectly well describe a building the road passes under, and the generator
@@ -123,19 +125,81 @@ impl Deref for ValidatedMap {
 /// not where a generator's taste is enforced.
 fn check_buildings(map: &Map, issues: &mut Vec<ValidationIssue>) {
     for building in map.buildings.iter() {
-        if !building.height.is_finite() || building.height <= 0.0 {
+        // A building is what its parts add up to, so a building with none is not a
+        // building — it is a name with nothing under it.
+        if building.parts.is_empty() {
             issues.push(ValidationIssue::ImplausibleBuilding {
                 building: building.id.clone(),
+                detail: "no parts; a building is what its parts add up to".to_owned(),
+            });
+        }
+        for part in &building.parts {
+            match map.building_parts.get(part) {
+                None => issues.push(ValidationIssue::DanglingBuildingPartReference {
+                    referrer: building.id.to_string(),
+                    part: part.clone(),
+                }),
+                // The composition is recorded from both ends, as a road and its lanes
+                // record it, so the two have to agree.
+                Some(entry) if entry.building != building.id => {
+                    issues.push(ValidationIssue::ImplausibleBuilding {
+                        building: building.id.clone(),
+                        detail: format!("part {part} claims building {}", entry.building),
+                    })
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(frontage) = &building.frontage {
+            if !map.roads.contains(&frontage.road) {
+                issues.push(ValidationIssue::DanglingRoadReference {
+                    referrer: building.id.to_string(),
+                    road: frontage.road.clone(),
+                });
+            }
+        }
+    }
+
+    for part in map.building_parts.iter() {
+        if !map.buildings.contains(&part.building) {
+            issues.push(ValidationIssue::ImplausibleBuilding {
+                building: part.building.clone(),
+                detail: format!("part {} belongs to no building on this map", part.id),
+            });
+        }
+        let solid = &part.solid;
+        if !solid.wall_height.is_finite() || solid.wall_height <= 0.0 {
+            issues.push(ValidationIssue::ImplausibleBuildingPart {
+                part: part.id.clone(),
                 detail: format!(
-                    "height is {}, and a building rises above its footprint",
-                    building.height
+                    "walls {} m high, and a wall rises above the outline it stands on",
+                    solid.wall_height
                 ),
             });
         }
-        if building.levels == 0 {
-            issues.push(ValidationIssue::ImplausibleBuilding {
-                building: building.id.clone(),
-                detail: "no storeys; a building has at least one".to_owned(),
+        if !solid.roof.height.is_finite() || solid.roof.height < 0.0 {
+            issues.push(ValidationIssue::ImplausibleBuildingPart {
+                part: part.id.clone(),
+                detail: format!("a roof cannot rise {} m", solid.roof.height),
+            });
+        }
+        // The two are stated together, so they have to mean the same thing: a shape
+        // with no rise is flat, and a flat roof has no rise.
+        if (solid.roof.shape == crate::buildings::RoofShape::Flat) != (solid.roof.height == 0.0) {
+            issues.push(ValidationIssue::ImplausibleBuildingPart {
+                part: part.id.clone(),
+                detail: format!(
+                    "a {} roof rising {} m: a flat roof rises nothing and a roof that \
+                     rises is not flat",
+                    solid.roof.shape.as_str(),
+                    solid.roof.height
+                ),
+            });
+        }
+        if part.levels == 0 {
+            issues.push(ValidationIssue::ImplausibleBuildingPart {
+                part: part.id.clone(),
+                detail: "no storeys; a part of a building has at least one".to_owned(),
             });
         }
     }

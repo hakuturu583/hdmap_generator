@@ -34,7 +34,6 @@ impl Bounds {
         }
         bounds
     }
-
 }
 
 /// Whether two convex polygons share any area, by the separating-axis test.

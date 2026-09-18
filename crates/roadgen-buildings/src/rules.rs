@@ -38,6 +38,13 @@
 //! line that declares an `attr`, a `const` or a `style`, or that heads a rule
 //! (`Name -->`, `Name(a, b) -->`); every other line continues the statement before
 //! it. That is what lets a rule's body run over as many lines as it reads best on.
+//!
+//! A line that is only a comment is dropped rather than joined to the statement above
+//! it, so that a mistake on it is reported against itself. `//` is CGA's line comment
+//! and `#` is accepted beside it, because rules are usually written inside a Python
+//! string and `#` is what the hand reaches for there; neither means anything else in
+//! a grammar, so nothing is shadowed by taking both. A `#` or a `//` inside a quoted
+//! name — `I("http://x")` — is part of the name and not a comment.
 
 use std::collections::BTreeMap;
 
@@ -71,11 +78,16 @@ attr FloorHeight = 3.2
 Lot     --> Size(scope.x - 2, 0, scope.z - 2) Center(XZ) Plot
 Plot    --> 45% House | 30% Terrace | 15% Shop | else: Block
 
-House   --> Extrude(rand(6, 9)) I("house")
+// A pitched roof is the top of the mass, split off and given a shape. What the
+// IR keeps of it is the shape, the rise and which way the ridge runs.
+House   --> Extrude(rand(6, 9)) Split(Y) { ~1: Walls | 2.5: Gable }
+Walls   --> I("house")
 Terrace --> Split(X) { ~1: Unit | ~1: Unit }
-Unit    --> Extrude(rand(6.5, 8.5)) I("terrace")
+Unit    --> Extrude(rand(6.5, 8.5)) Split(Y) { ~1: Party | 2: Gable }
+Party   --> I("terrace")
 Shop    --> Extrude(FloorHeight * 2) I("retail")
 Block   --> Extrude(FloorHeight * rand(3, 5)) I("apartments")
+Gable   --> Roof(Gable, height=scope.y) { Slope: Tiles | GableEnd: Wall }
 "#;
 
 /// Detached houses on generous plots, well back from the kerb.
@@ -90,10 +102,15 @@ attr FloorHeight = 3.0
 Lot      --> Size(scope.x - 4, 0, scope.z - 8) Center(XZ) Plot
 Plot     --> 70% Detached | else: WithWing
 
-Detached --> Extrude(rand(5.5, 8.0)) I("house")
-// An L plan: a front range with a wing behind it, which is two footprints.
+Detached --> Extrude(rand(5.5, 8.0)) Split(Y) { ~1: Walls | 2.5: Cap }
+Walls    --> I("house")
+// An L plan: a front range with a wing behind it, which is two buildings side by
+// side rather than one, because neither stands on the other.
 WithWing --> ShapeL(rand(7, 9), rand(6, 8)) { Shape: Wing | Remainder: NIL }
-Wing     --> Extrude(rand(5.5, 7.5)) I("house")
+Wing     --> Extrude(rand(5.5, 7.5)) Split(Y) { ~1: Walls | 2.5: Cap }
+Cap      --> 60% Hip | else: Gable
+Hip      --> Roof(Hip, height=scope.y) { Slope: Tiles | HipEnd: Tiles }
+Gable    --> Roof(Gable, height=scope.y) { Slope: Tiles | GableEnd: Wall }
 "#;
 
 /// A terraced high street, built to the pavement and going up.
@@ -109,9 +126,11 @@ Lot      --> Size(scope.x, 0, scope.z - 4) Center(XZ) Frontage
 Frontage --> 45% MidRise | 25% Tower | else: Retail
 
 MidRise  --> Extrude(FloorHeight * rand(4, 7)) I("commercial")
-// A tower stands on a smaller plan than its neighbours and goes up instead of out.
-Tower    --> Size(scope.x - 4, 0, scope.z - 4) Center(XZ) Shaft
-Shaft    --> Extrude(FloorHeight * rand(9, 16)) I("office")
+// A shopping base with a tower set back on top of it: two masses standing on each
+// other, so one building of two parts.
+Tower    --> Extrude(FloorHeight * rand(11, 18)) Split(Y) { 7.2: Podium | ~1: Shaft }
+Podium   --> I("retail")
+Shaft    --> Size(scope.x * 0.65, scope.y, scope.z * 0.65) Center(XZ) I("office")
 Retail   --> Extrude(FloorHeight * rand(1, 3)) I("retail")
 "#;
 
@@ -127,9 +146,13 @@ attr FloorHeight = 6.0
 Lot  --> Size(scope.x - 10, 0, scope.z - 12) Center(XZ) Yard
 Yard --> 75% Shed | else: Pair
 
-Shed --> Extrude(rand(7, 11)) I("industrial")
+Shed --> Extrude(rand(7, 11)) Split(Y) { ~1: Walls | 1.5: Slope }
+Walls --> I("industrial")
 Pair --> Split(X) { ~1: Half | 6: NIL | ~1: Half }
-Half --> Extrude(rand(6, 9)) I("warehouse")
+Half --> Extrude(rand(6, 9)) Split(Y) { ~1: Bay | 1.2: Slope }
+Bay  --> I("warehouse")
+// A sawtooth, which is what a shed roof is for.
+Slope --> Roof(Shed, height=scope.y) { Slope: Metal | Back: Glass }
 "#;
 
 /// The grammar for `name`, if there is one built in.
@@ -307,6 +330,10 @@ fn layout_attrs(layout: &Layout, floor_height: f64) -> [(&'static str, f64); 6] 
 fn statements(source: &str) -> Vec<(usize, String)> {
     let mut statements: Vec<(usize, String)> = Vec::new();
     for (index, line) in source.lines().enumerate() {
+        // Comments never reach the parser: `#` would be an error to it, and dropping
+        // a comment-only line here is what keeps it from being glued to the statement
+        // above it and reported against that one instead.
+        let line = strip_comment(line);
         if line.trim().is_empty() {
             continue;
         }
@@ -318,14 +345,10 @@ fn statements(source: &str) -> Vec<(usize, String)> {
             statements[last].1.push_str(line);
         }
     }
-    // A statement that is nothing but comment lines parses to nothing and would be
-    // an error rather than a comment.
-    statements.retain(|(_, statement)| !is_only_comment(statement));
     statements
 }
 
-fn heads_a_statement(line: &str) -> bool {
-    let code = strip_line_comment(line);
+fn heads_a_statement(code: &str) -> bool {
     let trimmed = code.trim_start();
     for keyword in ["attr", "const", "style"] {
         if let Some(rest) = trimmed.strip_prefix(keyword) {
@@ -345,17 +368,22 @@ fn heads_a_statement(line: &str) -> bool {
         && name.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
-fn strip_line_comment(line: &str) -> &str {
-    match line.find("//") {
-        Some(at) => &line[..at],
-        None => line,
+/// The code part of a line: everything before a `//` or a `#` that is not inside a
+/// quoted name.
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quoted = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => quoted = !quoted,
+            b'#' if !quoted => return &line[..index],
+            b'/' if !quoted && bytes.get(index + 1) == Some(&b'/') => return &line[..index],
+            _ => {}
+        }
+        index += 1;
     }
-}
-
-fn is_only_comment(statement: &str) -> bool {
-    statement
-        .lines()
-        .all(|line| strip_line_comment(line).trim().is_empty())
+    line
 }
 
 #[cfg(test)]
