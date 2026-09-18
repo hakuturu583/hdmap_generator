@@ -1124,3 +1124,61 @@ def test_gpudrive_says_what_it_cannot_carry():
     # And it stays out of the general warnings, which are about OpenDRIVE and
     # Lanelet2 and would otherwise be noise for a caller who never writes a scene.
     assert m.format_warnings() == []
+
+
+# --------------------------------------------------------------------------- #
+# Drawing what was written
+# --------------------------------------------------------------------------- #
+
+
+def test_every_export_can_be_drawn_back(tmp_path):
+    """The `render_*` functions read the files, so they are a check on the files.
+
+    Nothing here passes the map to the renderer: each picture is made from the bytes
+    on disk, which is what makes an empty one worth failing over.
+    """
+    m = clipgt_map()
+    m.export_opendrive(tmp_path / "map.xodr")
+    m.export_sumo(tmp_path / "sumo")
+    m.export_clipgt(tmp_path / "clip")
+    m.export_gpudrive(tmp_path / "scene.json")
+
+    pictures = {
+        "OpenDRIVE": roadgen.render_opendrive(str(tmp_path / "map.xodr")),
+        "SUMO": roadgen.render_sumo(str(tmp_path / "sumo")),
+        "ClipGT": roadgen.render_clipgt(str(tmp_path / "clip")),
+        "GPUDrive": roadgen.render_gpudrive(str(tmp_path / "scene.json")),
+    }
+
+    for name, svg in pictures.items():
+        assert svg.startswith("<svg"), name
+        assert svg.rstrip().endswith("</svg>"), name
+        assert f"<title>{name}</title>" in svg
+        # A document a browser will not draw is not a picture.
+        ET.fromstring(svg)
+        # Something was found. An empty picture parses and says nothing.
+        assert "<polyline" in svg or "<polygon" in svg, name
+        assert "nothing to draw" not in svg, name
+
+
+def test_a_picture_explains_what_the_format_could_not_carry(tmp_path):
+    m = clipgt_map()
+    m.export_gpudrive(tmp_path / "scene.json")
+    svg = roadgen.render_gpudrive(str(tmp_path / "scene.json"))
+    # The same thing `gpudrive_warnings()` says, said to whoever is looking at the
+    # picture rather than to whoever wrote the export.
+    assert "no z" in svg
+
+
+def test_drawing_a_file_that_is_not_there_says_so(tmp_path):
+    with pytest.raises(RuntimeError):
+        roadgen.render_opendrive(str(tmp_path / "nothing.xodr"))
+    with pytest.raises(RuntimeError):
+        roadgen.render_sumo(str(tmp_path / "no-such-directory"))
+
+
+def test_drawing_a_file_that_is_not_the_format_says_so(tmp_path):
+    path = tmp_path / "map.xodr"
+    path.write_text("<not-opendrive/>")
+    with pytest.raises(RuntimeError):
+        roadgen.render_opendrive(str(path))

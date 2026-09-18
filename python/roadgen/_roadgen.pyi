@@ -182,3 +182,15 @@ class Map:
     def connections(self) -> list[tuple[str, str]]: ...
     def successors(self, lane: str) -> list[str]: ...
     def lane_centerline(self, lane: str) -> list[Point]: ...
+
+def render_opendrive(path: str) -> str:
+    """The OpenDRIVE file at `path`, drawn as an SVG document."""
+
+def render_sumo(directory: str) -> str:
+    """The SUMO plain-XML network in `directory`, drawn as an SVG document."""
+
+def render_clipgt(directory: str) -> str:
+    """The ClipGT clip in `directory`, drawn as an SVG document."""
+
+def render_gpudrive(path: str) -> str:
+    """The GPUDrive scene at `path`, drawn as an SVG document."""

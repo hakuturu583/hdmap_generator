@@ -29,9 +29,29 @@ the Rust core owns, so there is one model of the map and not two.
     m.export_sumo("sumo/")
     m.export_clipgt("clip/")
     m.export_gpudrive("scene.json")
+
+Every export can be drawn back:
+
+    svg = roadgen.render_opendrive("map.xodr")
+
+The `render_*` functions read the file rather than the map, so what they draw is
+what a consumer would receive. They return an SVG document as text — in a notebook,
+`IPython.display.SVG(svg)`; anywhere else, a string to write out or put in a page.
 """
 
-from ._roadgen import Alignment, Junction, Lane, LaneRef, Map, Road, __version__
+from ._roadgen import (
+    Alignment,
+    Junction,
+    Lane,
+    LaneRef,
+    Map,
+    Road,
+    __version__,
+    render_clipgt,
+    render_gpudrive,
+    render_opendrive,
+    render_sumo,
+)
 
 __all__ = [
     "Alignment",
@@ -41,4 +61,8 @@ __all__ = [
     "Map",
     "Road",
     "__version__",
+    "render_clipgt",
+    "render_gpudrive",
+    "render_opendrive",
+    "render_sumo",
 ]

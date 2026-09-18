@@ -1,0 +1,143 @@
+name: Pages
+
+# Builds the demo page and, on main, publishes it.
+#
+# The page is roadgen running, so building it means building roadgen for the browser:
+# a wheel for Pyodide, cross-compiled to wasm32 through Emscripten. That is three
+# toolchains pinned to each other — Pyodide fixes the Python version and the ABI the
+# wheel is tagged with, Pyodide's cross-build environment fixes the Emscripten
+# version, and the Rust target has to match both — so every version here is exact and
+# none of them floats.
+#
+# A pull request builds the page and runs it in a browser; only main deploys.
+#
+# Publishing needs Pages turned on for the repository with GitHub Actions as its
+# source (Settings → Pages → Build and deployment → Source). Until that is done the
+# deploy step fails and the build step still tells you whether the page works.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The Pyodide the wheel is built against and the page ships. `web/build.mjs` fetches
+  # the same one: a wheel carries the ABI tag of the cross-build environment it came
+  # out of, and a runtime that does not match refuses to load it.
+  PYODIDE: "0.28.3"
+  PYODIDE_BUILD: "0.39.0"
+  # Pyodide 0.28's cross-build environment is built with this, and a side module
+  # linked by a different Emscripten is not loadable by it.
+  EMSCRIPTEN: "4.0.9"
+  # Stable Rust cannot link this target: emcc rejects the mangled names rustc emits
+  # for it ("invalid export name"). The fix is in nightly, so nightly it is — pinned
+  # to a date, because "nightly" is not a version.
+  RUST: "nightly-2026-09-17"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pyodide 0.28 is CPython 3.13, and pyodide-build cross-compiles with a host
+      # interpreter of the same version.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST }}
+          targets: wasm32-unknown-emscripten
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: emscripten-${{ env.EMSCRIPTEN }}
+
+      - name: Cache Emscripten
+        id: emsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ env.EMSCRIPTEN }}
+
+      - name: Install Emscripten
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
+          ~/emsdk/emsdk install ${EMSCRIPTEN}
+          ~/emsdk/emsdk activate ${EMSCRIPTEN}
+
+      - name: Install pyodide-build
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pyodide-build==${PYODIDE_BUILD}"
+          # By URL rather than by version: `pyodide xbuildenv install 0.28.3` resolves
+          # the release through a metadata service and checks it against this
+          # pyodide-build's idea of what it works with. The pinning here is the point,
+          # so the release asset is named outright and the check is not consulted.
+          pyodide xbuildenv install --url \
+            "https://github.com/pyodide/pyodide/releases/download/${PYODIDE}/xbuildenv-${PYODIDE}.tar.bz2"
+
+      # `USE_LEGACY_PLATFORM` is what decides the wheel's platform tag. pyodide-build
+      # has moved on to `pyemscripten_*`; Pyodide 0.28 still looks for `pyodide_*`, and
+      # a tag it does not recognise is a wheel it will not install.
+      - name: Build the wheel for Pyodide
+        env:
+          USE_LEGACY_PLATFORM: "1"
+          CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUSTFLAGS: "-C link-arg=-sSIDE_MODULE=2"
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          emcc --version | head -1
+          pyodide build -o dist
+          ls -la dist
+
+      - name: Build the page
+        working-directory: web
+        run: |
+          npm ci
+          node build.mjs --wheel ../dist/*.whl
+
+      # The wheel is a wasm32 build: nothing on this runner can import it, so whether
+      # it works is a question only a browser can answer. This asks one.
+      - name: Run the page in a browser
+        working-directory: web
+        run: |
+          npx playwright install --with-deps chromium
+          node smoke.mjs
+
+      - name: Upload the site
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/site
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

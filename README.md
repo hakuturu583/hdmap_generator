@@ -8,6 +8,11 @@ This is a generator, not a converter. Nothing here parses an existing HD map: yo
 describe roads, lanes, junctions and the movements between them, and the library
 builds the geometry and writes the files.
 
+**[Try it in a browser](https://hakuturu583.github.io/hdmap_generator/)** — the demo
+page runs this package, compiled for WebAssembly, and draws every export beside the
+code that made it. Nothing is uploaded and nothing is installed; see
+[the demo page](#the-demo-page).
+
 ```python
 import roadgen
 
@@ -64,11 +69,19 @@ m.export_gpudrive("scene.json")
                      ├──▶ SUMO           .nod/.edg/.con.xml  `quick-xml` + netconvert
                      ├──▶ ClipGT         .parquet layers     `arrow`/`parquet`
                      └──▶ GPUDrive       scene .json         `serde_json`
+
+              the written files ──▶ roadgen-viewer ──▶ SVG
 ```
 
 Every exporter reads a `ValidatedMap` and writes nothing back into it: what a format
 cannot hold comes back to the caller through that exporter's `check()`, never as a
 field in the IR.
+
+The arrow at the bottom goes the other way, and is the only one that does.
+`roadgen-viewer` reads the **written files** — never the IR — so a picture it draws
+is a picture of what a consumer would receive. It is what the
+[demo page](#the-demo-page) shows, and it is the one thing here that looks at an
+export rather than producing one.
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
 
@@ -208,6 +221,14 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
+| `render_opendrive(path)` / `render_sumo(directory)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
+
+The `render_*` functions are module-level rather than methods on `Map`, because they
+read the **file** and not the map. Drawing the IR would agree with the IR by
+construction and so would say nothing about whether the export is right; drawing what
+was written says quite a lot. They are what the
+[demo page](#the-demo-page) puts on the screen, and in a notebook they are
+`IPython.display.SVG(...)`.
 
 Handedness decides which side of the reference line a `forward` lane lands on:
 `"rht"` (the default) puts it on the right, `"lht"` on the left. A lane can override
@@ -770,6 +791,92 @@ past which the simulator silently drops what does not fit. The `speed_bump` and
 `driveway` elements go the other way: the IR has nothing that means either, so they
 are never written.
 
+## The demo page
+
+<https://hakuturu583.github.io/hdmap_generator/>
+
+Write roadgen in the page, press Run, and every file the script exports appears
+beside it — drawn, listed and downloadable. It is the same argument the rest of this
+README makes, made in one screen: one description of a road network, six files, and
+what each format could and could not carry written under each picture.
+
+**It is the package, not a demonstration of the package.** The page loads
+[Pyodide](https://pyodide.org/) — CPython built for WebAssembly — and installs
+roadgen's own wheel into it, cross-compiled to `wasm32-unknown-emscripten`. The
+`import roadgen` on the page is the `import roadgen` everywhere else, so there is no
+second implementation to keep in step and nothing that can be right in the demo and
+wrong in the library. The generation runs in the tab: no file is uploaded, no server
+does the work, and the page keeps working with the network unplugged once it has
+loaded.
+
+The script is run in a directory of its own and then the directory is *looked at*.
+Panels are not a fixed set — they are whatever turned up — so a script that exports
+one format gets one panel, and a format added to roadgen gets a panel without the page
+being changed.
+
+### Which viewer draws what
+
+| Export | Drawn by | Why |
+| --- | --- | --- |
+| Lanelet2, OpenStreetMap | [Leaflet](https://leafletjs.com/) and [osmtogeojson](https://github.com/tyrasd/osmtogeojson) | Both are OSM XML in latitudes and longitudes. A map library already knows what to do with that, and puts the result on the Earth rather than on a blank sheet. |
+| OpenDRIVE, SUMO, ClipGT, GPUDrive | `roadgen-viewer`, in this repository | There is no off-the-shelf browser viewer for these that an Apache-2.0 project can ship. |
+
+`roadgen-viewer` reads the **written file** — with the same libraries that wrote it,
+and never the IR — and draws it as SVG. That is what makes the pictures worth looking
+at: a panel can only be right if the file is. It is not browser-only, either; it is
+in the wheel, so a notebook can draw an export too:
+
+```python
+from IPython.display import SVG
+m.export_opendrive("map.xodr")
+SVG(roadgen.render_opendrive("map.xodr"))       # or render_sumo, render_clipgt, render_gpudrive
+```
+
+OpenDRIVE is the interesting one to draw. It does not hold a road as a shape: it
+holds a reference line as a chain of lines, arcs and clothoids, and every lane as a
+polynomial width measured sideways from it. So the picture is *evaluated* rather than
+read, which means it goes wrong in exactly the ways the geometry can — and a lane
+that lands in the wrong place on the page is a lane in the wrong place in the file.
+
+Everything is a plan view. The heights, the grades and the superelevation are in the
+files and not on the screen, and each picture says so under itself rather than leaving
+a reader to assume the map is flat.
+
+### Building it
+
+```bash
+# The wheel, for Pyodide rather than for this machine.
+pip install pyodide-build==0.39.0
+pyodide xbuildenv install --url \
+  https://github.com/pyodide/pyodide/releases/download/0.28.3/xbuildenv-0.28.3.tar.bz2
+source /path/to/emsdk/emsdk_env.sh      # Emscripten 4.0.9
+USE_LEGACY_PLATFORM=1 \
+  CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUSTFLAGS="-C link-arg=-sSIDE_MODULE=2" \
+  RUSTUP_TOOLCHAIN=nightly-2026-09-17 \
+  pyodide build -o dist
+
+# The page, which is the wheel plus Pyodide plus three JavaScript libraries.
+cd web && npm ci && node build.mjs --wheel ../dist/*.whl
+node smoke.mjs                          # opens site/ in headless Chromium
+```
+
+Four versions are pinned to each other and none of them floats: Pyodide fixes the
+Python version and the ABI tag the wheel must carry, its cross-build environment fixes
+the Emscripten version, and the Rust toolchain has to satisfy both — stable cannot
+link this target, because `emcc` rejects the mangled names it emits. The same numbers
+appear once each in [`.github/workflows/pages.yml`](.github/workflows/pages.yml) and
+[`web/build.mjs`](web/build.mjs), with a note beside each saying what breaks if it
+moves.
+
+The published page is self-contained. Pyodide, Leaflet, osmtogeojson and CodeMirror
+are all copied in at build time — from npm and from a GitHub release, pinned by
+`web/package-lock.json` — so the page makes no request to a CDN and what ships is what
+the lockfile says. The one thing it does fetch at runtime is OpenStreetMap's map
+tiles, and only for the two panels that have a place on the Earth to show.
+
+Publishing needs Pages enabled for the repository with **GitHub Actions** as the
+source. A pull request builds the page and runs it in a browser; only `main` deploys.
+
 ## Validation
 
 `validate()` reports everything wrong at once, rather than failing on the first
@@ -823,8 +930,10 @@ roadgen/
 │   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON
 │   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
 │   ├── roadgen-sumo/        lowering onto SUMO's plain-XML network
+│   ├── roadgen-viewer/      reading the exports back, and drawing them as SVG
 │   └── roadgen-python/      PyO3 bindings
 ├── examples/                ClipGT and GPUDrive scenario files
+├── web/                     the demo page: roadgen in a browser, through Pyodide
 ├── python/roadgen/          the Python package
 ├── tests/
 │   ├── integration/         scenarios and cross-format checks
@@ -843,6 +952,8 @@ cargo fmt --all --check
 
 maturin develop                 # build and install the Python extension
 python -m pytest tests/python
+
+cd web && npm ci && node smoke.mjs   # the demo page, in a browser
 ```
 
 The SUMO tests run SUMO. `netconvert` builds the exported network and `sumo` loads
@@ -859,6 +970,13 @@ Dependencies are kept to licences an Apache-2.0 project may redistribute — the
 OpenDRIVE data model and writer (`opendrive`, MIT), the Lanelet2 model, OSM I/O and
 projections (`simple_lanelet2`, BSD-3-Clause), and Arrow and Parquet
 (`arrow`/`parquet`, Apache-2.0), plus MIT/Apache-2.0 transitive crates.
+
+The demo page ships three more, copied in at build time and pinned by
+`web/package-lock.json`: [Leaflet](https://leafletjs.com/) (BSD-2-Clause),
+[osmtogeojson](https://github.com/tyrasd/osmtogeojson) (MIT) and
+[CodeMirror](https://codemirror.net/5/) (MIT). Their licence texts are copied in
+beside them, into `site/vendor/`. [Pyodide](https://pyodide.org/) (MPL-2.0) goes in
+whole, from its own release.
 
 The ClipGT layer names and field names were read off the public
 [`clipgt_loader.py`](https://github.com/nvidia-cosmos/cosmos-transfer2.5/blob/main/cosmos_transfer2/_src/imaginaire/auxiliary/world_scenario/dataloaders/clipgt_loader.py).
