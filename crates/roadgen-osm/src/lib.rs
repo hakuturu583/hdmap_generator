@@ -42,9 +42,13 @@
 //! what each one occupies. A building of a single part writes one way and puts all of
 //! that on it, because a reader of a simple building expects to find it there.
 //!
-//! So the whole of the IR's solid survives: the parts, the heights they span, the
-//! roofs and which way their ridges run. Nothing here is approximated and [`check`]
-//! has no complaint to make about it.
+//! So nearly the whole of the IR's solid survives: the parts, the heights they span,
+//! the roofs and which way their ridges run. What does not is the little the scheme
+//! has no room for — a part standing on sloping ground becomes one `height` above one
+//! ground level, a building of several parts is surrounded by the outline of the part
+//! that meets the ground rather than by their union, and the frontage that says which
+//! street a building faces has no tag at all. [`check`] says each of those rather
+//! than letting the file look like a round trip.
 
 pub mod error;
 pub mod tags;
@@ -153,6 +157,50 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             heights.1 - heights.0
         ));
     }
+    problems.extend(building_losses(map));
+    problems
+}
+
+/// What a building loses, which is only what Simple 3D Buildings has no room for.
+fn building_losses(map: &ValidatedMap) -> Vec<String> {
+    if map.buildings.is_empty() {
+        return Vec::new();
+    }
+    let mut problems = Vec::new();
+    if map
+        .buildings
+        .iter()
+        .any(|building| building.frontage.is_some())
+    {
+        problems.push(
+            "OSM has no tag for which street a building faces, so the frontages are \
+             dropped: the geometry still stands beside the way"
+                .to_owned(),
+        );
+    }
+    let sloping = map
+        .building_parts
+        .iter()
+        .filter(|part| part.solid.footprint.highest() - part.solid.footprint.lowest() > 0.05)
+        .count();
+    if sloping > 0 {
+        problems.push(format!(
+            "`height` and `min_height` are single numbers above one ground level, so \
+             the sloping base of {sloping} parts is written level"
+        ));
+    }
+    let compound = map
+        .buildings
+        .iter()
+        .filter(|building| building.parts.len() > 1)
+        .count();
+    if compound > 0 {
+        problems.push(format!(
+            "a building's outline is one way, so the {compound} buildings of several \
+             parts are surrounded by the outline of the part that meets the ground \
+             rather than by the union of them all"
+        ));
+    }
     problems
 }
 
@@ -257,27 +305,20 @@ impl<'a> Exporter<'a> {
     fn add_buildings(&mut self) -> Result<(), ExportError> {
         for building in self.map.buildings.iter() {
             let parts = self.map.parts_of(&building.id);
-            let Some(ground) = parts
-                .iter()
-                .map(|part| part.solid.base_height())
-                .reduce(f64::min)
-            else {
-                continue;
-            };
             // The building's own outline is the outline of the part that meets the
             // ground: OSM wants one way around the whole thing, and for a massing
             // built upwards from a footprint that is the footprint.
             let Some(lowest) = parts
                 .iter()
-                .find(|part| part.solid.base_height() <= ground + 1e-9)
+                .min_by(|a, b| a.solid.base_height().total_cmp(&b.solid.base_height()))
             else {
                 continue;
             };
+            let ground = lowest.solid.base_height();
 
-            let single = (parts.len() == 1).then_some(*lowest);
             let outline = lowest.solid.footprint.points().to_vec();
-            self.add_closed_way(&outline, tags::building_tags(building, single, ground))?;
-            if single.is_some() {
+            self.add_closed_way(&outline, tags::building_tags(building, &parts, ground))?;
+            if parts.len() == 1 {
                 continue;
             }
             for part in &parts {

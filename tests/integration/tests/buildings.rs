@@ -15,58 +15,25 @@ use opendrive::object::orientation::ObjectType;
 use roadgen_buildings::{Rules, PRESETS};
 use roadgen_core::buildings::RoofShape;
 use roadgen_core::prelude::*;
-use roadgen_core::topology::RoadEnd;
-use roadgen_integration_tests::{reload_osm, reparse_opendrive, scenarios};
+use roadgen_integration_tests::{redraw_opendrive, reload_osm, reparse_opendrive, scenarios};
 use roadgen_viewer::{Kind, Shape};
 use uom::si::length::meter;
 
+/// Every shape the IR can name, so a tag read back out of a file can be checked
+/// against the vocabulary rather than against a hand-written list of strings.
+const ROOF_SHAPES: [RoofShape; 5] = [
+    RoofShape::Flat,
+    RoofShape::Skillion,
+    RoofShape::Gabled,
+    RoofShape::Hipped,
+    RoofShape::Pyramidal,
+];
+
 /// A crossroads whose arms are long enough to have frontages worth building on.
 fn town(rules: &Rules) -> ValidatedMap {
-    let mut builder = MapBuilder::new(scenarios::metadata("town"));
-    let arms = [
-        (
-            "north",
-            Point3::new(0.0, 260.0, 0.0),
-            Point3::new(0.0, 14.0, 0.0),
-        ),
-        (
-            "east",
-            Point3::new(260.0, 0.0, 0.0),
-            Point3::new(14.0, 0.0, 0.0),
-        ),
-        (
-            "south",
-            Point3::new(0.0, -260.0, 0.0),
-            Point3::new(0.0, -14.0, 0.0),
-        ),
-        (
-            "west",
-            Point3::new(-260.0, 0.0, 0.0),
-            Point3::new(-14.0, 0.0, 0.0),
-        ),
-    ];
-    let mut roads = Vec::new();
-    for (name, start, end) in arms {
-        roads.push(
-            builder
-                .add_road(
-                    RoadSpec::line(start, end, scenarios::two_way())
-                        .unwrap()
-                        .with_name(name),
-                )
-                .unwrap(),
-        );
-    }
-    let junction = builder.add_junction(Some("x"));
-    for (index, from) in roads.iter().enumerate() {
-        for to in roads.iter().skip(index + 1) {
-            builder
-                .connect_ends(from, RoadEnd::End, to, RoadEnd::End, Some(&junction))
-                .unwrap();
-        }
-    }
-
-    let mut map = builder.finish().expect("the town should build");
+    let mut map = scenarios::crossroads_builder("town", 260.0)
+        .finish()
+        .expect("the town should build");
     roadgen_buildings::generate(&mut map, rules).expect("the rules should derive");
     map.validate().expect("a generated town should validate")
 }
@@ -300,7 +267,7 @@ fn a_pitched_roof_reaches_openstreetmap_as_a_pitched_roof() {
             continue;
         };
         assert!(
-            RoofShape::parse(shape).is_some(),
+            ROOF_SHAPES.iter().any(|known| known.as_str() == shape),
             "{shape:?} is not a roof shape"
         );
         let height: f64 = way
@@ -414,7 +381,7 @@ fn an_opendrive_reader_gets_the_footprints_back() {
 #[test]
 fn the_viewer_draws_the_town_the_file_describes() {
     let map = town(&Rules::default());
-    let drawing = drawn(&map);
+    let drawing = redraw_opendrive(&map);
 
     let areas: Vec<_> = drawing
         .shapes
@@ -453,7 +420,7 @@ fn a_map_with_no_buildings_exports_and_draws_exactly_as_it_did_before() {
     let plain = scenarios::crossroads();
     let xml = roadgen_opendrive::to_xml(&plain).expect("the map should export");
     assert!(!xml.contains("building"));
-    assert!(drawn(&plain)
+    assert!(redraw_opendrive(&plain)
         .shapes
         .iter()
         .all(|shape| shape.kind() != Kind::Building));
@@ -503,7 +470,7 @@ fn a_building_beside_a_bend_comes_back_the_shape_it_went_in() {
     let map = map.validate().expect("it should validate");
     assert!(map.buildings.len() > 4);
 
-    for shape in drawn(&map)
+    for shape in redraw_opendrive(&map)
         .shapes
         .iter()
         .filter(|shape| shape.kind() == Kind::Building)
@@ -530,12 +497,4 @@ fn a_building_beside_a_bend_comes_back_the_shape_it_went_in() {
             side(3, 0)
         );
     }
-}
-
-/// Writes the map as OpenDRIVE and draws the file, which is what the viewer is for.
-fn drawn(map: &ValidatedMap) -> roadgen_viewer::Drawing {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    let path = directory.path().join("map.xodr");
-    roadgen_opendrive::write(map, &path).expect("the map should export");
-    roadgen_viewer::opendrive_file(&path).expect("the export should draw")
 }

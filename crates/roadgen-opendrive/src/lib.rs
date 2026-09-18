@@ -115,7 +115,7 @@ use uom::si::f64::{Angle, Curvature, Length};
 use uom::si::length::meter;
 use vec1::Vec1;
 
-use roadgen_core::buildings::Building;
+use roadgen_core::buildings::{Building, BuildingPart};
 use roadgen_core::geometry::{Curve3, Point3, Sample};
 use roadgen_core::id::ObjectId;
 use roadgen_core::id::{BuildingId, JunctionId, LaneId, RoadId};
@@ -275,13 +275,26 @@ impl Numbering {
 struct Exporter<'a> {
     map: &'a Map,
     numbering: Numbering,
+    /// The buildings each road is written against, in the map's own order.
+    ///
+    /// Resolving one is a search when it names no frontage, so every building is
+    /// resolved once for the whole map rather than once for every road it is not on.
+    buildings: HashMap<RoadId, Vec<&'a Building>>,
 }
 
 impl<'a> Exporter<'a> {
     fn new(map: &'a ValidatedMap) -> Self {
+        let map = map.as_map();
+        let mut buildings: HashMap<RoadId, Vec<&Building>> = HashMap::new();
+        for building in map.buildings.iter() {
+            if let Some(road) = owning_road_of(map, building) {
+                buildings.entry(road.id.clone()).or_default().push(building);
+            }
+        }
         Exporter {
-            numbering: Numbering::new(map.as_map()),
-            map: map.as_map(),
+            numbering: Numbering::new(map),
+            buildings,
+            map,
         }
     }
 
@@ -1106,7 +1119,7 @@ impl<'a> Exporter<'a> {
             };
             objects.push(entry);
         }
-        for building in self.buildings_of(road) {
+        for building in self.buildings.get(&road.id).into_iter().flatten() {
             if let Some(entry) = self.building_object(road, building)? {
                 objects.push(entry);
             }
@@ -1173,63 +1186,6 @@ impl<'a> Exporter<'a> {
         Ok(priorities)
     }
 
-    /// The road a building is written against.
-    ///
-    /// The one its frontage names, which is where the generator put it. A building
-    /// that came from somewhere else and names no road falls back to the nearest by
-    /// the horizontal distance from its centre to a reference line — never a junction
-    /// connector, because a connector is one movement through a junction and
-    /// measuring a building from it would move the building depending on which turn
-    /// happened to be closest.
-    fn owning_road_of(&self, building: &Building) -> Option<&Road> {
-        if let Some(frontage) = &building.frontage {
-            if let Some(road) = self.map.roads.get(&frontage.road) {
-                return Some(road);
-            }
-        }
-        let centre = self.building_centre(building)?;
-        let mut best: Option<(&Road, f64)> = None;
-        for road in self.map.roads.iter() {
-            if road.is_connector() {
-                continue;
-            }
-            let Ok(line) = road.reference_line.to_polyline(self.map.metadata.sampling) else {
-                continue;
-            };
-            let distance = line
-                .points()
-                .iter()
-                .map(|point| point.horizontal_distance_to(centre))
-                .fold(f64::INFINITY, f64::min);
-            if best.is_none_or(|(_, previous)| distance < previous) {
-                best = Some((road, distance));
-            }
-        }
-        best.map(|(road, _)| road)
-    }
-
-    /// The middle of the part of a building that meets the ground.
-    fn building_centre(&self, building: &Building) -> Option<Point3> {
-        let parts = self.map.parts_of(&building.id);
-        parts
-            .iter()
-            .min_by(|a, b| {
-                a.solid
-                    .base_height()
-                    .partial_cmp(&b.solid.base_height())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|part| part.solid.footprint.centroid())
-    }
-
-    /// Buildings written against `road`, in the map's own order.
-    fn buildings_of<'b>(&'b self, road: &'b Road) -> impl Iterator<Item = &'b Building> + 'b {
-        self.map.buildings.iter().filter(move |building| {
-            self.owning_road_of(building)
-                .is_some_and(|owner| owner.id == road.id)
-        })
-    }
-
     /// One building, as an object carrying an outline per part.
     ///
     /// `None` when the road has no geometry to measure against, which leaves the
@@ -1240,7 +1196,7 @@ impl<'a> Exporter<'a> {
         building: &Building,
     ) -> Result<Option<Object>, ExportError> {
         let parts = self.map.parts_of(&building.id);
-        let Some(centre) = self.building_centre(building) else {
+        let Some(centre) = building_centre(&parts) else {
             return Ok(None);
         };
         let Some(position) = road_coordinates::locate(self.map, road, centre) else {
@@ -1487,4 +1443,47 @@ fn lane_type(lane_type: LaneType) -> OdLaneType {
         LaneType::Restricted => OdLaneType::Restricted,
         LaneType::None => OdLaneType::None,
     }
+}
+
+/// The road a building is written against.
+///
+/// The one its frontage names, which is where the generator put it. A building that
+/// came from somewhere else and names no road falls back to the nearest by the
+/// horizontal distance from its centre to a reference line — never a junction
+/// connector, because a connector is one movement through a junction and measuring a
+/// building from it would move the building depending on which turn happened to be
+/// closest.
+fn owning_road_of<'m>(map: &'m Map, building: &Building) -> Option<&'m Road> {
+    if let Some(frontage) = &building.frontage {
+        if let Some(road) = map.roads.get(&frontage.road) {
+            return Some(road);
+        }
+    }
+    let centre = building_centre(&map.parts_of(&building.id))?;
+    let mut best: Option<(&Road, f64)> = None;
+    for road in map.roads.iter() {
+        if road.is_connector() {
+            continue;
+        }
+        let Ok(line) = road.reference_line.to_polyline(map.metadata.sampling) else {
+            continue;
+        };
+        let distance = line
+            .points()
+            .iter()
+            .map(|point| point.horizontal_distance_to(centre))
+            .fold(f64::INFINITY, f64::min);
+        if best.is_none_or(|(_, previous)| distance < previous) {
+            best = Some((road, distance));
+        }
+    }
+    best.map(|(road, _)| road)
+}
+
+/// The middle of the part of a building that meets the ground.
+fn building_centre(parts: &[&BuildingPart]) -> Option<Point3> {
+    parts
+        .iter()
+        .min_by(|a, b| a.solid.base_height().total_cmp(&b.solid.base_height()))
+        .map(|part| part.solid.footprint.centroid())
 }

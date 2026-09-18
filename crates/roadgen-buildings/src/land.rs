@@ -103,40 +103,27 @@ impl Default for Layout {
 }
 
 /// The road surface plus its setback: the region no building may reach into.
-#[derive(Debug, Clone)]
-pub struct Blocked {
-    index: Index,
-}
-
-impl Blocked {
-    /// Builds the blocked region of `map`, widened by `setback` metres on each side.
-    pub fn of(map: &Map, setback: f64) -> Blocked {
-        // Cells a little wider than a lot is long, so a candidate touches few of them
-        // and each holds few triangles.
-        let mut index = Index::new(25.0);
-        for road in map.roads.iter() {
-            let Some(edges) = corridor_edges(map, road, setback) else {
-                continue;
-            };
-            for pair in edges.windows(2) {
-                let (near, far) = (pair[0], pair[1]);
-                // Two triangles rather than a quad: a quad spanning a sharp bend is
-                // not convex, and a separating-axis test on a non-convex shape
-                // quietly answers a different question.
-                index.insert(vec![flat(near.0), flat(near.1), flat(far.1)]);
-                index.insert(vec![flat(near.0), flat(far.1), flat(far.0)]);
-            }
+///
+/// An [`Index`] of triangles, which is exactly what asking "does this outline hit the
+/// road?" needs — there is nothing for a wrapper around it to add.
+pub fn blocked_region(map: &Map, setback: f64) -> Index {
+    // Cells a little wider than a lot is long, so a candidate touches few of them and
+    // each holds few triangles.
+    let mut index = Index::new(25.0);
+    for road in map.roads.iter() {
+        let Some(edges) = corridor_edges(map, road, setback) else {
+            continue;
+        };
+        for pair in edges.windows(2) {
+            let (near, far) = (pair[0], pair[1]);
+            // Two triangles rather than a quad: a quad spanning a sharp bend is not
+            // convex, and a separating-axis test on a non-convex shape quietly
+            // answers a different question.
+            index.insert(vec![flat(near.0), flat(near.1), flat(far.1)]);
+            index.insert(vec![flat(near.0), flat(far.1), flat(far.0)]);
         }
-        Blocked { index }
     }
-
-    pub fn hits(&self, plan: &[Point2]) -> bool {
-        self.index.hits(plan)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
-    }
+    index
 }
 
 fn flat(point: Point3) -> Point2 {
@@ -392,7 +379,7 @@ mod tests {
     fn no_lot_reaches_into_the_road_it_faces() {
         let map = straight(200.0);
         let layout = Layout::default();
-        let blocked = Blocked::of(&map, layout.setback);
+        let blocked = blocked_region(&map, layout.setback);
         assert!(!blocked.is_empty());
         for lot in lots(&map, &layout) {
             assert!(!blocked.hits(&lot.ground_plan()), "{lot:?}");
@@ -402,7 +389,7 @@ mod tests {
     #[test]
     fn the_blocked_region_covers_the_road_surface() {
         let map = straight(200.0);
-        let blocked = Blocked::of(&map, 0.0);
+        let blocked = blocked_region(&map, 0.0);
         // A metre square on the centreline is in the road.
         assert!(blocked.hits(&[[100.0, -0.5], [101.0, -0.5], [101.0, 0.5], [100.0, 0.5]]));
         // One well outside it is not.

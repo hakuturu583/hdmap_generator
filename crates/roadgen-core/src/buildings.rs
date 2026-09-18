@@ -83,21 +83,16 @@ impl Footprint {
     /// not finite, or when the ring encloses no area in plan — a "polygon" whose
     /// vertices are collinear is a line, and no consumer of one draws anything.
     pub fn new(points: impl IntoIterator<Item = Point3>) -> Result<Self, GeometryError> {
-        let mut ring: Vec<Point3> = Vec::new();
+        let mut given: Vec<Point3> = Vec::new();
         for point in points {
             if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
                 return Err(GeometryError::NonFiniteCoordinate);
             }
-            // A ring written closed repeats its first vertex; so does one whose
-            // generator emitted the same corner twice. Neither is a vertex.
-            if ring.last().is_some_and(|last| last.is_close(point, 1e-9)) {
-                continue;
-            }
-            ring.push(point);
+            given.push(point);
         }
-        while ring.len() > 1 && ring[0].is_close(ring[ring.len() - 1], 1e-9) {
-            ring.pop();
-        }
+        // A ring written closed repeats its first vertex; so does one whose generator
+        // emitted the same corner twice. Neither is a vertex.
+        let mut ring = ring_without_repeats(given);
         if ring.len() < 3 {
             return Err(GeometryError::TooFewPoints { got: ring.len() });
         }
@@ -133,7 +128,7 @@ impl Footprint {
 
     /// The centre of area in plan, at the mean height of the ring.
     pub fn centroid(&self) -> Point3 {
-        let area = signed_area(&self.ring);
+        let area = self.area();
         let (mut x, mut y) = (0.0, 0.0);
         for index in 0..self.ring.len() {
             let a = self.ring[index];
@@ -193,9 +188,10 @@ fn signed_area(ring: &[Point3]) -> f64 {
 /// is a word that does nothing. A roof a generator cannot say in these terms is not
 /// approximated with the nearest one: it becomes the flat top of the volume that
 /// contains it, so the massing stays right and only the word is missing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum RoofShape {
     /// The walls are the whole of it.
+    #[default]
     Flat,
     /// One slope, falling across the building.
     Skillion,
@@ -229,21 +225,10 @@ impl RoofShape {
             RoofShape::Pyramidal => "pyramidal",
         }
     }
-
-    pub fn parse(value: &str) -> Option<RoofShape> {
-        Some(match value.to_ascii_lowercase().as_str() {
-            "flat" => RoofShape::Flat,
-            "skillion" | "shed" | "mono" => RoofShape::Skillion,
-            "gabled" | "gable" => RoofShape::Gabled,
-            "hipped" | "hip" => RoofShape::Hipped,
-            "pyramidal" | "pyramid" => RoofShape::Pyramidal,
-            _ => return None,
-        })
-    }
 }
 
 /// A part's roof.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Roof {
     pub shape: RoofShape,
     /// How far the roof rises above the eaves, metres. Zero exactly when the shape is
@@ -272,12 +257,6 @@ impl Roof {
             },
             direction: if shape.is_directed() { direction } else { 0.0 },
         }
-    }
-}
-
-impl Default for Roof {
-    fn default() -> Self {
-        Roof::FLAT
     }
 }
 
@@ -415,7 +394,7 @@ fn roof_faces(eaves: &[Point3], roof: &Roof) -> Vec<Face> {
     // massing model produces — the two give the same answer, and it is the right one.
     let (from, to) = ridge(eaves, roof);
     let nearer = |point: &Point3| {
-        if plan_distance(*point, from) <= plan_distance(*point, to) {
+        if point.horizontal_distance_to(from) <= point.horizontal_distance_to(to) {
             from
         } else {
             to
@@ -435,10 +414,6 @@ fn roof_faces(eaves: &[Point3], roof: &Roof) -> Vec<Face> {
         }
     }
     faces
-}
-
-fn plan_distance(a: Point3, b: Point3) -> f64 {
-    (a.x - b.x).hypot(a.y - b.y)
 }
 
 /// The ridge segment of a gabled, hipped or pyramidal roof over `eaves`.
@@ -810,19 +785,5 @@ mod tests {
         }
         assert_eq!(ridge_direction(PI), 0.0);
         assert_eq!(ridge_direction(0.0), 0.0);
-    }
-
-    #[test]
-    fn roof_shapes_round_trip_through_their_names() {
-        for shape in [
-            RoofShape::Flat,
-            RoofShape::Skillion,
-            RoofShape::Gabled,
-            RoofShape::Hipped,
-            RoofShape::Pyramidal,
-        ] {
-            assert_eq!(RoofShape::parse(shape.as_str()), Some(shape));
-        }
-        assert_eq!(RoofShape::parse("onion"), None);
     }
 }

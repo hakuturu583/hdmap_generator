@@ -127,11 +127,6 @@ impl Part {
 }
 
 impl Massing {
-    /// Every plan the massing occupies, which is what has to fit beside the road.
-    pub fn plans(&self) -> Vec<&[Point2]> {
-        self.parts.iter().map(|part| part.plan.as_slice()).collect()
-    }
-
     /// The building this massing is, named for the lot it stands on.
     ///
     /// `None` when no part of it survives being turned into a solid, which is a
@@ -303,8 +298,15 @@ fn part_of(mass: &Box3, kind: &str) -> Part {
 fn read_box(terminal: &Terminal) -> Box3 {
     let corners = surface_corners(terminal);
     let flat: Vec<Point2> = corners.iter().map(|point| [point.x, point.y]).collect();
-    let plan = convex_hull(&flat);
     let size = terminal.scope.size;
+    // Only a box with all three extents casts a plan worth hulling; a panel is a
+    // surface, and its plan is never asked for.
+    let volume = size.x > NO_EXTENT && size.y > NO_EXTENT && size.z > NO_EXTENT;
+    let plan = if volume {
+        convex_hull(&flat)
+    } else {
+        Vec::new()
+    };
     Box3 {
         plan: if plan.len() >= 3 { plan } else { Vec::new() },
         middle: centre(&flat),
@@ -314,7 +316,7 @@ fn read_box(terminal: &Terminal) -> Box3 {
             .map(|p| p.z)
             .fold(f64::NEG_INFINITY, f64::max),
         corners,
-        volume: size.x > NO_EXTENT && size.y > NO_EXTENT && size.z > NO_EXTENT,
+        volume,
     }
 }
 
@@ -534,14 +536,15 @@ fn furthest_apart(points: &[Point2]) -> (Point2, Point2) {
 /// How far a plan reaches along `direction` and across it, metres.
 fn extents(plan: &[Point2], direction: f64) -> (f64, f64) {
     let (cos, sin) = (direction.cos(), direction.sin());
-    let span = |values: Vec<f64>| {
-        values.iter().copied().fold(f64::NEG_INFINITY, f64::max)
-            - values.iter().copied().fold(f64::INFINITY, f64::min)
-    };
-    (
-        span(plan.iter().map(|p| p[0] * cos + p[1] * sin).collect()),
-        span(plan.iter().map(|p| -p[0] * sin + p[1] * cos).collect()),
-    )
+    let mut along = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut across = (f64::INFINITY, f64::NEG_INFINITY);
+    for point in plan {
+        let value = point[0] * cos + point[1] * sin;
+        along = (along.0.min(value), along.1.max(value));
+        let value = -point[0] * sin + point[1] * cos;
+        across = (across.0.min(value), across.1.max(value));
+    }
+    (along.1 - along.0, across.1 - across.0)
 }
 
 fn centre(plan: &[Point2]) -> Point2 {

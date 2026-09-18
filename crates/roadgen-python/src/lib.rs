@@ -855,7 +855,6 @@ impl PyMap {
     }
 
     /// Builds and validates the map, raising if anything is wrong.
-    /// Builds and validates the map, raising if anything is wrong.
     fn validate(&mut self) -> PyResult<()> {
         self.ensure_built()
     }
@@ -1407,13 +1406,16 @@ fn building_presets() -> Vec<String> {
 fn building_rules(name: Option<&str>) -> PyResult<String> {
     match name {
         None => Ok(BuildingRules::default().source().to_owned()),
+        // The same error the generator raises for the same mistake, said the same
+        // way: a second wording of "no preset is called that" would drift from the
+        // first the moment either changed.
         Some(name) => roadgen_buildings::preset(name)
             .map(str::to_owned)
             .ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "no building rules are called {name:?}; the ones built in are {}",
-                    building_presets().join(", ")
-                ))
+                value_error(roadgen_buildings::Error::UnknownPreset {
+                    name: name.to_owned(),
+                    known: roadgen_buildings::PRESETS.iter().map(|(n, _)| *n).collect(),
+                })
             }),
     }
 }

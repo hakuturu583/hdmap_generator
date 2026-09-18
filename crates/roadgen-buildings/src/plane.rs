@@ -34,6 +34,14 @@ impl Bounds {
         }
         bounds
     }
+
+    /// Whether two boxes share any area, touching included.
+    pub fn overlaps(&self, other: &Bounds) -> bool {
+        self.min[0] <= other.max[0]
+            && other.min[0] <= self.max[0]
+            && self.min[1] <= other.max[1]
+            && other.min[1] <= self.max[1]
+    }
 }
 
 /// Whether two convex polygons share any area, by the separating-axis test.
@@ -108,18 +116,19 @@ pub fn convex_hull(points: &[Point2]) -> Vec<Point2> {
         // What the pass before it left: the lower chain is never popped into while
         // the upper one is built, which is the whole of the algorithm's bookkeeping.
         let base = hull.len();
-        let ordered: Box<dyn Iterator<Item = &Point2>> = if pass == 0 {
-            Box::new(sorted.iter())
-        } else {
-            Box::new(sorted.iter().rev())
-        };
-        for point in ordered {
+        for step in 0..sorted.len() {
+            // Left to right for the lower chain, right to left for the upper one.
+            let point = if pass == 0 {
+                sorted[step]
+            } else {
+                sorted[sorted.len() - 1 - step]
+            };
             while hull.len() >= base + 2
-                && cross(hull[hull.len() - 2], hull[hull.len() - 1], *point) <= 0.0
+                && cross(hull[hull.len() - 2], hull[hull.len() - 1], point) <= 0.0
             {
                 hull.pop();
             }
-            hull.push(*point);
+            hull.push(point);
         }
         // The last point of a pass is the first of the next one.
         hull.pop();
@@ -141,7 +150,8 @@ fn cross(a: Point2, b: Point2, c: Point2) -> f64 {
 #[derive(Debug, Clone)]
 pub struct Index {
     cell: f64,
-    shapes: Vec<Vec<Point2>>,
+    /// Each shape with the box around it, which is what a query is filtered on.
+    shapes: Vec<(Bounds, Vec<Point2>)>,
     buckets: std::collections::HashMap<(i64, i64), Vec<usize>>,
 }
 
@@ -165,26 +175,26 @@ impl Index {
             return;
         }
         let index = self.shapes.len();
-        for key in self.cells(&Bounds::of(&shape)) {
+        let bounds = Bounds::of(&shape);
+        for key in self.cells(&bounds) {
             self.buckets.entry(key).or_default().push(index);
         }
-        self.shapes.push(shape);
+        self.shapes.push((bounds, shape));
     }
 
     /// Whether `shape` overlaps anything in the index.
     pub fn hits(&self, shape: &[Point2]) -> bool {
         let bounds = Bounds::of(shape);
-        let mut seen: Vec<usize> = Vec::new();
         for key in self.cells(&bounds) {
             let Some(bucket) = self.buckets.get(&key) else {
                 continue;
             };
             for candidate in bucket {
-                if seen.contains(candidate) {
-                    continue;
-                }
-                seen.push(*candidate);
-                if convex_overlap(shape, &self.shapes[*candidate]) {
+                let (around, other) = &self.shapes[*candidate];
+                // Two shapes sharing a cell usually miss, and the boxes say so for
+                // the price of four comparisons. It is also why a shape met twice —
+                // once per cell it spans — needs no bookkeeping to skip.
+                if bounds.overlaps(around) && convex_overlap(shape, other) {
                     return true;
                 }
             }

@@ -174,11 +174,11 @@ mod tests {
 /// that is what a reader of a simple building expects to find on the building itself.
 /// One of several parts carries only what it is; the heights are on the parts, which
 /// is what Simple 3D Buildings asks for.
-pub fn building_tags(building: &Building, single: Option<&BuildingPart>, ground: f64) -> Tags {
+pub fn building_tags(building: &Building, parts: &[&BuildingPart], ground: f64) -> Tags {
     let mut tags = Tags::new();
     tags.insert("building".into(), building_value(&building.kind));
-    if let Some(part) = single {
-        add_solid(&mut tags, part, ground);
+    if let [single] = parts {
+        add_solid(&mut tags, single, ground);
     }
     tags
 }
@@ -309,7 +309,7 @@ mod building_tests {
     #[test]
     fn a_buildings_kind_becomes_the_building_value() {
         let single = part(Roof::FLAT, 0.0, 9.5);
-        let tags = building_tags(&building("apartments"), Some(&single), 0.0);
+        let tags = building_tags(&building("apartments"), &[&single], 0.0);
         assert_eq!(tags.get("building").map(String::as_str), Some("apartments"));
         assert_eq!(tags.get("building:levels").map(String::as_str), Some("3"));
         assert_eq!(tags.get("height").map(String::as_str), Some("9.5"));
@@ -322,13 +322,13 @@ mod building_tests {
     fn a_kind_osm_could_not_spell_becomes_one_it_can() {
         let single = part(Roof::FLAT, 0.0, 9.5);
         assert_eq!(
-            building_tags(&building("Semi Detached"), Some(&single), 0.0)
+            building_tags(&building("Semi Detached"), &[&single], 0.0)
                 .get("building")
                 .map(String::as_str),
             Some("semi_detached")
         );
         assert_eq!(
-            building_tags(&building("  "), Some(&single), 0.0)
+            building_tags(&building("  "), &[&single], 0.0)
                 .get("building")
                 .map(String::as_str),
             Some("yes")

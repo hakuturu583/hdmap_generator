@@ -579,7 +579,7 @@ part/high_street/left/3/0/1        ← the one standing on it
 
 | Format | What it does with a building |
 | --- | --- |
-| **OpenStreetMap** | [Simple 3D Buildings](https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings): the outline as a closed `building=<kind>` way, a `building:part=yes` way per part where there is more than one, with `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and `roof:direction`. Nothing is lost. |
+| **OpenStreetMap** | [Simple 3D Buildings](https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings): the outline as a closed `building=<kind>` way, a `building:part=yes` way per part where there is more than one, with `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and `roof:direction`. The solid survives; the frontage, a sloping base and the union of several parts' outlines do not, and `check` says so. |
 | **OpenDRIVE** | one `<object type="building">` carrying an `<outline>` per part, corners as `<cornerLocal>`. The massing survives; the roof shape does not, and `format_warnings()` says how many were flattened. |
 | Lanelet2, SUMO, ClipGT, GPUDrive | nothing; each one's warnings say how many were dropped. |
 

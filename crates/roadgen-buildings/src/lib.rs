@@ -88,7 +88,7 @@ pub use error::Error;
 pub use land::{Layout, Lot};
 pub use rules::{preset, Compiled, Rules, PRESETS, ROOT};
 
-use crate::land::Blocked;
+use crate::land::blocked_region;
 use crate::plane::Index;
 
 /// What generating a town came to.
@@ -127,7 +127,7 @@ pub fn generate(map: &mut UnvalidatedMap, rules: &Rules) -> Result<Report, Error
         floor_height,
     } = rules.compile()?;
 
-    let blocked = Blocked::of(map.as_map(), layout.setback);
+    let blocked = blocked_region(map.as_map(), layout.setback);
     let lots = land::lots(map.as_map(), &layout);
 
     // Neighbours are tested against as they are placed, so the first lot of a street
@@ -171,32 +171,25 @@ pub fn generate(map: &mut UnvalidatedMap, rules: &Rules) -> Result<Report, Error
         //
         // Every part is tested, not just the one on the ground: a wing that oversails
         // the pavement is as much in the road as a wall would be.
-        let plans: Vec<Vec<_>> = derived
+        if derived
             .iter()
-            .map(|massing| {
-                massing
-                    .plans()
-                    .into_iter()
-                    .map(<[_]>::to_vec)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        if plans
-            .iter()
-            .flatten()
-            .any(|plan| blocked.hits(plan) || placed.hits(plan))
+            .flat_map(|massing| &massing.parts)
+            .any(|part| blocked.hits(&part.plan) || placed.hits(&part.plan))
         {
             report.clashes += 1;
             continue;
         }
 
         for (index, massing) in derived.into_iter().enumerate() {
+            // Taken before the massing is consumed, and kept only for a massing that
+            // becomes a building: what goes into the index is what is standing there.
+            let plans: Vec<Vec<_>> = massing.parts.iter().map(|part| part.plan.clone()).collect();
             let Some((building, massing_parts)) = massing.into_building(lot, index, floor_height)
             else {
                 continue;
             };
-            for plan in &plans[index] {
-                placed.insert(plan.clone());
+            for plan in plans {
+                placed.insert(plan);
             }
             buildings.push(building);
             parts.extend(massing_parts);

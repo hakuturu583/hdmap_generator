@@ -274,7 +274,8 @@ impl Rules {
         for (name, value) in layout_attrs(&layout, floor_height) {
             interpreter.set_attr(name, value);
         }
-        interpreter.seed = self.seed;
+        // The seed is not set here: every derivation sets its own, from these rules'
+        // seed and the lot it is standing on.
         Ok(Compiled {
             interpreter,
             layout,
@@ -349,16 +350,12 @@ fn statements(source: &str) -> Vec<(usize, String)> {
 }
 
 fn heads_a_statement(code: &str) -> bool {
-    let trimmed = code.trim_start();
-    for keyword in ["attr", "const", "style"] {
-        if let Some(rest) = trimmed.strip_prefix(keyword) {
-            if rest.starts_with(|c: char| c.is_whitespace()) {
-                return true;
-            }
-        }
+    let first = code.split_whitespace().next();
+    if matches!(first, Some("attr" | "const" | "style")) {
+        return true;
     }
     // `Name -->` or `Name(a, b) -->`, with nothing but the head in between.
-    let Some(head) = code.split("-->").next().filter(|_| code.contains("-->")) else {
+    let Some((head, _)) = code.split_once("-->") else {
         return false;
     };
     let head = head.trim();
