@@ -26,14 +26,17 @@
 
 use roadgen_core::geometry::{Point3, Vector3};
 
+use crate::materials::{Material, MATERIALS};
 use crate::tags::Role;
 
-/// How far a texture tiles, metres per repeat.
+/// How far a texture tiles when its material does not say, metres per repeat.
 ///
 /// Every surface here is textured by *projection* rather than by an unwrapped chart:
 /// asphalt, grass and concrete are materials without a seam anyone can point at, so a
-/// planar or along-the-strip projection at a stated real-world scale is both what
-/// looks right and what a substitute texture can be dropped into without re-authoring.
+/// planar or along-the-strip projection at the texture's own real-world scale is both
+/// what looks right and what a substitute texture can be dropped into without
+/// re-authoring. The scale comes from the material ([`Material::scale`]); this is
+/// only for a slot whose material the table does not know.
 pub const TEXTURE_SCALE: f64 = 4.0;
 
 /// One triangle mesh, named the way CARLA's classifier will read it.
@@ -104,6 +107,7 @@ impl Mesh {
             return;
         }
         let base = self.positions.len() as u32;
+        let scale = self.texture_scale(slot);
 
         let mut along = 0.0;
         for index in 0..rungs {
@@ -115,11 +119,11 @@ impl Mesh {
                 along += previous.distance_to(current);
             }
             let across = left[index].distance_to(right[index]);
-            let u = along / TEXTURE_SCALE;
+            let u = along / scale;
             self.positions.push(left[index]);
             self.uvs.push([u, 0.0]);
             self.positions.push(right[index]);
-            self.uvs.push([u, across / TEXTURE_SCALE]);
+            self.uvs.push([u, across / scale]);
         }
 
         for index in 0..rungs - 1 {
@@ -151,18 +155,26 @@ impl Mesh {
             return;
         };
         let (u_axis, v_axis) = plane_axes(normal);
+        let scale = self.texture_scale(slot);
         let base = self.positions.len() as u32;
         for point in ring {
             let vector = point.to_vector();
             self.positions.push(*point);
-            self.uvs.push([
-                vector.dot(u_axis) / TEXTURE_SCALE,
-                vector.dot(v_axis) / TEXTURE_SCALE,
-            ]);
+            self.uvs
+                .push([vector.dot(u_axis) / scale, vector.dot(v_axis) / scale]);
         }
         for index in 1..ring.len() as u32 - 1 {
             self.push_triangle([base, base + index, base + index + 1], slot);
         }
+    }
+
+    /// Metres of surface per repeat of the texture in `slot`: the material's own
+    /// scale, or [`TEXTURE_SCALE`] for a material the table does not list.
+    fn texture_scale(&self, slot: usize) -> f64 {
+        self.materials
+            .get(slot)
+            .and_then(|&index| MATERIALS.get(index))
+            .map_or(TEXTURE_SCALE, |material: &Material| material.scale)
     }
 
     fn push_triangle(&mut self, triangle: [u32; 3], slot: usize) {
@@ -289,13 +301,45 @@ mod tests {
 
     #[test]
     fn a_strip_measures_its_texture_along_the_ground_it_covers() {
-        let mut mesh = Mesh::new("t", Role::Road, 0);
+        let mut mesh = Mesh::new("t", Role::Road, crate::materials::ASPHALT);
         mesh.strip(&rail(2.0), &rail(-2.0), 0);
-        // Thirty metres of road at four metres a repeat is seven and a half repeats,
-        // which is what stops a texture sliding as a lane widens.
+        // Thirty metres of road at the asphalt's three metres a repeat is ten
+        // repeats, which is what stops a texture sliding as a lane widens.
+        let scale = MATERIALS[crate::materials::ASPHALT].scale;
         let last = mesh.uvs.last().unwrap();
-        assert!((last[0] - 30.0 / TEXTURE_SCALE).abs() < 1e-9);
-        assert!((last[1] - 4.0 / TEXTURE_SCALE).abs() < 1e-9);
+        assert!((last[0] - 30.0 / scale).abs() < 1e-9);
+        assert!((last[1] - 4.0 / scale).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_texture_tiles_at_the_size_it_was_scanned_at() {
+        // The same wall in brick and in plaster: the brick was scanned over a metre
+        // and the plaster over two, so the brick repeats twice as often.
+        let wall = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(0.0, 4.0, 0.0),
+            Point3::new(0.0, 4.0, 3.0),
+            Point3::new(0.0, 0.0, 3.0),
+        ];
+        let mut brick = Mesh::new("b", Role::Building, crate::materials::BRICK);
+        brick.face(&wall, 0);
+        let mut plaster = Mesh::new("p", Role::Building, crate::materials::PLASTER);
+        plaster.face(&wall, 0);
+        let span = |mesh: &Mesh| {
+            let us: Vec<f64> = mesh.uvs.iter().map(|uv| uv[0]).collect();
+            us.iter().cloned().fold(f64::MIN, f64::max)
+                - us.iter().cloned().fold(f64::MAX, f64::min)
+        };
+        assert!(
+            (span(&brick) - 4.0).abs() < 1e-9,
+            "brick spans {} repeats",
+            span(&brick)
+        );
+        assert!(
+            (span(&plaster) - 2.0).abs() < 1e-9,
+            "plaster spans {} repeats",
+            span(&plaster)
+        );
     }
 
     #[test]
