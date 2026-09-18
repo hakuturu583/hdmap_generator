@@ -177,16 +177,10 @@ fn apply(document: Document, base: ClipConfig) -> Result<ClipConfig, ExportError
     Ok(config)
 }
 
-/// Reads a lane identifier the way `Map::lane_ids` prints it.
-///
-/// The prefix is added if the file left it off, so both `lane/north/0` and `north/0`
-/// name the same lane — a scenario is written by hand, and `LaneId::new` would
-/// otherwise quietly turn the printed form into `lane/lane/north/0`.
+/// Reads a lane identifier the way `Map::lane_ids` prints it, with the prefix or
+/// without it.
 pub fn lane_id(text: &str) -> LaneId {
-    match text.strip_prefix(&format!("{}/", LaneId::PREFIX)) {
-        Some(_) => LaneId::from_raw(text),
-        None => LaneId::new(text),
-    }
+    LaneId::parse_printed(text)
 }
 
 fn route_of(document: RouteDocument) -> Result<Route, ExportError> {

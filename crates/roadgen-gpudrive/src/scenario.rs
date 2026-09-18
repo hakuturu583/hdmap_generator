@@ -34,7 +34,6 @@ use serde::Deserialize;
 use roadgen_core::LaneId;
 
 use crate::error::ExportError;
-use crate::objects::default_size;
 use crate::scene::ObjectKind;
 use crate::{Agent, Route, SceneConfig};
 
@@ -123,19 +122,21 @@ fn apply(document: Document, base: SceneConfig) -> Result<SceneConfig, ExportErr
 
 fn agent_of(document: AgentDocument) -> Result<Agent, ExportError> {
     let kind = match document.kind.as_deref() {
-        Some(text) => ObjectKind::parse(text).ok_or_else(|| {
-            ExportError::Scenario(format!(
-                "{text:?} is not an agent type: GPUDrive knows vehicle, pedestrian and \
-                 cyclist"
-            ))
-        })?,
+        Some(text) => object_kind(text)?,
         None => ObjectKind::Vehicle,
     };
-    let (length, width, height) = default_size(kind);
+    // `Agent::new` has already sized the agent for its kind; the file only says where
+    // it differs.
     let mut agent = Agent::new(kind);
-    agent.length = document.length.unwrap_or(length);
-    agent.width = document.width.unwrap_or(width);
-    agent.height = document.height.unwrap_or(height);
+    if let Some(length) = document.length {
+        agent.length = length;
+    }
+    if let Some(width) = document.width {
+        agent.width = width;
+    }
+    if let Some(height) = document.height {
+        agent.height = height;
+    }
     if let Some(speed) = document.speed {
         agent.speed = speed;
     }
@@ -157,9 +158,25 @@ fn agent_of(document: AgentDocument) -> Result<Agent, ExportError> {
     Ok(agent)
 }
 
+/// The agent types the scenario file spells, including the aliases a caller is likely
+/// to write. The three kinds themselves are the reader's, and live with its model.
+fn object_kind(text: &str) -> Result<ObjectKind, ExportError> {
+    Ok(match text.to_ascii_lowercase().as_str() {
+        "vehicle" | "car" => ObjectKind::Vehicle,
+        "pedestrian" => ObjectKind::Pedestrian,
+        "cyclist" | "bicycle" => ObjectKind::Cyclist,
+        _ => {
+            return Err(ExportError::Scenario(format!(
+                "{text:?} is not an agent type: GPUDrive knows vehicle, pedestrian and \
+                 cyclist"
+            )))
+        }
+    })
+}
+
 fn route_of(document: RouteDocument) -> Result<Route, ExportError> {
     match (document.start, document.lanes) {
-        (Some(start), None) => Ok(Route::From(lane_id(&start))),
+        (Some(start), None) => Ok(Route::From(LaneId::parse_printed(start))),
         (None, Some(lanes)) => {
             if lanes.is_empty() {
                 return Err(ExportError::Scenario(
@@ -169,7 +186,7 @@ fn route_of(document: RouteDocument) -> Result<Route, ExportError> {
                 ));
             }
             Ok(Route::Lanes(
-                lanes.iter().map(String::as_str).map(lane_id).collect(),
+                lanes.iter().map(LaneId::parse_printed).collect(),
             ))
         }
         (Some(_), Some(_)) => Err(ExportError::Scenario(
@@ -180,18 +197,6 @@ fn route_of(document: RouteDocument) -> Result<Route, ExportError> {
         (None, None) => Err(ExportError::Scenario(
             "route has neither `start` nor `lanes`".into(),
         )),
-    }
-}
-
-/// Reads a lane identifier the way `Map::lane_ids` prints it.
-///
-/// The prefix is added if the file left it off, so both `lane/north/0` and `north/0`
-/// name the same lane — a scenario is written by hand, and `LaneId::new` would
-/// otherwise quietly turn the printed form into `lane/lane/north/0`.
-pub fn lane_id(text: &str) -> LaneId {
-    match text.strip_prefix(&format!("{}/", LaneId::PREFIX)) {
-        Some(_) => LaneId::from_raw(text),
-        None => LaneId::new(text),
     }
 }
 
@@ -214,6 +219,8 @@ mod tests {
 
     #[test]
     fn an_agent_keeps_the_size_of_its_kind_unless_it_says_otherwise() {
+        use crate::objects::default_size;
+
         let config = from_yaml_str(
             "agents:\n  - type: cyclist\n  - type: vehicle\n    length: 12.0\n",
             SceneConfig::default(),
@@ -234,7 +241,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             config.agents[0].route,
-            Some(Route::From(lane_id("lane/north/0")))
+            Some(Route::From(LaneId::parse_printed("lane/north/0")))
         );
 
         for text in [
@@ -258,11 +265,5 @@ mod tests {
             from_yaml_str("agents:\n  - type: tram\n", SceneConfig::default()),
             Err(ExportError::Scenario(_))
         ));
-    }
-
-    #[test]
-    fn a_lane_identifier_reads_the_same_with_or_without_its_prefix() {
-        assert_eq!(lane_id("lane/north/0"), lane_id("north/0"));
-        assert_eq!(lane_id("lane/north/0").as_str(), "lane/north/0");
     }
 }

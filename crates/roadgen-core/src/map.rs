@@ -6,9 +6,11 @@
 //! junctions, the connections between them, 3D geometry and semantics — with each of
 //! those concerns kept in its own module.
 
+use std::collections::HashSet;
+
 use crate::arena::Arena;
 use crate::error::GeometryError;
-use crate::geometry::{Curve3, Point3, Poly3Profile, SamplingConfig, WidthProfile};
+use crate::geometry::{Curve3, Point3, Poly3Profile, Polyline3, SamplingConfig, WidthProfile};
 use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
 use crate::topology::{
@@ -96,6 +98,19 @@ impl Projection {
             _ => return None,
         })
     }
+}
+
+/// Which lanes a vehicle drives.
+///
+/// A route is not part of the road network — it is something a caller wants *over*
+/// one — but it is said entirely in the IR's own terms, and every exporter that has
+/// to drive a generated map needs the same two ways of saying it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Set off here and follow the first successor at every branch.
+    From(LaneId),
+    /// Drive exactly these lanes, in this order.
+    Lanes(Vec<LaneId>),
 }
 
 /// Map-wide settings that are not about any one road.
@@ -323,6 +338,19 @@ impl Lane {
         self.endpoint(self.direction.entry_end())
     }
 
+    /// The lane's centreline, sampled in travel order.
+    ///
+    /// The same vertices [`Lane::travel_geometry`] would give, for a caller that
+    /// wants the path and not the two boundaries beside it: a polyline's vertices are
+    /// symmetric under reversal, so a backward lane's are the centreline's reversed.
+    pub fn travel_polyline(&self, config: SamplingConfig) -> Result<Polyline3, GeometryError> {
+        let polyline = self.centerline.to_polyline(config)?;
+        Ok(match self.direction {
+            Direction::Forward => polyline,
+            Direction::Backward => polyline.reversed(),
+        })
+    }
+
     /// Boundaries and centreline in travel order, with `left` to the driver's left.
     ///
     /// For a backward lane this reverses each curve *and* swaps the two boundaries;
@@ -462,6 +490,43 @@ impl Map {
             .into_iter()
             .map(|connection| connection.from.lane.clone())
             .collect()
+    }
+
+    /// The lanes a vehicle can drive in one run, starting from `start`.
+    ///
+    /// Follows the first successor at every branch and stops when the route would
+    /// repeat a lane, so a ring road terminates rather than looping forever. Which
+    /// branch to take is a policy rather than a fact about the map; it lives here so
+    /// that two exporters driving the same map drive it the same way.
+    pub fn route_from(&self, start: &LaneId) -> Vec<LaneId> {
+        let mut route = vec![start.clone()];
+        let mut seen: HashSet<LaneId> = HashSet::from([start.clone()]);
+        loop {
+            let last = route.last().expect("non-empty");
+            let next = self
+                .connections
+                .iter()
+                .find(|connection| &connection.from.lane == last)
+                .map(|connection| connection.to.lane.clone());
+            match next {
+                Some(next) if seen.insert(next.clone()) => route.push(next),
+                _ => return route,
+            }
+        }
+    }
+
+    /// A lane to set off from: the first drivable lane of a road that is not a
+    /// junction connector, in the order the caller added them.
+    pub fn default_start(&self) -> Option<LaneId> {
+        self.lanes
+            .iter()
+            .find(|lane| {
+                lane.lane_type.is_drivable()
+                    && self
+                        .road(&lane.road)
+                        .is_some_and(|road| !road.is_connector())
+            })
+            .map(|lane| lane.id.clone())
     }
 
     /// Where a junction's arms would meet.

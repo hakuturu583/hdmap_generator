@@ -771,16 +771,16 @@ impl PyMap {
     /// checked too.
     #[pyo3(signature = (scenario = None))]
     fn gpudrive_warnings(&mut self, scenario: Option<PathBuf>) -> PyResult<Vec<String>> {
-        self.ensure_built()?;
-        let map = self.built.as_ref().expect("just built");
         let config = match scenario {
-            Some(path) => Some(
-                roadgen_gpudrive::SceneConfig::for_map(map)
-                    .with_scenario_file(path)
-                    .map_err(value_error)?,
-            ),
-            None => None,
+            Some(path) => {
+                Some(self.gpudrive_config(Some(path), None, None, None, None, None, None)?)
+            }
+            None => {
+                self.ensure_built()?;
+                None
+            }
         };
+        let map = self.built.as_ref().expect("just built");
         Ok(roadgen_gpudrive::check(map, config.as_ref()))
     }
 
@@ -1139,26 +1139,14 @@ impl PyMap {
         if let Some(time_step) = time_step {
             config.time_step = time_step;
         }
-        if speed.is_some() || route.is_some() {
-            // Both nudge the scene's own vehicle, which is the first agent. A scenario
-            // that emptied the list has none, so one is added rather than the argument
-            // being silently dropped.
-            if config.agents.is_empty() {
-                config.agents.push(roadgen_gpudrive::Agent::default());
-            }
-            let agent = &mut config.agents[0];
-            if let Some(speed) = speed {
-                agent.speed = speed;
-            }
-            if let Some(route) = route {
-                agent.route = Some(roadgen_gpudrive::Route::Lanes(
-                    route
-                        .iter()
-                        .map(String::as_str)
-                        .map(roadgen_gpudrive::scenario::lane_id)
-                        .collect(),
-                ));
-            }
+        // Both nudge the scene's own vehicle, which the exporter knows how to find.
+        if let Some(speed) = speed {
+            config.sdc_mut().speed = speed;
+        }
+        if let Some(route) = route {
+            config.sdc_mut().route = Some(roadgen_gpudrive::Route::Lanes(
+                route.iter().map(LaneId::parse_printed).collect(),
+            ));
         }
         Ok(config)
     }

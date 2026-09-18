@@ -8,25 +8,14 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use serde_json::Value;
-
 use roadgen_core::prelude::*;
 use roadgen_core::Lane;
 use roadgen_gpudrive::scene::{MapElement, RoadKind, Scene};
 use roadgen_gpudrive::{Agent, ObjectKind, SceneConfig};
-use roadgen_integration_tests::scenarios;
-
-/// The scene as JSON, and as the model, from one export.
-fn export(map: &ValidatedMap, config: &SceneConfig) -> (Value, Scene) {
-    let text = roadgen_gpudrive::to_json(map, config).expect("the map should export as a scene");
-    (
-        serde_json::from_str(&text).expect("the scene should be JSON"),
-        serde_json::from_str(&text).expect("the scene should read back as a scene"),
-    )
-}
+use roadgen_integration_tests::{read_scene, read_scene_json, scenarios};
 
 fn scene_of(map: &ValidatedMap) -> Scene {
-    export(map, &SceneConfig::for_map(map)).1
+    read_scene(map, &SceneConfig::for_map(map))
 }
 
 fn roads_of(scene: &Scene, kind: RoadKind) -> Vec<&roadgen_gpudrive::Road> {
@@ -40,7 +29,7 @@ fn roads_of(scene: &Scene, kind: RoadKind) -> Vec<&roadgen_gpudrive::Road> {
 #[test]
 fn a_scene_holds_every_key_the_reader_insists_on() {
     let map = scenarios::controlled_crossroads();
-    let (json, _) = export(&map, &SceneConfig::new("x"));
+    let json = read_scene_json(&map, &SceneConfig::new("x"));
 
     for key in ["name", "scenario_id", "objects", "roads", "metadata"] {
         assert!(json.get(key).is_some(), "the scene has no {key}");
@@ -96,7 +85,7 @@ fn a_scene_holds_every_key_the_reader_insists_on() {
 #[test]
 fn the_types_written_are_the_strings_the_reader_compares_against() {
     let map = scenarios::controlled_crossroads();
-    let (json, _) = export(&map, &SceneConfig::default());
+    let json = read_scene_json(&map, &SceneConfig::default());
 
     let object_types: BTreeSet<&str> = json["objects"]
         .as_array()
@@ -268,7 +257,7 @@ fn an_agent_drives_its_route_at_the_speed_it_was_asked_for() {
         .with_steps(20)
         .with_time_step(0.1)
         .with_agents(vec![Agent::new(ObjectKind::Vehicle).with_speed(12.0)]);
-    let scene = export(&map, &config).1;
+    let scene = read_scene(&map, &config);
 
     let agent = &scene.objects[0];
     assert_eq!(agent.steps(), 20);
@@ -301,7 +290,7 @@ fn an_agent_stands_at_its_goal_once_the_route_runs_out() {
     // Ninety-one steps at 20 m/s is 180 m of driving and the fixture is 120 m long, so
     // the last steps are the agent waiting at the end of it.
     let config = SceneConfig::new("short").with_agents(vec![Agent::default().with_speed(20.0)]);
-    let scene = export(&map, &config).1;
+    let scene = read_scene(&map, &config);
     let agent = &scene.objects[0];
 
     let last = agent.position.last().unwrap();
@@ -334,7 +323,7 @@ fn a_scenario_file_says_who_drives_and_where() {
     let config = SceneConfig::for_map(&map)
         .with_scenario_str(&text)
         .expect("the scenario should read");
-    let scene = export(&map, &config).1;
+    let scene = read_scene(&map, &config);
 
     assert_eq!(scene.name, "crossing");
     assert_eq!(scene.scenario_id, "crossing-1");

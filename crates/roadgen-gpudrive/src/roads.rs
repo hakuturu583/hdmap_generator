@@ -90,11 +90,11 @@ impl Rows {
 fn lanes(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportError> {
     let config = map.metadata.sampling;
     for lane in map.lanes.iter().filter(|lane| lane.lane_type.is_drivable()) {
-        let travel = lane.travel_geometry(config)?;
+        let centerline = lane.travel_polyline(config)?;
         rows.push(
             RoadKind::Lane,
             lane_element(map, lane),
-            vertices(&travel.centerline, config)?,
+            flatten(centerline.points()),
         );
     }
     Ok(())
@@ -114,16 +114,28 @@ fn lane_element(map: &ValidatedMap, lane: &Lane) -> MapElement {
 }
 
 /// What sits against one cross-section edge, from the edge's own point of view.
+#[derive(Default)]
 struct Edge<'a> {
     /// The lane to the left of the edge, which is the one whose `right_edge` it is.
     left: Option<&'a Lane>,
     /// The lane to the right of it: the one whose `left_edge` it is.
     right: Option<&'a Lane>,
-    curve: &'a Curve3,
-    marking: BoundaryMarking,
 }
 
-impl Edge<'_> {
+impl<'a> Edge<'a> {
+    /// The curve and the paint, from whichever lane bounds the edge.
+    ///
+    /// The lane on the right is asked first — an arbitrary but fixed choice, and the
+    /// two answers differ only in a map that said two different things about one line.
+    fn boundary(&self) -> Option<(&'a Curve3, BoundaryMarking)> {
+        self.right
+            .map(|lane| (&lane.left_boundary, lane.left_marking))
+            .or_else(|| {
+                self.left
+                    .map(|lane| (&lane.right_boundary, lane.right_marking))
+            })
+    }
+
     fn drivable_sides(&self) -> usize {
         [self.left, self.right]
             .iter()
@@ -142,11 +154,14 @@ fn edges_and_lines(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportErro
             continue;
         }
         for section in 0..road.sections.len() {
-            for (_, edge) in edges_of(&map.lanes_of_section(&road.id, section)) {
-                let Some((kind, element)) = classify(&edge) else {
+            for edge in edges_of(&map.lanes_of_section(&road.id, section)).values() {
+                let Some((curve, marking)) = edge.boundary() else {
                     continue;
                 };
-                rows.push(kind, element, vertices(edge.curve, config)?);
+                let Some((kind, element)) = classify(edge, marking) else {
+                    continue;
+                };
+                rows.push(kind, element, vertices(curve, config)?);
             }
         }
     }
@@ -155,53 +170,29 @@ fn edges_and_lines(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportErro
 
 /// The edges of one cross-section, keyed by edge index so that two lanes meeting at
 /// one produce one element rather than two.
-///
-/// Where both lanes have painted their shared edge, the marking taken is the one on
-/// the right-hand lane's left — an arbitrary but fixed choice, and the two disagree
-/// only in a map that said two different things about one line.
 fn edges_of<'a>(lanes: &[&'a Lane]) -> BTreeMap<i32, Edge<'a>> {
     let mut edges: BTreeMap<i32, Edge<'a>> = BTreeMap::new();
     for lane in lanes {
-        edges
-            .entry(lane.left_edge)
-            .and_modify(|edge| {
-                edge.right = Some(lane);
-                edge.curve = &lane.left_boundary;
-                edge.marking = lane.left_marking;
-            })
-            .or_insert(Edge {
-                left: None,
-                right: Some(lane),
-                curve: &lane.left_boundary,
-                marking: lane.left_marking,
-            });
-        edges
-            .entry(lane.right_edge)
-            .and_modify(|edge| edge.left = Some(lane))
-            .or_insert(Edge {
-                left: Some(lane),
-                right: None,
-                curve: &lane.right_boundary,
-                marking: lane.right_marking,
-            });
+        edges.entry(lane.left_edge).or_default().right = Some(lane);
+        edges.entry(lane.right_edge).or_default().left = Some(lane);
     }
     edges
 }
 
 /// What an edge becomes, or `None` when GPUDrive has nothing to say about it.
-fn classify(edge: &Edge<'_>) -> Option<(RoadKind, MapElement)> {
+fn classify(edge: &Edge<'_>, marking: BoundaryMarking) -> Option<(RoadKind, MapElement)> {
     match edge.drivable_sides() {
         // Out in the verge or between two footways: nothing an agent drives on, and
         // nothing GPUDrive's vocabulary has a word for.
         0 => None,
         // The drivable surface ends here, whatever is painted on it.
         1 => Some((RoadKind::RoadEdge, MapElement::RoadEdgeBoundary)),
-        _ => match edge.marking.marking {
+        _ => match marking.marking {
             // A kerb between two drivable lanes is a median: something an agent hits
             // rather than something it may cross.
             RoadMarking::Curbstone => Some((RoadKind::RoadEdge, MapElement::RoadEdgeMedian)),
             RoadMarking::None => None,
-            _ => Some((RoadKind::RoadLine, line_element(edge.marking))),
+            _ => Some((RoadKind::RoadLine, line_element(marking))),
         },
     }
 }
@@ -259,13 +250,13 @@ fn stop_signs(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportError> {
         rows.push(
             RoadKind::StopSign,
             MapElement::StopSign,
-            vec![flatten(point)],
+            vec![Vector2::new(point.x, point.y)],
         );
     }
     Ok(())
 }
 
-fn objects_of<'a>(
+pub(crate) fn objects_of<'a>(
     map: &'a ValidatedMap,
     wanted: impl Fn(&MapObjectKind) -> bool + 'a,
 ) -> impl Iterator<Item = &'a MapObject> {
@@ -276,17 +267,14 @@ fn objects_of<'a>(
 
 /// A curve's vertices, with the height dropped: GPUDrive is a plane.
 fn vertices(curve: &Curve3, config: SamplingConfig) -> Result<Vec<Vector2>, ExportError> {
-    Ok(curve
-        .to_polyline(config)?
-        .points()
-        .iter()
-        .copied()
-        .map(flatten)
-        .collect())
+    Ok(flatten(curve.to_polyline(config)?.points()))
 }
 
-fn flatten(point: Point3) -> Vector2 {
-    Vector2::new(point.x, point.y)
+fn flatten(points: &[Point3]) -> Vec<Vector2> {
+    points
+        .iter()
+        .map(|point| Vector2::new(point.x, point.y))
+        .collect()
 }
 
 #[cfg(test)]

@@ -31,6 +31,20 @@ macro_rules! define_id {
                 $name(Arc::from(raw.as_ref()))
             }
 
+            /// Reads an identifier the way it is printed, with the prefix or without
+            /// it: both `lane/north/0` and `north/0` name the same lane.
+            ///
+            /// This is what a file written by hand needs. `new` would turn the
+            /// printed form into `lane/lane/north/0`, and `from_raw` would take the
+            /// bare form as if it were already prefixed.
+            pub fn parse_printed(text: impl AsRef<str>) -> Self {
+                let text = text.as_ref();
+                match text.strip_prefix($prefix) {
+                    Some(rest) if rest.starts_with('/') => $name::from_raw(text),
+                    _ => $name::new(text),
+                }
+            }
+
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -140,6 +154,23 @@ mod tests {
         assert_eq!(
             ConnectionId::between(Some(&junction), &from, &to).to_string(),
             "connection/j0/north_0/east_0"
+        );
+    }
+
+    #[test]
+    fn an_identifier_reads_the_same_with_or_without_its_prefix() {
+        assert_eq!(
+            LaneId::parse_printed("lane/north/0"),
+            LaneId::new("north/0")
+        );
+        assert_eq!(
+            LaneId::parse_printed("lane/north/0").as_str(),
+            "lane/north/0"
+        );
+        // A name that merely starts with the prefix's letters is not prefixed.
+        assert_eq!(
+            RoadId::parse_printed("roadworks").as_str(),
+            "road/roadworks"
         );
     }
 

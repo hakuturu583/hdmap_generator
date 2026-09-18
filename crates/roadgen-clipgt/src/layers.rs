@@ -103,13 +103,13 @@ pub fn poses(map: &ValidatedMap, config: &ClipConfig) -> Result<Vec<ego::Pose>, 
                     "{start} is not a lane of this map"
                 )));
             }
-            ego::route_from(map, start)
+            map.route_from(start)
         }
         None => {
-            let start = ego::default_start(map).ok_or_else(|| {
+            let start = map.default_start().ok_or_else(|| {
                 ExportError::NoRoute("the map has no drivable lane outside a junction".into())
             })?;
-            ego::route_from(map, &start)
+            map.route_from(&start)
         }
     };
     ego::track(map, &route, config.speed, config.frame_rate)

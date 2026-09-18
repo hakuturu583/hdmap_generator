@@ -49,18 +49,13 @@ use roadgen_core::semantics::{MapObjectKind, TrafficRule};
 use roadgen_core::{LaneId, ValidatedMap};
 
 pub use error::ExportError;
+// The route is the IR's own: it names lanes of the map and follows the map's
+// successors, so it is said the same way here as in every other exporter that drives
+// a generated map.
+pub use roadgen_core::Route;
 pub use scene::{
     MapElement, Metadata, Object, ObjectKind, Road, RoadKind, Scene, TrackToPredict, Vector2,
 };
-
-/// Which lanes an agent drives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Route {
-    /// Set off here and follow the first successor at every branch.
-    From(LaneId),
-    /// Drive exactly these lanes, in this order.
-    Lanes(Vec<LaneId>),
-}
 
 /// One agent of the scene.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,26 +107,6 @@ impl Agent {
 
     pub fn with_speed(mut self, speed: f64) -> Self {
         self.speed = speed;
-        self
-    }
-
-    /// Drives exactly these lanes, in this order.
-    pub fn with_route(mut self, route: Vec<LaneId>) -> Self {
-        self.route = Some(Route::Lanes(route));
-        self
-    }
-
-    /// Sets off at `start` and follows successors from there.
-    pub fn starting_at(mut self, start: LaneId) -> Self {
-        self.route = Some(Route::From(start));
-        self
-    }
-
-    /// Metres: length along the agent's forward axis, width across it, height up.
-    pub fn with_size(mut self, length: f64, width: f64, height: f64) -> Self {
-        self.length = length;
-        self.width = width;
-        self.height = height;
         self
     }
 }
@@ -199,6 +174,16 @@ impl SceneConfig {
         self
     }
 
+    /// The scene's own vehicle, to nudge: the first agent, because that is the one
+    /// `sdc_track_index` points at. A configuration whose agents were all taken away
+    /// gets one back, since a caller asking for the ego vehicle means to have one.
+    pub fn sdc_mut(&mut self) -> &mut Agent {
+        if self.agents.is_empty() {
+            self.agents.push(Agent::default());
+        }
+        &mut self.agents[0]
+    }
+
     /// Reads a scenario file over this configuration: anything the file does not
     /// mention keeps the value it already has.
     pub fn with_scenario_file(self, path: impl AsRef<Path>) -> Result<Self, ExportError> {
@@ -247,8 +232,8 @@ pub fn to_scene(map: &ValidatedMap, config: &SceneConfig) -> Result<Scene, Expor
         .collect();
 
     Ok(Scene {
-        name: truncate(&config.name),
-        scenario_id: truncate(&config.scenario_id),
+        name: scene::truncate_name(&config.name),
+        scenario_id: scene::truncate_name(&config.scenario_id),
         metadata: Metadata {
             // The first agent is the scene's own vehicle; a scene with no agents has
             // none, which is what -1 says.
@@ -268,23 +253,23 @@ pub fn to_json(map: &ValidatedMap, config: &SceneConfig) -> Result<String, Expor
 }
 
 /// Writes `map` to `path` as a GPUDrive scene.
+///
+/// Rendered straight into the file rather than into a string first: a dense map's
+/// scene is megabytes of JSON, and there is no reason to hold all of it in memory to
+/// hand it to the kernel a moment later.
 pub fn write(
     map: &ValidatedMap,
     path: impl AsRef<Path>,
     config: &SceneConfig,
 ) -> Result<(), ExportError> {
     let path = path.as_ref();
-    std::fs::write(path, to_json(map, config)?)
-        .map_err(|error| ExportError::Io(format!("{}: {error}", path.display())))
-}
-
-/// As much of a name as the reader keeps.
-///
-/// It copies into a `char[32]` with `strncpy`, which writes no terminator when the
-/// source fills the buffer, so the last byte is left to be the terminator. Truncation
-/// is on characters rather than bytes: half a character would not be a name.
-fn truncate(name: &str) -> String {
-    name.chars().take(scene::MAX_NAME).collect()
+    let scene = to_scene(map, config)?;
+    let io = |error: std::io::Error| ExportError::Io(format!("{}: {error}", path.display()));
+    let file = std::fs::File::create(path).map_err(io)?;
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer(&mut writer, &scene)
+        .map_err(|error| ExportError::Json(error.to_string()))?;
+    std::io::Write::flush(&mut writer).map_err(io)
 }
 
 /// What this map loses on the way into GPUDrive, and what the scene runs up against.
@@ -317,14 +302,14 @@ pub fn check(map: &ValidatedMap, config: Option<&SceneConfig>) -> Vec<String> {
             .to_owned(),
     );
 
-    let lights = objects_of(map, |kind| matches!(kind, MapObjectKind::TrafficLight));
+    let lights = roads::objects_of(map, |kind| matches!(kind, MapObjectKind::TrafficLight)).count();
     if lights > 0 {
         problems.push(format!(
             "the scene format has no traffic-light element, so the {lights} lights and \
              the phases they govern are not written"
         ));
     }
-    let stop_lines = objects_of(map, |kind| matches!(kind, MapObjectKind::StopLine));
+    let stop_lines = roads::objects_of(map, |kind| matches!(kind, MapObjectKind::StopLine)).count();
     if stop_lines > 0 {
         problems.push(format!(
             "there is no stop-line element either: the {stop_lines} stop lines are \
@@ -332,10 +317,11 @@ pub fn check(map: &ValidatedMap, config: Option<&SceneConfig>) -> Vec<String> {
              beside it"
         ));
     }
-    let other_signs = objects_of(map, |kind| match kind {
+    let other_signs = roads::objects_of(map, |kind| match kind {
         MapObjectKind::TrafficSign { code } => !roads::is_stop_sign(code),
         _ => false,
-    });
+    })
+    .count();
     if other_signs > 0 {
         problems.push(format!(
             "GPUDrive's map vocabulary has one sign in it — the stop sign — so the \
@@ -390,66 +376,29 @@ fn check_config(map: &ValidatedMap, config: &SceneConfig) -> Vec<String> {
             scene::MAX_NAME
         ));
     }
-    if config.steps > scene::MAX_POSITIONS {
-        problems.push(format!(
-            "the scene runs for {} timesteps and the reader keeps {}, which is \
-             GPUDrive's episode length: the rest of every track is dropped as it loads",
-            config.steps,
-            scene::MAX_POSITIONS
-        ));
+    for route in config
+        .agents
+        .iter()
+        .filter_map(|agent| agent.route.as_ref())
+    {
+        let named: &[LaneId] = match route {
+            Route::Lanes(lanes) => lanes,
+            Route::From(start) => std::slice::from_ref(start),
+        };
+        for lane in named.iter().filter(|lane| map.lane(lane).is_none()) {
+            problems.push(format!(
+                "an agent's route names {lane}, which is not a lane of this map"
+            ));
+        }
     }
 
-    let scene = match to_scene(map, config) {
-        Ok(scene) => scene,
-        Err(error) => {
-            problems.push(error.to_string());
-            return problems;
-        }
-    };
-    if scene.objects.len() > scene::MAX_OBJECTS {
-        problems.push(format!(
-            "the scene has {} agents and the reader keeps {}",
-            scene.objects.len(),
-            scene::MAX_OBJECTS
-        ));
-    }
-    if scene.roads.len() > scene::MAX_ROADS {
-        problems.push(format!(
-            "the map is {} road elements and the reader keeps {}: the rest are dropped \
-             as it loads",
-            scene.roads.len(),
-            scene::MAX_ROADS
-        ));
-    }
-    let long = scene
-        .roads
-        .iter()
-        .filter(|road| road.geometry.len() > scene::MAX_GEOMETRY)
-        .count();
-    if long > 0 {
-        problems.push(format!(
-            "{long} road elements are longer than the {} vertices the reader keeps, so \
-             they are written truncated; sample the map more coarsely to fit",
-            scene::MAX_GEOMETRY
-        ));
-    }
-    let segments = scene.road_segments();
-    if segments > scene::MAX_ROAD_SEGMENTS {
-        problems.push(format!(
-            "the map is {segments} road segments and the simulator has room for {}; \
-             GPUDrive reduces polylines as it loads, but a map this dense may not fit \
-             even so",
-            scene::MAX_ROAD_SEGMENTS
-        ));
+    // The reader's fixed buffers are properties of the scene rather than of the
+    // configuration, so they are the scene's own to report.
+    match to_scene(map, config) {
+        Ok(scene) => problems.extend(scene.over_limits()),
+        Err(error) => problems.push(format!("this scenario cannot be exported: {error}")),
     }
     problems
-}
-
-fn objects_of(map: &ValidatedMap, wanted: impl Fn(&MapObjectKind) -> bool) -> usize {
-    map.objects
-        .iter()
-        .filter(|object| wanted(&object.kind))
-        .count()
 }
 
 #[cfg(test)]

@@ -7,14 +7,8 @@
 //! no use to anyone.
 
 use roadgen_core::prelude::*;
-use roadgen_gpudrive::scene::Scene;
 use roadgen_gpudrive::{ObjectKind, SceneConfig};
-use roadgen_integration_tests::scenarios;
-
-fn written(map: &ValidatedMap, config: &SceneConfig) -> Scene {
-    let text = roadgen_gpudrive::to_json(map, config).expect("the map should export");
-    serde_json::from_str(&text).expect("the scene should read back")
-}
+use roadgen_integration_tests::{read_scene, scenarios};
 
 #[test]
 fn a_scenario_sets_the_route_the_agent_actually_drives() {
@@ -24,7 +18,7 @@ fn a_scenario_sets_the_route_the_agent_actually_drives() {
     let config = SceneConfig::new("x")
         .with_scenario_str("agents:\n  - speed: 8.0\n    route:\n      start: lane/south/0\n")
         .expect("the scenario should load");
-    let scene = written(&map, &config);
+    let scene = read_scene(&map, &config);
 
     let lane = map.lane(&LaneId::from_raw("lane/south/0")).unwrap();
     let entry = lane.entry_point();
@@ -49,7 +43,7 @@ fn a_listed_route_is_driven_exactly_as_written() {
     let config = SceneConfig::new("x")
         .with_scenario_str("agents:\n  - route:\n      lanes: [b/1, a/1]\n")
         .expect("the scenario should load");
-    let scene = written(&map, &config);
+    let scene = read_scene(&map, &config);
 
     let track = &scene.objects[0];
     let start = map
@@ -82,7 +76,7 @@ fn the_example_scenario_in_the_repository_still_works() {
     assert_eq!(config.steps, 91);
     assert_eq!(config.agents.len(), 2);
 
-    let scene = written(&map, &config);
+    let scene = read_scene(&map, &config);
     assert_eq!(scene.objects[0].kind, ObjectKind::Vehicle);
     assert_eq!(scene.objects[1].kind, ObjectKind::Cyclist);
     assert!(scene.objects[1].mark_as_expert);

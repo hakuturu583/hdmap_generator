@@ -13,7 +13,6 @@
 //! second rather than ten metres of a climbing road.
 
 use roadgen_core::geometry::Point3;
-use roadgen_core::topology::Direction;
 use roadgen_core::{LaneId, ValidatedMap};
 
 use crate::error::ExportError;
@@ -23,39 +22,6 @@ use crate::{Agent, Route};
 /// Two positions closer than this are the same place: lanes joined through a junction
 /// share their endpoint, and keeping both would put a zero-length step in the path.
 const WELD_TOLERANCE: f64 = 1e-6;
-
-/// The lanes a vehicle can drive in one run, starting from `start`.
-///
-/// Follows the first successor at every branch and stops when the route would repeat a
-/// lane, so a ring road terminates rather than looping forever.
-pub fn route_from(map: &ValidatedMap, start: &LaneId) -> Vec<LaneId> {
-    let mut route = vec![start.clone()];
-    while let Some(next) = map
-        .successors(route.last().expect("non-empty"))
-        .first()
-        .cloned()
-    {
-        if route.contains(&next) {
-            break;
-        }
-        route.push(next);
-    }
-    route
-}
-
-/// A lane to set off from: the first drivable lane of a road that is not a junction
-/// connector, in the order the caller added them.
-pub fn default_start(map: &ValidatedMap) -> Option<LaneId> {
-    map.lanes
-        .iter()
-        .find(|lane| {
-            lane.lane_type.is_drivable()
-                && map
-                    .road(&lane.road)
-                    .is_some_and(|road| !road.is_connector())
-        })
-        .map(|lane| lane.id.clone())
-}
 
 /// The lanes an agent drives, whether it named them, named a start, or named nothing.
 pub fn route_of(map: &ValidatedMap, agent: &Agent) -> Result<Vec<LaneId>, ExportError> {
@@ -76,13 +42,13 @@ pub fn route_of(map: &ValidatedMap, agent: &Agent) -> Result<Vec<LaneId>, Export
                     "{start} is not a lane of this map"
                 )));
             }
-            route_from(map, start)
+            map.route_from(start)
         }
         None => {
-            let start = default_start(map).ok_or_else(|| {
+            let start = map.default_start().ok_or_else(|| {
                 ExportError::NoRoute("the map has no drivable lane outside a junction".into())
             })?;
-            route_from(map, &start)
+            map.route_from(&start)
         }
     };
     if route.is_empty() {
@@ -132,10 +98,11 @@ pub fn track(
 
     // Distance to each vertex, so a sample is placed by arc length rather than by
     // counting vertices, which are not evenly spaced.
-    let mut travelled = vec![0.0];
+    let mut travelled = Vec::with_capacity(path.len());
+    travelled.push(0.0);
     for pair in path.windows(2) {
         let last = travelled.last().copied().expect("non-empty");
-        travelled.push(last + pair[0].distance_to(pair[1]));
+        travelled.push(last + pair[0].horizontal_distance_to(pair[1]));
     }
     let total = travelled.last().copied().expect("non-empty");
 
@@ -187,11 +154,11 @@ pub fn track(
     })
 }
 
-/// The route's path in plan view, in travel order.
+/// The route's path, in travel order.
 ///
-/// A lane's centreline is stored in reference-line order, so a backward lane's is
-/// reversed here: an agent drives a lane the way traffic does, not the way the road
-/// was written.
+/// The heights ride along unused: what the track is paced and aimed by is plan-view
+/// distance, because GPUDrive is a plane, and flattening at the last moment keeps this
+/// function saying only what order the lanes come in.
 fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<Vec<Point3>, ExportError> {
     let config = map.metadata.sampling;
     let mut path: Vec<Point3> = Vec::new();
@@ -199,18 +166,12 @@ fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<Vec<Point3>, ExportError
         let lane = map
             .lane(id)
             .ok_or_else(|| ExportError::NoRoute(format!("{id} is not a lane of this map")))?;
-        let centerline = match lane.direction {
-            Direction::Forward => lane.centerline.clone(),
-            Direction::Backward => lane.centerline.reversed(config)?,
-        };
-        for point in centerline.to_polyline(config)?.points() {
-            // Flattened here rather than at the end, so that both the distances the
-            // track is paced by and the headings it carries are the ones of the
-            // ground the agent covers.
-            let next = Point3::new(point.x, point.y, 0.0);
+        for point in lane.travel_polyline(config)?.points() {
             match path.last() {
-                Some(previous) if previous.distance_to(next) < WELD_TOLERANCE => continue,
-                _ => path.push(next),
+                Some(previous) if previous.horizontal_distance_to(*point) < WELD_TOLERANCE => {
+                    continue
+                }
+                _ => path.push(*point),
             }
         }
     }
