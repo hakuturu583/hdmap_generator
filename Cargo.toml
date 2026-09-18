@@ -5,6 +5,7 @@ members = [
     "crates/roadgen-opendrive",
     "crates/roadgen-lanelet2",
     "crates/roadgen-clipgt",
+    "crates/roadgen-gpudrive",
     "crates/roadgen-osm",
     "crates/roadgen-sumo",
     "crates/roadgen-python",
@@ -24,6 +25,7 @@ roadgen-core = { path = "crates/roadgen-core", version = "0.1.0" }
 roadgen-opendrive = { path = "crates/roadgen-opendrive", version = "0.1.0" }
 roadgen-lanelet2 = { path = "crates/roadgen-lanelet2", version = "0.1.0" }
 roadgen-clipgt = { path = "crates/roadgen-clipgt", version = "0.1.0" }
+roadgen-gpudrive = { path = "crates/roadgen-gpudrive", version = "0.1.0" }
 roadgen-osm = { path = "crates/roadgen-osm", version = "0.1.0" }
 roadgen-sumo = { path = "crates/roadgen-sumo", version = "0.1.0" }
 

@@ -1,0 +1,22 @@
+[package]
+name = "roadgen-gpudrive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto GPUDrive's scene JSON"
+
+[dependencies]
+roadgen-core.workspace = true
+serde.workspace = true
+# `float_roundtrip` is what makes reading a scene back give the same numbers that
+# were written: serde_json's default parser is fast rather than exact, and GPUDrive's
+# own reader — strtod, through nlohmann — is exact. Without it a scene read here would
+# differ from the one the simulator sees by an ulp here and there.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+serde_norway.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

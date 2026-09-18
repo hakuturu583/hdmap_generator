@@ -981,3 +981,146 @@ def test_sumo_says_what_it_cannot_carry():
     assert any("netconvert generates the phases" in warning for warning in warnings)
     # And, as with the OpenStreetMap export, it stays out of the general warnings.
     assert clipgt_map().format_warnings() == []
+
+
+# --------------------------------------------------------------------------- #
+# GPUDrive
+#
+# A GPUDrive scene is JSON with no schema: what makes a file a scene is that the
+# simulator's reader accepts it. So these read the written file the way that reader
+# does — the keys it insists on, the arrays it steps through in parallel, the type
+# strings it compares against — rather than asserting against the exporter's opinion
+# of what it wrote. The map is the same signalised crossroads the ClipGT tests use.
+# --------------------------------------------------------------------------- #
+
+
+def export_scene(m, tmp_path, **arguments):
+    path = tmp_path / "scene.json"
+    m.export_gpudrive(path, **arguments)
+    return json.loads(path.read_text())
+
+
+def test_a_gpudrive_scene_holds_every_key_the_reader_insists_on(tmp_path):
+    scene = export_scene(clipgt_map(), tmp_path)
+
+    assert set(scene) >= {"name", "scenario_id", "objects", "roads", "metadata"}
+    assert scene["name"] == "demo town"
+    assert set(scene["metadata"]) >= {
+        "sdc_track_index",
+        "tracks_to_predict",
+        "objects_of_interest",
+    }
+    assert scene["metadata"]["sdc_track_index"] == 0
+
+    for obj in scene["objects"]:
+        assert set(obj) >= {
+            "position",
+            "width",
+            "length",
+            "height",
+            "id",
+            "heading",
+            "velocity",
+            "valid",
+            "goalPosition",
+            "type",
+        }
+        assert obj["type"] in ("vehicle", "pedestrian", "cyclist")
+        steps = len(obj["position"])
+        assert steps == len(obj["heading"]) == len(obj["velocity"]) == len(obj["valid"])
+
+    kinds = {road["type"] for road in scene["roads"]}
+    assert kinds <= {
+        "lane",
+        "road_line",
+        "road_edge",
+        "crosswalk",
+        "speed_bump",
+        "stop_sign",
+    }
+    assert {"lane", "road_edge", "crosswalk", "stop_sign"} <= kinds
+    for road in scene["roads"]:
+        assert road["geometry"], "an element with no points is one the reader misreads"
+        # The Waymo map-feature codes, gaps and all: 4 is not one of them.
+        assert road["map_element_id"] in set(range(0, 21)) - {4} | {-1}
+        assert all(set(point) == {"x", "y"} for point in road["geometry"])
+
+
+def test_a_gpudrive_agent_drives_the_map(tmp_path):
+    scene = export_scene(
+        clipgt_map(), tmp_path, steps=30, time_step=0.1, speed=15.0, name="driven"
+    )
+    assert scene["name"] == "driven"
+
+    agent = scene["objects"][0]
+    assert len(agent["position"]) == 30
+    assert all(agent["valid"])
+
+    # 15 m/s at a tenth of a second is 1.5 m a step, measured on the ground: the arms
+    # of this map are graded, and a track paced along the slope would fall short.
+    steps = [
+        ((b["x"] - a["x"]) ** 2 + (b["y"] - a["y"]) ** 2) ** 0.5
+        for a, b in zip(agent["position"], agent["position"][1:])
+    ]
+    assert all(step == pytest.approx(1.5, abs=1e-2) for step in steps)
+    assert sum(steps) == pytest.approx(29 * 1.5, abs=1e-2)
+
+    # Thirty steps is 43.5 m of a route that is longer than that, so the goal — where
+    # the route ends — is somewhere the agent has not reached yet.
+    last = agent["position"][-1]
+    assert set(agent["goalPosition"]) == {"x", "y"}
+    assert agent["goalPosition"] != pytest.approx(last, abs=1.0)
+
+
+def test_a_gpudrive_scenario_file_says_who_drives_and_where(tmp_path):
+    m = clipgt_map()
+    scenario = write_scenario(
+        tmp_path,
+        """\
+        name: from_yaml
+        scenario_id: from_yaml-1
+        steps: 25
+
+        agents:
+          - type: vehicle
+            speed: 9.0
+            route:
+              start: lane/east/0
+          - type: cyclist
+            speed: 4.0
+            mark_as_expert: true
+            of_interest: true
+        """,
+    )
+    scene = export_scene(m, tmp_path, scenario=scenario)
+
+    assert scene["name"] == "from_yaml"
+    assert scene["scenario_id"] == "from_yaml-1"
+    assert [obj["type"] for obj in scene["objects"]] == ["vehicle", "cyclist"]
+    assert scene["objects"][1]["mark_as_expert"] is True
+    assert len(scene["objects"][0]["position"]) == 25
+    assert scene["metadata"]["objects_of_interest"] == [scene["objects"][1]["id"]]
+
+    # The route reached the track: the east arm is driven inwards from (70, 0).
+    start = scene["objects"][0]["position"][0]
+    assert start["x"] == pytest.approx(70.0, abs=2.0)
+
+    # And the same scene comes back as a string, for a caller who does not want a file.
+    assert json.loads(m.to_gpudrive_json(scenario=scenario)) == scene
+
+
+def test_a_gpudrive_scenario_with_an_unknown_key_is_refused(tmp_path):
+    scenario = write_scenario(tmp_path, "speed: 3.0\n")
+    with pytest.raises(ValueError, match="scenario"):
+        clipgt_map().export_gpudrive(tmp_path / "scene.json", scenario=scenario)
+
+
+def test_gpudrive_says_what_it_cannot_carry():
+    m = clipgt_map()
+    warnings = m.gpudrive_warnings()
+    assert any("no z" in warning for warning in warnings)
+    assert any("topology" in warning for warning in warnings)
+    assert any("traffic-light element" in warning for warning in warnings)
+    # And it stays out of the general warnings, which are about OpenDRIVE and
+    # Lanelet2 and would otherwise be noise for a caller who never writes a scene.
+    assert m.format_warnings() == []

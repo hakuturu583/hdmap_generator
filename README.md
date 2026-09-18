@@ -2,7 +2,7 @@
 
 Generate 3D road networks, and write the same network out as **OpenDRIVE**, as an
 **Autoware-ready Lanelet2** map, as plain **OpenStreetMap**, as a **SUMO** network,
-and as a **ClipGT** clip for NVIDIA Cosmos.
+as a **ClipGT** clip for NVIDIA Cosmos, and as a **GPUDrive** scene.
 
 This is a generator, not a converter. Nothing here parses an existing HD map: you
 describe roads, lanes, junctions and the movements between them, and the library
@@ -34,6 +34,7 @@ m.export_lanelet2("map.osm")
 m.export_osm("openstreetmap.osm")
 m.export_sumo("sumo/")
 m.export_clipgt("clip/")
+m.export_gpudrive("scene.json")
 ```
 
 ## How it is put together
@@ -55,12 +56,12 @@ m.export_clipgt("clip/")
                      │
                  Validation
                      │
-    ┌────────┬────────┴─────┬───────┬───────┐
-    ▼        ▼              ▼       ▼       ▼
-OpenDRIVE Lanelet2  OpenStreetMap  SUMO  ClipGT
- exporter  exporter    exporter   exporter exporter
-    │         │            │         │       │
-`opendrive`   `simple_lanelet2`  plain XML  arrow/parquet
+    ┌────────┬────────┴─────┬───────┬───────┬─────────┐
+    ▼        ▼              ▼       ▼       ▼         ▼
+OpenDRIVE Lanelet2  OpenStreetMap  SUMO  ClipGT   GPUDrive
+ exporter  exporter    exporter   exporter exporter exporter
+    │         │            │         │       │         │
+`opendrive`   `simple_lanelet2`  plain XML  arrow/parquet  JSON
 ```
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
@@ -190,6 +191,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `add_traffic_light_rule`, `add_right_of_way`, `add_speed_limit` | rules over lanes |
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
 | `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
+| `gpudrive_warnings(scenario=None)` | what a GPUDrive export would lose, and what its scene runs up against |
 | `osm_warnings()` | what a plain OpenStreetMap export would lose |
 | `sumo_warnings()` | what a SUMO export would lose |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
@@ -197,7 +199,8 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `export_sumo(directory)` | write a SUMO plain-XML network and its netconvert configuration; returns the prefix |
 | `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
-| `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` | the same, as strings |
+| `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
+| `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 
 Handedness decides which side of the reference line a `forward` lane lands on:
@@ -663,6 +666,104 @@ reports that rather than letting a caller assume a round trip, and checks the
 scenario's route against the map while it is there. The `pole`, `road_island` and
 `road_marking` layers have no counterpart in the IR and are not written.
 
+## GPUDrive
+
+[GPUDrive](https://github.com/Emerge-Lab/gpudrive) is a GPU-accelerated driving
+simulator that loads scenes from JSON: one file holding a map as polylines and the
+agents driving it as logged tracks.
+
+```python
+m.export_gpudrive("scene.json", scenario="examples/gpudrive-scenario.yaml")
+```
+
+There is no published schema for that file. What there is is the simulator's reader,
+[`src/json_serialization.hpp`](https://github.com/Emerge-Lab/gpudrive/blob/main/src/json_serialization.hpp),
+and the data model in `roadgen-gpudrive` is shaped by it field for field: every key it
+insists on, every key it will do without, and the strings it compares types against.
+
+| Element | What goes in it |
+| --- | --- |
+| `lane` | each drivable lane's centreline, in travel order |
+| `road_line` | a painted boundary between lanes, with its Waymo line code |
+| `road_edge` | the edge of the drivable surface, and a kerbed median |
+| `crosswalk` | the outline of a crossing |
+| `stop_sign` | a single point, where a stop sign applies |
+| `objects` | one track per agent: position, heading, velocity and validity per timestep |
+
+`map_element_id` is the Waymo Open Motion feature code the simulator's `MapType` is
+built from, so a solid single white line goes out as 7 and a median kerb as 16. The
+markings the IR carries map onto it directly; a broken-and-solid pair painted white
+has no code there and goes out as `ROAD_LINE_UNKNOWN` rather than as a colour it is
+not.
+
+**GPUDrive is a plane.** A position is an `(x, y)` in metres and the document has no z
+anywhere, so the elevation, grade and superelevation the generator computed are
+dropped at the boundary. Distances along an agent's route are measured in plan view
+for the same reason: an agent asked for 10 m/s covers ten metres of ground a second,
+not ten metres of a climbing road.
+
+Two decisions do not fall out of the IR on their own. **An edge is one element**:
+either the boundary of the drivable surface or a painted line, never both, because the
+IR has one curve there and writing it twice would put two elements on top of each
+other. And **a junction connector has no edges** — its lane centreline is written,
+because that is the path through the intersection, but its boundaries are not, since a
+`road_edge` is something an agent collides with and there is no wall down the middle of
+a junction.
+
+### The scenario file
+
+A scene is a map *and the agents driving it*; a generated map has no logged traffic, so
+the agents come from a file.
+
+```yaml
+name: town
+scenario_id: town-0001
+steps: 91                  # timesteps; 91 is GPUDrive's episode length and its maximum
+time_step: 0.1             # seconds between them
+
+agents:
+  # The first agent is the scene's self-driving car: `sdc_track_index` is 0.
+  - type: vehicle          # vehicle, pedestrian or cyclist
+    speed: 12.0            # metres per second, held for the whole route
+    route:
+      start: lane/north/0          # follow successors from here
+      # lanes: [lane/north/0, ...] # or drive exactly these, in order
+    length: 4.6            # metres; left out, an agent is the ordinary size of its kind
+    width: 2.0
+    height: 1.6
+    track_to_predict: true # listed in the scene's tracks_to_predict; the default
+    difficulty: 0
+  - type: cyclist
+    speed: 4.5
+    mark_as_expert: true   # replayed from the track rather than handed to a policy
+    of_interest: true      # listed in the scene's objects_of_interest
+```
+
+[`examples/gpudrive-scenario.yaml`](examples/gpudrive-scenario.yaml) is this file, kept
+in the repository and loaded by a test so that it cannot quietly stop working.
+
+Everything is optional and anything left out keeps the value it already had. Arguments
+passed to `export_gpudrive` override the file; `speed` and `route` apply to the first
+agent, which is the scene's own vehicle. **An unknown key is an error**, not a silence.
+
+An agent drives its route at a constant speed and stands at the end of it for whatever
+is left of the episode, rather than vanishing — every timestep is `valid`, because an
+agent that is there for the whole scene is what the others have to deal with. Where its
+track ends is its `goalPosition`, which is what the simulator scores a policy against.
+
+**What it cannot carry.** A scene holds no lane topology: a lane does not say what it
+leads to, so an agent's route is baked into its track rather than routed at load time.
+There is no traffic-light element and no stop-line element, so signals and the phases
+they govern are dropped — and of signs, only the stop sign has anywhere to go. Lane
+widths go with them: a GPUDrive lane is a centreline. Road element ids are the row
+index in the written file, so the IR's stable identifiers do not survive either.
+`Map.gpudrive_warnings(scenario)` reports all of that rather than letting a caller
+assume a round trip, and checks the scene against the reader's fixed buffers while it
+is there — 515 objects, 956 road elements, 1746 vertices an element and 91 timesteps,
+past which the simulator silently drops what does not fit. The `speed_bump` and
+`driveway` elements go the other way: the IR has nothing that means either, so they
+are never written.
+
 ## Validation
 
 `validate()` reports everything wrong at once, rather than failing on the first
@@ -713,10 +814,11 @@ roadgen/
 │   ├── roadgen-opendrive/   lowering onto the `opendrive` crate
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
+│   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON
 │   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
 │   ├── roadgen-sumo/        lowering onto SUMO's plain-XML network
 │   └── roadgen-python/      PyO3 bindings
-├── examples/                a ClipGT scenario file
+├── examples/                ClipGT and GPUDrive scenario files
 ├── python/roadgen/          the Python package
 ├── tests/
 │   ├── integration/         scenarios and cross-format checks
@@ -756,4 +858,9 @@ The ClipGT layer names and field names were read off the public
 [`clipgt_loader.py`](https://github.com/nvidia-cosmos/cosmos-transfer2.5/blob/main/cosmos_transfer2/_src/imaginaire/auxiliary/world_scenario/dataloaders/clipgt_loader.py).
 That file is NVIDIA's and carries a proprietary header; none of it is reproduced here,
 only the names two programs have to agree on to exchange data.
+
+The GPUDrive scene fields were read the same way, off the simulator's own reader,
+[`src/json_serialization.hpp`](https://github.com/Emerge-Lab/gpudrive/blob/main/src/json_serialization.hpp),
+and its `init.hpp` and `types.hpp` beside it. Nothing from those files is reproduced
+either — what is written down here is the shape of the document they accept.
 Check licence compatibility before adding a dependency.
