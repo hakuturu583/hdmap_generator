@@ -1,0 +1,20 @@
+{
+  "name": "roadgen-demo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "The roadgen demo page: roadgen's own Python wheel, run in the browser",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "smoke": "node smoke.mjs"
+  },
+  "dependencies": {
+    "codemirror": "5.65.19",
+    "leaflet": "1.9.4",
+    "osmtogeojson": "3.0.0-beta.5"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}

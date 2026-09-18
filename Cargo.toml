@@ -8,6 +8,7 @@ members = [
     "crates/roadgen-gpudrive",
     "crates/roadgen-osm",
     "crates/roadgen-sumo",
+    "crates/roadgen-viewer",
     "crates/roadgen-python",
     "tests/integration",
 ]
@@ -28,6 +29,7 @@ roadgen-clipgt = { path = "crates/roadgen-clipgt", version = "0.1.0" }
 roadgen-gpudrive = { path = "crates/roadgen-gpudrive", version = "0.1.0" }
 roadgen-osm = { path = "crates/roadgen-osm", version = "0.1.0" }
 roadgen-sumo = { path = "crates/roadgen-sumo", version = "0.1.0" }
+roadgen-viewer = { path = "crates/roadgen-viewer", version = "0.1.0" }
 
 # OpenDRIVE 1.7 data model, parser and writer. MIT, which an Apache-2.0 project may
 # redistribute. Used so that neither the XML schema nor its serializer is rewritten
@@ -56,6 +58,11 @@ quick-xml = "0.41"
 # container nor the Arrow type system is rewritten here.
 arrow = { version = "59", default-features = false }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
+
+# `bytes`, so that a Parquet file already in memory can be read as one. MIT, which an
+# Apache-2.0 project may redistribute. It is the only `ChunkReader` parquet offers
+# that is not a file on disk, and the viewer has no disk to put one on.
+bytes = { version = "1", default-features = false }
 
 # The ClipGT scenario file, and the rig JSON a clip's calibration table carries.
 # serde and serde_json are MIT/Apache-2.0; serde_norway is the maintained fork of

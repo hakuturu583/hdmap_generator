@@ -1159,6 +1159,55 @@ impl PyMap {
     }
 }
 
+// --------------------------------------------------------------------------- //
+// Drawing what was written
+// --------------------------------------------------------------------------- //
+
+/// The module-level `render_*` functions, which are the only things here that read a
+/// file rather than write one.
+///
+/// They take a path because what they draw is the export, not the map: a picture made
+/// from the IR would agree with the IR by construction and so would say nothing about
+/// whether the file is right. Reading the file back is the point.
+///
+/// Every one returns an SVG document as text. In a notebook that is
+/// `IPython.display.SVG(...)`; on a page it goes straight into the DOM; written to a
+/// file it opens in anything.
+#[pyfunction]
+#[pyo3(name = "render_opendrive")]
+fn render_opendrive(path: PathBuf) -> PyResult<String> {
+    Ok(roadgen_viewer::opendrive_file(&path)
+        .map_err(runtime_error)?
+        .to_svg())
+}
+
+/// Draws the SUMO plain-XML network in `directory` — the one `export_sumo` wrote.
+#[pyfunction]
+#[pyo3(name = "render_sumo")]
+fn render_sumo(directory: PathBuf) -> PyResult<String> {
+    Ok(roadgen_viewer::sumo_directory(&directory)
+        .map_err(runtime_error)?
+        .to_svg())
+}
+
+/// Draws the ClipGT clip in `directory` — the one `export_clipgt` wrote.
+#[pyfunction]
+#[pyo3(name = "render_clipgt")]
+fn render_clipgt(directory: PathBuf) -> PyResult<String> {
+    Ok(roadgen_viewer::clipgt_directory(&directory)
+        .map_err(runtime_error)?
+        .to_svg())
+}
+
+/// Draws the GPUDrive scene at `path` — the one `export_gpudrive` wrote.
+#[pyfunction]
+#[pyo3(name = "render_gpudrive")]
+fn render_gpudrive(path: PathBuf) -> PyResult<String> {
+    Ok(roadgen_viewer::gpudrive_file(&path)
+        .map_err(runtime_error)?
+        .to_svg())
+}
+
 #[pymodule]
 fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add(
@@ -1172,5 +1221,9 @@ fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyJunction>()?;
     module.add_class::<PyLaneRef>()?;
     module.add_class::<PyAlignment>()?;
+    module.add_function(wrap_pyfunction!(render_opendrive, module)?)?;
+    module.add_function(wrap_pyfunction!(render_sumo, module)?)?;
+    module.add_function(wrap_pyfunction!(render_clipgt, module)?)?;
+    module.add_function(wrap_pyfunction!(render_gpudrive, module)?)?;
     Ok(())
 }

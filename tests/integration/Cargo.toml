@@ -15,6 +15,7 @@ roadgen-clipgt.workspace = true
 roadgen-gpudrive.workspace = true
 roadgen-osm.workspace = true
 roadgen-sumo.workspace = true
+roadgen-viewer.workspace = true
 opendrive.workspace = true
 ll2-core.workspace = true
 ll2-io.workspace = true

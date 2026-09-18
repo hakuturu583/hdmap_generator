@@ -1,0 +1,24 @@
+[package]
+name = "roadgen-viewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Draws what roadgen wrote: the exported files, read back and rendered as SVG"
+
+[dependencies]
+# The exported files are read with the same libraries that wrote them, so the
+# viewer is a reader rather than a second opinion about what the format means.
+opendrive.workspace = true
+uom.workspace = true
+quick-xml.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+# GPUDrive's scene model is `Deserialize` for exactly this: reading a written scene
+# back the way a consumer would. So the viewer borrows it rather than describing the
+# document a second time.
+roadgen-gpudrive.workspace = true

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>roadgen — generate a road network, in the browser</title>
+    <meta
+      name="description"
+      content="roadgen's own Python package, compiled to WebAssembly: describe roads,
+               lanes and junctions, and see the same network written as OpenDRIVE,
+               Lanelet2, OpenStreetMap, SUMO, ClipGT and GPUDrive."
+    />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%232563eb'/><path d='M8 1v14' stroke='white' stroke-width='1.6' stroke-dasharray='3 2'/></svg>" />
+    <link rel="stylesheet" href="./vendor/leaflet.css" />
+    <link rel="stylesheet" href="./vendor/codemirror.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <div class="masthead-text">
+        <h1>roadgen</h1>
+        <p>
+          Describe roads, lanes and junctions in Python and press Run. One script
+          writes <strong>OpenDRIVE</strong>, an Autoware-ready
+          <strong>Lanelet2</strong> map, plain <strong>OpenStreetMap</strong>, a
+          <strong>SUMO</strong> network, a <strong>ClipGT</strong> clip and a
+          <strong>GPUDrive</strong> scene; the switch above the viewer flips between
+          them, in the same frame, so what changes is the format and nothing else.
+        </p>
+      </div>
+      <a class="repo" href="https://github.com/hakuturu583/hdmap_generator">
+        github.com/hakuturu583/hdmap_generator
+      </a>
+    </header>
+
+    <main>
+      <section class="pane editor-pane">
+        <div class="toolbar">
+          <label class="visually-hidden" for="example">Example</label>
+          <select id="example"></select>
+          <button id="run" type="button" disabled>Run</button>
+        </div>
+        <div class="editor" id="editor"></div>
+        <div class="console" id="console" aria-live="polite">
+          <div class="status">Starting Python…</div>
+        </div>
+      </section>
+
+      <section class="pane results-pane">
+        <div class="results" id="results">
+          <p class="placeholder">
+            Press Run. The viewer appears here, with a tab for each format your script
+            exports.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        Python runs here as <a href="https://pyodide.org/">Pyodide</a>, and
+        <code>roadgen</code> is its own wheel built for it, so what you are running is
+        the package rather than a demonstration of it. Every tab is drawn from the
+        file itself, read back: OpenDRIVE, SUMO, ClipGT and GPUDrive by
+        <code>roadgen-viewer</code>, in the same wheel, and the two OpenStreetMap
+        exports by <a href="https://leafletjs.com/">Leaflet</a>, which already knows
+        how to draw a map in geographic coordinates.
+      </p>
+      <p id="build-line"></p>
+    </footer>
+
+    <!-- Deferred, in this order: none of them has anything to do while the page is
+         still being parsed, and the module below runs after all of them either way. -->
+    <script defer src="./vendor/codemirror.js"></script>
+    <script defer src="./vendor/codemirror-python.js"></script>
+    <script defer src="./vendor/leaflet.js"></script>
+    <script defer src="./vendor/osmtogeojson.js"></script>
+    <script defer src="./pyodide/pyodide.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
