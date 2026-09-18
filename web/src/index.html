@@ -20,11 +20,12 @@
       <div class="masthead-text">
         <h1>roadgen</h1>
         <p>
-          Describe roads, lanes and junctions in Python. The same network comes out as
-          <strong>OpenDRIVE</strong>, an Autoware-ready <strong>Lanelet2</strong> map,
-          plain <strong>OpenStreetMap</strong>, a <strong>SUMO</strong> network, a
-          <strong>ClipGT</strong> clip and a <strong>GPUDrive</strong> scene — all of
-          them at once, and all of it in this tab.
+          Describe roads, lanes and junctions in Python and press Run. One script
+          writes <strong>OpenDRIVE</strong>, an Autoware-ready
+          <strong>Lanelet2</strong> map, plain <strong>OpenStreetMap</strong>, a
+          <strong>SUMO</strong> network, a <strong>ClipGT</strong> clip and a
+          <strong>GPUDrive</strong> scene; the switch above the viewer flips between
+          them, in the same frame, so what changes is the format and nothing else.
         </p>
       </div>
       <a class="repo" href="https://github.com/hakuturu583/hdmap_generator">
@@ -48,7 +49,8 @@
       <section class="pane results-pane">
         <div class="results" id="results">
           <p class="placeholder">
-            The exports will appear here — one panel per file your script writes.
+            Press Run. The viewer appears here, with a tab for each format your script
+            exports.
           </p>
         </div>
       </section>
@@ -58,10 +60,11 @@
       <p>
         Python runs here as <a href="https://pyodide.org/">Pyodide</a>, and
         <code>roadgen</code> is its own wheel built for it, so what you are running is
-        the package rather than a demonstration of it. OpenDRIVE, SUMO, ClipGT and
-        GPUDrive are drawn by <code>roadgen-viewer</code>, in the same wheel; the two
-        OpenStreetMap exports go to <a href="https://leafletjs.com/">Leaflet</a>,
-        which already knows how to draw a map in geographic coordinates.
+        the package rather than a demonstration of it. Every tab is drawn from the
+        file itself, read back: OpenDRIVE, SUMO, ClipGT and GPUDrive by
+        <code>roadgen-viewer</code>, in the same wheel, and the two OpenStreetMap
+        exports by <a href="https://leafletjs.com/">Leaflet</a>, which already knows
+        how to draw a map in geographic coordinates.
       </p>
       <p id="build-line"></p>
     </footer>

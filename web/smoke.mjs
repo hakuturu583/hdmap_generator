@@ -5,8 +5,8 @@
 // The page is the one deliverable no unit test can stand in for: the wheel is a
 // wasm32 build that nothing on the build machine can import, and whether it loads is
 // a question about a browser. So this opens `site/` in headless Chromium, runs each
-// example, and holds the page to what it promises — a panel per format, drawn, with
-// nothing thrown on the way.
+// example, and clicks through every tab — because a format that is drawn only when
+// you look at it is a format that has to be looked at to be checked.
 //
 // Tiles are not fetched: a smoke test that needs the network to pass is a smoke test
 // that fails for reasons that are not about this repository.
@@ -61,7 +61,7 @@ page.on('console', (message) => {
 
 await page.goto(`${origin}/index.html`)
 // The wheel and the Pyodide runtime are megabytes; a slow runner is not a failure.
-await page.waitForSelector('.card', { timeout: 300_000 })
+await page.waitForSelector('.tab', { timeout: 300_000 })
 
 const examples = await page.$$eval('#example option', (options) =>
   options.map((option) => option.textContent),
@@ -82,27 +82,41 @@ await browser.close()
 server.close()
 
 async function check(example) {
-  const cards = await page.$$eval('.card', (nodes) =>
-    nodes.map((node) => ({
-      format: node.querySelector('.badge')?.textContent ?? '',
-      title: node.querySelector('h2')?.textContent ?? '',
-      note: node.querySelector('.note')?.textContent ?? '',
-      bad: node.querySelector('.bad')?.textContent ?? '',
-      // A Leaflet map draws its features into an overlay pane; a viewer panel is an
-      // SVG of its own. Either way, an empty one is the thing worth failing on.
-      drawn:
-        node.querySelectorAll('.figure svg polyline, .figure svg polygon').length +
-        node.querySelectorAll('.leaflet-overlay-pane path').length,
-      files: node.querySelectorAll('.chip').length,
-    })),
-  )
-
+  const offered = await page.$$eval('.tab', (tabs) => tabs.map((tab) => tab.textContent))
   for (const format of FORMATS) {
-    const card = cards.find((card) => card.format === format)
-    if (!card) fail(`${example}: no ${format} panel`)
-    if (card.bad) fail(`${example}: ${format} said "${card.bad}"`)
-    if (card.drawn === 0) fail(`${example}: the ${format} panel is empty`)
-    if (card.files === 0) fail(`${example}: the ${format} panel lists no files`)
+    if (!offered.includes(format)) fail(`${example}: no ${format} tab`)
+  }
+
+  for (const format of offered) {
+    await page.click(`.tab:text-is("${format}")`)
+    // Leaflet resizes itself when its panel is shown, and refitting takes a frame.
+    await page.waitForTimeout(250)
+
+    const panel = await page.$$eval(
+      '.panel:not([hidden])',
+      (nodes) => {
+        const node = nodes[0]
+        if (!node) return null
+        return {
+          title: node.querySelector('h2')?.textContent ?? '',
+          bad: node.querySelector('.bad')?.textContent ?? '',
+          // A Leaflet map draws its features into an overlay pane; a viewer panel is
+          // an SVG of its own. Either way, an empty one is the thing worth failing on.
+          drawn:
+            node.querySelectorAll('.figure svg polyline, .figure svg polygon').length +
+            node.querySelectorAll('.leaflet-overlay-pane path').length,
+          files: node.querySelectorAll('.chip').length,
+        }
+      },
+    )
+
+    if (!panel) fail(`${example}: choosing ${format} showed nothing`)
+    if (panel.bad) fail(`${example}: ${format} said "${panel.bad}"`)
+    if (panel.drawn === 0) fail(`${example}: the ${format} panel is empty`)
+    if (panel.files === 0) fail(`${example}: the ${format} panel lists no files`)
+
+    const shown = await page.$$eval('.panel:not([hidden])', (nodes) => nodes.length)
+    if (shown !== 1) fail(`${example}: ${shown} panels are visible at once, not 1`)
   }
 
   const console_ = await page.$eval('#console', (node) => node.textContent)
@@ -112,7 +126,7 @@ async function check(example) {
   if (thrown.length > 0) {
     fail(`${example}: the page threw\n  ${thrown.join('\n  ')}`)
   }
-  console.log(`  ${example}: ${cards.length} panels`)
+  console.log(`  ${example}: ${offered.length} tabs`)
 }
 
 function serve(request, response) {

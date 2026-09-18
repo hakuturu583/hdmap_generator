@@ -24,6 +24,10 @@ let editor = null
 // be taken down before its panel is thrown away — otherwise it goes on listening to a
 // window it is no longer in.
 let maps = []
+// Which format the viewer is showing. It outlives a run: change the script, press Run
+// again, and you are still looking at the format you were looking at before, which is
+// the whole point of being able to compare them.
+let showing = null
 
 boot()
 
@@ -133,26 +137,103 @@ function show({ views, files, error }) {
     return
   }
 
+  if (!views.some((view) => view.format === showing)) showing = views[0].format
+
   const sizes = new Map(files.map((file) => [file.path, file.size]))
-  ui.results.replaceChildren(...views.map((view) => card(view, sizes)))
+  // Every panel is built now and all but one is hidden. Building them on demand would
+  // save the work of drawing five pictures nobody has asked for yet; it would also
+  // make every first click on a tab cost a Parquet read, and the whole run took less
+  // time than that hesitation would.
+  const panels = views.map((view) => panel(view, sizes))
+  const bar = tabs(views, panels)
+
+  ui.results.replaceChildren(bar, ...panels.map((panel) => panel.node))
+  select(showing, views, panels)
 }
 
-function card(view, sizes) {
-  const body = view.error
-    ? element('p', { class: 'bad' }, `${view.format} would not draw: ${view.error}`)
-    : view.svg
-      ? figure(view.svg)
-      : mapOf(view.xml)
+/// The format switch: one button per thing that was written.
+function tabs(views, panels) {
+  const bar = element('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Format' })
+  for (const view of views) {
+    const tab = element(
+      'button',
+      {
+        class: 'tab',
+        type: 'button',
+        role: 'tab',
+        id: `tab-${view.format}`,
+        'aria-controls': `panel-${view.format}`,
+        'aria-selected': 'false',
+        tabindex: '-1',
+      },
+      view.format,
+    )
+    tab.addEventListener('click', () => select(view.format, views, panels))
+    // A tab strip is one stop in the tab order and the arrow keys move within it,
+    // which is what a screen reader and a keyboard both expect of one.
+    tab.addEventListener('keydown', (event) => {
+      const step = { ArrowRight: 1, ArrowLeft: -1, Home: -Infinity, End: Infinity }[event.key]
+      if (step === undefined) return
+      event.preventDefault()
+      const at = views.findIndex((candidate) => candidate.format === showing)
+      const next = Math.min(
+        views.length - 1,
+        Math.max(0, step === Infinity ? views.length - 1 : step === -Infinity ? 0 : at + step),
+      )
+      select(views[next].format, views, panels)
+      bar.querySelector('[aria-selected="true"]').focus()
+    })
+    bar.append(tab)
+  }
+  return bar
+}
 
-  return element('article', { class: 'card' }, [
-    element('header', {}, [
-      element('span', { class: 'badge' }, view.format),
-      element('h2', {}, view.title),
-      note(view),
-    ]),
-    element('div', { class: 'chips' }, view.files.map((path) => chip(path, sizes))),
-    body,
-  ])
+function select(format, views, panels) {
+  showing = format
+  for (const [index, view] of views.entries()) {
+    const chosen = view.format === format
+    const tab = document.querySelector(`#tab-${CSS.escape(view.format)}`)
+    if (tab) {
+      tab.setAttribute('aria-selected', String(chosen))
+      tab.tabIndex = chosen ? 0 : -1
+    }
+    panels[index].node.hidden = !chosen
+    // Leaflet measured a hidden element as nothing at all, so a map only finds out
+    // how big it is once its panel is shown.
+    if (chosen) panels[index].shown?.()
+  }
+}
+
+function panel(view, sizes) {
+  let shown
+  let body
+  if (view.error) {
+    body = element('p', { class: 'bad' }, `${view.format} would not draw: ${view.error}`)
+  } else if (view.svg) {
+    body = figure(view.svg)
+  } else {
+    const drawn = mapOf(view.xml)
+    body = drawn.node
+    shown = drawn.shown
+  }
+
+  const node = element(
+    'section',
+    {
+      class: 'panel',
+      id: `panel-${view.format}`,
+      role: 'tabpanel',
+      'aria-labelledby': `tab-${view.format}`,
+      tabindex: '0',
+      hidden: 'hidden',
+    },
+    [
+      element('header', {}, [element('h2', {}, view.title), note(view)]),
+      element('div', { class: 'chips' }, view.files.map((path) => chip(path, sizes))),
+      body,
+    ],
+  )
+  return { node, shown }
 }
 
 /// The picture's own `<desc>`: what the reader found in the file, and what the format
@@ -184,6 +265,7 @@ function figure(svg) {
 
 function mapOf(xml) {
   const holder = element('div', { class: 'map' })
+  let fit = () => {}
   // Leaflet measures the element it is given, so it can only be set up once the
   // element is in the document.
   queueMicrotask(() => {
@@ -209,14 +291,20 @@ function mapOf(xml) {
       },
     }).addTo(map)
 
-    const bounds = layer.getBounds()
-    if (bounds.isValid()) {
-      map.fitBounds(bounds, { padding: [24, 24] })
-    } else {
-      map.setView([0, 0], 2)
+    fit = () => {
+      map.invalidateSize()
+      const bounds = layer.getBounds()
+      if (bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [24, 24] })
+      } else {
+        map.setView([0, 0], 2)
+      }
     }
+    fit()
   })
-  return holder
+  // `fit` is called again every time the panel is shown, because until then the map
+  // has been measuring an element of no size.
+  return { node: holder, shown: () => fit() }
 }
 
 /// Ways, and the nodes that say something on their own.
@@ -256,7 +344,7 @@ function chip(path, sizes) {
 }
 
 function toggleSource(button, path) {
-  const card = button.closest('.card')
+  const card = button.closest('.panel')
   const open = card.querySelector(`.source[data-path="${cssEscape(path)}"]`)
   for (const shown of card.querySelectorAll('.source')) shown.remove()
   for (const other of card.querySelectorAll('.chip button')) {

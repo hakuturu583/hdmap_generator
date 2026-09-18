@@ -9,8 +9,8 @@ describe roads, lanes, junctions and the movements between them, and the library
 builds the geometry and writes the files.
 
 **[Try it in a browser](https://hakuturu583.github.io/hdmap_generator/)** — the demo
-page runs this package, compiled for WebAssembly, and draws every export beside the
-code that made it. Nothing is uploaded and nothing is installed; see
+page runs this package, compiled for WebAssembly. Write a script, press Run, and flip
+between the formats it wrote. Nothing is uploaded and nothing is installed; see
 [the demo page](#the-demo-page).
 
 ```python
@@ -795,10 +795,14 @@ are never written.
 
 <https://hakuturu583.github.io/hdmap_generator/>
 
-Write roadgen in the page, press Run, and every file the script exports appears
-beside it — drawn, listed and downloadable. It is the same argument the rest of this
-README makes, made in one screen: one description of a road network, six files, and
-what each format could and could not carry written under each picture.
+An editor on the left, a viewer on the right. Write roadgen, press Run, and the viewer
+fills with what the script wrote; the switch above it flips between the formats — in
+the same frame, so what changes is the format and nothing else. That is the argument
+the rest of this README makes, made in one screen: one description of a road network,
+six files, and what each format could and could not carry written under each picture.
+
+Whichever format is showing, its files are listed under the switch with their sizes, a
+`source` toggle and a `save` button, so the bytes behind the picture are a click away.
 
 **It is the package, not a demonstration of the package.** The page loads
 [Pyodide](https://pyodide.org/) — CPython built for WebAssembly — and installs
@@ -810,9 +814,10 @@ does the work, and the page keeps working with the network unplugged once it has
 loaded.
 
 The script is run in a directory of its own and then the directory is *looked at*.
-Panels are not a fixed set — they are whatever turned up — so a script that exports
-one format gets one panel, and a format added to roadgen gets a panel without the page
-being changed.
+The tabs are not a fixed set — they are whatever turned up — so a script that exports
+one format gets one tab, and a format added to roadgen gets a tab without the page
+being changed. The format you were looking at survives a re-run, which is what makes
+it possible to change one line and watch one format.
 
 ### Which viewer draws what
 
