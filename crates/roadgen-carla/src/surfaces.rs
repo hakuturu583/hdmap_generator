@@ -47,6 +47,7 @@ use roadgen_core::semantics::{LaneType, MarkingColor, RoadMarking};
 use roadgen_core::topology::LateralSide;
 use roadgen_core::topology::RoadEnd;
 
+use crate::facades;
 use crate::materials;
 use crate::mesh::Mesh;
 use crate::tags::{mesh_name, Role};
@@ -786,11 +787,18 @@ pub fn buildings(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh
             wall_material(&building.kind),
         );
         let walls = mesh.materials[0];
-        for part in building
+        let parts: Vec<&roadgen_core::buildings::BuildingPart> = building
             .parts
             .iter()
             .filter_map(|id| map.building_parts.get(id))
-        {
+            .collect();
+        // The door goes on the part that stands on the ground, which is the lowest
+        // one; a tower on a podium is entered through the podium.
+        let ground = parts
+            .iter()
+            .map(|part| part.solid.base_height())
+            .fold(f64::INFINITY, f64::min);
+        for part in parts {
             let solid = &part.solid;
             let faces = solid.shell();
             // `Solid::shell` returns the base, then one quad per wall, then the roof:
@@ -802,10 +810,25 @@ pub fn buildings(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh
             } else {
                 walls
             };
+            let street = if solid.base_height() <= ground + 1e-6 {
+                facades::street_wall(map, building, part)
+            } else {
+                None
+            };
             for (index, face) in faces.iter().enumerate() {
                 let material = if index > sides { roof_material } else { walls };
                 let slot = mesh.slot_for(material);
                 mesh.face(face, slot);
+                // Walls are faces 1..=sides; each gets its windows, and the one that
+                // faces the street its door.
+                if (1..=sides).contains(&index) {
+                    let kind = part.kind.as_deref().unwrap_or(&building.kind);
+                    let door = street == Some(index - 1);
+                    for opening in facades::openings(face, part.levels, kind, door) {
+                        let slot = mesh.slot_for(opening.material);
+                        mesh.face(&opening.ring, slot);
+                    }
+                }
             }
         }
         if !mesh.is_empty() {

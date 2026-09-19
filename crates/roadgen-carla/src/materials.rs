@@ -258,6 +258,30 @@ pub const MATERIALS: &[Material] = &[
         }),
         scale: 1.50,
     },
+    Material {
+        // Glazing: a dark, slightly blue surface with the low roughness that makes it
+        // read as glass under a sky. No texture — a window is a reflection, not a
+        // picture.
+        name: "M_Building_Glazing",
+        color: [0.10, 0.13, 0.17],
+        roughness: 0.15,
+        texture: None,
+        scale: 1.0,
+    },
+    Material {
+        name: "M_Building_Frame",
+        color: [0.88, 0.87, 0.84],
+        roughness: 0.5,
+        texture: None,
+        scale: 1.0,
+    },
+    Material {
+        name: "M_Building_Door",
+        color: [0.28, 0.17, 0.10],
+        roughness: 0.6,
+        texture: None,
+        scale: 1.0,
+    },
 ];
 
 pub const ASPHALT: usize = 0;
@@ -269,6 +293,9 @@ pub const GRASS: usize = 5;
 pub const BRICK: usize = 6;
 pub const PLASTER: usize = 7;
 pub const ROOF_TILES: usize = 8;
+pub const GLAZING: usize = 9;
+pub const FRAME: usize = 10;
+pub const DOOR: usize = 11;
 
 /// One texture file the package expects, and where it comes from.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

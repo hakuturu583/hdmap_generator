@@ -57,6 +57,7 @@
 //! ```
 
 pub mod error;
+pub mod facades;
 pub mod fbx;
 pub mod materials;
 pub mod mesh;
