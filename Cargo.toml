@@ -51,6 +51,10 @@ ll2-projection = { git = "https://github.com/hakuturu583/simple_lanelet2", rev =
 ll2-routing = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
 ll2-traffic-rules = { git = "https://github.com/hakuturu583/simple_lanelet2", rev = "024f149195d25a600f8559d7e1ae3035041cc484" }
 
+# spade, a constrained Delaunay triangulation, for the CARLA terrain: one continuous
+# mesh that meets every road edge exactly, which a grid cannot. MIT/Apache-2.0.
+spade = "2"
+
 # quick-xml, for the SUMO plain-XML network. MIT, which an Apache-2.0 project may
 # redistribute. SUMO's node, edge and connection files have no data model worth
 # depending on — they are attributes on flat elements — so what is borrowed here is

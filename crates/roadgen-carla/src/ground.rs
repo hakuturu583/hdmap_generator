@@ -1,35 +1,27 @@
-//! The ground under and around the road network.
+//! The height of the ground around the road network.
 //!
-//! A road network says nothing about the shape of the land it runs through, and the
-//! verge beside each road is as far as it can honestly go. A simulator needs more
-//! than that: a lidar reaches a hundred metres or more, and a vehicle that leaves
-//! the verge should land on something. So the surface is finished with a **ground**
-//! — one mesh, a grid over the network's extent plus a margin, whose height at each
-//! vertex is taken from the roads near it. It is not terrain, and it is not
-//! pretending to be: it is the flattest thing that stays under every road at the
-//! road's own height, which is what a road network *does* say about its land.
+//! A road network says nothing about the shape of the land it runs through, and
+//! nothing here pretends otherwise: the ground is the flattest thing that stays
+//! under every road at the road's own height, which is what a road network *does*
+//! say about its land. It is a height field — a grid over the network's extent plus
+//! a margin, whose height at each vertex is taken from the roads near it — that the
+//! land in [`crate::terrain`] reads its heights off, away from the roads.
 //!
-//! Two things keep it under the roads rather than through them. Each ground vertex
-//! takes the *lowest* road vertex within a cell's reach of it, a little under —
-//! never an average, because an average of a road climbing away from a vertex sits
-//! above the road at that vertex. And the verges are laid down *onto* it: a verge's
-//! inner edge is the road's, its outer edge is on the ground, and the grass slopes
-//! between the two, so there is no ledge where the verge ends and the land begins.
+//! Each vertex takes the *lowest* road vertex within a cell's reach of it, a little
+//! under — never an average, because an average of a road climbing away from a
+//! vertex sits above the road at that vertex, and the land would come up through
+//! the road there.
 
 use roadgen_core::geometry::{Curve3, Point3};
 use roadgen_core::map::Map;
 
-use crate::materials;
 use crate::mesh::Mesh;
-use crate::surfaces::{Ordinals, SurfaceConfig};
-use crate::tags::{mesh_name, Role};
+use crate::surfaces::SurfaceConfig;
+use crate::tags::Role;
 
 /// How far under the roads the ground sits, metres: more than a road can bend
 /// under the chord between two ground vertices.
 pub const DROP: f64 = 0.05;
-/// How far above the ground a verge's outer edge is laid, so that the two meet
-/// without fighting for the same depth value.
-pub const LIFT: f64 = 0.01;
 /// How far apart the reference line is sampled for the ground, metres.
 const SAMPLE_SPACING: f64 = 2.0;
 
@@ -184,8 +176,8 @@ impl Field {
         let fy = ((y - self.y0) / self.cell).clamp(0.0, self.rows as f64 - 1e-9);
         let (i, j) = (fx.floor() as usize, fy.floor() as usize);
         let (u, v) = (fx - i as f64, fy - j as f64);
-        // The strip splits each cell along the diagonal from its north-west corner
-        // to its south-east one; see `mesh`.
+        // The cell is split along the diagonal from its north-west corner to its
+        // south-east one.
         let (sw, se, nw, ne) = (
             self.vertex(i, j).z,
             self.vertex(i + 1, j).z,
@@ -201,24 +193,9 @@ impl Field {
         }
     }
 
-    /// The ground as one mesh, tagged as terrain.
-    pub fn mesh(&self, map_name: &str, ordinals: &mut Ordinals) -> Mesh {
-        let mut mesh = Mesh::new(
-            mesh_name(map_name, Role::Ground, ordinals.take(Role::Ground)),
-            Role::Ground,
-            materials::GRASS,
-        );
-        // Rows of vertices, south to north; each pair of rows is one strip, with
-        // the northern row as the strip's left rail so that the surface faces up.
-        let row =
-            |j: usize| -> Vec<Point3> { (0..=self.columns).map(|i| self.vertex(i, j)).collect() };
-        let mut south = row(0);
-        for j in 1..=self.rows {
-            let north = row(j);
-            mesh.strip(&north, &south, 0);
-            south = north;
-        }
-        mesh
+    /// Every vertex of the grid, at its height, row by row from the south-west.
+    pub fn vertices(&self) -> impl Iterator<Item = Point3> + '_ {
+        (0..=self.rows).flat_map(move |j| (0..=self.columns).map(move |i| self.vertex(i, j)))
     }
 }
 
@@ -260,13 +237,13 @@ mod tests {
     fn build(map: &ValidatedMap, config: &SurfaceConfig) -> Option<Mesh> {
         crate::surfaces::build(map, "g", config)
             .into_iter()
-            .find(|mesh| mesh.role == Role::Ground)
+            .find(|mesh| mesh.role == Role::Terrain)
     }
 
     #[test]
-    fn the_ground_reaches_the_margin_past_the_network() {
+    fn the_land_reaches_the_margin_past_the_network() {
         let map = map();
-        let mesh = build(&map, &config()).expect("a ground");
+        let mesh = build(&map, &config()).expect("a terrain");
         let span = |pick: fn(&Point3) -> f64| {
             let values: Vec<f64> = mesh.positions.iter().map(pick).collect();
             (
@@ -280,7 +257,7 @@ mod tests {
         // The one lane is on the right of the reference line: y from 0 to -3.5.
         assert!((x_min - (-100.0 - verge)).abs() < 1e-9 && x_max >= 300.0 + verge);
         assert!((y_min - (-100.0 - 3.5 - verge)).abs() < 1e-9 && y_max >= 100.0 + verge);
-        assert!(mesh.name.starts_with("g_Terrain_Land_"));
+        assert!(mesh.name.starts_with("g_Terrain_Ground_"));
         assert_eq!(crate::tags::label_of(&mesh.name), crate::Label::Terrain);
         assert!(
             mesh.normals().iter().all(|n| n.z > 0.5),
@@ -289,38 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ground_meets_each_road_just_under_its_own_height() {
-        let map = map();
-        let mesh = build(&map, &config()).expect("a ground");
-        // Under the road near x = 100 the road is at z = 15; the ground a little
-        // under the lowest road vertex within a cell's reach, which on a 5 % grade
-        // is up to 14 m back down the road.
-        let under = mesh
-            .positions
-            .iter()
-            .min_by(|a, b| {
-                ((a.x - 100.0).abs() + (a.y + 1.75).abs())
-                    .total_cmp(&((b.x - 100.0).abs() + (b.y + 1.75).abs()))
-            })
-            .expect("a vertex under the road");
-        assert!(
-            under.z <= 15.0 - DROP + 0.5 && under.z >= 15.0 - DROP - 1.0,
-            "ground at {:?}",
-            under
-        );
-        // Far from it the ground holds the nearest road's height rather than
-        // dropping to zero or drifting off.
-        let far = mesh
-            .positions
-            .iter()
-            .filter(|p| (p.x - under.x).abs() < 1e-6)
-            .max_by(|a, b| a.y.total_cmp(&b.y))
-            .unwrap();
-        assert!(far.z > 13.0 && far.z < 17.0, "ground far out at {}", far.z);
-    }
-
-    #[test]
-    fn the_field_reads_back_the_height_its_mesh_has() {
+    fn the_field_sits_just_under_the_road_and_holds_its_height_far_out() {
         let map = map();
         let config = config();
         let roads = crate::surfaces::build(
@@ -332,35 +278,69 @@ mod tests {
             },
         );
         let field = Field::under(&map, &roads, &config).expect("a field");
-        let mesh = field.mesh("g", &mut Ordinals::default());
-        for point in mesh.positions.iter().step_by(7) {
+        // Under the road at x = 100 the road is at z = 15; the field a little under
+        // the lowest road vertex within a cell's reach, which on a 5 % grade is up
+        // to 14 m back down the road.
+        let under = field.height(100.0, -1.75);
+        assert!(
+            (15.0 - DROP - 1.0..=15.0 - DROP + 0.5).contains(&under),
+            "ground under the road at {under}"
+        );
+        // Far from it the field holds the nearest road's height rather than
+        // dropping to zero or drifting off.
+        let far = field.height(100.0, 100.0);
+        assert!(far > 13.0 && far < 17.0, "ground far out at {far}");
+    }
+
+    #[test]
+    fn the_field_reads_back_the_height_its_vertices_have() {
+        let map = map();
+        let config = config();
+        let roads = crate::surfaces::build(
+            &map,
+            "g",
+            &SurfaceConfig {
+                ground_extent: 0.0,
+                ..config
+            },
+        );
+        let field = Field::under(&map, &roads, &config).expect("a field");
+        let vertices: Vec<Point3> = field.vertices().collect();
+        for point in vertices.iter().step_by(7) {
             assert!((field.height(point.x, point.y) - point.z).abs() < 1e-9);
         }
-        // And between vertices it is on the mesh's own triangles: a point on the
-        // first cell's diagonal is on both, one off it is on only the right one.
+        // And between vertices it is on the cell's own two triangles: a point on
+        // the first cell's diagonal, and one on each edge, read back exactly.
+        let stride = field.columns + 1;
         for (a, b) in [
-            (mesh.positions[0], mesh.positions[3]),
-            (mesh.positions[0], mesh.positions[1]),
-            (mesh.positions[2], mesh.positions[3]),
+            (vertices[stride], vertices[1]),
+            (vertices[0], vertices[1]),
+            (vertices[0], vertices[stride]),
         ] {
             let between = a.lerp(b, 0.3);
             assert!((field.height(between.x, between.y) - between.z).abs() < 1e-9);
         }
-        let [a, b, c] = mesh.triangles[0].map(|i| mesh.positions[i as usize]);
-        let inside = Point3::new(
-            (a.x + b.x + c.x) / 3.0,
-            (a.y + b.y + c.y) / 3.0,
-            (a.z + b.z + c.z) / 3.0,
-        );
-        assert!((field.height(inside.x, inside.y) - inside.z).abs() < 1e-9);
     }
 
     #[test]
-    fn no_extent_means_no_ground() {
+    fn no_extent_means_no_field_but_still_a_verge() {
         let config = SurfaceConfig {
             ground_extent: 0.0,
             ..SurfaceConfig::default()
         };
-        assert!(build(&map(), &config).is_none());
+        let map = map();
+        assert!(Field::under(&map, &[], &config).is_none());
+        // The land is then the verges alone, level with the road they are beside.
+        let mesh = build(&map, &config).expect("a verge");
+        let (x_min, x_max) = mesh
+            .positions
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+                (lo.min(p.x), hi.max(p.x))
+            });
+        assert!(
+            x_min >= -1e-9 && x_max <= 200.0 + 1e-9,
+            "a verge past the road's ends"
+        );
     }
 }

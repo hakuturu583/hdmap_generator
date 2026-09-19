@@ -91,7 +91,7 @@ pub fn document(meshes: &[Mesh], map: &Map) -> String {
 fn precedence(role: Role) -> u8 {
     match role {
         Role::Building | Role::Curb => 0,
-        Role::Terrain | Role::Ground => 1,
+        Role::Terrain => 1,
         Role::Road | Role::Gutter => 2,
         Role::Sidewalk => 3,
         Role::Marking => 4,
@@ -105,7 +105,7 @@ fn material_of(role: Role) -> Option<&'static str> {
     Some(match role {
         Role::Road | Role::Gutter => "road",
         Role::Sidewalk => "sidewalk",
-        Role::Terrain | Role::Ground => "grass",
+        Role::Terrain => "grass",
         Role::Curb | Role::Building => "block",
         Role::Marking => return None,
     })
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn the_ground_is_written_before_the_road_and_the_road_before_the_pavement() {
-        let mut ground = Mesh::new("T_Terrain_Land_0", Role::Ground, 0);
+        let mut ground = Mesh::new("T_Terrain_Ground_0", Role::Terrain, 0);
         ground.strip(
             &[Point3::new(0.0, 5.0, 0.0), Point3::new(10.0, 5.0, 0.0)],
             &[Point3::new(0.0, -5.0, 0.0), Point3::new(10.0, -5.0, 0.0)],
@@ -154,6 +154,6 @@ mod tests {
     fn paint_is_left_out_and_a_building_is_a_block() {
         assert_eq!(material_of(Role::Marking), None);
         assert_eq!(material_of(Role::Building), Some("block"));
-        assert_eq!(material_of(Role::Ground), Some("grass"));
+        assert_eq!(material_of(Role::Terrain), Some("grass"));
     }
 }

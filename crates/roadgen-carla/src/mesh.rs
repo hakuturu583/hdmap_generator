@@ -168,6 +168,23 @@ impl Mesh {
         }
     }
 
+    /// Adds a surface already triangulated, with vertices shared as given.
+    ///
+    /// Texture coordinates are the map's own plan, `x` and `y` over the texture's
+    /// scale: a surface that is not a ribbon has no along and across to follow, and
+    /// the ground reads the same wherever two of its triangles meet.
+    pub fn sheet(&mut self, positions: &[Point3], triangles: &[[u32; 3]], slot: usize) {
+        let base = self.positions.len() as u32;
+        let scale = self.texture_scale(slot);
+        for point in positions {
+            self.positions.push(*point);
+            self.uvs.push([point.x / scale, point.y / scale]);
+        }
+        for triangle in triangles {
+            self.push_triangle(triangle.map(|index| base + index), slot);
+        }
+    }
+
     /// Metres of surface per repeat of the texture in `slot`, or [`TEXTURE_SCALE`]
     /// for a material without one.
     fn texture_scale(&self, slot: usize) -> f64 {

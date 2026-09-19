@@ -30,16 +30,21 @@
 //! the driving surface the way a real one is. Neither is a lane in the IR and neither
 //! should be: they are what a *surface* has and a road network does not.
 //!
-//! # Where the ground stops
+//! # Where the road stops
 //!
-//! Beside the outermost band is a **verge**: grass, for as far as the road network can
-//! honestly say anything about the land. It follows the road's own elevation, so a
-//! road on a grade has ground beside it at the right height.
+//! Beyond the outermost band is the **land**, which is [`crate::terrain`]'s: one
+//! surface from every road's edge outwards, sloping down over a verge's width to the
+//! ground's height and carrying on at that height to where a lidar reaches. What
+//! this module gives it is each section's two edges — the rails the land meets,
+//! vertex for vertex — and it is one surface rather than a strip per road so that
+//! there is no seam for a wheel or a lidar to find.
 //!
-//! There is no landscape past the verge, and there should not be. A road network says
-//! nothing about the shape of the country it runs through, and a generator that
-//! produced hills here would be inventing a terrain model rather than deriving one.
+//! There is no landscape in it, and there should not be. A road network says nothing
+//! about the shape of the country it runs through, and a generator that produced
+//! hills here would be inventing a terrain model rather than deriving one.
 //! [`crate::check`] says so rather than leaving it to be discovered in the editor.
+
+use std::collections::HashMap;
 
 use roadgen_core::geometry::{Frame3, Point3, Vector3};
 use roadgen_core::map::{Map, Road};
@@ -68,13 +73,14 @@ pub struct SurfaceConfig {
     /// A broken line's painted length, and then the gap after it.
     pub dash_on: f64,
     pub dash_off: f64,
-    /// How far the grass beside a road reaches. Zero writes no verge.
+    /// How far out from a road's edge the land slopes down to the ground's height:
+    /// the verge. Zero puts the ground's own vertices right up against the road.
     pub verge_width: f64,
-    /// How far past the road network the ground is written, metres: one grid
-    /// mesh at the roads' own heights, for a lidar to reach and a vehicle to land
-    /// on beyond the verge. Zero writes no ground; see [`crate::ground`].
+    /// How far past the road network the land is written, metres, at the roads'
+    /// own heights, for a lidar to reach and a vehicle to land on beyond the verge.
+    /// Zero writes no land past the verges; see [`crate::terrain`].
     pub ground_extent: f64,
-    /// The ground grid's cell size.
+    /// How far apart the land's vertices are past the verges.
     pub ground_cell: f64,
 }
 
@@ -107,15 +113,19 @@ impl Default for SurfaceConfig {
 pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
     let mut meshes = Vec::new();
     let mut ordinal = Ordinals::default();
-    // The roads first, then the ground under them, then the verges laid down from
-    // each road's edge onto that ground — so the order the roads come in is the
-    // order their surfaces are written, and the verges and the ground follow.
-    let mut sections: Vec<(Layout, Vec<&Rung>)> = Vec::new();
+    // The roads first, then the land round them: the land is one surface built
+    // out from every road's edge, so it needs every edge before it can start.
+    let mut land = crate::terrain::Land::new(config.verge_width);
     let all_rungs: Vec<Option<Vec<Rung>>> = map.roads.iter().map(|road| rungs(map, road)).collect();
+    let centres = junction_centres(map, &all_rungs);
     for (road, rungs) in map.roads.iter().zip(&all_rungs) {
         let Some(rungs) = rungs else {
             continue;
         };
+        let facing = road
+            .junction
+            .as_ref()
+            .and_then(|junction| centres.get(junction).copied());
         for section in 0..road.sections.len() {
             let Some(layout) = Layout::of(map, road, section, config) else {
                 continue;
@@ -129,26 +139,46 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             }
             layout.surfaces(&within, map_name, &mut ordinal, &mut meshes);
             layout.markings(&within, map_name, config, &mut ordinal, &mut meshes);
-            sections.push((layout, within));
+            if let Some((left, right)) =
+                layout.flanks(&within, facing, config, map_name, &mut ordinal, &mut meshes)
+            {
+                land.section(left, right);
+            }
         }
     }
     crate::crosswalks::paint(map, map_name, config, &mut ordinal, &mut meshes);
     let field = crate::ground::Field::under(map, &meshes, config);
-    for (layout, within) in &sections {
-        layout.verges(
-            within,
-            map_name,
-            config,
-            field.as_ref(),
-            &mut ordinal,
-            &mut meshes,
-        );
-    }
-    if let Some(field) = field {
-        meshes.push(field.mesh(map_name, &mut ordinal));
+    if let Some(terrain) = land.mesh(field.as_ref(), map_name, &mut ordinal) {
+        meshes.push(terrain);
     }
     meshes.retain(|mesh| !mesh.is_empty());
     meshes
+}
+
+/// Where each junction is: the mean of the midpoints of the roads through it.
+///
+/// A road through a junction has other roads, not land, on the side that faces the
+/// junction, and this is what a verge is checked against to find that side.
+fn junction_centres(
+    map: &Map,
+    all_rungs: &[Option<Vec<Rung>>],
+) -> HashMap<roadgen_core::id::JunctionId, Point3> {
+    let mut sums: HashMap<roadgen_core::id::JunctionId, (Vector3, f64)> = HashMap::new();
+    for (road, rungs) in map.roads.iter().zip(all_rungs) {
+        let (Some(junction), Some(rungs)) = (&road.junction, rungs) else {
+            continue;
+        };
+        let middle = rungs[rungs.len() / 2].frame.origin;
+        let (sum, count) = sums.entry(junction.clone()).or_insert((Vector3::ZERO, 0.0));
+        *sum = *sum + Vector3::new(middle.x, middle.y, middle.z);
+        *count += 1.0;
+    }
+    sums.into_iter()
+        .map(|(junction, (sum, count))| {
+            let mean = sum * (1.0 / count);
+            (junction, Point3::new(mean.x, mean.y, mean.z))
+        })
+        .collect()
 }
 
 /// The ordinal each role's next mesh takes, so that no two meshes in a map share a
@@ -493,38 +523,12 @@ impl<'a> Layout<'a> {
         ordinals: &mut Ordinals,
         out: &mut Vec<Mesh>,
     ) {
-        let same = |point: Point3| point;
-        self.band_onto(
-            rungs, left, right, left_rise, right_rise, &same, &same, role, material, map_name,
-            ordinals, out,
-        );
-    }
-
-    /// [`Layout::band`], with each rail's points passed through a function of their
-    /// own before they are used — which is how a verge's outer edge is put on the
-    /// ground.
-    #[allow(clippy::too_many_arguments)]
-    fn band_onto(
-        &self,
-        rungs: &[&Rung],
-        left: impl Fn(&[f64]) -> f64,
-        right: impl Fn(&[f64]) -> f64,
-        left_rise: f64,
-        right_rise: f64,
-        onto_left: &dyn Fn(Point3) -> Point3,
-        onto_right: &dyn Fn(Point3) -> Point3,
-        role: Role,
-        material: usize,
-        map_name: &str,
-        ordinals: &mut Ordinals,
-        out: &mut Vec<Mesh>,
-    ) {
         let mut left_rail = Vec::with_capacity(rungs.len());
         let mut right_rail = Vec::with_capacity(rungs.len());
         for rung in rungs {
             let cuts = self.cuts(rung.station);
-            left_rail.push(onto_left(rung.at(left(&cuts), left_rise)));
-            right_rail.push(onto_right(rung.at(right(&cuts), right_rise)));
+            left_rail.push(rung.at(left(&cuts), left_rise));
+            right_rail.push(rung.at(right(&cuts), right_rise));
         }
         let mut mesh = Mesh::new(
             mesh_name(map_name, role, ordinals.take(role)),
@@ -590,79 +594,122 @@ impl<'a> Layout<'a> {
         out.push(mesh);
     }
 
-    /// The grass beside the road, on each side that has an outermost band to put it
-    /// against.
-    fn verges(
+    /// The road's two edges as the land meets them, and the kerb faces the land
+    /// does not.
+    ///
+    /// Each side's flank is the outermost surfaced band's edge — a `none` lane
+    /// carries no surface, so the land starts where the surface does — with the
+    /// verge's toe `verge_width` out from it on a side that has land. `facing` is
+    /// where the junction this road runs through is, if it runs through one. A road
+    /// in a junction has land on one side of it at most, the side that faces away
+    /// from the junction; the other side has the junction's other roads, and a
+    /// raised band there gets a kerb face down to the road level instead of a
+    /// verge, which the land then meets at the foot. `None` when nothing on the
+    /// section is surfaced.
+    #[allow(clippy::too_many_arguments)]
+    fn flanks(
         &self,
         rungs: &[&Rung],
-        map_name: &str,
+        facing: Option<Point3>,
         config: &SurfaceConfig,
-        ground: Option<&crate::ground::Field>,
+        map_name: &str,
         ordinals: &mut Ordinals,
         out: &mut Vec<Mesh>,
-    ) {
-        if config.verge_width <= 0.0 {
-            return;
-        }
-        // Outermost *surfaced* band on each side: a `none` lane carries no surface,
-        // so the grass starts where it starts rather than beyond it.
+    ) -> Option<(crate::terrain::Flank, crate::terrain::Flank)> {
         let first = self
             .lanes
             .iter()
-            .position(|lane| Self::role_of(lane).is_some());
+            .position(|lane| Self::role_of(lane).is_some())?;
         let last = self
             .lanes
             .iter()
-            .rposition(|lane| Self::role_of(lane).is_some());
-        let (Some(first), Some(last)) = (first, last) else {
-            return;
-        };
-        let width = config.verge_width;
-        let left_rise = self.rise_of(self.lanes[first]);
-        let right_rise = self.rise_of(self.lanes[last]);
-
-        // The verge's inner edge is the road's; its outer edge is on the ground,
-        // when there is one, so the grass slopes down to the land rather than
-        // stopping on a ledge above it.
-        let onto_ground = |point: Point3| -> Point3 {
-            match ground {
-                Some(field) => Point3::new(
-                    point.x,
-                    point.y,
-                    field.height(point.x, point.y) + crate::ground::LIFT,
-                ),
-                None => point,
+            .rposition(|lane| Self::role_of(lane).is_some())?;
+        let rises = [
+            self.rise_of(self.lanes[first]),
+            self.rise_of(self.lanes[last]),
+        ];
+        // Which side the land is on, when only one is: the side whose edge, halfway
+        // along, is farther from the junction.
+        let land = match facing {
+            None => [true, true],
+            Some(centre) => {
+                let rung = rungs[rungs.len() / 2];
+                let cuts = self.cuts(rung.station);
+                let left = rung
+                    .at(cuts[first], rises[0])
+                    .horizontal_distance_to(centre);
+                let right = rung
+                    .at(cuts[last + 1], rises[1])
+                    .horizontal_distance_to(centre);
+                [left >= right, right > left]
             }
         };
-        let as_is = |point: Point3| point;
-        self.band_onto(
-            rungs,
-            move |cuts| cuts[first] + width,
-            move |cuts| cuts[first],
-            left_rise,
-            left_rise,
-            &onto_ground,
-            &as_is,
-            Role::Terrain,
-            materials::GRASS,
-            map_name,
-            ordinals,
-            out,
-        );
-        self.band_onto(
-            rungs,
-            move |cuts| cuts[last + 1],
-            move |cuts| cuts[last + 1] - width,
-            right_rise,
-            right_rise,
-            &as_is,
-            &onto_ground,
-            Role::Terrain,
-            materials::GRASS,
-            map_name,
-            ordinals,
-            out,
-        );
+        // A verge is a strip of fixed width, and a strip of fixed width on the
+        // inside of a bend folds over itself where the bend is tighter than the
+        // strip's outer edge is far from the road's centre. On the inside it is
+        // drawn out only as far as the bend's radius allows.
+        let limit = bend_limits(rungs);
+        let width = config.verge_width.max(0.0);
+
+        let mut flanks = Vec::with_capacity(2);
+        for (side, (cut, rise)) in [(first, rises[0]), (last + 1, rises[1])]
+            .into_iter()
+            .enumerate()
+        {
+            // Rail and toe, outwards: to the left on the left side, the right on
+            // the right.
+            let sign = if side == 0 { 1.0 } else { -1.0 };
+            let (rail, toe): (Vec<Point3>, Vec<Option<Point3>>) = rungs
+                .iter()
+                .enumerate()
+                .map(|(index, rung)| {
+                    let cuts = self.cuts(rung.station);
+                    let edge = cuts[cut];
+                    let reach = if side == 0 {
+                        limit[index].0
+                    } else {
+                        limit[index].1
+                    };
+                    // A toe only where the whole verge fits — a toe pulled in
+                    // towards the rail is a ledge the land steps down — and
+                    // never in a junction, whose roads have the pavements round
+                    // its corners for neighbours rather than open land.
+                    let room = land[side]
+                        && facing.is_none()
+                        && width > 0.0
+                        && reach - sign * edge >= width;
+                    let rail_rise = if land[side] { rise } else { 0.0 };
+                    (
+                        rung.at(edge, rail_rise),
+                        room.then(|| rung.at(edge + sign * width, 0.0)),
+                    )
+                })
+                .unzip();
+            if !land[side] && rise > 0.0 {
+                // The kerb face, anticlockwise seen from the junction: the low
+                // rail on the outside of the face.
+                let (low, high) = match side {
+                    0 => (0.0, rise),
+                    _ => (rise, 0.0),
+                };
+                self.band(
+                    rungs,
+                    move |cuts| cuts[cut],
+                    move |cuts| cuts[cut],
+                    low,
+                    high,
+                    Role::Curb,
+                    materials::CURB,
+                    map_name,
+                    ordinals,
+                    out,
+                );
+            }
+            flanks.push(crate::terrain::Flank { rail, toe });
+        }
+        let right = flanks.pop()?;
+        let left = flanks.pop()?;
+        Some((left, right))
     }
 
     /// The line a cut traces through space, with the lateral direction at each point.
@@ -679,6 +726,45 @@ impl<'a> Layout<'a> {
             })
             .collect()
     }
+}
+
+/// How far out of each rung a rail can be laid to the left and to the right before
+/// it folds: a rail offset `d` to the inside of a bend of radius `r` runs backwards
+/// once `d` passes `r`, so on the inside it stops short of that, and on the outside —
+/// and on a straight — there is no limit.
+fn bend_limits(rungs: &[&Rung]) -> Vec<(f64, f64)> {
+    // Leave the bend some rail to run along rather than collapsing it to a point.
+    const KEEP: f64 = 0.8;
+    (0..rungs.len())
+        .map(|index| {
+            let mut limit = (f64::INFINITY, f64::INFINITY);
+            // The signed curvature at this rung, from the turn to its neighbour on
+            // each side: positive turning left, where the inside is the left.
+            for (a, b) in [(index.wrapping_sub(1), index), (index, index + 1)] {
+                let (Some(a), Some(b)) = (rungs.get(a), rungs.get(b)) else {
+                    continue;
+                };
+                let ta = a.frame.tangent.get();
+                let tb = b.frame.tangent.get();
+                let run = a.frame.origin.horizontal_distance_to(b.frame.origin);
+                if run < 1e-9 {
+                    continue;
+                }
+                let turn = (ta.x * tb.y - ta.y * tb.x).atan2(ta.x * tb.x + ta.y * tb.y);
+                let curvature = turn / run;
+                if curvature.abs() < 1e-9 {
+                    continue;
+                }
+                let radius = KEEP / curvature.abs();
+                if curvature > 0.0 {
+                    limit.0 = limit.0.min(radius);
+                } else {
+                    limit.1 = limit.1.min(radius);
+                }
+            }
+            limit
+        })
+        .collect()
 }
 
 /// Two gutters out of one lane, cut back until they leave some lane behind them.
@@ -894,6 +980,141 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Four arms with a pavement each side, joined through a junction, so that each
+    /// corner gets a pavement round it.
+    fn crossroads() -> roadgen_core::validation::ValidatedMap {
+        use roadgen_core::prelude::*;
+        let mut builder = MapBuilder::new(MapMetadata {
+            name: Some("x".into()),
+            ..MapMetadata::default()
+        });
+        let width = |w| PositiveWidth::new(w).unwrap();
+        let street = || {
+            vec![
+                LaneSpec::new(width(3.5), Direction::Backward),
+                LaneSpec::new(width(2.0), Direction::Backward).with_type(LaneType::Sidewalk),
+                LaneSpec::new(width(3.5), Direction::Forward),
+                LaneSpec::new(width(2.0), Direction::Forward).with_type(LaneType::Sidewalk),
+            ]
+        };
+        let junction = builder.add_junction(Some("x"));
+        let mut arm = |from: (f64, f64), to: (f64, f64)| {
+            builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(from.0, from.1, 0.0),
+                        Point3::new(to.0, to.1, 0.0),
+                        street(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        let w = arm((-60.0, 0.0), (-12.0, 0.0));
+        let e = arm((12.0, 0.0), (60.0, 0.0));
+        let n = arm((0.0, 12.0), (0.0, 60.0));
+        let s = arm((0.0, -60.0), (0.0, -12.0));
+        for (from, to) in [(&w, &e), (&s, &n), (&w, &n), (&s, &e)] {
+            builder.connect_via(&junction, from, to).unwrap();
+        }
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    #[test]
+    fn no_land_lies_over_the_roads_through_a_junction() {
+        // A corner pavement is raised, and the land that slopes down from it goes
+        // on the land side of it: on the junction side it would lie across the
+        // junction's roads. There the pavement gets a kerb face down to the road
+        // instead, and the land meets its foot.
+        let map = crossroads();
+        let config = SurfaceConfig {
+            ground_extent: 20.0,
+            ground_cell: 5.0,
+            ..SurfaceConfig::default()
+        };
+        let meshes = build(&map, "x", &config);
+        let land = meshes
+            .iter()
+            .find(|mesh| mesh.role == Role::Terrain)
+            .expect("the land");
+        let mut over = 0;
+        for point in &land.positions {
+            if point.x.abs() < 6.0 && point.y.abs() < 6.0 && point.z > 1e-9 {
+                over += 1;
+            }
+        }
+        assert_eq!(over, 0, "{over} land vertices above the junction's roads");
+        // And nothing of it on the arms' carriageways either: no land triangle is
+        // centred on a lane.
+        for triangle in &land.triangles {
+            let [a, b, c] = triangle.map(|index| land.positions[index as usize]);
+            let (x, y) = ((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0);
+            let arm = 12.0..60.0;
+            let on_an_arm = (arm.contains(&x.abs()) && y.abs() < 5.5 - 1e-9)
+                || (arm.contains(&y.abs()) && x.abs() < 5.5 - 1e-9);
+            assert!(!on_an_arm, "land at ({x}, {y}) on an arm");
+        }
+        // The pavements do get their kerb face, so they are not left floating.
+        assert!(meshes.iter().any(|mesh| mesh.role == Role::Curb
+            && mesh
+                .positions
+                .iter()
+                .any(|point| point.x.abs() < 10.0 && point.y.abs() < 10.0)));
+    }
+
+    #[test]
+    fn the_land_has_no_ledge_in_it() {
+        // Every slope in the land is a verge's: a kerb's height over a verge's
+        // width, more or less. A land triangle steeper than that is a step — the
+        // kind a shortened toe leaves round a corner pavement, where the land
+        // dropped a kerb's height in a hand's width.
+        let map = crossroads();
+        let meshes = build(&map, "x", &SurfaceConfig::default());
+        let land = meshes
+            .iter()
+            .find(|mesh| mesh.role == Role::Terrain)
+            .expect("the land");
+        let mut steepest = 0.0_f64;
+        for triangle in &land.triangles {
+            let [a, b, c] = triangle.map(|index| land.positions[index as usize]);
+            let normal = (b - a).cross(c - a);
+            let length = normal.norm();
+            if length < 1e-9 {
+                continue;
+            }
+            // The gradient is the tangent of the angle the normal makes with up.
+            let gradient = (normal.x * normal.x + normal.y * normal.y).sqrt() / normal.z;
+            steepest = steepest.max(gradient);
+        }
+        assert!(
+            steepest < 0.15,
+            "the land has a slope of {:.0} % in it",
+            steepest * 100.0
+        );
+    }
+
+    #[test]
+    fn the_land_is_one_surface_that_faces_up_everywhere() {
+        // Round a corner pavement the land is on the inside of the bend, and the
+        // bend is tighter than the verge is wide. Still one mesh, and every
+        // triangle of it faces up: nothing has folded over.
+        let map = crossroads();
+        let meshes = build(&map, "x", &SurfaceConfig::default());
+        let land: Vec<&Mesh> = meshes
+            .iter()
+            .filter(|mesh| mesh.role == Role::Terrain)
+            .collect();
+        assert_eq!(land.len(), 1, "the land is in more than one piece");
+        for triangle in &land[0].triangles {
+            let [a, b, c] = triangle.map(|index| land[0].positions[index as usize]);
+            let normal = (b - a).cross(c - a);
+            assert!(
+                normal.z > 0.0,
+                "a land triangle {a:?} {b:?} {c:?} faces down"
+            );
+        }
     }
 
     #[test]

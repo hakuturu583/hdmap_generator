@@ -188,11 +188,14 @@ fn the_surface_stands_where_the_road_network_says_it_does() {
     let config = PackageConfig::for_map(&map);
     let meshes = roadgen_carla::to_meshes(&map, &config);
 
-    // The road's own surfaces, without the ground that is written out past them
-    // for a lidar to reach; that one is the ground module's own business.
+    // The road's own surfaces, without the land that is written out past them
+    // for a lidar to reach — that one is the terrain module's own business — and
+    // without the paint, which straddles the edge it is on.
     let street: Vec<&roadgen_carla::Mesh> = meshes
         .iter()
-        .filter(|mesh| mesh.role != roadgen_carla::Role::Ground)
+        .filter(|mesh| {
+            mesh.role != roadgen_carla::Role::Terrain && mesh.role != roadgen_carla::Role::Marking
+        })
         .collect();
     let xs: Vec<f64> = street
         .iter()
@@ -215,14 +218,27 @@ fn the_surface_stands_where_the_road_network_says_it_does() {
         "the street ends at {}",
         max(&xs)
     );
-    // Eleven metres of cross-section, and eight of verge either side of it.
-    let reach = 5.5 + config.surfaces.verge_width;
+    // Eleven metres of cross-section: the pavements' outer edges, and past them
+    // the verges are the land's.
     assert!(
-        (max(&ys) - reach).abs() < 1e-6,
-        "the ground reaches {}",
+        (max(&ys) - 5.5).abs() < 1e-6,
+        "the street reaches {}",
         max(&ys)
     );
-    assert!((min(&ys) + reach).abs() < 1e-6);
+    assert!((min(&ys) + 5.5).abs() < 1e-6);
+    let land = meshes
+        .iter()
+        .find(|mesh| mesh.role == roadgen_carla::Role::Terrain)
+        .expect("the land");
+    let far = land
+        .positions
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        far >= 5.5 + config.surfaces.verge_width,
+        "the land reaches {far}"
+    );
     let _ = directory;
 }
 

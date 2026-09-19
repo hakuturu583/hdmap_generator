@@ -133,20 +133,22 @@ fn the_surface_covers_the_road_network_it_was_built_from() {
 }
 
 #[test]
-fn the_ground_goes_out_as_far_as_a_lidar_does() {
-    // A long-range lidar sees about 200 m; the ground past the last road is there so
-    // that every return it makes lands on something, and it sits just under the
-    // roads rather than on them.
+fn the_land_goes_out_as_far_as_a_lidar_does() {
+    // A long-range lidar sees about 200 m; the land past the last road is there so
+    // that every return it makes lands on something — and it is one mesh, because
+    // a seam between two is a step a wheel finds and a lidar draws.
     let map = scenarios::crossroads();
     let config = PackageConfig::for_map(&map);
     let meshes = roadgen_carla::to_meshes(&map, &config);
-    let ground = meshes
+    let land: Vec<&roadgen_carla::Mesh> = meshes
         .iter()
-        .find(|mesh| mesh.role == Role::Ground)
-        .expect("a ground mesh");
-    assert_eq!(roadgen_carla::tags::label_of(&ground.name), Label::Terrain);
+        .filter(|mesh| mesh.role == Role::Terrain)
+        .collect();
+    assert_eq!(land.len(), 1, "the land is in {} pieces", land.len());
+    let land = land[0];
+    assert_eq!(roadgen_carla::tags::label_of(&land.name), Label::Terrain);
     let network = redraw_opendrive(&map).bounds().expect("a road network");
-    let far = ground
+    let far = land
         .positions
         .iter()
         .map(|point| point.x)
@@ -154,23 +156,8 @@ fn the_ground_goes_out_as_far_as_a_lidar_does() {
     let edge = network.max.x + config.surfaces.verge_width + config.surfaces.ground_extent;
     assert!(
         far >= edge && far < edge + config.surfaces.ground_cell,
-        "the ground reaches x = {far}, the network ends at {}",
+        "the land reaches x = {far}, the network ends at {}",
         network.max.x
-    );
-    let roads: Vec<f64> = meshes
-        .iter()
-        .filter(|mesh| mesh.role == Role::Road)
-        .flat_map(|mesh| mesh.positions.iter().map(|point| point.z))
-        .collect();
-    let lowest_road = roads.iter().copied().fold(f64::INFINITY, f64::min);
-    let highest_ground = ground
-        .positions
-        .iter()
-        .map(|point| point.z)
-        .fold(f64::NEG_INFINITY, f64::max);
-    assert!(
-        highest_ground < lowest_road,
-        "the ground ({highest_ground}) pokes through the road ({lowest_road})"
     );
 }
 
@@ -421,10 +408,11 @@ fn two_roads_that_meet_at_an_angle_share_one_edge() {
 }
 
 #[test]
-fn the_ground_stays_under_every_road_everywhere() {
-    // Not just the highest ground under the lowest road: at every vertex of every
-    // road surface, the ground directly beneath it is lower. A ground that comes up
-    // through a road anywhere is a road a vehicle falls through.
+fn the_land_and_the_roads_tile_the_map_with_neither_gap_nor_overlap() {
+    // Seen from above, every point of the map within the land's reach is on
+    // exactly one of two things: a road's surface, or the land. A point on neither
+    // is a hole a vehicle falls through; a point on both is the land coming up
+    // through a road, or lying over it.
     for (name, map) in [
         ("joined", scenarios::two_roads_joined()),
         ("graded", scenarios::graded_road()),
@@ -432,51 +420,59 @@ fn the_ground_stays_under_every_road_everywhere() {
         ("banked", scenarios::banked_curve()),
         ("spiral", scenarios::spiral_transition_road()),
     ] {
-        ground_stays_under(name, &map);
+        land_and_roads_tile(name, &map);
     }
 }
 
-fn ground_stays_under(name: &str, map: &ValidatedMap) {
+fn land_and_roads_tile(name: &str, map: &ValidatedMap) {
     let config = PackageConfig::for_map(map);
     let meshes = roadgen_carla::to_meshes(map, &config);
-    let ground = meshes
-        .iter()
-        .find(|mesh| mesh.role == Role::Ground)
-        .expect("a ground mesh");
-    let height_under = |x: f64, y: f64| -> Option<f64> {
-        for triangle in &ground.triangles {
-            let [a, b, c] = triangle.map(|index| ground.positions[index as usize]);
+    let covers = |mesh: &roadgen_carla::Mesh, x: f64, y: f64| -> bool {
+        mesh.triangles.iter().any(|triangle| {
+            let [a, b, c] = triangle.map(|index| mesh.positions[index as usize]);
             let det = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
             if det.abs() < 1e-12 {
-                continue;
+                return false;
             }
             let u = ((x - a.x) * (c.y - a.y) - (c.x - a.x) * (y - a.y)) / det;
             let v = ((b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y)) / det;
-            if u >= -1e-9 && v >= -1e-9 && u + v <= 1.0 + 1e-9 {
-                return Some(a.z + u * (b.z - a.z) + v * (c.z - a.z));
-            }
-        }
-        None
+            u >= -1e-9 && v >= -1e-9 && u + v <= 1.0 + 1e-9
+        })
     };
-    // Roads and verges both: the verge is the ground's neighbour, and the one a
-    // vehicle drives onto first.
-    let mut worst: Option<(f64, Point3)> = None;
-    for mesh in meshes
+    let land = meshes
         .iter()
-        .filter(|mesh| mesh.role == Role::Road || mesh.role == Role::Terrain)
-    {
-        for point in &mesh.positions {
-            let under = height_under(point.x, point.y).expect("ground under every road vertex");
-            let clearance = point.z - under;
-            if worst.is_none_or(|(c, _)| clearance < c) {
-                worst = Some((clearance, *point));
-            }
+        .find(|mesh| mesh.role == Role::Terrain)
+        .expect("the land");
+    // Every surface a wheel can be on, seen from above: not the kerb faces, which
+    // are vertical, and not the paint, which is on a road.
+    let roads: Vec<&roadgen_carla::Mesh> = meshes
+        .iter()
+        .filter(|mesh| matches!(mesh.role, Role::Road | Role::Sidewalk | Role::Gutter))
+        .collect();
+    let network = redraw_opendrive(map).bounds().expect("a road network");
+    let step = 2.5;
+    let mut probes = 0;
+    let mut x = network.min.x - 5.0;
+    while x <= network.max.x + 5.0 {
+        let mut y = network.min.y - 5.0;
+        while y <= network.max.y + 5.0 {
+            // Off the probe lattice by a little, so that no probe sits on a
+            // vertex or an edge shared by two surfaces.
+            let (px, py) = (x + 0.137, y + 0.211);
+            let on_land = covers(land, px, py);
+            let on_roads = roads.iter().filter(|mesh| covers(mesh, px, py)).count();
+            assert!(
+                on_land || on_roads > 0,
+                "{name}: a hole at ({px}, {py}): neither land nor road"
+            );
+            assert!(
+                !(on_land && on_roads > 0),
+                "{name}: the land at ({px}, {py}) is on a road"
+            );
+            probes += 1;
+            y += step;
         }
+        x += step;
     }
-    let (clearance, at) = worst.expect("road vertices");
-    assert!(
-        clearance > 0.0,
-        "{name}: the ground is {} m above the surface at {at:?}",
-        -clearance
-    );
+    assert!(probes > 100, "{name}: {probes} probes is not a survey");
 }

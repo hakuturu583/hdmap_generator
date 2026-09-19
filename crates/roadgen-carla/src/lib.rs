@@ -68,6 +68,7 @@ pub mod package;
 pub mod script;
 pub mod surfaces;
 pub mod tags;
+pub mod terrain;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -453,16 +454,15 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
 
     if config.surfaces.ground_extent > 0.0 {
         warnings.push(format!(
-            "the ground past the {:.0} m verge is a grid at the roads' own heights, \
-             out to {:.0} m beyond the network: flat where the roads are flat and \
-             sloping between roads at different heights, because a road network says \
-             nothing more about the land it runs through. Hills are CARLA's editor's \
-             to add",
+            "the land past the {:.0} m verge is at the roads' own heights, out to \
+             {:.0} m beyond the network: flat where the roads are flat and sloping \
+             between roads at different heights, because a road network says nothing \
+             more about the land it runs through. Hills are CARLA's editor's to add",
             config.surfaces.verge_width, config.surfaces.ground_extent
         ));
     } else if config.surfaces.verge_width > 0.0 {
         warnings.push(format!(
-            "the ground is a {:.0} m verge either side of each road and nothing \
+            "the land is a {:.0} m verge either side of each road and nothing \
              further: a road network says nothing about the shape of the land it runs \
              through, so there is no landscape here to invent one from. CARLA's \
              editor is where a map gets terrain",
@@ -470,8 +470,9 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
         ));
     } else {
         warnings.push(
-            "there is no ground at all beside the roads: the verge is switched off, so \
-             the map's roads stand on nothing"
+            "there is no ground at all past the roads: the verge and the ground are \
+             both switched off, so the land stops at the network's outermost edges \
+             and a vehicle that leaves a road there drives off the map"
                 .into(),
         );
     }

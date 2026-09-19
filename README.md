@@ -969,7 +969,6 @@ against:
 | `Town01_Road_Curb_0` | `SideWalk` | `Sidewalks` | 2 |
 | `Town01_Road_Gutter_0` | `SideWalk` | `Sidewalks` | 2 |
 | `Town01_Terrain_Ground_0` | `Terrain` | `Terrain` | 10 |
-| `Town01_Terrain_Land_0` | `Terrain` | `Terrain` | 10 |
 
 Get it wrong and nothing fails. The mesh imports, the map loads, the camera renders —
 and the pavements come back labelled as ground. `Map.carla_warnings()` exists mostly
@@ -1018,16 +1017,29 @@ way a real one is. Neither is a lane in the IR and neither should be: they are w
 texture — a broken line is a strip per dash, cut by arc length so that a three-metre
 dash is three metres however the sampler laid its vertices.
 
-Beyond the outermost band is a **verge**: grass, following the road's own elevation.
-Beyond that is the **ground**: one grid mesh over the whole network and 150 m past it
-(`ground_extent`), whose height at each vertex is taken from the nearest stretches of
-road, so it is flat where the roads are flat and slopes gently between roads at
-different heights. It is there because a lidar reaches that far and a vehicle that
-leaves the verge should land on something; it is not terrain, and it is not pretending
-to be — a road network says nothing about the shape of the country it runs through,
-and generating hills here would be inventing a terrain model rather than deriving one.
-It sits five centimetres under the roads, so nothing z-fights, and is tagged `Terrain`
-like the verges. CARLA's editor is still where a map gets hills.
+Beyond the outermost band is the **land**: one mesh, from every road's edge out to
+150 m past the network (`ground_extent`), for a lidar to reach and a vehicle that
+leaves the road to land on. It is a constrained Delaunay triangulation, not a grid,
+because a grid cannot meet a road's edge and the land has to: its constraints are
+the roads' own outer edges, vertex for vertex the points the surfaces end on, so no
+triangle crosses a road and what is inside a road's outline is cut away. Next to each
+edge the land slopes down over the **verge** (`verge_width`, 8 m) to the ground's
+height, and past the verges its vertices are a height field (`ground_cell` apart)
+whose height at each vertex is the lowest nearby road's, a little under, so it is
+flat where the roads are flat and slopes gently between roads at different heights.
+It is not terrain, and it is not pretending to be — a road network says nothing about
+the shape of the country it runs through, and generating hills here would be
+inventing a terrain model rather than deriving one. CARLA's editor is still where a
+map gets hills.
+
+One mesh, meeting every edge exactly, is the point. A grass strip per road laid over
+a grid under all of them is two surfaces wherever they overlap and a step wherever
+they do not quite meet: the strips of neighbouring roads cross at a junction, a strip
+round a tight corner folds over itself, and a lidar return or a wheel finds every
+seam. A road through a junction has land on one side of it at most — the side that
+faces away from the junction — and a raised pavement facing the junction gets a kerb
+face down to the road level instead, which the land meets at the foot. The land is
+tagged `Terrain` and is the one mesh of that class.
 
 ### Pedestrians
 
@@ -1045,9 +1057,9 @@ server hands to clients and `world.get_random_location_from_navigation()` draws 
 
 Two things about that `.obj` are not obvious and both were found the hard way. The
 loader labels triangles in file order and the last label wins, so the meshes are
-written in order of precedence — buildings and kerbs first, then the ground, the
-roads, the sidewalks and last the markings — or a ground grid written last would
-relabel everything under it as grass. And the crosswalk bands in it are not the
+written in order of precedence — buildings and kerbs first, then the land, the
+roads, the sidewalks and last the markings — so that where two meet along an edge
+the one a walker should be on wins the voxels there. And the crosswalk bands in it are not the
 painted stripes: they are one quad per crossing, `crosswalk` from kerb to kerb,
 because the stripes are what a camera sees and the band is what a walker needs.
 
