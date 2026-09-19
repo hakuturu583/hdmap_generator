@@ -66,6 +66,10 @@ importing one is `m.carla_warnings()`. The textures are listed rather than shipp
         print(warning)
     roadgen.fetch_textures("Import/Town01")
     svg = roadgen.render_carla("Import/Town01/Town01.fbx")
+
+CARLA's importer builds the map on a level with no sky. After `Import.py` has run,
+`roadgen.carla_sky(carla_root, package, name)` opens the level it made and gives it
+one — a sun, an atmosphere and exposure — using the editor's own scripting.
 """
 
 from ._roadgen import (
@@ -86,6 +90,18 @@ from ._roadgen import (
 )
 from .textures import TextureError, fetch_textures, texture_manifest
 
+
+
+def __getattr__(name):
+    # `roadgen.sky` is also a command (`python -m roadgen.sky`), and a package that
+    # imported it eagerly would run it twice; so it is fetched on first use.
+    if name in ("carla_sky", "CarlaSkyError"):
+        from . import sky
+
+        return getattr(sky, name)
+    raise AttributeError("module 'roadgen' has no attribute %r" % name)
+
+
 __all__ = [
     "Alignment",
     "Junction",
@@ -98,6 +114,8 @@ __all__ = [
     "building_presets",
     "building_rules",
     "fetch_textures",
+    "carla_sky",
+    "CarlaSkyError",
     "render_carla",
     "render_clipgt",
     "render_gpudrive",

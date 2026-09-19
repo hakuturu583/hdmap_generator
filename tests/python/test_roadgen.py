@@ -1630,3 +1630,28 @@ def test_fetching_textures_leaves_alone_what_is_already_there(tmp_path):
 
     # Nothing to do, so nothing is reached for and nothing is raised.
     assert roadgen.fetch_textures(str(package)) == []
+
+
+def test_carla_sky_refuses_to_run_without_an_engine(tmp_path, monkeypatch):
+    monkeypatch.delenv("CARLA_UNREAL_ENGINE_PATH", raising=False)
+    with pytest.raises(roadgen.CarlaSkyError, match="CARLA_UNREAL_ENGINE_PATH"):
+        roadgen.carla_sky(str(tmp_path), "Pkg", "Town")
+
+
+def test_carla_sky_checks_the_checkout_before_running_anything(tmp_path):
+    engine = tmp_path / "engine"
+    (engine / "Engine" / "Binaries" / "Linux").mkdir(parents=True)
+    (engine / "Engine" / "Binaries" / "Linux" / "UnrealEditor").write_text("")
+    with pytest.raises(roadgen.CarlaSkyError, match="CarlaUnreal.uproject"):
+        roadgen.carla_sky(str(tmp_path / "not-carla"), "Pkg", "Town", engine=str(engine))
+
+
+def test_the_editor_side_sky_script_ships_with_the_package():
+    import roadgen.sky
+
+    assert os.path.exists(roadgen.sky.EDITOR_SCRIPT)
+    with open(roadgen.sky.EDITOR_SCRIPT, encoding="utf-8") as file:
+        text = file.read()
+    # It reads the level and the sun from the environment the caller sets up.
+    for name in ("ROADGEN_LEVEL", "ROADGEN_SUN_ALTITUDE", "ROADGEN_SUN_AZIMUTH", "ROADGEN_SUN_LUX"):
+        assert name in text

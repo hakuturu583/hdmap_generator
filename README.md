@@ -241,6 +241,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
 | `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=)` | write a CARLA UE5 package; returns what was written and what each mesh will be tagged |
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
+| `carla_sky(carla_root, package, map_name, engine=, sun_altitude=, sun_azimuth=)` | after `Import.py`: give the imported level a daylight sky, with the editor's own scripting |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 | `render_opendrive(path)` / `render_sumo(directory)` / `render_carla(path)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
@@ -873,6 +874,8 @@ m.export_carla("Import/", name="Town01")
 for warning in m.carla_warnings(name="Town01"):
     print(warning)
 roadgen.fetch_textures("Import/Town01")     # optional; see Textures below
+# … Util/Tools/Import.py --package Town01Package, in the CARLA checkout, then:
+roadgen.carla_sky("/opt/carla", "Town01Package", "Town01")   # see The sky, below
 ```
 
 ```text
@@ -1004,6 +1007,48 @@ wrong label on a building is recoverable in the editor while a missing town is a
 re-export. `props` writes a second `.fbx` and declares it in the descriptor's `props`
 array with `tag: "Building"` — which is the one place in the whole pipeline where a tag
 is *stated* rather than spelled into a mesh name.
+
+### Facades
+
+The IR's building is a massing model — an outline, walls, a roof, a storey count and
+the street it faces — and by design it has no windows: a facade's openings are
+neither parts nor roofs, and no format the IR is written to has a word for them. A
+camera does not care. To a camera a wall with no windows is a warehouse, and a street
+of them is a street of warehouses whatever the grammar called them.
+
+So the CARLA surface puts them in. Each wall is divided into bays at the pitch its
+building kind uses — a house every 3 m, a shed every 4.5 — every storey of every bay
+gets a window sized for that kind, a shop's ground storey is a shopfront, and the
+ground storey of the wall that faces the building's street gets a door in its middle
+bay. Each opening is two quads a couple of centimetres proud of the wall, a frame and
+the glazing inside it, so the wall's own quad and the building's semantic tag are
+untouched. The rhythms are in `roadgen-carla/src/facades.rs`, one per kind the
+presets emit; a kind the grammar made up is built like a house.
+
+### The sky, which the import does not give you
+
+CARLA's importer builds every map on its `BaseMap`, and in the UE5 branch that level
+has a sun, a sky light and nothing for either to light: no atmosphere, no fog, no
+exposure. A map imported through `Import.py` renders its surfaces and, above them,
+black. CARLA's towns get their sky from a `BP_Carla_Sky` actor the weather system
+drives — but that actor is not in the `BaseMap`, and dropping one into an imported
+level does not give it the daylight the towns have, because those are lit by per-map
+weather sublevels with baked lighting (`Town10HD_Opt/Weathers/T10HD_Day`) that an
+imported map has not got.
+
+```python
+roadgen.carla_sky("/opt/carla", "Town01Package", "Town01")   # after Import.py
+```
+
+runs the editor once more, on the level `Import.py` made, and gives it a plain
+Unreal daylight: a sky atmosphere and height fog, a physical sun of 75 000 lux in
+place of `BaseMap`'s dim one, a sky light that captures the sky it now has, and an
+unbound post-process volume that turns auto exposure on — the project leaves it off,
+and without it a physical sun is a white frame. Running it twice changes nothing.
+`python -m roadgen.sky` is the same thing from a shell. What it does not do is
+hook the sky into `set_weather()`, which will store its parameters and move nothing:
+the only sky that API knows how to move is the one the towns have. The sun's position
+is an argument here instead.
 
 ### Textures
 
