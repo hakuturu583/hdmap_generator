@@ -754,20 +754,37 @@ impl Curve3 {
         }
     }
 
+    /// The tangent at the start, in closed form where the curve has one; a Bézier
+    /// is sampled, as it is everywhere else.
     pub fn start_tangent(&self) -> Result<UnitVector3, GeometryError> {
-        Ok(self
-            .samples(SamplingConfig::default())?
-            .first()
-            .expect("a curve always samples at least its two ends")
-            .tangent)
+        match self {
+            Curve3::Line(line) => (line.end() - line.start()).normalize(),
+            Curve3::Arc(arc) => Ok(arc.at(0.0).1),
+            Curve3::Clothoid(clothoid) => Ok(clothoid.tangent_at(0.0)),
+            Curve3::Polyline(polyline) => polyline.tangent_at(0),
+            Curve3::Composite(segments) => segments[0].start_tangent(),
+            Curve3::Bezier(_) => Ok(self
+                .samples(SamplingConfig::default())?
+                .first()
+                .expect("a curve always samples at least its two ends")
+                .tangent),
+        }
     }
 
+    /// The tangent at the end; see [`Curve3::start_tangent`].
     pub fn end_tangent(&self) -> Result<UnitVector3, GeometryError> {
-        Ok(self
-            .samples(SamplingConfig::default())?
-            .last()
-            .expect("a curve always samples at least its two ends")
-            .tangent)
+        match self {
+            Curve3::Line(line) => (line.end() - line.start()).normalize(),
+            Curve3::Arc(arc) => Ok(arc.at(arc.horizontal_length).1),
+            Curve3::Clothoid(clothoid) => Ok(clothoid.tangent_at(clothoid.horizontal_length)),
+            Curve3::Polyline(polyline) => polyline.tangent_at(polyline.len() - 1),
+            Curve3::Composite(segments) => segments[segments.len() - 1].end_tangent(),
+            Curve3::Bezier(_) => Ok(self
+                .samples(SamplingConfig::default())?
+                .last()
+                .expect("a curve always samples at least its two ends")
+                .tangent),
+        }
     }
 
     /// Arc length of the curve's shadow on the horizontal plane — the length an

@@ -1653,5 +1653,14 @@ def test_the_editor_side_sky_script_ships_with_the_package():
     with open(roadgen.sky.EDITOR_SCRIPT, encoding="utf-8") as file:
         text = file.read()
     # It reads the level and the sun from the environment the caller sets up.
-    for name in ("ROADGEN_LEVEL", "ROADGEN_SUN_ALTITUDE", "ROADGEN_SUN_AZIMUTH", "ROADGEN_SUN_LUX"):
+    for name in ("ROADGEN_LEVEL", "ROADGEN_SUN_ALTITUDE", "ROADGEN_SUN_AZIMUTH"):
         assert name in text
+
+
+def test_the_package_has_a_sky_command(capsys):
+    import roadgen.__main__ as commands
+
+    assert commands.main([]) == 2
+    with pytest.raises(SystemExit):
+        commands.main(["sky", "--help"])
+    assert "python -m roadgen sky" in capsys.readouterr().out

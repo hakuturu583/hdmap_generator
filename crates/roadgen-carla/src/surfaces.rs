@@ -45,7 +45,6 @@ use roadgen_core::geometry::{Frame3, Point3, Vector3};
 use roadgen_core::map::{Map, Road};
 use roadgen_core::semantics::{LaneType, MarkingColor, RoadMarking};
 use roadgen_core::topology::LateralSide;
-use roadgen_core::topology::RoadEnd;
 
 use crate::facades;
 use crate::materials;
@@ -178,15 +177,6 @@ impl Ordinals {
 struct Rung {
     station: f64,
     frame: Frame3,
-    /// The direction a lateral offset is laid along at this station.
-    ///
-    /// Everywhere but a road's ends this is the frame's own `left`. At an end that
-    /// meets another road at an angle it is the *mitred* lateral the IR laid the lane
-    /// boundaries along — not a unit vector, and not perpendicular to the reference
-    /// line — so that this road's cross-section and the next one's end on the same
-    /// line. Cut perpendicular to each reference line instead, the two roads leave a
-    /// wedge of nothing on the outside of the kink and overlap on the inside.
-    left: Vector3,
 }
 
 impl Rung {
@@ -196,11 +186,16 @@ impl Rung {
     /// Both are measured in the *banked* frame, so a superelevated road's kerb stands
     /// perpendicular to its surface rather than to the horizon.
     fn at(&self, lateral: f64, rise: f64) -> Point3 {
-        self.frame.origin + self.left * lateral + self.frame.up.scaled(rise)
+        self.frame.to_global([0.0, lateral, rise])
     }
 }
 
 /// Every station a road is sampled at, with its banked frame.
+///
+/// The frame's own lateral is the right one at every station, the ends included:
+/// two roads that meet are tangent-continuous by the time they are built — a corner
+/// between them is rounded into an arc — so a cut perpendicular to one is
+/// perpendicular to the other, and the two surfaces end on the same line.
 fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
     let stations = map.vertex_stations(&road.id).ok()?;
     let mut rungs = Vec::with_capacity(stations.len());
@@ -214,63 +209,12 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
         let Ok(frame) = sample.frame() else {
             continue;
         };
-        let frame = frame.banked(road.superelevation.evaluate(station));
         rungs.push(Rung {
             station,
-            frame,
-            left: frame.left.get(),
+            frame: frame.banked(road.superelevation.evaluate(station)),
         });
     }
-    if rungs.len() < 2 {
-        return None;
-    }
-    // The ends take the lateral the lane boundaries were actually built along, which
-    // is the mitred one wherever this road meets another at an angle.
-    if let Some(left) = boundary_lateral(map, road, RoadEnd::Start) {
-        rungs[0].left = left;
-    }
-    if let Some(left) = boundary_lateral(map, road, RoadEnd::End) {
-        rungs.last_mut().expect("two or more rungs").left = left;
-    }
-    Some(rungs)
-}
-
-/// The lateral direction the IR laid this road's lane boundaries along at one end,
-/// read back off a boundary rather than recomputed: the IR is the one place that
-/// knows whether the joint was mitred, and by how much.
-///
-/// Recovered as the vector from a lane's right boundary to its left one, divided by
-/// the lane's width there. A lane that has tapered to nothing at that end says
-/// nothing about the direction, so the first lane with some width answers.
-fn boundary_lateral(map: &Map, road: &Road, end: RoadEnd) -> Option<Vector3> {
-    let section = match end {
-        RoadEnd::Start => 0,
-        RoadEnd::End => road.sections.len().checked_sub(1)?,
-    };
-    let station = match end {
-        RoadEnd::Start => 0.0,
-        RoadEnd::End => road.horizontal_length().ok()?,
-    };
-    map.lanes_of_section(&road.id, section)
-        .into_iter()
-        .find_map(|lane| {
-            let width = lane.width_at(station);
-            if width < 1e-6 {
-                return None;
-            }
-            let (left, right) = match end {
-                RoadEnd::Start => (
-                    lane.left_boundary.start_point(),
-                    lane.right_boundary.start_point(),
-                ),
-                RoadEnd::End => (
-                    lane.left_boundary.end_point(),
-                    lane.right_boundary.end_point(),
-                ),
-            };
-            let lateral = (left - right) * (1.0 / width);
-            (lateral.norm() > 0.5).then_some(lateral)
-        })
+    (rungs.len() >= 2).then_some(rungs)
 }
 
 /// What one cross-section of one road is made of, left to right.
@@ -533,12 +477,38 @@ impl<'a> Layout<'a> {
         ordinals: &mut Ordinals,
         out: &mut Vec<Mesh>,
     ) {
+        let same = |point: Point3| point;
+        self.band_onto(
+            rungs, left, right, left_rise, right_rise, &same, &same, role, material, map_name,
+            ordinals, out,
+        );
+    }
+
+    /// [`Layout::band`], with each rail's points passed through a function of their
+    /// own before they are used — which is how a verge's outer edge is put on the
+    /// ground.
+    #[allow(clippy::too_many_arguments)]
+    fn band_onto(
+        &self,
+        rungs: &[&Rung],
+        left: impl Fn(&[f64]) -> f64,
+        right: impl Fn(&[f64]) -> f64,
+        left_rise: f64,
+        right_rise: f64,
+        onto_left: &dyn Fn(Point3) -> Point3,
+        onto_right: &dyn Fn(Point3) -> Point3,
+        role: Role,
+        material: usize,
+        map_name: &str,
+        ordinals: &mut Ordinals,
+        out: &mut Vec<Mesh>,
+    ) {
         let mut left_rail = Vec::with_capacity(rungs.len());
         let mut right_rail = Vec::with_capacity(rungs.len());
         for rung in rungs {
             let cuts = self.cuts(rung.station);
-            left_rail.push(rung.at(left(&cuts), left_rise));
-            right_rail.push(rung.at(right(&cuts), right_rise));
+            left_rail.push(onto_left(rung.at(left(&cuts), left_rise)));
+            right_rail.push(onto_right(rung.at(right(&cuts), right_rise)));
         }
         let mut mesh = Mesh::new(
             mesh_name(map_name, role, ordinals.take(role)),
@@ -648,40 +618,34 @@ impl<'a> Layout<'a> {
                 None => point,
             }
         };
-        let mut lay = |outer: &dyn Fn(&[f64]) -> f64,
-                       inner: &dyn Fn(&[f64]) -> f64,
-                       rise: f64,
-                       outer_is_left: bool| {
-            let mut outer_rail = Vec::with_capacity(rungs.len());
-            let mut inner_rail = Vec::with_capacity(rungs.len());
-            for rung in rungs {
-                let cuts = self.cuts(rung.station);
-                outer_rail.push(onto_ground(rung.at(outer(&cuts), rise)));
-                inner_rail.push(rung.at(inner(&cuts), rise));
-            }
-            let mut mesh = Mesh::new(
-                mesh_name(map_name, Role::Terrain, ordinals.take(Role::Terrain)),
-                Role::Terrain,
-                materials::GRASS,
-            );
-            if outer_is_left {
-                mesh.strip(&outer_rail, &inner_rail, 0);
-            } else {
-                mesh.strip(&inner_rail, &outer_rail, 0);
-            }
-            out.push(mesh);
-        };
-        lay(
-            &|cuts: &[f64]| cuts[first] + width,
-            &|cuts: &[f64]| cuts[first],
+        let as_is = |point: Point3| point;
+        self.band_onto(
+            rungs,
+            move |cuts| cuts[first] + width,
+            move |cuts| cuts[first],
             left_rise,
-            true,
+            left_rise,
+            &onto_ground,
+            &as_is,
+            Role::Terrain,
+            materials::GRASS,
+            map_name,
+            ordinals,
+            out,
         );
-        lay(
-            &|cuts: &[f64]| cuts[last + 1] - width,
-            &|cuts: &[f64]| cuts[last + 1],
+        self.band_onto(
+            rungs,
+            move |cuts| cuts[last + 1],
+            move |cuts| cuts[last + 1] - width,
             right_rise,
-            false,
+            right_rise,
+            &as_is,
+            &onto_ground,
+            Role::Terrain,
+            materials::GRASS,
+            map_name,
+            ordinals,
+            out,
         );
     }
 
@@ -695,7 +659,7 @@ impl<'a> Layout<'a> {
             .iter()
             .map(|rung| {
                 let cuts = self.cuts(rung.station);
-                (rung.at(cuts[cut] + shift, rise), rung.left)
+                (rung.at(cuts[cut] + shift, rise), rung.frame.left.get())
             })
             .collect()
     }
@@ -841,11 +805,7 @@ pub fn buildings(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh
             wall_material(&building.kind),
         );
         let walls = mesh.materials[0];
-        let parts: Vec<&roadgen_core::buildings::BuildingPart> = building
-            .parts
-            .iter()
-            .filter_map(|id| map.building_parts.get(id))
-            .collect();
+        let parts = map.parts_of(&building.id);
         // The door goes on the part that stands on the ground, which is the lowest
         // one; a tower on a podium is entered through the podium.
         let ground = parts

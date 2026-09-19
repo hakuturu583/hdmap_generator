@@ -1051,7 +1051,7 @@ Unreal daylight: a sky atmosphere and height fog, a physical sun of 75 000 lux i
 place of `BaseMap`'s dim one, a sky light that captures the sky it now has, and an
 unbound post-process volume that turns auto exposure on — the project leaves it off,
 and without it a physical sun is a white frame. Running it twice changes nothing.
-`python -m roadgen.sky` is the same thing from a shell. What it does not do is
+`python -m roadgen sky …` is the same thing from a shell. What it does not do is
 hook the sky into `set_weather()`, which will store its parameters and move nothing:
 the only sky that API knows how to move is the one the towns have. The sun's position
 is an argument here instead.

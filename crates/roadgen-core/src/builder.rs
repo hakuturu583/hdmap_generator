@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use crate::error::{BuildError, GeometryError};
 use crate::geometry::{
     Arc3, Bezier3, Curve3, Point3, Poly3Piece, Poly3Profile, Polyline3, Sample, SamplingConfig,
-    Taper, Vector3, WidthProfile,
+    Taper, UnitVector3, Vector3, WidthProfile,
 };
 use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::map::{CrossSection, Lane, Map, MapMetadata, Road, TravelGeometry};
@@ -238,11 +238,11 @@ enum ObjectSpec {
         height: f64,
         lanes: Vec<LaneRef>,
     },
-    /// A band across a whole road at a fraction of its length.
+    /// A band across a whole road at a station along it.
     AcrossRoad {
         kind: MapObjectKind,
         road: RoadId,
-        fraction: f64,
+        station: f64,
         width: f64,
         lanes: Vec<LaneRef>,
     },
@@ -713,15 +713,20 @@ impl MapBuilder {
         fraction: f64,
         width: f64,
     ) -> Result<ObjectId, BuildError> {
-        let lanes = (0..self.draft(road)?.spec.all_lanes().count())
+        let draft = self.draft(road)?;
+        let lanes = (0..draft.spec.all_lanes().count())
             .map(|index| LaneRef::new(road.clone(), index))
             .collect();
+        // Resolved to a station now, so that it is one more station the road
+        // carries and moves with, rather than a fraction of whatever length the
+        // road ends up with.
+        let station = draft.spec.reference_line.horizontal_length()? * fraction.clamp(0.0, 1.0);
         self.push_object(
             format!("crosswalk/{}/{fraction}", road.local_name()),
             ObjectSpec::AcrossRoad {
                 kind: MapObjectKind::Crosswalk,
                 road: road.clone(),
-                fraction,
+                station,
                 width,
                 lanes,
             },
@@ -1037,10 +1042,9 @@ impl Generator {
 
         // The flow through the joint: `into` arrives along road a, `out` leaves along
         // road b. Both horizontal, because a corner is a plan-view thing.
-        let into = horizontal(into_joint(&curve_a, a.1)?);
-        let out = horizontal(-into_joint(&curve_b, b.1)?);
-        let cosine = into.dot(out).clamp(-1.0, 1.0);
-        let angle = cosine.acos();
+        let into = horizontal(into_joint(&curve_a, a.1)?)?;
+        let out = horizontal(-into_joint(&curve_b, b.1)?)?;
+        let angle = into.dot(out).clamp(-1.0, 1.0).acos();
         if angle < CORNER_TOLERANCE {
             return Ok(());
         }
@@ -1056,7 +1060,7 @@ impl Generator {
             ));
         }
         // Positive is a left turn, which puts the inside of the corner on the left.
-        let turn = into.cross(out).z.signum();
+        let turn = into.get().cross(out.get()).z.signum();
         let inside = if turn > 0.0 {
             LateralSide::Left
         } else {
@@ -1080,19 +1084,14 @@ impl Generator {
                     road.0
                 ))
             })?;
-            let draft = self.builder.draft(&road.0)?;
+            let sections = &self.builder.draft(&road.0)?.spec.cross_sections;
+            let section = self.builder.section_at_end(&road.0, road.1)?;
             let length = curve.horizontal_length()?;
-            let section = match road.1 {
-                RoadEnd::End => {
-                    length - draft.spec.cross_sections.last().map_or(0.0, |s| s.station)
-                }
-                RoadEnd::Start => draft
-                    .spec
-                    .cross_sections
-                    .get(1)
-                    .map_or(length, |s| s.station),
+            let span = match road.1 {
+                RoadEnd::End => length - sections[section].station,
+                RoadEnd::Start => sections.get(1).map_or(length, |next| next.station),
             };
-            Ok(straight.min(section) - 1.0)
+            Ok(straight.min(span) - 1.0)
         };
         let available = spare(a, &curve_a)?.min(spare(b, &curve_b)?);
         if radius * half_tangent > available {
@@ -1118,21 +1117,20 @@ impl Generator {
         let start = endpoint(&trimmed_a, a.1);
         let finish = endpoint(&trimmed_b, b.1);
         let curvature = turn / radius;
+        let heading = into.heading();
         let mid_z = (start.z + finish.z) / 2.0;
-        let first_half = Arc3::new(start, into.y.atan2(into.x), curvature, half_arc, mid_z)?;
-        let middle = Curve3::Arc(first_half.clone()).end_point();
-        let second_half = Arc3::new(
-            middle,
-            into.y.atan2(into.x) + curvature * half_arc,
+        let first_half = Curve3::Arc(Arc3::new(start, heading, curvature, half_arc, mid_z)?);
+        let second_half = Curve3::Arc(Arc3::new(
+            first_half.end_point(),
+            heading + curvature * half_arc,
             curvature,
             half_arc,
             finish.z,
-        )?;
-        let landing = Curve3::Arc(second_half.clone()).end_point();
-        if landing.horizontal_distance_to(finish) > Curve3::JOIN_TOLERANCE {
+        )?);
+        let miss = second_half.end_point().horizontal_distance_to(finish);
+        if miss > Curve3::JOIN_TOLERANCE {
             return Err(too_sharp(format!(
-                "the arc misses the far road by {:.3} m",
-                landing.horizontal_distance_to(finish)
+                "the arc misses the far road by {miss:.3} m"
             )));
         }
 
@@ -1142,7 +1140,6 @@ impl Generator {
             (a, trimmed_a, first_half, a.1 == RoadEnd::Start),
             (b, trimmed_b, second_half, b.1 == RoadEnd::End),
         ] {
-            let half = Curve3::Arc(half);
             let half = if against_flow {
                 half.reversed(config)?
             } else {
@@ -1152,10 +1149,25 @@ impl Generator {
                 RoadEnd::End => Curve3::composite([trimmed, half])?,
                 RoadEnd::Start => Curve3::composite([half, trimmed])?,
             };
-            let length = reference_line.horizontal_length()?;
+            let moved = station_map(
+                road.1,
+                setback,
+                half_arc,
+                reference_line.horizontal_length()?,
+            );
             let draft = self.builder.draft_mut(&road.0)?;
             draft.spec.reference_line = reference_line;
-            remap_stations(&mut draft.spec, road.1, setback, half_arc, length);
+            draft.spec.map_stations(&moved);
+            for (_, object) in &mut self.builder.objects {
+                if let ObjectSpec::AcrossRoad {
+                    road: at, station, ..
+                } = object
+                {
+                    if at == &road.0 {
+                        *station = moved(*station);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1168,11 +1180,15 @@ impl Generator {
         end: RoadEnd,
         side: LateralSide,
     ) -> Result<f64, BuildError> {
-        let draft = self.builder.draft(road)?;
-        let length = draft.spec.reference_line.horizontal_length()?;
-        let (section, station) = match end {
-            RoadEnd::Start => (0, 0.0),
-            RoadEnd::End => (draft.spec.cross_sections.len() - 1, length),
+        let section = self.builder.section_at_end(road, end)?;
+        let station = match end {
+            RoadEnd::Start => 0.0,
+            RoadEnd::End => self
+                .builder
+                .draft(road)?
+                .spec
+                .reference_line
+                .horizontal_length()?,
         };
         // A road met at its start runs against the flow, so its left is the flow's
         // right.
@@ -1765,7 +1781,7 @@ impl Generator {
                 ObjectSpec::AcrossRoad {
                     kind,
                     road,
-                    fraction,
+                    station,
                     width,
                     lanes,
                 } => {
@@ -1778,7 +1794,7 @@ impl Generator {
                         .ok_or_else(|| BuildError::UnknownRoad(road.clone()))?;
                     let length = entry.horizontal_length()?;
                     let half = (width / 2.0).min(length / 2.0);
-                    let station = (length * fraction.clamp(0.0, 1.0)).clamp(half, length - half);
+                    let station = station.clamp(half, length - half);
                     let sample = entry.reference_line.sample_at(station, config)?;
                     let lateral = sample
                         .frame()?
@@ -1886,14 +1902,9 @@ fn into_joint(curve: &Curve3, end: RoadEnd) -> Result<Vector3, GeometryError> {
     })
 }
 
-fn horizontal(vector: Vector3) -> Vector3 {
-    let flat = Vector3::new(vector.x, vector.y, 0.0);
-    let norm = flat.horizontal_norm();
-    if norm > 0.0 {
-        flat * (1.0 / norm)
-    } else {
-        flat
-    }
+/// The direction's shadow on the horizontal plane, as a unit vector.
+fn horizontal(vector: Vector3) -> Result<UnitVector3, GeometryError> {
+    Vector3::new(vector.x, vector.y, 0.0).normalize()
 }
 
 fn endpoint(curve: &Curve3, end: RoadEnd) -> Point3 {
@@ -1903,60 +1914,64 @@ fn endpoint(curve: &Curve3, end: RoadEnd) -> Point3 {
     }
 }
 
-/// Horizontal length of the straight piece a curve arrives at `end` on, or `None`
-/// when it arrives on a curve.
-fn straight_run(curve: &Curve3, end: RoadEnd) -> Option<f64> {
+/// The straight piece a curve arrives at `end` on, as the two points of its last
+/// segment with the end itself second, or `None` when it arrives on a curve.
+fn last_segment(curve: &Curve3, end: RoadEnd) -> Option<[Point3; 2]> {
     match curve {
-        Curve3::Line(line) => Some(line.start().horizontal_distance_to(line.end())),
+        Curve3::Line(line) => Some(match end {
+            RoadEnd::End => [line.start(), line.end()],
+            RoadEnd::Start => [line.end(), line.start()],
+        }),
         Curve3::Polyline(polyline) => {
             let points = polyline.points();
-            let (near, next) = match end {
-                RoadEnd::End => (points[points.len() - 1], points[points.len() - 2]),
-                RoadEnd::Start => (points[0], points[1]),
-            };
-            Some(near.horizontal_distance_to(next))
+            Some(match end {
+                RoadEnd::End => [points[points.len() - 2], points[points.len() - 1]],
+                RoadEnd::Start => [points[1], points[0]],
+            })
         }
         Curve3::Composite(segments) => {
             let piece = match end {
                 RoadEnd::End => segments.last()?,
                 RoadEnd::Start => segments.first()?,
             };
-            straight_run(piece, end)
+            last_segment(piece, end)
         }
         Curve3::Arc(_) | Curve3::Clothoid(_) | Curve3::Bezier(_) => None,
     }
 }
 
+/// Horizontal length of the straight piece a curve arrives at `end` on, or `None`
+/// when it arrives on a curve.
+fn straight_run(curve: &Curve3, end: RoadEnd) -> Option<f64> {
+    let [from, to] = last_segment(curve, end)?;
+    Some(from.horizontal_distance_to(to))
+}
+
 /// The curve with `setback` metres taken off its `end`. Only ever asked of a curve
 /// that `straight_run` said arrives straight, and for less than that run.
 fn trim(curve: &Curve3, end: RoadEnd, setback: f64) -> Result<Curve3, GeometryError> {
+    // The end point, moved back along the segment it ends.
+    let shortened = |[from, to]: [Point3; 2]| -> Point3 {
+        let run = from.horizontal_distance_to(to);
+        from.lerp(to, (run - setback) / run)
+    };
     match curve {
-        Curve3::Line(line) => {
-            let length = line.start().horizontal_distance_to(line.end());
-            Ok(match end {
-                RoadEnd::End => Curve3::line(
-                    line.start(),
-                    line.start().lerp(line.end(), (length - setback) / length),
-                )?,
-                RoadEnd::Start => {
-                    Curve3::line(line.start().lerp(line.end(), setback / length), line.end())?
-                }
-            })
-        }
-        Curve3::Polyline(polyline) => {
-            let mut points = polyline.points().to_vec();
-            match end {
-                RoadEnd::End => {
-                    let n = points.len();
-                    let run = points[n - 2].horizontal_distance_to(points[n - 1]);
-                    points[n - 1] = points[n - 2].lerp(points[n - 1], (run - setback) / run);
-                }
-                RoadEnd::Start => {
-                    let run = points[0].horizontal_distance_to(points[1]);
-                    points[0] = points[0].lerp(points[1], setback / run);
-                }
+        Curve3::Line(_) | Curve3::Polyline(_) => {
+            let mut points = match curve {
+                Curve3::Line(line) => vec![line.start(), line.end()],
+                Curve3::Polyline(polyline) => polyline.points().to_vec(),
+                _ => unreachable!(),
+            };
+            let segment = last_segment(curve, end).ok_or(GeometryError::NoHorizontalExtent)?;
+            let index = match end {
+                RoadEnd::End => points.len() - 1,
+                RoadEnd::Start => 0,
+            };
+            points[index] = shortened(segment);
+            match curve {
+                Curve3::Line(_) => Curve3::line(points[0], points[1]),
+                _ => Curve3::polyline(points),
             }
-            Curve3::polyline(points)
         }
         Curve3::Composite(segments) => {
             let mut segments = segments.clone();
@@ -1973,14 +1988,14 @@ fn trim(curve: &Curve3, end: RoadEnd, setback: f64) -> Result<Curve3, GeometryEr
     }
 }
 
-/// Moves everything a road spec places by station to where it is after `setback`
-/// metres at `end` were replaced by an arc `half_arc` metres long.
+/// Where a station on a road is after `setback` metres at `end` were replaced by
+/// an arc `half_arc` metres long, leaving the road `new_length` long.
 ///
 /// Stations on the part of the road that was kept move rigidly; a station that was
 /// on the part cut away is spread over the arc that replaced it, so it stays on the
 /// road and keeps its order.
-fn remap_stations(spec: &mut RoadSpec, end: RoadEnd, setback: f64, half_arc: f64, new_length: f64) {
-    let map = |station: f64| -> f64 {
+fn station_map(end: RoadEnd, setback: f64, half_arc: f64, new_length: f64) -> impl Fn(f64) -> f64 {
+    move |station: f64| -> f64 {
         let moved = match end {
             RoadEnd::Start => {
                 if station < setback {
@@ -1999,30 +2014,37 @@ fn remap_stations(spec: &mut RoadSpec, end: RoadEnd, setback: f64, half_arc: f64
             }
         };
         moved.clamp(0.0, new_length)
-    };
-    for section in &mut spec.cross_sections {
-        section.station = map(section.station);
-        for lane in &mut section.lanes {
-            let taper = lane.width.taper();
-            let knots: Vec<(f64, PositiveWidth)> = lane
-                .width
-                .knots()
-                .iter()
-                .map(|(station, width)| (map(*station), *width))
-                .collect();
-            if let Ok(width) = WidthProfile::new(knots, taper) {
-                lane.width = width;
+    }
+}
+
+impl RoadSpec {
+    /// Moves everything the spec places by station through `map`: its cross-section
+    /// boundaries, its lanes' width knots and its roll profile.
+    fn map_stations(&mut self, map: &impl Fn(f64) -> f64) {
+        for section in &mut self.cross_sections {
+            section.station = map(section.station);
+            for lane in &mut section.lanes {
+                let taper = lane.width.taper();
+                let knots: Vec<(f64, PositiveWidth)> = lane
+                    .width
+                    .knots()
+                    .iter()
+                    .map(|(station, width)| (map(*station), *width))
+                    .collect();
+                if let Ok(width) = WidthProfile::new(knots, taper) {
+                    lane.width = width;
+                }
             }
         }
-    }
-    let pieces: Vec<Poly3Piece> = spec
-        .superelevation
-        .pieces()
-        .iter()
-        .map(|piece| Poly3Piece::new(map(piece.station), piece.a, piece.b, piece.c, piece.d))
-        .collect();
-    if let Ok(profile) = Poly3Profile::new(pieces) {
-        spec.superelevation = profile;
+        let pieces: Vec<Poly3Piece> = self
+            .superelevation
+            .pieces()
+            .iter()
+            .map(|piece| Poly3Piece::new(map(piece.station), piece.a, piece.b, piece.c, piece.d))
+            .collect();
+        if let Ok(profile) = Poly3Profile::new(pieces) {
+            self.superelevation = profile;
+        }
     }
 }
 
@@ -2039,6 +2061,13 @@ mod tests {
             LaneSpec::new(width(3.5), Direction::Forward),
             LaneSpec::new(width(3.5), Direction::Backward),
         ]
+    }
+
+    /// A straight two-way road between two points, added to the builder.
+    fn straight(builder: &mut MapBuilder, from: Point3, to: Point3, name: &str) -> RoadId {
+        builder
+            .add_road(RoadSpec::line(from, to, two_way()).unwrap().with_name(name))
+            .unwrap()
     }
 
     #[test]
@@ -2067,28 +2096,18 @@ mod tests {
     #[test]
     fn a_bend_is_rounded_into_an_arc_tangent_to_both_roads() {
         let mut builder = MapBuilder::default();
-        let a = builder
-            .add_road(
-                RoadSpec::line(
-                    Point3::new(0.0, 0.0, 10.0),
-                    Point3::new(100.0, 0.0, 12.0),
-                    two_way(),
-                )
-                .unwrap()
-                .with_name("a"),
-            )
-            .unwrap();
-        let b = builder
-            .add_road(
-                RoadSpec::line(
-                    Point3::new(100.0, 0.0, 12.0),
-                    Point3::new(200.0, 50.0, 15.0),
-                    two_way(),
-                )
-                .unwrap()
-                .with_name("b"),
-            )
-            .unwrap();
+        let a = straight(
+            &mut builder,
+            Point3::new(0.0, 0.0, 10.0),
+            Point3::new(100.0, 0.0, 12.0),
+            "a",
+        );
+        let b = straight(
+            &mut builder,
+            Point3::new(100.0, 0.0, 12.0),
+            Point3::new(200.0, 50.0, 15.0),
+            "b",
+        );
         builder.connect(&a, &b).unwrap();
         let map = builder.finish().unwrap().into_map();
 
@@ -2118,28 +2137,18 @@ mod tests {
         // Road b is drawn towards the joint rather than away from it, so its
         // reference line runs against the flow through the corner.
         let mut builder = MapBuilder::default();
-        let a = builder
-            .add_road(
-                RoadSpec::line(
-                    Point3::new(0.0, 0.0, 0.0),
-                    Point3::new(100.0, 0.0, 0.0),
-                    two_way(),
-                )
-                .unwrap()
-                .with_name("a"),
-            )
-            .unwrap();
-        let b = builder
-            .add_road(
-                RoadSpec::line(
-                    Point3::new(100.0, 100.0, 0.0),
-                    Point3::new(100.0, 0.0, 0.0),
-                    two_way(),
-                )
-                .unwrap()
-                .with_name("b"),
-            )
-            .unwrap();
+        let a = straight(
+            &mut builder,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(100.0, 0.0, 0.0),
+            "a",
+        );
+        let b = straight(
+            &mut builder,
+            Point3::new(100.0, 100.0, 0.0),
+            Point3::new(100.0, 0.0, 0.0),
+            "b",
+        );
         builder
             .connect_ends(&a, RoadEnd::End, &b, RoadEnd::End, None)
             .unwrap();
@@ -2161,17 +2170,12 @@ mod tests {
     #[test]
     fn what_a_road_places_by_station_moves_with_the_rounded_corner() {
         let mut builder = MapBuilder::default();
-        let a = builder
-            .add_road(
-                RoadSpec::line(
-                    Point3::new(0.0, 0.0, 0.0),
-                    Point3::new(100.0, 0.0, 0.0),
-                    two_way(),
-                )
-                .unwrap()
-                .with_name("a"),
-            )
-            .unwrap();
+        let a = straight(
+            &mut builder,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(100.0, 0.0, 0.0),
+            "a",
+        );
         // A second cross-section 30 m in from the joint end of road b.
         let b = builder
             .add_road(
@@ -2207,30 +2211,20 @@ mod tests {
     #[test]
     fn a_corner_too_tight_to_round_is_refused_with_a_reason() {
         let mut builder = MapBuilder::default();
-        let a = builder
-            .add_road(
-                RoadSpec::line(
-                    Point3::new(0.0, 0.0, 0.0),
-                    Point3::new(100.0, 0.0, 0.0),
-                    two_way(),
-                )
-                .unwrap()
-                .with_name("a"),
-            )
-            .unwrap();
+        let a = straight(
+            &mut builder,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(100.0, 0.0, 0.0),
+            "a",
+        );
         // The arc shrinks to fit a short road, down to a corner as tight as the road
         // is wide — and four metres of road is not even that.
-        let b = builder
-            .add_road(
-                RoadSpec::line(
-                    Point3::new(100.0, 0.0, 0.0),
-                    Point3::new(100.0, 4.0, 0.0),
-                    two_way(),
-                )
-                .unwrap()
-                .with_name("b"),
-            )
-            .unwrap();
+        let b = straight(
+            &mut builder,
+            Point3::new(100.0, 0.0, 0.0),
+            Point3::new(100.0, 4.0, 0.0),
+            "b",
+        );
         builder.connect(&a, &b).unwrap();
         let error = match builder.finish() {
             Ok(_) => panic!("the corner should be refused"),

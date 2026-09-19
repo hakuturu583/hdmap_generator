@@ -88,18 +88,9 @@ from ._roadgen import (
     render_opendrive,
     render_sumo,
 )
+from .sky import CarlaSkyError, carla_sky
 from .textures import TextureError, fetch_textures, texture_manifest
 
-
-
-def __getattr__(name):
-    # `roadgen.sky` is also a command (`python -m roadgen.sky`), and a package that
-    # imported it eagerly would run it twice; so it is fetched on first use.
-    if name in ("carla_sky", "CarlaSkyError"):
-        from . import sky
-
-        return getattr(sky, name)
-    raise AttributeError("module 'roadgen' has no attribute %r" % name)
 
 
 __all__ = [

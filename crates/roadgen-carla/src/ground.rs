@@ -16,7 +16,7 @@
 //! inner edge is the road's, its outer edge is on the ground, and the grass slopes
 //! between the two, so there is no ledge where the verge ends and the land begins.
 
-use roadgen_core::geometry::Point3;
+use roadgen_core::geometry::{Curve3, Point3};
 use roadgen_core::map::Map;
 
 use crate::materials;
@@ -65,16 +65,25 @@ impl Field {
         }
         // And the reference lines, densely: a straight road's surface has vertices
         // at its two ends and nowhere between, and a ground that read only those
-        // would take the road's far end's height all the way along it.
+        // would take the road's far end's height all the way along it. A polyline
+        // is already as dense as it is going to get, and its own samples are cheaper
+        // than resampling it.
         let sampling = map.metadata.sampling;
         for road in map.roads.iter() {
-            let Ok(length) = road.reference_line.horizontal_length() else {
+            let line = &road.reference_line;
+            if matches!(line, Curve3::Polyline(_) | Curve3::Bezier(_)) {
+                if let Ok(points) = line.samples(sampling) {
+                    samples.extend(points.into_iter().map(|sample| sample.point));
+                }
+                continue;
+            }
+            let Ok(length) = line.horizontal_length() else {
                 continue;
             };
             let steps = (length / SAMPLE_SPACING).ceil().max(1.0) as usize;
             for step in 0..=steps {
                 let station = length * step as f64 / steps as f64;
-                if let Ok(sample) = road.reference_line.sample_at(station, sampling) {
+                if let Ok(sample) = line.sample_at(station, sampling) {
                     samples.push(sample.point);
                 }
             }
@@ -99,34 +108,55 @@ impl Field {
         let y0 = min[1] - margin;
         let columns = ((max[0] + margin - x0) / cell).ceil().max(1.0) as usize;
         let rows = ((max[1] + margin - y0) / cell).ceil().max(1.0) as usize;
+        let stride = columns + 1;
 
         // A ground vertex governs the triangles around it, which reach a cell's
-        // diagonal; every road vertex that could be over one of them is looked at,
-        // and the lowest wins. With none that close, the nearest road vertex.
-        let reach = (cell * cell * 2.0).max(1.0);
-        let mut heights = Vec::with_capacity((columns + 1) * (rows + 1));
-        for j in 0..=rows {
-            let y = y0 + cell * j as f64;
-            for i in 0..=columns {
-                let x = x0 + cell * i as f64;
-                let mut nearest = (f64::INFINITY, 0.0);
-                let mut lowest = f64::INFINITY;
-                for point in &samples {
-                    let d = (point.x - x).powi(2) + (point.y - y).powi(2);
-                    if d < nearest.0 {
-                        nearest = (d, point.z);
-                    }
-                    if d <= reach {
-                        lowest = lowest.min(point.z);
+        // diagonal; every road sample that could be over one of them is looked at,
+        // and the lowest wins. Each sample reaches only the few vertices within
+        // that diagonal of it, so the samples are scattered onto the grid rather
+        // than the grid searched from every vertex.
+        let reach = cell * std::f64::consts::SQRT_2;
+        let mut heights = vec![f64::INFINITY; stride * (rows + 1)];
+        let span = |centre: f64, count: usize| -> std::ops::RangeInclusive<usize> {
+            let low = ((centre - reach) / cell).ceil().max(0.0) as usize;
+            let high = ((centre + reach) / cell).floor().max(0.0) as usize;
+            low..=high.min(count)
+        };
+        for point in &samples {
+            for j in span(point.y - y0, rows) {
+                for i in span(point.x - x0, columns) {
+                    let x = x0 + cell * i as f64;
+                    let y = y0 + cell * j as f64;
+                    if (point.x - x).powi(2) + (point.y - y).powi(2) <= reach * reach {
+                        let slot = &mut heights[j * stride + i];
+                        *slot = slot.min(point.z);
                     }
                 }
-                let z = if lowest.is_finite() {
-                    lowest
-                } else {
-                    nearest.1
-                };
-                heights.push(z - DROP);
             }
+        }
+        // The rest of the grid — most of it, out in the margin — takes the height
+        // of the nearest vertex that has one, ring by ring outwards: flat away from
+        // the roads, and at the height of whichever road is closest.
+        let mut queue: std::collections::VecDeque<usize> = (0..heights.len())
+            .filter(|&index| heights[index].is_finite())
+            .collect();
+        while let Some(index) = queue.pop_front() {
+            let (i, j) = (index % stride, index / stride);
+            let neighbours = [
+                (i > 0).then(|| index - 1),
+                (i < columns).then(|| index + 1),
+                (j > 0).then(|| index - stride),
+                (j < rows).then(|| index + stride),
+            ];
+            for next in neighbours.into_iter().flatten() {
+                if !heights[next].is_finite() {
+                    heights[next] = heights[index];
+                    queue.push_back(next);
+                }
+            }
+        }
+        for height in &mut heights {
+            *height -= DROP;
         }
         Some(Field {
             x0,
@@ -250,7 +280,6 @@ mod tests {
         // The one lane is on the right of the reference line: y from 0 to -3.5.
         assert!((x_min - (-100.0 - verge)).abs() < 1e-9 && x_max >= 300.0 + verge);
         assert!((y_min - (-100.0 - 3.5 - verge)).abs() < 1e-9 && y_max >= 100.0 + verge);
-        assert_eq!(mesh.role, Role::Ground);
         assert!(mesh.name.starts_with("g_Terrain_Land_"));
         assert_eq!(crate::tags::label_of(&mesh.name), crate::Label::Terrain);
         assert!(

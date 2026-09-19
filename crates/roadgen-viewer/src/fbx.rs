@@ -60,25 +60,19 @@ pub fn draw(text: &str) -> Result<Drawing, ViewError> {
         *classes.entry(label.as_str()).or_default() += 1;
         let kind = kind_of(label, mesh);
 
-        // A closed solid has no silhouette and is drawn as its faces; an open
-        // surface is drawn as its outline. A mesh can be both — a building is its
-        // closed shell and the windows standing off it — and gets both, less the
-        // outlines that are lines in plan, which is what a window is from above.
-        let closed = mesh.closed_polygons();
-        let loops: Vec<Vec<Point>> = mesh
-            .silhouette()
-            .into_iter()
-            .filter(|outline| plan_area(outline) > 1e-6)
-            .collect();
-        if !closed.is_empty() {
+        // A closed solid is drawn as its faces and an open surface as its outline.
+        // A mesh can be both — a building is its closed shell and the windows
+        // standing off it — and gets both.
+        let Surfaces { faces, outlines } = mesh.surfaces();
+        if !faces.is_empty() {
             solids += 1;
-            for face in closed {
+            for face in faces {
                 drawing.area(kind, face);
             }
         }
-        if !loops.is_empty() {
+        if !outlines.is_empty() {
             silhouettes += 1;
-            for outline in loops {
+            for outline in outlines {
                 drawing.area(kind, outline);
             }
         }
@@ -169,6 +163,38 @@ pub struct Mesh {
 /// is the tolerance the workspace holds geometry to everywhere else.
 const WELD: f64 = 1e6;
 
+/// A mesh's closed parts as faces and its open parts as outlines, in plan.
+pub struct Surfaces {
+    pub faces: Vec<Vec<Point>>,
+    pub outlines: Vec<Vec<Point>>,
+}
+
+/// Which polygons are joined to which: a union-find over polygon indices.
+struct Parts(Vec<usize>);
+
+impl Parts {
+    fn new(count: usize) -> Parts {
+        Parts((0..count).collect())
+    }
+
+    fn find(&mut self, index: usize) -> usize {
+        let mut root = index;
+        while self.0[root] != root {
+            root = self.0[root];
+        }
+        let mut at = index;
+        while self.0[at] != root {
+            at = std::mem::replace(&mut self.0[at], root);
+        }
+        root
+    }
+
+    fn join(&mut self, a: usize, b: usize) {
+        let (a, b) = (self.find(a), self.find(b));
+        self.0[a] = b;
+    }
+}
+
 impl Mesh {
     /// A vertex in plan view.
     fn plan(&self, index: usize) -> Point {
@@ -176,18 +202,10 @@ impl Mesh {
         Point::new(x, y)
     }
 
-    /// Every polygon, flattened.
-    pub fn triangles(&self) -> Vec<Vec<Point>> {
-        self.polygons
-            .iter()
-            .map(|polygon| polygon.iter().map(|&index| self.plan(index)).collect())
-            .collect()
-    }
-
     /// The loops bounding the surface: edges used by one polygon rather than two.
     ///
     /// Empty for a closed solid, which is the answer rather than a failure — a
-    /// building is closed, and the caller draws its triangles instead.
+    /// building is closed, and the caller draws its faces instead.
     ///
     /// Edges are matched by **position** rather than by index. A writer is free to
     /// give every face its own vertices — this one does, so that the crease between
@@ -196,11 +214,69 @@ impl Mesh {
     /// question "is this surface closed" a question about the shape rather than about
     /// how the file happened to be written.
     pub fn silhouette(&self) -> Vec<Vec<Point>> {
+        self.surfaces().outlines
+    }
+
+    /// What the mesh is made of, for a plan view: the faces of its closed parts
+    /// and the outlines of its open ones.
+    ///
+    /// The polygons are gathered into parts along their shared edges; a part with
+    /// no edge belonging to one polygon alone is closed, and every other part is
+    /// open. The parts are what tell a building's shell — closed, drawn as faces —
+    /// from the window quads standing off it and from a road — open, drawn as
+    /// outlines — without knowing which is which. An outline that is a line in
+    /// plan, which is what a window is from above, is dropped by the drawing.
+    pub fn surfaces(&self) -> Surfaces {
         let (of, counts) = self.edge_counts();
 
+        // Which part each polygon belongs to: polygons sharing a welded edge are
+        // joined, and a part is closed unless one of its edges is used once.
+        let mut part = Parts::new(self.polygons.len());
+        let mut owner: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for (index, polygon) in self.polygons.iter().enumerate() {
+            for corner in 0..polygon.len() {
+                let a = of[polygon[corner]];
+                let b = of[polygon[(corner + 1) % polygon.len()]];
+                if a == b {
+                    continue;
+                }
+                match owner.get(&edge(a, b)) {
+                    Some(&other) => part.join(index, other),
+                    None => {
+                        owner.insert(edge(a, b), index);
+                    }
+                }
+            }
+        }
+        let mut open: BTreeMap<usize, bool> = BTreeMap::new();
+        for (edge, &count) in &counts {
+            if count == 1 {
+                open.insert(part.find(owner[edge]), true);
+            }
+        }
+        let faces = self
+            .polygons
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !open.contains_key(&part.find(*index)))
+            .map(|(_, polygon)| polygon.iter().map(|&index| self.plan(index)).collect())
+            .collect();
+
+        Surfaces {
+            faces,
+            outlines: self.walk_borders(&of, &counts),
+        }
+    }
+
+    /// The border loops, walked along the edges used once.
+    fn walk_borders(
+        &self,
+        of: &[usize],
+        counts: &BTreeMap<(usize, usize), usize>,
+    ) -> Vec<Vec<Point>> {
         // A vertex's unused-once neighbours. Chaining through these walks the border.
         let mut neighbours: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for (&(a, b), &count) in &counts {
+        for (&(a, b), &count) in counts {
             if count != 1 {
                 continue;
             }
@@ -268,36 +344,6 @@ impl Mesh {
         }
         (of, counts)
     }
-
-    /// The polygons that are part of a closed surface: every edge of each is shared
-    /// with one other polygon. A building's shell is made of these; the window quads
-    /// standing off its walls are not, and neither is a road.
-    pub fn closed_polygons(&self) -> Vec<Vec<Point>> {
-        let (of, counts) = self.edge_counts();
-        self.polygons
-            .iter()
-            .filter(|polygon| {
-                (0..polygon.len()).all(|index| {
-                    let a = of[polygon[index]];
-                    let b = of[polygon[(index + 1) % polygon.len()]];
-                    a == b || counts.get(&edge(a, b)) == Some(&2)
-                })
-            })
-            .map(|polygon| polygon.iter().map(|&index| self.plan(index)).collect())
-            .collect()
-    }
-}
-
-/// Twice the signed area of a plan-view ring, which is zero for a ring that is
-/// really a line — a vertical quad seen from above.
-fn plan_area(ring: &[Point]) -> f64 {
-    (0..ring.len())
-        .map(|index| {
-            let (a, b) = (ring[index], ring[(index + 1) % ring.len()]);
-            a.x * b.y - b.x * a.y
-        })
-        .sum::<f64>()
-        .abs()
 }
 
 fn edge(a: usize, b: usize) -> (usize, usize) {
@@ -829,6 +875,44 @@ Connections:  {
             materials: Vec::new(),
         };
         assert!(mesh.silhouette().is_empty());
+        assert_eq!(mesh.surfaces().faces.len(), 4);
+    }
+
+    #[test]
+    fn a_closed_shell_with_a_quad_standing_off_it_is_both() {
+        // A building with a window: the shell is closed and drawn as faces, the
+        // window is its own open part and drawn as its outline — and a vertical
+        // window is a line in plan, so the drawing then drops it.
+        let mesh = Mesh {
+            name: "Town01_Building_Part_0".into(),
+            vertices: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                // A flat quad beside the shell, sharing no edge with it.
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [2.0, 1.0, 0.0],
+            ],
+            polygons: vec![
+                vec![0, 1, 2],
+                vec![0, 2, 3],
+                vec![6, 5, 4],
+                vec![7, 6, 4],
+                vec![8, 9, 10, 11],
+            ],
+            materials: Vec::new(),
+        };
+        let surfaces = mesh.surfaces();
+        assert_eq!(surfaces.faces.len(), 4, "the shell's faces");
+        assert_eq!(surfaces.outlines.len(), 1, "the quad's outline");
+        assert_eq!(surfaces.outlines[0].len(), 4);
     }
 
     #[test]

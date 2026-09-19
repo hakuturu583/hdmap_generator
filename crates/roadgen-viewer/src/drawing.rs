@@ -261,9 +261,10 @@ impl Drawing {
         }
     }
 
-    /// A closed outline, dropped when it is not one.
+    /// A closed outline, dropped when it is not one — too few points, or no area
+    /// between them, which is what a vertical face is from above.
     pub fn area(&mut self, kind: Kind, points: Vec<Point>) {
-        if points.len() >= 3 {
+        if points.len() >= 3 && plan_area(&points) > 1e-6 {
             self.push(Shape::Area { kind, points });
         }
     }
@@ -313,6 +314,17 @@ impl Drawing {
     pub fn to_svg(&self) -> String {
         crate::svg::render(self)
     }
+}
+
+/// Twice the area of a ring, which is zero for a ring that is really a line.
+fn plan_area(ring: &[Point]) -> f64 {
+    (0..ring.len())
+        .map(|index| {
+            let (a, b) = (ring[index], ring[(index + 1) % ring.len()]);
+            a.x * b.y - b.x * a.y
+        })
+        .sum::<f64>()
+        .abs()
 }
 
 #[cfg(test)]

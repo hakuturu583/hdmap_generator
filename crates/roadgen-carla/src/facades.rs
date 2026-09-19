@@ -107,7 +107,7 @@ pub fn rhythm_of(kind: &str) -> Rhythm {
 
 /// One opening: its ring, wound to face out of the wall, and its material.
 pub struct Opening {
-    pub ring: Vec<Point3>,
+    pub ring: [Point3; 4],
     pub material: usize,
 }
 
@@ -122,15 +122,14 @@ pub fn openings(wall: &[Point3], levels: u32, kind: &str, door: bool) -> Vec<Ope
         return openings;
     }
     let (a, b, top_b, top_a) = (wall[0], wall[1], wall[2], wall[3]);
-    let along = Vector3::new(b.x - a.x, b.y - a.y, 0.0);
-    let length = along.horizontal_norm();
+    let length = a.horizontal_distance_to(b);
     if length < 1e-6 {
         return openings;
     }
-    let along = along * (1.0 / length);
     // Outwards is to the right of the base edge walked from `a` to `b`, which is
     // the side the quad faces when the outline runs anticlockwise.
-    let out = Vector3::new(along.y, -along.x, 0.0);
+    let along = b - a;
+    let out = Vector3::new(along.y, -along.x, 0.0) * (1.0 / length);
     let height = (top_a.z - a.z).min(top_b.z - b.z);
     let storeys = levels.max(1) as usize;
     let storey = height / storeys as f64;
@@ -147,80 +146,65 @@ pub fn openings(wall: &[Point3], levels: u32, kind: &str, door: bool) -> Vec<Ope
     // A point on the wall's plane: `x` metres along it from `a`, `z` metres above
     // the base there, `relief` metres out of it.
     let at = |x: f64, z: f64, relief: f64| -> Point3 {
-        let t = x / length;
-        let base = a.z + (b.z - a.z) * t;
-        Point3::new(
-            a.x + along.x * x + out.x * relief,
-            a.y + along.y * x + out.y * relief,
-            base + z,
-        )
+        a.lerp(b, x / length) + out * relief + Vector3::UP * z
     };
-    let mut quad = |x0: f64, x1: f64, z0: f64, z1: f64, relief: f64, material: usize| {
-        openings.push(Opening {
-            ring: vec![
-                at(x0, z0, relief),
-                at(x1, z0, relief),
-                at(x1, z1, relief),
-                at(x0, z1, relief),
-            ],
-            material,
-        });
+    // An opening between `x0..x1` along and `z0..z1` up: its frame, and inside
+    // that its pane. A door's frame stops at the ground rather than going under it.
+    let mut opening = |x0: f64, x1: f64, z0: f64, z1: f64, pane: usize, framed_below: bool| {
+        let sill = if framed_below { z0 - FRAME } else { z0 };
+        for (x0, x1, z0, z1, relief, material) in [
+            (
+                x0 - FRAME,
+                x1 + FRAME,
+                sill,
+                z1 + FRAME,
+                RELIEF,
+                materials::FRAME,
+            ),
+            (x0, x1, z0, z1, 2.0 * RELIEF, pane),
+        ] {
+            openings.push(Opening {
+                ring: [
+                    at(x0, z0, relief),
+                    at(x1, z0, relief),
+                    at(x1, z1, relief),
+                    at(x0, z1, relief),
+                ],
+                material,
+            });
+        }
     };
 
     for bay in 0..bays {
         let centre = rhythm.margin + (bay as f64 + 0.5) * pitch;
         for level in 0..storeys {
             let floor = level as f64 * storey;
-            if level == 0 && door_bay == Some(bay) {
-                let half = (rhythm.door / 2.0).min(pitch / 2.0 - FRAME);
-                let top = DOOR_HEIGHT.min(storey - HEADROOM);
-                if top > 1.0 {
-                    quad(
-                        centre - half - FRAME,
-                        centre + half + FRAME,
-                        floor,
-                        floor + top + FRAME,
-                        RELIEF,
-                        materials::FRAME,
-                    );
-                    quad(
-                        centre - half,
-                        centre + half,
-                        floor,
-                        floor + top,
-                        2.0 * RELIEF,
-                        materials::DOOR,
-                    );
-                }
-                continue;
-            }
-            let ((width, tall), sill) = if level == 0 {
-                (rhythm.ground_window, rhythm.ground_sill)
+            // What this cell holds: the door, a shopfront, or a window — as a
+            // width, a bottom and a top above the storey's floor, and a pane.
+            let (width, bottom, top, pane) = if level == 0 && door_bay == Some(bay) {
+                (rhythm.door, 0.0, DOOR_HEIGHT, materials::DOOR)
             } else {
-                (rhythm.window, rhythm.sill)
+                let ((width, tall), sill) = if level == 0 {
+                    (rhythm.ground_window, rhythm.ground_sill)
+                } else {
+                    (rhythm.window, rhythm.sill)
+                };
+                (width, sill, sill + tall, materials::GLAZING)
             };
             let half = (width / 2.0).min(pitch / 2.0 - FRAME);
-            // A window that will not fit its storey is shortened, and one that
+            // An opening that will not fit its storey is shortened, and one that
             // would not leave a wall above or below it is left out.
-            let top = (sill + tall).min(storey - HEADROOM);
-            if top - sill < 0.4 || half <= 0.1 {
+            let top = top.min(storey - HEADROOM);
+            if top - bottom < 0.4 || half <= 0.1 {
                 continue;
             }
-            quad(
-                centre - half - FRAME,
-                centre + half + FRAME,
-                floor + sill - FRAME,
-                floor + top + FRAME,
-                RELIEF,
-                materials::FRAME,
-            );
-            quad(
+            opening(
                 centre - half,
                 centre + half,
-                floor + sill,
+                floor + bottom,
                 floor + top,
-                2.0 * RELIEF,
-                materials::GLAZING,
+                pane,
+                pane != materials::DOOR,
             );
         }
     }

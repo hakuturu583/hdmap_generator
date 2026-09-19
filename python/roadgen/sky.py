@@ -18,6 +18,7 @@ frame. It is one more run of the editor after `Import.py`'s four, on the same
 level, and running it twice changes nothing.
 
     roadgen.carla_sky("/opt/carla", "Town01Package", "Town01")
+    python -m roadgen sky /opt/carla Town01Package Town01     # the same, from a shell
 
 What it does not do is hook the sky into CARLA's weather API: `set_weather()` will
 store its parameters and move nothing, because the thing it knows how to move is
@@ -28,7 +29,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 
 __all__ = ["carla_sky", "CarlaSkyError"]
 
@@ -48,7 +48,6 @@ def carla_sky(
     engine=None,
     sun_altitude=45.0,
     sun_azimuth=-50.0,
-    sun_lux=75000.0,
     log=None,
 ):
     """Adds a daylight sky to the level `Import.py` built for `map_name` in `package`.
@@ -59,8 +58,6 @@ def carla_sky(
 
     `sun_altitude` and `sun_azimuth` are degrees, the way `carla.WeatherParameters`
     spells them. `log`, if given, receives the editor's output line by line.
-
-    Returns the path of the editor log the run wrote.
     """
     engine = engine or os.environ.get("CARLA_UNREAL_ENGINE_PATH")
     if not engine:
@@ -87,7 +84,6 @@ def carla_sky(
             "ROADGEN_LEVEL": level,
             "ROADGEN_SUN_ALTITUDE": repr(float(sun_altitude)),
             "ROADGEN_SUN_AZIMUTH": repr(float(sun_azimuth)),
-            "ROADGEN_SUN_LUX": repr(float(sun_lux)),
         }
     )
     command = [
@@ -110,7 +106,6 @@ def carla_sky(
     )
     succeeded = False
     changed = None
-    log_path = None
     for line in process.stdout:
         if log is not None:
             log(line.rstrip("\n"))
@@ -118,8 +113,6 @@ def carla_sky(
             succeeded = True
         if "roadgen-sky: saved" in line:
             changed = "True" in line
-        if "LogInit: Display: Log file: " in line or "Log file open, " in line:
-            log_path = line.strip()
     process.wait()
     if not succeeded:
         raise CarlaSkyError(
@@ -128,14 +121,14 @@ def carla_sky(
         )
     if changed is False:
         raise CarlaSkyError("the editor ran but could not save %s" % level)
-    return log_path
 
 
 def main(argv=None):
+    """The command: `python -m roadgen sky <carla_root> <package> <map>`."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="python -m roadgen.sky",
+        prog="python -m roadgen sky",
         description="Give an imported CARLA map a daylight sky.",
     )
     parser.add_argument("carla_root", help="the CARLA checkout")
@@ -144,7 +137,6 @@ def main(argv=None):
     parser.add_argument("--engine", help="Unreal Engine directory (default: $CARLA_UNREAL_ENGINE_PATH)")
     parser.add_argument("--sun-altitude", type=float, default=45.0, help="degrees above the horizon")
     parser.add_argument("--sun-azimuth", type=float, default=-50.0, help="degrees, as CARLA's weather spells it")
-    parser.add_argument("--sun-lux", type=float, default=75000.0)
     parser.add_argument("--verbose", action="store_true", help="show the editor's output")
     args = parser.parse_args(argv)
     carla_sky(
@@ -154,12 +146,7 @@ def main(argv=None):
         engine=args.engine,
         sun_altitude=args.sun_altitude,
         sun_azimuth=args.sun_azimuth,
-        sun_lux=args.sun_lux,
         log=print if args.verbose else None,
     )
     print("sky added to %s/%s" % (args.package, args.map_name))
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

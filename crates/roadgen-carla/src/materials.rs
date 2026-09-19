@@ -75,7 +75,7 @@ impl Map {
 }
 
 /// A Poly Haven texture, at the resolution and format a package takes it in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Texture {
     /// The asset's identifier on polyhaven.com — the last part of its page URL.
     pub slug: &'static str,
@@ -86,6 +86,14 @@ pub struct Texture {
     /// 4k PNG normal map is forty megabytes of a package.
     pub format: &'static str,
     pub maps: &'static [Map],
+    /// How many metres of surface one repeat covers: the size the asset was scanned
+    /// at, which Poly Haven publishes as its `dimensions`. Projected at that scale a
+    /// brick is brick-sized whatever wall it is on; at any other, a wall reads as a
+    /// wall of the wrong bricks — four times too big, in the first packages this
+    /// wrote. Aerial ground textures are scanned over tens of metres and tile at
+    /// that; up close they are the ground seen from a drone, which is what a verge
+    /// is from a car.
+    pub scale: f64,
 }
 
 impl Texture {
@@ -130,16 +138,6 @@ pub struct Material {
     pub roughness: f64,
     /// The Poly Haven asset this material is a stand-in for, if any.
     pub texture: Option<Texture>,
-    /// How many metres of surface one repeat of the texture covers.
-    ///
-    /// This is the size the asset was scanned at, which Poly Haven publishes as its
-    /// `dimensions`, so a brick is brick-sized and a roof tile tile-sized whatever
-    /// the wall or roof it is on. Textured by projection at any other scale a wall
-    /// reads as a wall of the wrong bricks — four times too big, in the first
-    /// packages this wrote. Aerial ground textures are scanned over tens of metres
-    /// and tile at that; up close they are what the ground looks like from a drone,
-    /// which is what a verge needs to be from a car.
-    pub scale: f64,
 }
 
 impl fmt::Display for Material {
@@ -166,8 +164,8 @@ pub const MATERIALS: &[Material] = &[
             resolution: "2k",
             format: "jpg",
             maps: FULL,
+            scale: 3.0,
         }),
-        scale: 3.0,
     },
     Material {
         // No `Yellow` in the name, so CARLA's marking pass takes it for the white one.
@@ -175,7 +173,6 @@ pub const MATERIALS: &[Material] = &[
         color: [0.90, 0.90, 0.88],
         roughness: 0.6,
         texture: None,
-        scale: 1.0,
     },
     Material {
         // `Yellow` is load-bearing: `PrepareAssetsForCookingCommandlet` matches the
@@ -184,7 +181,6 @@ pub const MATERIALS: &[Material] = &[
         color: [0.85, 0.68, 0.11],
         roughness: 0.6,
         texture: None,
-        scale: 1.0,
     },
     Material {
         name: "M_Sidewalk_Concrete",
@@ -195,8 +191,8 @@ pub const MATERIALS: &[Material] = &[
             resolution: "2k",
             format: "jpg",
             maps: FULL,
+            scale: 3.0,
         }),
-        scale: 3.0,
     },
     Material {
         name: "M_Curb_Concrete",
@@ -207,8 +203,8 @@ pub const MATERIALS: &[Material] = &[
             resolution: "2k",
             format: "jpg",
             maps: FULL,
+            scale: 2.71,
         }),
-        scale: 2.71,
     },
     Material {
         name: "M_Terrain_Grass",
@@ -219,8 +215,8 @@ pub const MATERIALS: &[Material] = &[
             resolution: "2k",
             format: "jpg",
             maps: FULL,
+            scale: 15.0,
         }),
-        scale: 15.0,
     },
     Material {
         name: "M_Building_Brick",
@@ -231,8 +227,8 @@ pub const MATERIALS: &[Material] = &[
             resolution: "2k",
             format: "jpg",
             maps: FULL,
+            scale: 1.0,
         }),
-        scale: 1.0,
     },
     Material {
         name: "M_Building_Plaster",
@@ -243,8 +239,8 @@ pub const MATERIALS: &[Material] = &[
             resolution: "2k",
             format: "jpg",
             maps: FULL,
+            scale: 2.0,
         }),
-        scale: 2.0,
     },
     Material {
         name: "M_Building_RoofTiles",
@@ -255,8 +251,8 @@ pub const MATERIALS: &[Material] = &[
             resolution: "2k",
             format: "jpg",
             maps: FULL,
+            scale: 1.50,
         }),
-        scale: 1.50,
     },
     Material {
         // Glazing: a dark, slightly blue surface with the low roughness that makes it
@@ -266,21 +262,18 @@ pub const MATERIALS: &[Material] = &[
         color: [0.10, 0.13, 0.17],
         roughness: 0.15,
         texture: None,
-        scale: 1.0,
     },
     Material {
         name: "M_Building_Frame",
         color: [0.88, 0.87, 0.84],
         roughness: 0.5,
         texture: None,
-        scale: 1.0,
     },
     Material {
         name: "M_Building_Door",
         color: [0.28, 0.17, 0.10],
         roughness: 0.6,
         texture: None,
-        scale: 1.0,
     },
 ];
 

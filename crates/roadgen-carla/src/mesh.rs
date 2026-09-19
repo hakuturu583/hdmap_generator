@@ -26,17 +26,17 @@
 
 use roadgen_core::geometry::{Point3, Vector3};
 
-use crate::materials::{Material, MATERIALS};
+use crate::materials::{Texture, MATERIALS};
 use crate::tags::Role;
 
-/// How far a texture tiles when its material does not say, metres per repeat.
+/// How far a material without a texture tiles, metres per repeat.
 ///
 /// Every surface here is textured by *projection* rather than by an unwrapped chart:
 /// asphalt, grass and concrete are materials without a seam anyone can point at, so a
 /// planar or along-the-strip projection at the texture's own real-world scale is both
 /// what looks right and what a substitute texture can be dropped into without
-/// re-authoring. The scale comes from the material ([`Material::scale`]); this is
-/// only for a slot whose material the table does not know.
+/// re-authoring. A texture brings its scale ([`Texture::scale`]); a flat colour has
+/// none, and gets this.
 pub const TEXTURE_SCALE: f64 = 4.0;
 
 /// One triangle mesh, named the way CARLA's classifier will read it.
@@ -168,13 +168,14 @@ impl Mesh {
         }
     }
 
-    /// Metres of surface per repeat of the texture in `slot`: the material's own
-    /// scale, or [`TEXTURE_SCALE`] for a material the table does not list.
+    /// Metres of surface per repeat of the texture in `slot`, or [`TEXTURE_SCALE`]
+    /// for a material without one.
     fn texture_scale(&self, slot: usize) -> f64 {
         self.materials
             .get(slot)
             .and_then(|&index| MATERIALS.get(index))
-            .map_or(TEXTURE_SCALE, |material: &Material| material.scale)
+            .and_then(|material| material.texture)
+            .map_or(TEXTURE_SCALE, |texture: Texture| texture.scale)
     }
 
     fn push_triangle(&mut self, triangle: [u32; 3], slot: usize) {
@@ -305,7 +306,7 @@ mod tests {
         mesh.strip(&rail(2.0), &rail(-2.0), 0);
         // Thirty metres of road at the asphalt's three metres a repeat is ten
         // repeats, which is what stops a texture sliding as a lane widens.
-        let scale = MATERIALS[crate::materials::ASPHALT].scale;
+        let scale = MATERIALS[crate::materials::ASPHALT].texture.unwrap().scale;
         let last = mesh.uvs.last().unwrap();
         assert!((last[0] - 30.0 / scale).abs() < 1e-9);
         assert!((last[1] - 4.0 / scale).abs() < 1e-9);

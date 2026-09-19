@@ -10,7 +10,8 @@ import unreal  # only exists inside the editor
 LEVEL = os.environ["ROADGEN_LEVEL"]
 SUN_ALTITUDE = float(os.environ.get("ROADGEN_SUN_ALTITUDE", "45"))
 SUN_AZIMUTH = float(os.environ.get("ROADGEN_SUN_AZIMUTH", "-50"))
-SUN_LUX = float(os.environ.get("ROADGEN_SUN_LUX", "75000"))
+#: A clear-sky sun, in lux, which is what the atmosphere is calibrated for.
+SUN_LUX = 75000.0
 
 
 def say(message):
