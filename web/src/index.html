@@ -8,7 +8,8 @@
       name="description"
       content="roadgen's own Python package, compiled to WebAssembly: describe roads,
                lanes and junctions, and see the same network written as OpenDRIVE,
-               Lanelet2, OpenStreetMap, SUMO, ClipGT and GPUDrive."
+               Lanelet2, OpenStreetMap, SUMO, a CARLA UE5 package, ClipGT and
+               GPUDrive."
     />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%232563eb'/><path d='M8 1v14' stroke='white' stroke-width='1.6' stroke-dasharray='3 2'/></svg>" />
     <link rel="stylesheet" href="./vendor/leaflet.css" />
@@ -23,9 +24,10 @@
           Describe roads, lanes and junctions in Python and press Run. One script
           writes <strong>OpenDRIVE</strong>, an Autoware-ready
           <strong>Lanelet2</strong> map, plain <strong>OpenStreetMap</strong>, a
-          <strong>SUMO</strong> network, a <strong>ClipGT</strong> clip and a
-          <strong>GPUDrive</strong> scene; the switch above the viewer flips between
-          them, in the same frame, so what changes is the format and nothing else.
+          <strong>SUMO</strong> network, a <strong>CARLA</strong> UE5 asset package, a
+          <strong>ClipGT</strong> clip and a <strong>GPUDrive</strong> scene; the
+          switch above the viewer flips between them, in the same frame, so what
+          changes is the format and nothing else.
         </p>
       </div>
       <a class="repo" href="https://github.com/hakuturu583/hdmap_generator">
@@ -61,7 +63,7 @@
         Python runs here as <a href="https://pyodide.org/">Pyodide</a>, and
         <code>roadgen</code> is its own wheel built for it, so what you are running is
         the package rather than a demonstration of it. Every tab is drawn from the
-        file itself, read back: OpenDRIVE, SUMO, ClipGT and GPUDrive by
+        file itself, read back: OpenDRIVE, SUMO, CARLA, ClipGT and GPUDrive by
         <code>roadgen-viewer</code>, in the same wheel, and the two OpenStreetMap
         exports by <a href="https://leafletjs.com/">Leaflet</a>, which already knows
         how to draw a map in geographic coordinates.

@@ -13,6 +13,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import textwrap
 import xml.etree.ElementTree as ET
 
@@ -545,7 +546,11 @@ def test_traffic_control_reaches_opendrive_too():
     kinds = {obj.get("type") for obj in objects}
     assert kinds == {"roadMark", "crosswalk"}
     crosswalk = next(obj for obj in objects if obj.get("type") == "crosswalk")
-    assert len(crosswalk.findall("outline/cornerRoad")) == 4
+    # Written the way CARLA reads a crosswalk: local corners about a pivot turned a
+    # quarter turn, the ring closed by repeating its first corner.
+    corners = crosswalk.findall("outline/cornerLocal")
+    assert len(corners) == 5 and corners[0].attrib == corners[-1].attrib
+    assert float(crosswalk.get("hdg")) == pytest.approx(math.pi / 2)
 
     # And the right-of-way rule becomes a junction priority.
     assert root.findall("junction/priority")
@@ -1437,3 +1442,257 @@ def test_the_opendrive_picture_shows_the_town(tmp_path):
     # A plan view draws every part, so the count is of parts and not of buildings.
     parts = sum(len(m.building_parts(b)) for b in m.building_ids())
     assert f"{parts} building parts, drawn from the outlines" in svg
+
+
+# --------------------------------------------------------------------------- #
+# CARLA
+# --------------------------------------------------------------------------- #
+
+
+def carla_street():
+    """A street with pavements, which is what exercises every CARLA class.
+
+    Lanes run outwards from the reference line on each side, which is the order the
+    builder counts them in: the carriageway first and the pavement beyond it.
+    """
+    m = roadgen.Map(name="Town01", origin=(35.6586, 139.7454, 0.0))
+    m.add_road(
+        start=(0.0, 0.0, 0.0),
+        end=(240.0, 0.0, 6.0),
+        lanes=[
+            roadgen.Lane(width=3.5, direction="backward"),
+            roadgen.Lane(width=2.0, direction="backward", type_="sidewalk"),
+            roadgen.Lane(width=3.5, direction="forward"),
+            roadgen.Lane(width=2.0, direction="forward", type_="sidewalk"),
+        ],
+        name="high",
+    )
+    return m
+
+
+def test_a_carla_package_is_a_descriptor_a_mesh_and_a_road_network(tmp_path):
+    m = carla_street()
+    report = m.export_carla(tmp_path / "Import")
+
+    assert pathlib.Path(report["descriptor"]).exists()
+    assert pathlib.Path(report["fbx"]).exists()
+    assert pathlib.Path(report["xodr"]).exists()
+    # CARLA pairs the mesh and the road network by name, in three separate places.
+    assert pathlib.Path(report["fbx"]).stem == pathlib.Path(report["xodr"]).stem
+
+    descriptor = json.loads(pathlib.Path(report["descriptor"]).read_text())
+    assert descriptor["maps"][0]["name"] == "Town01"
+    assert descriptor["maps"][0]["source"].endswith("Town01.fbx")
+    assert descriptor["maps"][0]["xodr"].endswith("Town01.xodr")
+    # `GetArrayField("props")` is called without checking whether it is there.
+    assert descriptor["props"] == []
+
+
+def test_the_report_says_what_carla_will_call_each_mesh(tmp_path):
+    """The point of the exporter, from Python.
+
+    CARLA reads a mesh's semantic class off its *name*, so the only way to know what a
+    package will segment as is to run the names back through CARLA's own classifier.
+    That is what the report holds, keyed by the tag a segmentation camera reports.
+    """
+    m = carla_street()
+    report = m.export_carla(tmp_path / "Import")
+
+    labels = report["labels"]
+    for tag in ("Roads", "RoadLines", "Sidewalks", "Terrain"):
+        assert labels.get(tag, 0) > 0, (tag, labels)
+    assert report["meshes"] == sum(labels.values())
+    assert report["triangles"] > report["meshes"]
+
+
+def test_a_map_name_that_would_tag_the_whole_map_is_reported(tmp_path):
+    """`Terrain` is tested bare and third in CARLA's classifier.
+
+    Every mesh in a map is named after the map, so a map called for one of the tokens
+    decides the class of every mesh in it before the mesh's own role is looked at.
+    """
+    m = carla_street()
+    warnings = m.carla_warnings(name="TerrainTown")
+    assert any("Rename the map" in warning for warning in warnings)
+    assert not any("Rename the map" in w for w in m.carla_warnings(name="Town01"))
+
+    # And it really would: the pavements come out as ground.
+    report = m.export_carla(tmp_path / "Import", name="TerrainTown")
+    assert report["labels"].get("Sidewalks") is None
+
+
+def test_a_town_is_placed_or_tagged_and_never_both(tmp_path):
+    m = carla_street()
+    m.generate_buildings()
+    assert m.building_ids()
+
+    in_map = m.export_carla(tmp_path / "in_map", name="Town01", buildings="in_map")
+    as_props = m.export_carla(tmp_path / "props", name="Town01", buildings="props")
+
+    # In the map, and counted as ground: CARLA's MoveAssets commandlet knows six mesh
+    # names and none of them is a building.
+    assert in_map["props"] is None
+    assert "Buildings" not in in_map["labels"]
+    # As props, they are tagged — and not in the level, so the map has fewer meshes.
+    assert as_props["props"] is not None
+    assert as_props["meshes"] < in_map["meshes"]
+
+    for placement in ("in_map", "props"):
+        warnings = m.carla_warnings(name="Town01", buildings=placement)
+        assert any("Buildings" in warning for warning in warnings)
+
+    with pytest.raises(ValueError):
+        m.carla_warnings(buildings="somewhere else")
+
+
+def test_the_textures_are_listed_rather_than_shipped(tmp_path):
+    """An exporter that reached for the network could not run in the browser."""
+    m = carla_street()
+    report = m.export_carla(tmp_path / "Import")
+
+    package = tmp_path / "Import" / "Town01"
+    manifest = roadgen.texture_manifest(str(package))
+    assert manifest["license"] == "CC0-1.0"
+    assert manifest["files"]
+    # Nothing has been fetched, so every one of them is still outstanding — and each
+    # says which Poly Haven asset it is, so swapping one is editing this file.
+    assert len(report["textures"]) == len(manifest["files"])
+    for entry in manifest["files"]:
+        assert entry["slug"] and entry["map"] and entry["resolution"]
+    assert (package / "Textures" / "CREDITS.md").exists()
+
+    # And a folder that is not a package says so rather than raising a KeyError.
+    with pytest.raises(roadgen.TextureError):
+        roadgen.texture_manifest(str(tmp_path))
+
+
+def test_the_carla_picture_is_coloured_by_what_carla_will_tag(tmp_path):
+    m = carla_street()
+    report = m.export_carla(tmp_path / "Import")
+    svg = roadgen.render_carla(report["fbx"])
+
+    assert svg.startswith("<svg")
+    ET.fromstring(svg)
+    assert "<title>CARLA (FBX)</title>" in svg
+    assert "nothing to draw" not in svg
+    # The pavements are drawn as pavements, which is the thing that goes wrong.
+    assert "rg-sidewalk" in svg
+    assert "rg-terrain" in svg
+    assert "MoveAssets commandlet" in svg
+
+
+def test_regenerating_a_package_gives_byte_identical_files(tmp_path):
+    m = carla_street()
+    first = m.export_carla(tmp_path / "one")
+    second = m.export_carla(tmp_path / "two")
+    assert (
+        pathlib.Path(first["fbx"]).read_bytes()
+        == pathlib.Path(second["fbx"]).read_bytes()
+    )
+
+
+def test_fetching_textures_reports_every_asset_it_could_not_get(tmp_path):
+    """The failure path, which is the one a catalogue that has moved on will hit.
+
+    Pointed at nothing — a port with no listener — so this says what the fetcher does
+    when it cannot reach Poly Haven, without reaching Poly Haven. Every asset is
+    reported rather than the first: a catalogue has usually moved on for more than one
+    of them, and one run should say so once.
+    """
+    m = carla_street()
+    m.export_carla(tmp_path / "Import")
+    package = tmp_path / "Import" / "Town01"
+
+    manifest_path = package / "Textures" / "polyhaven.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["api"] = "http://127.0.0.1:1"
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(roadgen.TextureError) as raised:
+        roadgen.fetch_textures(str(package))
+    message = str(raised.value)
+    for slug in {entry["slug"] for entry in manifest["files"]}:
+        assert slug in message
+    # And it says where the list it was working from is, because that file is the
+    # thing to edit when an asset has been renamed.
+    assert "polyhaven.json" in message
+
+
+def test_fetching_textures_leaves_alone_what_is_already_there(tmp_path):
+    """Running it twice costs one lookup per asset and no downloads."""
+    m = carla_street()
+    m.export_carla(tmp_path / "Import")
+    package = tmp_path / "Import" / "Town01"
+
+    manifest = roadgen.texture_manifest(str(package))
+    for entry in manifest["files"]:
+        (package / entry["path"]).write_bytes(b"not really a jpeg")
+
+    manifest_path = package / "Textures" / "polyhaven.json"
+    unreachable = json.loads(manifest_path.read_text())
+    unreachable["api"] = "http://127.0.0.1:1"
+    manifest_path.write_text(json.dumps(unreachable))
+
+    # Nothing to do, so nothing is reached for and nothing is raised.
+    assert roadgen.fetch_textures(str(package)) == []
+
+
+def test_carla_sky_refuses_to_run_without_an_engine(tmp_path, monkeypatch):
+    monkeypatch.delenv("CARLA_UNREAL_ENGINE_PATH", raising=False)
+    with pytest.raises(roadgen.CarlaSkyError, match="CARLA_UNREAL_ENGINE_PATH"):
+        roadgen.carla_sky(str(tmp_path), "Pkg", "Town")
+
+
+def test_carla_sky_checks_the_checkout_before_running_anything(tmp_path):
+    engine = tmp_path / "engine"
+    (engine / "Engine" / "Binaries" / "Linux").mkdir(parents=True)
+    (engine / "Engine" / "Binaries" / "Linux" / "UnrealEditor").write_text("")
+    with pytest.raises(roadgen.CarlaSkyError, match="CarlaUnreal.uproject"):
+        roadgen.carla_sky(str(tmp_path / "not-carla"), "Pkg", "Town", engine=str(engine))
+
+
+def test_the_editor_side_sky_script_ships_with_the_package():
+    import roadgen.sky
+
+    assert os.path.exists(roadgen.sky.EDITOR_SCRIPT)
+    with open(roadgen.sky.EDITOR_SCRIPT, encoding="utf-8") as file:
+        text = file.read()
+    # It reads the level and the sun from the environment the caller sets up.
+    for name in ("ROADGEN_LEVEL", "ROADGEN_SUN_ALTITUDE", "ROADGEN_SUN_AZIMUTH"):
+        assert name in text
+
+
+def test_the_package_has_a_sky_command(capsys):
+    import roadgen.__main__ as commands
+
+    assert commands.main([]) == 2
+    with pytest.raises(SystemExit):
+        commands.main(["sky", "--help"])
+    assert "python -m roadgen sky" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        commands.main(["textures", "--help"])
+    assert "python -m roadgen textures" in capsys.readouterr().out
+
+
+def test_a_package_comes_with_the_script_that_imports_it(tmp_path):
+    m = roadgen.Map(name="Scripted")
+    m.add_road(start=(0.0, 0.0, 0.0), end=(100.0, 0.0, 0.0), lanes=[roadgen.Lane(width=3.5)])
+    written = m.export_carla(
+        str(tmp_path), package="ScriptedPkg", carla_root="/opt/carla", engine="/opt/ue5",
+        use_carla_materials=False, sun_altitude=30.0,
+    )
+    script = pathlib.Path(written["script"])
+    assert script == tmp_path / "ScriptedPkg.py"
+    text = script.read_text()
+    assert 'CARLA_ROOT = "/opt/carla"' in text and 'ENGINE = "/opt/ue5"' in text
+    assert 'PACKAGE = "ScriptedPkg"' in text and 'MAP = "Scripted"' in text
+    assert "OWN_TEXTURES = True" in text and "SUN_ALTITUDE = 30" in text
+    # It is Python that compiles, and its help works without CARLA around.
+    compile(text, str(script), "exec")
+    result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True)
+    assert result.returncode == 0 and "--carla" in result.stdout and "--launch" in result.stdout
+    # And with nowhere to import into, it says so rather than doing anything.
+    result = subprocess.run(
+        [sys.executable, str(script), "--carla", str(tmp_path / "nowhere")], capture_output=True, text=True
+    )
+    assert result.returncode != 0 and "CarlaUnreal.uproject" in result.stderr

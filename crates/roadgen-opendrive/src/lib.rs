@@ -81,7 +81,6 @@ use opendrive::lane::width::Width;
 use opendrive::lane::Lane as OdLane;
 use opendrive::object::corner::Corner;
 use opendrive::object::corner_local::CornerLocal;
-use opendrive::object::corner_road::CornerRoad;
 use opendrive::object::lane_validity::LaneValidity;
 use opendrive::object::objects::Objects;
 use opendrive::object::orientation::{ObjectType, Orientation};
@@ -129,7 +128,7 @@ use roadgen_core::validation::ValidatedMap;
 use roadgen_core::GeometryError;
 
 mod error;
-mod road_coordinates;
+pub mod road_coordinates;
 
 pub use error::ExportError;
 pub use road_coordinates::RoadPosition;
@@ -240,9 +239,15 @@ impl Numbering {
         for (index, road) in map.roads.iter().enumerate() {
             roads.insert(road.id.clone(), index.to_string());
         }
+        // Junctions are numbered after the roads rather than from zero, so that no
+        // junction shares a number with a road. The standard keeps the two in
+        // separate spaces, but CARLA does not: a road's successor is taken for a
+        // junction only if no road has that number, so a junction numbered like a
+        // road is a road whose lanes lead nowhere, and every vehicle that reaches
+        // it is a vehicle the traffic manager removes.
         let mut junctions = HashMap::new();
         for (index, junction) in map.junctions.iter().enumerate() {
-            junctions.insert(junction.id.clone(), index.to_string());
+            junctions.insert(junction.id.clone(), (map.roads.len() + index).to_string());
         }
         let mut lanes = HashMap::new();
         for lane in map.lanes.iter() {
@@ -1043,8 +1048,12 @@ impl<'a> Exporter<'a> {
                         additional_data: AdditionalData::default(),
                     }
                 }
-                // A crosswalk has real extent, so it gets an outline: its four
-                // corners, each in the road's own coordinates.
+                // A crosswalk has real extent, so it gets an outline. Its corners are
+                // written the way RoadRunner writes them and CARLA reads them — and
+                // CARLA reads nothing else: `<cornerLocal>` about a pivot at the
+                // crosswalk's centre turned a quarter turn, so that `u` runs across the
+                // road and `v` along it, and the first corner repeated to close the
+                // ring, which is how its tools tell one crosswalk from the next.
                 MapObjectKind::Crosswalk => {
                     let ObjectGeometry::Band { left, right } = &object.geometry else {
                         continue;
@@ -1055,46 +1064,61 @@ impl<'a> Exporter<'a> {
                         right.end_point(),
                         right.start_point(),
                     ];
-                    let corners: Vec<Corner> = ring
+                    let positions: Vec<road_coordinates::RoadPosition> = ring
                         .iter()
                         .filter_map(|point| road_coordinates::locate(self.map, road, *point))
+                        .collect();
+                    let Some(centre) =
+                        road_coordinates::locate(self.map, road, ring[0].lerp(ring[2], 0.5))
+                    else {
+                        continue;
+                    };
+                    if positions.len() != 4 {
+                        continue;
+                    }
+                    // A quarter turn puts `u` along `t`, and `v` back along `s`.
+                    let mut corners: Vec<Corner> = positions
+                        .iter()
                         .map(|position| {
-                            Corner::Road(CornerRoad {
-                                dz: Length::new::<meter>(position.height),
+                            Corner::Local(CornerLocal {
                                 height: Length::new::<meter>(0.0),
                                 id: None,
-                                s: Length::new::<meter>(position.s),
-                                t: Length::new::<meter>(position.t),
+                                u: Length::new::<meter>(position.t - centre.t),
+                                v: Length::new::<meter>(centre.s - position.s),
+                                z: Length::new::<meter>(position.height - centre.height),
                             })
                         })
                         .collect();
+                    corners.push(corners[0].clone());
                     let Ok(choice) = Vec1::try_from_vec(corners) else {
                         continue;
                     };
-                    let centre =
-                        road_coordinates::locate(self.map, road, ring[0].lerp(ring[2], 0.5));
-                    let Some(position) = centre else {
-                        continue;
+                    let extent = |pick: fn(&road_coordinates::RoadPosition) -> f64| {
+                        let values = positions.iter().map(pick);
+                        values.clone().fold(f64::NEG_INFINITY, f64::max)
+                            - values.fold(f64::INFINITY, f64::min)
                     };
                     Object {
                         dynamic: Some(false),
-                        hdg: None,
+                        hdg: Some(Angle::new::<radian>(std::f64::consts::FRAC_PI_2)),
                         height: None,
                         id: self.object_id(&object.id)?.to_owned(),
-                        length: None,
+                        // Length across the road, width along it: the crosswalk's own
+                        // axes, which is how RoadRunner and CARLA spell them.
+                        length: Some(Length::new::<meter>(extent(|p| p.t))),
                         name: Some(object.id.to_string()),
-                        orientation: Some(Orientation::None),
+                        orientation: Some(Orientation::Plus),
                         perp_to_road: None,
                         pitch: None,
                         radius: None,
                         roll: None,
-                        s: Length::new::<meter>(position.s),
+                        s: Length::new::<meter>(centre.s),
                         subtype: None,
-                        t: Length::new::<meter>(position.t),
+                        t: Length::new::<meter>(centre.t),
                         r#type: Some(ObjectType::Crosswalk),
                         valid_length: None,
-                        width: None,
-                        z_offset: Length::new::<meter>(position.height),
+                        width: Some(Length::new::<meter>(extent(|p| p.s))),
+                        z_offset: Length::new::<meter>(centre.height),
                         repeat: Vec::new(),
                         outline: Some(Outline {
                             closed: Some(true),

@@ -1,0 +1,160 @@
+//! The folder CARLA imports, and the file that describes it.
+//!
+//! CARLA's `Util/Tools/Import.py` walks the `Import` directory looking for a `.json`
+//! that names maps and props, and hands each one to Unreal's `ImportAssets`
+//! commandlet. This is that JSON, and the folder around it.
+//!
+//! ```text
+//!   <package>/
+//!   ├── <Package>.json          what Import.py reads
+//!   └── <Map>/
+//!       ├── <Map>.fbx           the surface
+//!       ├── <Map>.xodr          the road network — same name, which CARLA insists on
+//!       ├── <Map>_Props.fbx     the town, when it is exported as props
+//!       └── Textures/
+//!           ├── polyhaven.json  what to fetch, and where each file goes
+//!           ├── CREDITS.md
+//!           └── …               the pictures, once they have been fetched
+//! ```
+//!
+//! The `.fbx` and the `.xodr` share a name because CARLA requires it in three
+//! separate places: `Import.py` pairs them by name when it has to generate a
+//! descriptor itself, it copies the `.xodr` to `Content/<Package>/Maps/<name>/
+//! OpenDrive/<name>.xodr` so the level and its road network agree, and
+//! `UOpenDrive::LoadXODR` finds the file by the level's own name at runtime.
+
+use serde::Serialize;
+
+use crate::materials;
+
+/// The descriptor `Import.py` reads.
+///
+/// Both arrays are always written, empty or not: `ULoadAssetMaterialsCommandlet`
+/// calls `GetArrayField` on each without checking, and a descriptor missing one is a
+/// descriptor that stops the import rather than skipping a step.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Descriptor {
+    pub maps: Vec<MapEntry>,
+    pub props: Vec<PropEntry>,
+}
+
+/// One map: a mesh, the road network under it, and whose materials it wears.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MapEntry {
+    /// The map's name, which is also the name of the `.fbx`, of the `.xodr`, and of
+    /// the level CARLA builds.
+    pub name: String,
+    /// Path to the `.fbx`, relative to the descriptor.
+    pub source: String,
+    /// Whether CARLA replaces the materials in the FBX with its own.
+    ///
+    /// With this on, `UPrepareAssetsForCookingCommandlet` assigns CARLA's asphalt,
+    /// lane paint, kerb, gutter, pavement and ground materials by reading each mesh's
+    /// *name* — so the textures in this package are what the map looks like with it
+    /// off, and what it falls back to for anything CARLA has no material for.
+    pub use_carla_materials: bool,
+    /// Path to the `.xodr`, relative to the descriptor.
+    pub xodr: String,
+}
+
+/// One prop: a mesh imported into a tagged folder, and not placed in any map.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PropEntry {
+    pub name: String,
+    pub source: String,
+    /// CARLA's own size vocabulary, which is what the blueprint library reports.
+    pub size: String,
+    /// The folder under `/Game/<Package>/Static/` the prop is imported into — which
+    /// is, through `ATagger::GetLabelByPath`, its semantic class. This is the one
+    /// place in the whole pipeline where a tag can be *stated* rather than spelled
+    /// into a mesh name.
+    pub tag: String,
+}
+
+impl Descriptor {
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        // Three spaces, which is what `Import.py` writes when it generates one of
+        // these itself. Matching it means a descriptor this crate wrote and one CARLA
+        // wrote diff cleanly against each other.
+        let mut text = serde_json::to_string_pretty(self)?;
+        text.push('\n');
+        Ok(text)
+    }
+}
+
+/// The manifest `roadgen.fetch_textures()` reads.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TextureManifest {
+    /// Where the fetcher gets them from. Written into the file rather than compiled
+    /// into the fetcher so that a package carries its own source.
+    pub api: String,
+    /// The licence every asset listed here is published under.
+    pub license: String,
+    pub files: Vec<materials::Entry>,
+}
+
+impl TextureManifest {
+    pub fn new(files: Vec<materials::Entry>) -> TextureManifest {
+        TextureManifest {
+            api: "https://api.polyhaven.com".to_owned(),
+            license: "CC0-1.0".to_owned(),
+            files,
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        let mut text = serde_json::to_string_pretty(self)?;
+        text.push('\n');
+        Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_descriptor_names_the_fbx_and_the_xodr_the_same() {
+        // CARLA pairs them by name, copies the xodr under the level's name and loads
+        // it back by that name. Three places, one rule.
+        let descriptor = Descriptor {
+            maps: vec![MapEntry {
+                name: "Town01".into(),
+                source: "./Town01/Town01.fbx".into(),
+                use_carla_materials: true,
+                xodr: "./Town01/Town01.xodr".into(),
+            }],
+            props: Vec::new(),
+        };
+        let json = descriptor.to_json().unwrap();
+        assert!(json.contains("\"name\": \"Town01\""));
+        assert!(json.contains("Town01.fbx"));
+        assert!(json.contains("Town01.xodr"));
+    }
+
+    #[test]
+    fn a_descriptor_always_writes_both_arrays() {
+        // `GetArrayField("props")` is called without checking, so a descriptor
+        // missing the key stops the import rather than skipping the props.
+        let json = Descriptor {
+            maps: Vec::new(),
+            props: Vec::new(),
+        }
+        .to_json()
+        .unwrap();
+        assert!(json.contains("\"maps\""));
+        assert!(json.contains("\"props\""));
+    }
+
+    #[test]
+    fn a_prop_states_its_tag_rather_than_spelling_it_into_a_name() {
+        let entry = PropEntry {
+            name: "Town01_Buildings".into(),
+            source: "./Town01/Town01_Props.fbx".into(),
+            size: "huge".into(),
+            tag: "Building".into(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"tag\":\"Building\""));
+    }
+}

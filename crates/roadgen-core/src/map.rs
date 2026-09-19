@@ -11,7 +11,9 @@ use std::collections::HashSet;
 use crate::arena::Arena;
 use crate::buildings::{Building, BuildingPart};
 use crate::error::GeometryError;
-use crate::geometry::{Curve3, Point3, Poly3Profile, Polyline3, SamplingConfig, WidthProfile};
+use crate::geometry::{
+    Curve3, Frame3, Point3, Poly3Profile, Polyline3, SamplingConfig, WidthProfile,
+};
 use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
 use crate::topology::{
@@ -236,6 +238,28 @@ impl Road {
         };
         Ok((start, end))
     }
+
+    /// The index of the section `station` falls in, or `None` off the road's ends.
+    pub fn section_at(&self, station: f64) -> Option<usize> {
+        (0..self.sections.len()).find(|&index| {
+            self.section_range(index)
+                .is_ok_and(|(start, end)| station >= start && station <= end)
+        })
+    }
+
+    /// The road's frame at `station`, banked by its superelevation there: the
+    /// frame a cross-section is laid out in, with its lateral axis along the
+    /// road's surface rather than the horizontal.
+    pub fn frame_at(
+        &self,
+        station: f64,
+        sampling: SamplingConfig,
+    ) -> Result<Frame3, GeometryError> {
+        let sample = self.reference_line.sample_at(station, sampling)?;
+        Ok(sample
+            .frame()?
+            .banked(self.superelevation.evaluate(station)))
+    }
 }
 
 /// One lane of one road.
@@ -303,22 +327,27 @@ impl Lane {
         self.width.evaluate(station).metres()
     }
 
+    /// The station of one end of the lane.
+    pub fn station_at_end(&self, end: LaneEnd) -> f64 {
+        match end {
+            LaneEnd::Start => self.station_range.0,
+            LaneEnd::End => self.station_range.1,
+        }
+    }
+
+    /// How wide the lane is at one of its ends.
+    pub fn width_at_end(&self, end: LaneEnd) -> f64 {
+        self.width_at(self.station_at_end(end))
+    }
+
     /// How wide the lane is where traffic enters it.
     pub fn entry_width(&self) -> f64 {
-        let (start, end) = self.station_range;
-        self.width_at(match self.direction {
-            Direction::Forward => start,
-            Direction::Backward => end,
-        })
+        self.width_at_end(self.direction.entry_end())
     }
 
     /// How wide the lane is where traffic leaves it.
     pub fn exit_width(&self) -> f64 {
-        let (start, end) = self.station_range;
-        self.width_at(match self.direction {
-            Direction::Forward => end,
-            Direction::Backward => start,
-        })
+        self.width_at_end(self.direction.exit_end())
     }
 
     /// The lane's endpoint on its reference line, by reference-line end.

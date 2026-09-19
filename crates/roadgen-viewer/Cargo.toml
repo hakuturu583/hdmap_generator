@@ -22,3 +22,7 @@ serde_json.workspace = true
 # back the way a consumer would. So the viewer borrows it rather than describing the
 # document a second time.
 roadgen-gpudrive.workspace = true
+# The CARLA exporter's own classifier, so a mesh is coloured here by exactly the rule
+# that will tag it in the simulator. Borrowed for the same reason the GPUDrive model
+# is: describing the rule a second time would be two chances to disagree with CARLA.
+roadgen-carla.workspace = true

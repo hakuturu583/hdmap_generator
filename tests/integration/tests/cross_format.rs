@@ -229,30 +229,51 @@ fn both_formats_put_the_lanes_in_the_same_place() {
 }
 
 #[test]
-fn a_kink_between_two_roads_is_the_one_place_the_formats_differ() {
-    // Where two roads meet at an angle, their lane boundaries can either meet or
-    // follow the reference lines — not both. The IR mitres the joint so that the
-    // boundaries meet, because Lanelet2 expresses continuity through shared points
-    // and would otherwise lose the connection. OpenDRIVE builds lane boundaries from
-    // the reference line and a width, and has no way to say the same thing, so it
-    // keeps the unmitred corner.
+fn two_roads_that_meet_at_an_angle_are_rounded_so_the_formats_agree() {
+    // Where two roads meet at an angle, their lane boundaries could either meet or
+    // follow the reference lines — not both, and OpenDRIVE can only do the latter.
+    // So the generator does not keep the corner: it cuts each road back a little and
+    // joins them with an arc tangent to both, half on each road. After that the
+    // reference lines are tangent-continuous and every format lands on the same
+    // vertices, kink or no kink.
     let map = scenarios::two_roads_joined();
     let worst = largest_centerline_disagreement(&map);
+    assert!(worst < 1e-6, "the two formats disagree by {worst} m");
+    lanelet2_agrees_with_the_ir(&map);
 
-    // The disagreement is confined to the mitre, and bounded by it: half a lane's
-    // width against a 26.6-degree change of heading.
-    assert!(worst > 1e-6, "there should be a difference to explain");
+    // The joint is where the arc is, and the two halves meet along one tangent.
+    let a = map.road(&RoadId::new("a")).unwrap();
+    let b = map.road(&RoadId::new("b")).unwrap();
     assert!(
-        worst < 0.45,
-        "the difference is {worst} m, more than a mitre"
+        matches!(&a.reference_line, Curve3::Composite(pieces) if matches!(pieces.last(), Some(Curve3::Arc(_)))),
+        "road a should end on an arc, not {:?}",
+        a.reference_line
+    );
+    assert!(
+        matches!(&b.reference_line, Curve3::Composite(pieces) if matches!(pieces.first(), Some(Curve3::Arc(_)))),
+        "road b should start on an arc, not {:?}",
+        b.reference_line
+    );
+    let leaving = a.reference_line.end_tangent().unwrap();
+    let arriving = b.reference_line.start_tangent().unwrap();
+    assert!(
+        leaving.dot(arriving) > 1.0 - 1e-9,
+        "the roads still meet at an angle: {leaving:?} vs {arriving:?}"
     );
 
-    // Away from the joint the two agree exactly: the first vertex of the first road
-    // is not a joint, and neither is the last vertex of the second.
+    // Away from the joint nothing moved: the first vertex of the first road is not
+    // a joint, and neither is the last vertex of the second.
     let document = reparse_opendrive(&map);
     let first = RoadEvaluator::find(&document, "0").unwrap();
     let lane = map.lane(&LaneId::of_road(&RoadId::new("a"), 0)).unwrap();
     let start = lane.centerline.start_point();
+    assert!(
+        a.reference_line
+            .start_point()
+            .is_close(Point3::new(0.0, 0.0, 10.0), 1e-9),
+        "road a's start moved to {:?}",
+        a.reference_line.start_point()
+    );
     let from_opendrive = first.lane_center(-1, 0.0).unwrap();
     assert!(
         from_opendrive.distance_to(Position {
@@ -261,6 +282,10 @@ fn a_kink_between_two_roads_is_the_one_place_the_formats_differ() {
             z: start.z
         }) < 1e-9
     );
+    assert!(b
+        .reference_line
+        .end_point()
+        .is_close(Point3::new(200.0, 50.0, 15.0), 1e-9));
 
     // The connection itself still holds in both: Lanelet2 finds both movements.
     assert_eq!(routing_edges(&reload_lanelet2(&map)), map.connections.len());

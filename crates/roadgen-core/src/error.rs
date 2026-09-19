@@ -89,6 +89,13 @@ pub enum BuildError {
         road: RoadId,
         detail: String,
     },
+    /// Two roads meet at an angle the generator cannot round into an arc.
+    CornerTooSharp {
+        from: RoadId,
+        to: RoadId,
+        angle_degrees: f64,
+        detail: String,
+    },
 }
 
 impl From<GeometryError> for BuildError {
@@ -123,6 +130,17 @@ impl fmt::Display for BuildError {
             BuildError::ConflictingRoadLink { road, detail } => {
                 write!(f, "conflicting link on road {road}: {detail}")
             }
+            BuildError::CornerTooSharp {
+                from,
+                to,
+                angle_degrees,
+                detail,
+            } => write!(
+                f,
+                "roads {from} and {to} meet at {angle_degrees:.1}° and the corner cannot be \
+                 rounded: {detail}. Join them with an arc or spiral alignment, or through \
+                 a junction"
+            ),
         }
     }
 }

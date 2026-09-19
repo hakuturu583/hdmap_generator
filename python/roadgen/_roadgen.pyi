@@ -1,6 +1,6 @@
 """Type stubs for the Rust extension module."""
 
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 __version__: str
 
@@ -137,6 +137,16 @@ class Map:
     def format_warnings(self) -> list[str]: ...
     def clipgt_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def gpudrive_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
+    def carla_warnings(
+        self,
+        name: Optional[str] = None,
+        package: Optional[str] = None,
+        buildings: Optional[str] = None,
+        use_carla_materials: Optional[bool] = None,
+        kerb_height: Optional[float] = None,
+        verge_width: Optional[float] = None,
+        ground_extent: Optional[float] = None,
+    ) -> list[str]: ...
     def osm_warnings(self) -> list[str]: ...
     def sumo_warnings(self) -> list[str]: ...
     def sumo_lane_ids(self) -> list[tuple[str, str]]: ...
@@ -164,6 +174,21 @@ class Map:
         speed: Optional[float] = None,
         route: Optional[Sequence[str]] = None,
     ) -> None: ...
+    def export_carla(
+        self,
+        directory: str,
+        name: Optional[str] = None,
+        package: Optional[str] = None,
+        buildings: Optional[str] = None,
+        use_carla_materials: Optional[bool] = None,
+        kerb_height: Optional[float] = None,
+        verge_width: Optional[float] = None,
+        ground_extent: Optional[float] = None,
+        carla_root: Optional[str] = None,
+        engine: Optional[str] = None,
+        sun_altitude: Optional[float] = None,
+        sun_azimuth: Optional[float] = None,
+    ) -> dict[str, Any]: ...
     def to_gpudrive_json(
         self,
         scenario: Optional[str] = None,
@@ -216,3 +241,10 @@ def render_clipgt(directory: str) -> str:
 
 def render_gpudrive(path: str) -> str:
     """The GPUDrive scene at `path`, drawn as an SVG document."""
+
+def render_carla(path: str) -> str:
+    """The FBX at `path`, drawn as an SVG document.
+
+    Coloured by the semantic class CARLA will give each mesh, worked out from the
+    mesh's name the way CARLA works it out.
+    """

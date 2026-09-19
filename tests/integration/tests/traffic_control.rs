@@ -155,36 +155,39 @@ fn a_crosswalk_becomes_an_object_with_its_four_corners() {
 
     let outline = crosswalk.outline.as_ref().expect("with an outline");
     assert_eq!(outline.closed, Some(true));
-    assert_eq!(outline.choice.len(), 4);
-
-    // The corners are in the road's own coordinates, spanning its full width and the
-    // crosswalk's own depth along it.
+    // Four corners and the first again: the way RoadRunner writes a crosswalk and
+    // the only way CARLA reads one — `cornerLocal` about a pivot at the crossing's
+    // centre, turned a quarter turn so that `u` runs across the road and `v` along
+    // it, closed by repeating the first corner.
+    assert_eq!(outline.choice.len(), 5);
+    assert!((crosswalk.hdg.unwrap().value - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
     let corners: Vec<(f64, f64)> = outline
         .choice
         .iter()
         .map(|corner| match corner {
-            opendrive::object::corner::Corner::Road(road) => (road.s.value, road.t.value),
-            _ => panic!("corners are given in road coordinates"),
+            opendrive::object::corner::Corner::Local(local) => (local.u.value, local.v.value),
+            _ => panic!("corners are given about the crosswalk's pivot"),
         })
         .collect();
-    let across = corners
-        .iter()
-        .map(|(_, t)| *t)
-        .fold(f64::NEG_INFINITY, f64::max)
-        - corners
-            .iter()
-            .map(|(_, t)| *t)
-            .fold(f64::INFINITY, f64::min);
-    assert!((across - 7.0).abs() < 1e-3, "across {across} m");
-    let along = corners
-        .iter()
-        .map(|(s, _)| *s)
-        .fold(f64::NEG_INFINITY, f64::max)
-        - corners
-            .iter()
-            .map(|(s, _)| *s)
-            .fold(f64::INFINITY, f64::min);
-    assert!((along - 4.0).abs() < 1e-3, "along {along} m");
+    assert_eq!(corners[0], corners[4]);
+    let span = |pick: fn(&(f64, f64)) -> f64| {
+        corners.iter().map(pick).fold(f64::NEG_INFINITY, f64::max)
+            - corners.iter().map(pick).fold(f64::INFINITY, f64::min)
+    };
+    // `u` spans the road's full width, `v` the crossing's own depth along it — and
+    // the object says the same as `length` and `width`.
+    assert!(
+        (span(|c| c.0) - 7.0).abs() < 1e-3,
+        "across {} m",
+        span(|c| c.0)
+    );
+    assert!(
+        (span(|c| c.1) - 4.0).abs() < 1e-3,
+        "along {} m",
+        span(|c| c.1)
+    );
+    assert!((crosswalk.length.unwrap().value - 7.0).abs() < 1e-3);
+    assert!((crosswalk.width.unwrap().value - 4.0).abs() < 1e-3);
 }
 
 #[test]

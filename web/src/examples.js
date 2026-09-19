@@ -1,8 +1,8 @@
 // The scripts the page starts you off with.
 //
 // Every one of them exports every format. That is not for completeness: the point of
-// the page is that one description becomes six files, so an example that wrote only
-// one would be hiding the thing it is meant to show.
+// the page is that one description becomes seven exports, so an example that wrote
+// only one would be hiding the thing it is meant to show.
 
 export const examples = [
   {
@@ -38,8 +38,14 @@ m.export_osm("openstreetmap.osm")
 m.export_sumo("sumo/")
 m.export_clipgt("clip/")
 m.export_gpudrive("scene.json")
+m.export_carla("Import/", name="Town01")
 
 print("lanes:", ", ".join(m.lane_ids()))
+
+# CARLA works out what a mesh *means* from its name, so the one thing
+# worth reading before importing a package is what it will get wrong.
+for warning in m.carla_warnings(name="Town01"):
+    print("carla:", warning)
 `,
   },
   {
@@ -89,6 +95,7 @@ m.export_osm("openstreetmap.osm")
 m.export_sumo("sumo/")
 m.export_clipgt("clip/")
 m.export_gpudrive("scene.json")
+m.export_carla("Import/", name="Town01")
 `,
   },
   {
@@ -128,6 +135,7 @@ m.export_osm("openstreetmap.osm")
 m.export_sumo("sumo/")
 m.export_clipgt("clip/")
 m.export_gpudrive("scene.json")
+m.export_carla("Import/", name="Town01")
 
 # The pictures are plan views, so the climb and the banking are in the files
 # rather than on the screen. This is where they went:
@@ -171,6 +179,7 @@ m.export_osm("openstreetmap.osm")
 m.export_sumo("sumo/")
 m.export_clipgt("clip/")
 m.export_gpudrive("scene.json")
+m.export_carla("Import/", name="Town01")
 
 for warning in m.format_warnings():
     print("note:", warning)
@@ -232,6 +241,7 @@ m.export_osm("openstreetmap.osm")
 m.export_sumo("sumo/")
 m.export_clipgt("clip/")
 m.export_gpudrive("scene.json")
+m.export_carla("Import/", name="Town01")
 
 # What came out is solid, not flat: a building is made of parts, and each
 # part has an outline, walls and a roof. building_shell() hands back the
@@ -245,12 +255,20 @@ for part in parts:
 print("roofs:", roofs)
 print("the first part is bounded by", len(m.building_shell(parts[0])), "faces")
 
-# Only two of the six have anywhere to put a building: OpenStreetMap, as
-# Simple 3D Buildings ways, and OpenDRIVE, as objects with an outline per
-# part. The OpenDRIVE panel is the one that draws them.
+# Three of the seven have anywhere to put a building: OpenStreetMap, as
+# Simple 3D Buildings ways; OpenDRIVE, as objects with an outline per part;
+# and CARLA, as actual walls and roofs. The OpenDRIVE panel draws them in
+# plan, and the CARLA panel draws what the simulator will see.
 for warning in m.sumo_warnings():
     if "buildings" in warning:
         print("note:", warning)
+
+# CARLA's map import knows six mesh names and none of them is a building,
+# so a town inside a map's FBX is tagged as ground. It stands in the level
+# either way; the report is where the trade is said out loud.
+for warning in m.carla_warnings(name="Town01"):
+    if "buildings" in warning:
+        print("carla:", warning)
 `,
   },
 ]
