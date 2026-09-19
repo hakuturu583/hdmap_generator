@@ -632,18 +632,17 @@ impl<'a> Layout<'a> {
             let (cut, rise) = edges[side];
             // Outwards: to the left on the left side, the right on the right.
             let sign = if side == 0 { 1.0 } else { -1.0 };
-            let (rail, toe): (Vec<Point3>, Vec<Point3>) = rungs
-                .iter()
-                .map(|rung| {
-                    let edge = self.cuts(rung.station)[cut];
-                    let rail_rise = if land[side] { rise } else { 0.0 };
-                    (rung.at(edge, rail_rise), rung.at(edge + sign * width, 0.0))
-                })
-                .unzip();
-            if land[side] {
-                return crate::terrain::Flank { rail, toe };
+            let rail_rise = if land[side] { rise } else { 0.0 };
+            let mut rail = Vec::with_capacity(rungs.len());
+            let mut toe = Vec::with_capacity(if land[side] { rungs.len() } else { 0 });
+            for rung in rungs {
+                let edge = self.cuts(rung.station)[cut];
+                rail.push(rung.at(edge, rail_rise));
+                if land[side] {
+                    toe.push(rung.at(edge + sign * width, 0.0));
+                }
             }
-            if rise > 0.0 {
+            if !land[side] && rise > 0.0 {
                 // The kerb face, anticlockwise seen from the junction: the low
                 // rail on the outside of the face.
                 let (low, high) = if side == 0 { (0.0, rise) } else { (rise, 0.0) };
@@ -660,10 +659,7 @@ impl<'a> Layout<'a> {
                     out,
                 );
             }
-            crate::terrain::Flank {
-                rail,
-                toe: Vec::new(),
-            }
+            crate::terrain::Flank { rail, toe }
         });
         Some(flanks)
     }

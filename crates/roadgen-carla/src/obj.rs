@@ -57,12 +57,7 @@ pub fn document(meshes: &[Mesh], map: &Map) -> String {
             right.end_point(),
             right.start_point(),
         ];
-        out.object(
-            &object.id.to_string(),
-            &corners,
-            &[[0, 1, 2], [0, 2, 3]],
-            "crosswalk",
-        );
+        out.object(&object.id, &corners, &[[0, 1, 2], [0, 2, 3]], "crosswalk");
     }
     out.text
 }
@@ -76,7 +71,13 @@ struct Writer {
 
 impl Writer {
     /// One object: its vertices, then its material, then its faces.
-    fn object(&mut self, name: &str, positions: &[Point3], triangles: &[[u32; 3]], material: &str) {
+    fn object(
+        &mut self,
+        name: impl std::fmt::Display,
+        positions: &[Point3],
+        triangles: &[[u32; 3]],
+        material: &str,
+    ) {
         let _ = writeln!(self.text, "o {name}");
         let first = self.vertices + 1;
         for point in positions {

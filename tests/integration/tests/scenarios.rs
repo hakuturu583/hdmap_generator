@@ -190,16 +190,6 @@ fn a_road_that_splits() {
         .map(|connection| connection.incoming_road.clone())
         .collect();
     assert_eq!(incoming[0], incoming[1]);
-    // The junction's number is no road's number. The standard keeps the two
-    // spaces apart, but CARLA tells a road's successor apart from a junction by
-    // whether a road has that number — and a junction numbered like a road is a
-    // road whose lanes lead nowhere.
-    let road_ids: Vec<&str> = document.road.iter().map(|road| road.id.as_str()).collect();
-    assert!(
-        !road_ids.contains(&document.junction[0].id.as_str()),
-        "junction {} is numbered like a road",
-        document.junction[0].id
-    );
 
     // And Lanelet2 routes through both, two hops each.
     assert_eq!(routing_edges(&reload_lanelet2(&map)), 4);

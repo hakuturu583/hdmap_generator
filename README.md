@@ -1039,11 +1039,13 @@ round a tight corner folds over itself, and a lidar return or a wheel finds ever
 seam. A road through a junction has land on one side of it at most — the side that
 faces away from the junction — and a raised pavement facing the junction gets a kerb
 face down to the road level instead, which the land meets at the foot. And a vertex
-of the land goes in only where it really is a verge's width from every road's edge,
-which is the one rule that keeps ledges out of it: the toe of a verge on the inside
-of a bend tighter than the verge is wide, or pushed out from a road in a junction
-into the pavement round the corner, is nearer than that to some edge and is left
-out. The land is tagged `Terrain` and is the one mesh of that class.
+of the land goes in only where it really is a verge's width from every road's edge
+— for a toe, every edge but the two chords of its own rail it stands on — which is
+the one rule that keeps ledges out of it: the toe of a verge on the inside of a bend
+tighter than the verge is wide has folded back over the rest of its rail, and one
+pushed out from a road in a junction lands beside the pavement round the corner;
+either is nearer than a verge to some edge and is left out. The land is tagged
+`Terrain` and is the one mesh of that class.
 
 ### Pedestrians
 

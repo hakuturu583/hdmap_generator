@@ -174,6 +174,16 @@ fn a_junction_becomes_a_junction_element() {
         .filter(|road| road.junction != "-1")
         .count();
     assert_eq!(connectors, 2);
+
+    // And the junction's number is no road's number. The standard keeps the two
+    // spaces apart, but CARLA tells a road's successor apart from a junction by
+    // whether a road has that number, and a junction numbered like a road is a
+    // road whose lanes lead nowhere.
+    assert!(
+        parsed.road.iter().all(|road| road.id != element.id),
+        "junction {} is numbered like a road",
+        element.id
+    );
 }
 
 /// A junction with two roads in a row, under the given handedness.

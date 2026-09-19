@@ -1591,11 +1591,11 @@ impl Generator {
                 let Some(RoadLinkTarget::Junction(junction)) = draft.link.at(end) else {
                     continue;
                 };
-                let outward = horizontal(-into_joint(&draft.spec.reference_line, end)?)?;
+                let outward = -into_joint(&draft.spec.reference_line, end)?;
                 arms_of.entry(junction.clone()).or_default().push((
                     draft.id.clone(),
                     end,
-                    outward.heading(),
+                    outward.y.atan2(outward.x),
                 ));
             }
         }
@@ -1744,20 +1744,17 @@ impl Generator {
         // own terms: a road's start is left against its direction and entered
         // along it. The sign says whether the new road runs with the lane's
         // reference line there (`+1`) or against it.
-        let start = endpoint(&from_lane.centerline, from_end);
+        let start = from_lane.endpoint(from_end.as_lane_end());
         let start_tangent = horizontal(into_joint(&from_lane.centerline, from_end)?)?;
-        let end = endpoint(&to_lane.centerline, to_end);
+        let end = to_lane.endpoint(to_end.as_lane_end());
         let end_tangent = horizontal(into_joint(&to_lane.centerline, to_end)?)?.reversed();
         let sign = |end: RoadEnd| match end {
             RoadEnd::End => 1.0,
             RoadEnd::Start => -1.0,
         };
         let (start_sign, end_sign) = (sign(from_end), -sign(to_end));
-        let width_at = |lane: &Lane, end: RoadEnd| match end {
-            RoadEnd::Start => lane.width_at(lane.station_range.0),
-            RoadEnd::End => lane.width_at(lane.station_range.1),
-        };
-        let (start_width, end_width) = (width_at(from_lane, from_end), width_at(to_lane, to_end));
+        let start_width = from_lane.width_at_end(from_end.as_lane_end());
+        let end_width = to_lane.width_at_end(to_end.as_lane_end());
 
         // The connector is realised at the map's resolution, which is fixed into the
         // curve: a Bézier's length is its vertices walked end to end, so the
@@ -1901,10 +1898,7 @@ impl Generator {
                     // Height is measured away from the road surface, not straight up:
                     // that is what "five metres above the road" means on a slope, and
                     // it is the quantity OpenDRIVE's `zOffset` carries.
-                    let station = match end {
-                        LaneEnd::Start => lane.station_range.0,
-                        LaneEnd::End => lane.station_range.1,
-                    };
+                    let station = lane.station_at_end(end);
                     let up = self
                         .map
                         .road(&lane.road)

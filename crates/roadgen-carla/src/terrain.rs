@@ -23,17 +23,17 @@
 //! everything else is one surface.
 //!
 //! A toe or a grid vertex goes in only where it really is a verge's width from
-//! every road's edge. That one test is what keeps the land off the roads and free
-//! of ledges: a toe on the inside of a bend tighter than the verge is wide has
-//! folded back over its own rail and is nearer than a verge to it; a toe pushed
-//! out from a road in a junction lands beside the next road, or the pavement round
-//! the corner, and is nearer than a verge to that; a grid vertex just past a kerb
-//! would make the slope down from it a step.
+//! every road's edge — for a toe, every edge but the two chords of its own rail
+//! it was pushed out from. That one test is what keeps the land off the roads and
+//! free of ledges: a toe on the inside of a bend tighter than the verge is wide
+//! has folded back over its own rail and is nearer than a verge to the rest of
+//! it; a toe pushed out from a road in a junction lands beside the next road, or
+//! the pavement round the corner, and is nearer than a verge to that; a grid
+//! vertex just past a kerb would make the slope down from it a step.
 
 use std::collections::HashMap;
 
 use roadgen_core::geometry::Point3;
-use spade::handles::FixedVertexHandle;
 use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation};
 
 use crate::ground::Field;
@@ -54,39 +54,53 @@ pub struct Flank {
     pub toe: Vec<Point3>,
 }
 
-/// What the land is built round: every road section's two flanks and its outline.
+/// One road section as the land sees it: its outline and the toes beside it.
+struct Section {
+    /// The outline, closed: the left rail, then the right rail back. Every edge
+    /// of it is a constraint the land's triangles do not cross.
+    ring: Vec<Point3>,
+    /// The toes, each with the index of the ring vertex it was pushed out from.
+    toes: Vec<(usize, Point3)>,
+    /// The outline in plan, which the land is cut out of.
+    footprint: Polygon,
+}
+
+/// What the land is built round: every road section's outline.
 #[derive(Default)]
 pub struct Land {
-    flanks: Vec<Flank>,
-    /// Each section's outline in plan, which the land is cut out of.
-    footprints: Vec<Polygon>,
-    /// The cut across each section's two ends, from one rail to the other, which
-    /// closes its outline.
-    ends: Vec<[Point3; 2]>,
+    sections: Vec<Section>,
 }
 
 impl Land {
-    /// Adds one road section: its left and right flanks, whose rails also bound
-    /// its footprint.
+    /// Adds one road section from its left and right flanks.
     pub fn section(&mut self, left: Flank, right: Flank) {
-        let outline = left
+        let ring: Vec<Point3> = left
             .rail
             .iter()
             .chain(right.rail.iter().rev())
-            .map(|point| [point.x, point.y])
+            .copied()
             .collect();
-        self.footprints.push(Polygon::new(outline));
-        if let (Some(&a), Some(&b), Some(&c), Some(&d)) = (
-            left.rail.first(),
-            right.rail.first(),
-            left.rail.last(),
-            right.rail.last(),
-        ) {
-            self.ends.push([a, b]);
-            self.ends.push([c, d]);
-        }
-        self.flanks.push(left);
-        self.flanks.push(right);
+        // The right rail runs backwards round the ring, so its vertex `k` is the
+        // ring's last but `k`.
+        let last = ring.len() - 1;
+        let toes = left
+            .toe
+            .into_iter()
+            .enumerate()
+            .chain(
+                right
+                    .toe
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, toe)| (last - index, toe)),
+            )
+            .collect();
+        let footprint = Polygon::new(ring.iter().map(|point| [point.x, point.y]).collect());
+        self.sections.push(Section {
+            ring,
+            toes,
+            footprint,
+        });
     }
 
     /// The land as one mesh, tagged as terrain, with the ground's height `verge`
@@ -98,82 +112,82 @@ impl Land {
         map_name: &str,
         ordinals: &mut Ordinals,
     ) -> Option<Mesh> {
-        if self.flanks.is_empty() {
+        if self.sections.is_empty() {
             return None;
         }
-        let roads = Index::new(&self.footprints);
-        // A verge's width, less a hair for a toe's own rail: a toe stands exactly a
-        // verge from the rung it was pushed out from, and a little less from the
-        // chord to the next rung on a bend.
-        let reach = verge.max(0.0) * 0.99;
-        let rails = Rails::new(self.flanks.iter().map(|flank| flank.rail.as_slice()), reach);
-        let free =
-            |point: &Point3| !roads.contains(point.x, point.y) && !rails.within(point.x, point.y);
+        let footprints: Vec<&Polygon> = self.sections.iter().map(|s| &s.footprint).collect();
+        let roads = Index::new(&footprints);
+        let edges = Edges::new(&self.sections, verge.max(0.0));
 
-        // The free points first, in bulk, and the rails inserted after them, so
-        // that a rail that lands on the same spot as a grid or toe point keeps its
-        // own height: the road's edge is the one height here that is not
-        // negotiable.
+        // The free points first, in bulk, and the outlines inserted after them,
+        // so that an outline vertex that lands on the same spot as a grid or toe
+        // point keeps its own height: the road's edge is the one height here that
+        // is not negotiable.
         let mut points: Vec<Vertex> = Vec::new();
         if let Some(field) = field {
-            points.extend(field.vertices().filter(free).map(Vertex));
+            points.extend(
+                field
+                    .vertices()
+                    .filter(|point| !roads.contains(point.x, point.y) && !edges.within(point, None))
+                    .map(Vertex::free),
+            );
         }
-        for flank in &self.flanks {
-            points.extend(flank.toe.iter().filter(|point| free(point)).map(|point| {
-                let z = field.map_or(point.z, |field| field.height(point.x, point.y));
-                Vertex(Point3::new(point.x, point.y, z))
-            }));
+        for (index, section) in self.sections.iter().enumerate() {
+            for &(vertex, toe) in &section.toes {
+                if roads.contains(toe.x, toe.y) || edges.within(&toe, Some((index, vertex))) {
+                    continue;
+                }
+                let z = field.map_or(toe.z, |field| field.height(toe.x, toe.y));
+                points.push(Vertex::free(Point3::new(toe.x, toe.y, z)));
+            }
         }
         let mut cdt: ConstrainedDelaunayTriangulation<Vertex> =
             ConstrainedDelaunayTriangulation::bulk_load(points).ok()?;
-        let rails = self
-            .flanks
-            .iter()
-            .map(|flank| flank.rail.as_slice())
-            .chain(self.ends.iter().map(|end| end.as_slice()));
-        for rail in rails {
-            let mut previous: Option<(FixedVertexHandle, Point3)> = None;
-            for &point in rail {
-                let Ok(handle) = cdt.insert(Vertex(point)) else {
-                    continue;
-                };
-                if let Some((from, start)) = previous {
-                    if from != handle {
-                        // Rails of different roads cross inside a junction; where
-                        // they do, both are split at the crossing, which takes the
-                        // height of the rail being added at that point.
-                        cdt.add_constraint_and_split(from, handle, |at| {
-                            let along = point - start;
-                            let run = along.x * along.x + along.y * along.y;
-                            let t = if run < 1e-24 {
-                                0.0
-                            } else {
-                                ((at.x - start.x) * along.x + (at.y - start.y) * along.y) / run
-                            };
-                            Vertex(Point3::new(
-                                at.x,
-                                at.y,
-                                start.lerp(point, t.clamp(0.0, 1.0)).z,
-                            ))
-                        });
-                    }
+        for section in &self.sections {
+            let mut handles = Vec::with_capacity(section.ring.len());
+            for &point in &section.ring {
+                if let Ok(handle) = cdt.insert(Vertex::on_road(point)) {
+                    handles.push((handle, point));
                 }
-                previous = Some((handle, point));
+            }
+            for pair in handles.windows(2).chain(
+                handles
+                    .last()
+                    .zip(handles.first())
+                    .map(|(a, b)| [*a, *b])
+                    .as_ref()
+                    .map(|end| end.as_slice()),
+            ) {
+                let ((from, start), (to, end)) = (pair[0], pair[1]);
+                if from == to {
+                    continue;
+                }
+                // Outlines of different roads cross inside a junction; where they
+                // do, both are split at the crossing, which takes the height of
+                // the outline being added at that point.
+                cdt.add_constraint_and_split(from, to, |at| {
+                    let t = fraction_along(start, end, [at.x, at.y]);
+                    Vertex::on_road(Point3::new(at.x, at.y, start.lerp(end, t).z))
+                });
             }
         }
 
         // Every triangle outside the roads, with the vertices it needs and no other.
+        // A triangle with a free corner is outside every road already: a free
+        // point is, and no triangle crosses an outline.
         let mut positions = Vec::with_capacity(cdt.num_vertices());
         let mut renumbered = vec![u32::MAX; cdt.num_vertices()];
         let mut triangles = Vec::with_capacity(cdt.num_inner_faces());
         for face in cdt.inner_faces() {
             let corners = face.vertices();
-            let centre = corners.iter().fold([0.0, 0.0], |sum, corner| {
-                let at = corner.position();
-                [sum[0] + at.x / 3.0, sum[1] + at.y / 3.0]
-            });
-            if roads.contains(centre[0], centre[1]) {
-                continue;
+            if corners.iter().all(|corner| corner.data().on_road) {
+                let centre = corners.iter().fold([0.0, 0.0], |sum, corner| {
+                    let at = corner.position();
+                    [sum[0] + at.x / 3.0, sum[1] + at.y / 3.0]
+                });
+                if roads.contains(centre[0], centre[1]) {
+                    continue;
+                }
             }
             // Spade winds an inner face anticlockwise in the plane, which is
             // anticlockwise seen from above: the face is up.
@@ -181,7 +195,7 @@ impl Land {
                 let slot = &mut renumbered[corner.fix().index()];
                 if *slot == u32::MAX {
                     *slot = positions.len() as u32;
-                    positions.push(corner.data().0);
+                    positions.push(corner.data().at);
                 }
                 *slot
             });
@@ -200,14 +214,39 @@ impl Land {
     }
 }
 
+/// How far along the segment `a..b` the point `p` falls, in plan, clamped to the
+/// segment: `0` at `a`, `1` at `b`.
+fn fraction_along(a: Point3, b: Point3, p: [f64; 2]) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let length = dx * dx + dy * dy;
+    if length < 1e-18 {
+        return 0.0;
+    }
+    (((p[0] - a.x) * dx + (p[1] - a.y) * dy) / length).clamp(0.0, 1.0)
+}
+
 /// A point of the land, as spade sees it: its plan position is the vertex.
-struct Vertex(Point3);
+struct Vertex {
+    at: Point3,
+    /// On a road's outline, as against free on the land.
+    on_road: bool,
+}
+
+impl Vertex {
+    fn free(at: Point3) -> Vertex {
+        Vertex { at, on_road: false }
+    }
+
+    fn on_road(at: Point3) -> Vertex {
+        Vertex { at, on_road: true }
+    }
+}
 
 impl HasPosition for Vertex {
     type Scalar = f64;
 
     fn position(&self) -> Point2<f64> {
-        Point2::new(self.0.x, self.0.y)
+        Point2::new(self.at.x, self.at.y)
     }
 }
 
@@ -305,64 +344,82 @@ impl<T> Buckets<T> {
     }
 }
 
-/// One straight piece of a rail, in plan.
-type Segment = ([f64; 2], [f64; 2]);
+/// One edge of a section's outline, in plan, with the section and the two ring
+/// vertices it joins.
+type Edge = ([f64; 2], [f64; 2], (usize, usize, usize));
 
-/// Every rail's segments, bucketed so that a point can ask whether a road's edge
+/// Every outline's edges, bucketed so that a point can ask whether a road's edge
 /// is within `reach` of it without measuring itself against every edge on the map.
-struct Rails {
+struct Edges {
     reach: f64,
-    buckets: Buckets<Segment>,
+    buckets: Buckets<Edge>,
 }
 
-impl Rails {
-    fn new<'a>(rails: impl Iterator<Item = &'a [Point3]>, reach: f64) -> Rails {
+impl Edges {
+    fn new(sections: &[Section], reach: f64) -> Edges {
         // Cells no smaller than the reach, so that a query never has to look past
-        // the cells round its own.
+        // the cells round its own. No reach, no index: nothing is ever within it.
         let mut buckets = Buckets::new(reach.max(1.0));
-        for rail in rails {
-            for pair in rail.windows(2) {
-                let (a, b) = ([pair[0].x, pair[0].y], [pair[1].x, pair[1].y]);
-                buckets.insert(
-                    [a[0].min(b[0]), a[1].min(b[1])],
-                    [a[0].max(b[0]), a[1].max(b[1])],
-                    (a, b),
-                );
+        if reach > 0.0 {
+            for (index, section) in sections.iter().enumerate() {
+                let count = section.ring.len();
+                for (vertex, &from) in section.ring.iter().enumerate() {
+                    let next = (vertex + 1) % count;
+                    let to = section.ring[next];
+                    let (a, b) = ([from.x, from.y], [to.x, to.y]);
+                    buckets.insert(
+                        [a[0].min(b[0]), a[1].min(b[1])],
+                        [a[0].max(b[0]), a[1].max(b[1])],
+                        (a, b, (index, vertex, next)),
+                    );
+                }
             }
         }
-        Rails { reach, buckets }
+        Edges { reach, buckets }
     }
 
-    /// Whether any rail passes within the reach of the point.
-    fn within(&self, x: f64, y: f64) -> bool {
+    /// Whether any outline passes within the reach of the point — leaving out,
+    /// for a toe, the two edges that meet at the ring vertex `own` it was pushed
+    /// out from: a toe stands exactly a verge from that vertex, and a hair less
+    /// from the chords either side of it on a bend, and neither is a fold.
+    fn within(&self, point: &Point3, own: Option<(usize, usize)>) -> bool {
         if self.reach <= 0.0 {
             return false;
         }
-        let square = self.reach * self.reach;
-        self.buckets.around(x, y).any(|&(a, b)| {
-            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-            let length = dx * dx + dy * dy;
-            let t = if length < 1e-18 {
-                0.0
-            } else {
-                (((x - a[0]) * dx + (y - a[1]) * dy) / length).clamp(0.0, 1.0)
-            };
-            let (px, py) = (a[0] + dx * t - x, a[1] + dy * t - y);
-            px * px + py * py < square
-        })
+        let (x, y) = (point.x, point.y);
+        // A whisker under the reach, so that a toe's own vertex, on an edge that
+        // is not skipped, does not count as within it.
+        let square = self.reach * self.reach * (1.0 - 1e-9);
+        self.buckets
+            .around(x, y)
+            .any(|&(a, b, (section, from, to))| {
+                if own.is_some_and(|(own_section, own_vertex)| {
+                    section == own_section && (from == own_vertex || to == own_vertex)
+                }) {
+                    return false;
+                }
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let t = fraction_along(
+                    Point3::new(a[0], a[1], 0.0),
+                    Point3::new(b[0], b[1], 0.0),
+                    [x, y],
+                );
+                let (px, py) = (a[0] + dx * t - x, a[1] + dy * t - y);
+                px * px + py * py < square
+            })
     }
 }
 
 /// Polygons bucketed by the cells their boxes cover.
 struct Index<'a> {
-    polygons: &'a [Polygon],
+    polygons: &'a [&'a Polygon],
     buckets: Buckets<usize>,
 }
 
 impl<'a> Index<'a> {
     const CELL: f64 = 25.0;
 
-    fn new(polygons: &'a [Polygon]) -> Index<'a> {
+    fn new(polygons: &'a [&'a Polygon]) -> Index<'a> {
         let mut buckets = Buckets::new(Self::CELL);
         for (index, polygon) in polygons.iter().enumerate() {
             buckets.insert(polygon.min, polygon.max, index);
@@ -381,11 +438,8 @@ impl<'a> Index<'a> {
 mod tests {
     use super::*;
 
-    fn flank(rail: Vec<Point3>, toe: Option<Vec<Point3>>) -> Flank {
-        Flank {
-            rail,
-            toe: toe.unwrap_or_default(),
-        }
+    fn flank(rail: Vec<Point3>, toe: Vec<Point3>) -> Flank {
+        Flank { rail, toe }
     }
 
     fn straight_road() -> Land {
@@ -396,10 +450,7 @@ mod tests {
                 .collect()
         };
         let mut land = Land::default();
-        land.section(
-            flank(rail(4.0), Some(rail(12.0))),
-            flank(rail(-4.0), Some(rail(-12.0))),
-        );
+        land.section(flank(rail(4.0), rail(12.0)), flank(rail(-4.0), rail(-12.0)));
         land
     }
 
@@ -436,19 +487,51 @@ mod tests {
         assert!(square.contains(5.0, 5.0));
         assert!(!square.contains(15.0, 5.0));
         assert!(!square.contains(5.0, -1.0));
-        let index = Index::new(std::slice::from_ref(&square));
+        let squares = [&square];
+        let index = Index::new(&squares);
         assert!(index.contains(9.0, 9.0));
         assert!(!index.contains(-9.0, 9.0));
     }
 
     #[test]
-    fn the_rails_know_what_is_near_them() {
-        let rail = vec![Point3::new(0.0, 0.0, 0.0), Point3::new(100.0, 0.0, 0.0)];
-        let rails = Rails::new(std::iter::once(rail.as_slice()), 8.0);
-        assert!(rails.within(50.0, 7.9));
-        assert!(!rails.within(50.0, 8.1));
-        assert!(rails.within(-3.0, 0.0), "the end of a rail is part of it");
-        assert!(!rails.within(50.0, 30.0));
+    fn the_edges_know_what_is_near_them_and_whose_toe_is_whose() {
+        // A road 100 m long and 8 m wide, with a toe 8 m out from each vertex of
+        // its left rail.
+        let mut land = Land::default();
+        let rail = |y: f64| -> Vec<Point3> {
+            (0..=10)
+                .map(|i| Point3::new(i as f64 * 10.0, y, 0.0))
+                .collect()
+        };
+        // The toes stand a hair under the verge from the rail, as they do from the
+        // chords of a bend.
+        land.section(flank(rail(4.0), rail(11.9)), flank(rail(-4.0), Vec::new()));
+        let edges = Edges::new(&land.sections, 8.0);
+        assert!(edges.within(&Point3::new(50.0, 11.9, 0.0), None));
+        assert!(!edges.within(&Point3::new(50.0, 12.1, 0.0), None));
+        assert!(
+            edges.within(&Point3::new(-3.0, 4.0, 0.0), None),
+            "the end of an outline is part of it"
+        );
+        assert!(!edges.within(&Point3::new(50.0, 30.0, 0.0), None));
+        // A toe's own rail does not count against it — not at the end of the rail
+        // either, where its vertex is also on the cut across the road's end — but
+        // any other edge does.
+        for vertex in [0, 5, 10] {
+            let toe = land.sections[0].toes[vertex].1;
+            assert!(
+                edges.within(&toe, None),
+                "toe {vertex} is not near its rail"
+            );
+            assert!(
+                !edges.within(&toe, Some((0, vertex))),
+                "toe {vertex} is within its own rail"
+            );
+            assert!(
+                edges.within(&toe, Some((0, (vertex + 3) % 11))),
+                "toe {vertex} is not within another vertex's rail"
+            );
+        }
     }
 
     #[test]
@@ -466,8 +549,14 @@ mod tests {
                 .collect()
         };
         let mut land = Land::default();
-        land.section(flank(along(4.0), None), flank(along(-4.0), None));
-        land.section(flank(across(-4.0), None), flank(across(4.0), None));
+        land.section(
+            flank(along(4.0), Vec::new()),
+            flank(along(-4.0), Vec::new()),
+        );
+        land.section(
+            flank(across(-4.0), Vec::new()),
+            flank(across(4.0), Vec::new()),
+        );
         let mesh = land
             .mesh(None, 8.0, "t", &mut Ordinals::default())
             .expect("a terrain");

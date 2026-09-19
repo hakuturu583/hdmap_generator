@@ -145,24 +145,12 @@ fn corridor_edges(map: &Map, road: &Road, margin: f64) -> Option<Vec<(Point3, Po
         let Some((left, right)) = section_edges(map, road, station) else {
             continue;
         };
-        let Some(frame) = frame_at(map, road, station) else {
+        let Ok(frame) = road.frame_at(station, map.metadata.sampling) else {
             continue;
         };
         edges.push((frame.offset(left + margin), frame.offset(right - margin)));
     }
     (edges.len() >= 2).then_some(edges)
-}
-
-/// The road local frame at `station`, banked the way the surface is.
-fn frame_at(map: &Map, road: &Road, station: f64) -> Option<roadgen_core::geometry::Frame3> {
-    Some(
-        road.reference_line
-            .sample_at(station, map.metadata.sampling)
-            .ok()?
-            .frame()
-            .ok()?
-            .banked(road.superelevation.evaluate(station)),
-    )
 }
 
 /// How far the cross-section reaches to each side of the reference line at
@@ -262,7 +250,7 @@ fn frontage_lot(
 ) -> Option<Lot> {
     let corner = |station: f64| -> Option<Point3> {
         let (left, right) = section_edges(map, road, station)?;
-        let frame = frame_at(map, road, station)?;
+        let frame = road.frame_at(station, map.metadata.sampling).ok()?;
         Some(frame.offset(match side {
             LateralSide::Left => left + layout.setback,
             LateralSide::Right => right - layout.setback,

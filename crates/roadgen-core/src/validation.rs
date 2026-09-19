@@ -420,7 +420,7 @@ fn check_superelevation(map: &Map, issues: &mut Vec<ValidationIssue>) {
 /// frame's lateral axis, rolled by whatever superelevation the road carries there.
 fn cross_section_direction(
     map: &Map,
-    lane: &crate::map::Lane,
+    lane: &Lane,
     station: f64,
 ) -> Option<crate::geometry::UnitVector3> {
     let road = map.roads.get(&lane.road)?;
@@ -587,9 +587,9 @@ fn check_connections(map: &Map, config: ValidationConfig, issues: &mut Vec<Valid
 fn boundary_gap(
     map: &Map,
     from_end: LaneEnd,
-    from: &crate::map::Lane,
+    from: &Lane,
     to_end: LaneEnd,
-    to: &crate::map::Lane,
+    to: &Lane,
 ) -> Result<f64, String> {
     let config = map.metadata.sampling;
     let from_travel = from.travel_geometry(config).map_err(|e| e.to_string())?;
