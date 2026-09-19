@@ -225,13 +225,16 @@ impl Rung {
 /// between them is rounded into an arc — so a cut perpendicular to one is
 /// perpendicular to the other, and the two surfaces end on the same line.
 fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
-    let stations = map.vertex_stations(&road.id).ok()?;
-    let mut rungs = Vec::with_capacity(stations.len());
-    for station in stations {
-        let Ok(frame) = road.frame_at(station, map.metadata.sampling) else {
+    let samples = map.vertex_samples(&road.id).ok()?;
+    let mut rungs = Vec::with_capacity(samples.len());
+    for sample in samples {
+        let Ok(frame) = sample.frame() else {
             continue;
         };
-        rungs.push(Rung { station, frame });
+        rungs.push(Rung {
+            station: sample.station,
+            frame: frame.banked(road.superelevation.evaluate(sample.station)),
+        });
     }
     (rungs.len() >= 2).then_some(rungs)
 }

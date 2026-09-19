@@ -136,18 +136,19 @@ fn flat(point: Point3) -> Point2 {
 /// Each entry is the (left, right) pair at one station. `None` when the road has no
 /// geometry to sample, which a connector between two coincident points can have.
 fn corridor_edges(map: &Map, road: &Road, margin: f64) -> Option<Vec<(Point3, Point3)>> {
-    let stations = map.vertex_stations(&road.id).ok()?;
-    if stations.len() < 2 {
+    let samples = map.vertex_samples(&road.id).ok()?;
+    if samples.len() < 2 {
         return None;
     }
-    let mut edges = Vec::with_capacity(stations.len());
-    for station in stations {
-        let Some((left, right)) = section_edges(map, road, station) else {
+    let mut edges = Vec::with_capacity(samples.len());
+    for sample in samples {
+        let Some((left, right)) = section_edges(map, road, sample.station) else {
             continue;
         };
-        let Ok(frame) = road.frame_at(station, map.metadata.sampling) else {
+        let Ok(frame) = sample.frame() else {
             continue;
         };
+        let frame = frame.banked(road.superelevation.evaluate(sample.station));
         edges.push((frame.offset(left + margin), frame.offset(right - margin)));
     }
     (edges.len() >= 2).then_some(edges)
