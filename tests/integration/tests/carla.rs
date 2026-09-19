@@ -109,7 +109,7 @@ fn the_surface_covers_the_road_network_it_was_built_from() {
     // itself: the mesh should cover every road the OpenDRIVE holds, and reach further
     // by the verge beside them.
     let map = scenarios::crossroads();
-    let config = PackageConfig::for_map(&map);
+    let mut config = PackageConfig::for_map(&map);
 
     let network = redraw_opendrive(&map).bounds().expect("a road network");
     let surface = redraw(&map, &config).bounds().expect("a surface");
@@ -118,10 +118,58 @@ fn the_surface_covers_the_road_network_it_was_built_from() {
         contains(surface, network),
         "the surface {surface:?} does not cover the road network {network:?}"
     );
-    // And not by an unbounded amount: the verge is the only thing beyond the road.
+    // And not by an unbounded amount: past the verge there is the ground, written
+    // out to a stated distance for a lidar to reach, and nothing beyond that.
+    let reach = config.surfaces.ground_extent + config.surfaces.ground_cell;
+    assert!(surface.min.x >= network.min.x - reach);
+    assert!(surface.max.x <= network.max.x + reach);
+    // Without it, the verge is the only thing beyond the road.
+    config.surfaces.ground_extent = 0.0;
+    let surface = redraw(&map, &config).bounds().expect("a surface");
     let reach = config.surfaces.verge_width + 1.0;
     assert!(surface.min.x >= network.min.x - reach);
     assert!(surface.max.x <= network.max.x + reach);
+}
+
+#[test]
+fn the_ground_goes_out_as_far_as_a_lidar_does() {
+    // A long-range lidar sees about 200 m; the ground past the last road is there so
+    // that every return it makes lands on something, and it sits just under the
+    // roads rather than on them.
+    let map = scenarios::crossroads();
+    let config = PackageConfig::for_map(&map);
+    let meshes = roadgen_carla::to_meshes(&map, &config);
+    let ground = meshes
+        .iter()
+        .find(|mesh| mesh.role == Role::Ground)
+        .expect("a ground mesh");
+    assert_eq!(roadgen_carla::tags::label_of(&ground.name), Label::Terrain);
+    let network = redraw_opendrive(&map).bounds().expect("a road network");
+    let far = ground
+        .positions
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        (far - (network.max.x + config.surfaces.ground_extent)).abs() < config.surfaces.ground_cell,
+        "the ground reaches x = {far}, the network ends at {}",
+        network.max.x
+    );
+    let roads: Vec<f64> = meshes
+        .iter()
+        .filter(|mesh| mesh.role == Role::Road)
+        .flat_map(|mesh| mesh.positions.iter().map(|point| point.z))
+        .collect();
+    let lowest_road = roads.iter().copied().fold(f64::INFINITY, f64::min);
+    let highest_ground = ground
+        .positions
+        .iter()
+        .map(|point| point.z)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        highest_ground < lowest_road,
+        "the ground ({highest_ground}) pokes through the road ({lowest_road})"
+    );
 }
 
 #[test]
@@ -129,6 +177,7 @@ fn a_map_with_no_verge_stops_where_the_road_stops() {
     let map = scenarios::straight_road();
     let mut config = PackageConfig::for_map(&map);
     config.surfaces.verge_width = 0.0;
+    config.surfaces.ground_extent = 0.0;
 
     let network = redraw_opendrive(&map).bounds().expect("a road network");
     let surface = redraw(&map, &config).bounds().expect("a surface");

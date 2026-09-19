@@ -239,7 +239,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
-| `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=)` | write a CARLA UE5 package; returns what was written and what each mesh will be tagged |
+| `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=)` | write a CARLA UE5 package; returns what was written and what each mesh will be tagged |
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
 | `carla_sky(carla_root, package, map_name, engine=, sun_altitude=, sun_azimuth=)` | after `Import.py`: give the imported level a daylight sky, with the editor's own scripting |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
@@ -929,6 +929,7 @@ against:
 | `Town01_Road_Curb_0` | `SideWalk` | `Sidewalks` | 2 |
 | `Town01_Road_Gutter_0` | `SideWalk` | `Sidewalks` | 2 |
 | `Town01_Terrain_Ground_0` | `Terrain` | `Terrain` | 10 |
+| `Town01_Terrain_Land_0` | `Terrain` | `Terrain` | 10 |
 
 Get it wrong and nothing fails. The mesh imports, the map loads, the camera renders —
 and the pavements come back labelled as ground. `Map.carla_warnings()` exists mostly
@@ -977,11 +978,16 @@ way a real one is. Neither is a lane in the IR and neither should be: they are w
 texture — a broken line is a strip per dash, cut by arc length so that a three-metre
 dash is three metres however the sampler laid its vertices.
 
-Beyond the outermost band is a **verge**: grass, for as far as the road network can
-honestly say anything about the land, following the road's own elevation. There is no
-landscape past it, and there should not be — a road network says nothing about the shape
-of the country it runs through, and generating hills here would be inventing a terrain
-model rather than deriving one. CARLA's editor is where a map gets terrain.
+Beyond the outermost band is a **verge**: grass, following the road's own elevation.
+Beyond that is the **ground**: one grid mesh over the whole network and 150 m past it
+(`ground_extent`), whose height at each vertex is taken from the nearest stretches of
+road, so it is flat where the roads are flat and slopes gently between roads at
+different heights. It is there because a lidar reaches that far and a vehicle that
+leaves the verge should land on something; it is not terrain, and it is not pretending
+to be — a road network says nothing about the shape of the country it runs through,
+and generating hills here would be inventing a terrain model rather than deriving one.
+It sits two centimetres under the roads, so nothing z-fights, and is tagged `Terrain`
+like the verges. CARLA's editor is still where a map gets hills.
 
 ### Where the town goes, and why it is a choice
 

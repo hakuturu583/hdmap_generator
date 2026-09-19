@@ -192,8 +192,12 @@ pub enum Role {
     Curb,
     /// The strip of road surface at the foot of a kerb.
     Gutter,
-    /// The ground the map stands on.
+    /// The grass beside a road: the verge.
     Terrain,
+    /// The ground past the verges, out to where a lidar reaches. Named
+    /// `Terrain_Land` so that it is told apart from the verges and classified the
+    /// same way: CARLA tests `Terrain` bare.
+    Ground,
     /// A part of a building.
     Building,
 }
@@ -211,6 +215,7 @@ impl Role {
             Role::Curb => ("Road", "Curb"),
             Role::Gutter => ("Road", "Gutter"),
             Role::Terrain => ("Terrain", "Ground"),
+            Role::Ground => ("Terrain", "Land"),
             Role::Building => ("Building", "Part"),
         }
     }
@@ -225,7 +230,7 @@ impl Role {
             Role::Road => Folder::Road,
             Role::Marking => Folder::RoadLine,
             Role::Sidewalk | Role::Curb | Role::Gutter => Folder::SideWalk,
-            Role::Terrain => Folder::Terrain,
+            Role::Terrain | Role::Ground => Folder::Terrain,
             Role::Building => Folder::Building,
         }
     }
@@ -238,6 +243,7 @@ impl Role {
             Role::Curb => "curb",
             Role::Gutter => "gutter",
             Role::Terrain => "terrain",
+            Role::Ground => "ground",
             Role::Building => "building",
         }
     }
@@ -443,6 +449,7 @@ mod tests {
             Role::Curb,
             Role::Gutter,
             Role::Terrain,
+            Role::Ground,
         ] {
             let name = mesh_name("Town01", role, 0);
             assert_eq!(

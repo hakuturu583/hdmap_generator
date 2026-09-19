@@ -71,6 +71,12 @@ pub struct SurfaceConfig {
     pub dash_off: f64,
     /// How far the grass beside a road reaches. Zero writes no verge.
     pub verge_width: f64,
+    /// How far past the road network the ground is written, metres: one grid
+    /// mesh at the roads' own heights, for a lidar to reach and a vehicle to land
+    /// on beyond the verge. Zero writes no ground; see [`crate::ground`].
+    pub ground_extent: f64,
+    /// The ground grid's cell size.
+    pub ground_cell: f64,
 }
 
 impl Default for SurfaceConfig {
@@ -85,6 +91,10 @@ impl Default for SurfaceConfig {
             dash_on: 3.0,
             dash_off: 6.0,
             verge_width: 8.0,
+            // A long-range lidar sees about 200 m; a hundred and fifty of ground
+            // past the last road keeps every return it makes on something.
+            ground_extent: 150.0,
+            ground_cell: 10.0,
         }
     }
 }
@@ -118,6 +128,7 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             layout.verges(&within, map_name, config, &mut ordinal, &mut meshes);
         }
     }
+    meshes.extend(crate::ground::ground(map, map_name, config, &mut ordinal));
     meshes.retain(|mesh| !mesh.is_empty());
     meshes
 }

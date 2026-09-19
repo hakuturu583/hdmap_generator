@@ -1112,6 +1112,7 @@ impl PyMap {
         use_carla_materials = None,
         kerb_height = None,
         verge_width = None,
+        ground_extent = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn export_carla(
@@ -1124,6 +1125,7 @@ impl PyMap {
         use_carla_materials: Option<bool>,
         kerb_height: Option<f64>,
         verge_width: Option<f64>,
+        ground_extent: Option<f64>,
     ) -> PyResult<Py<PyDict>> {
         let config = self.carla_config(
             name,
@@ -1132,6 +1134,7 @@ impl PyMap {
             use_carla_materials,
             kerb_height,
             verge_width,
+            ground_extent,
         )?;
         let map = self.built.as_ref().expect("just built");
         let written = roadgen_carla::write(map, directory, &config).map_err(runtime_error)?;
@@ -1178,6 +1181,7 @@ impl PyMap {
         use_carla_materials = None,
         kerb_height = None,
         verge_width = None,
+        ground_extent = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn carla_warnings(
@@ -1188,6 +1192,7 @@ impl PyMap {
         use_carla_materials: Option<bool>,
         kerb_height: Option<f64>,
         verge_width: Option<f64>,
+        ground_extent: Option<f64>,
     ) -> PyResult<Vec<String>> {
         let config = self.carla_config(
             name,
@@ -1196,6 +1201,7 @@ impl PyMap {
             use_carla_materials,
             kerb_height,
             verge_width,
+            ground_extent,
         )?;
         let map = self.built.as_ref().expect("just built");
         Ok(roadgen_carla::check(map, &config))
@@ -1425,6 +1431,7 @@ impl PyMap {
         use_carla_materials: Option<bool>,
         kerb_height: Option<f64>,
         verge_width: Option<f64>,
+        ground_extent: Option<f64>,
     ) -> PyResult<roadgen_carla::PackageConfig> {
         self.ensure_built()?;
         let map = self.built.as_ref().expect("just built");
@@ -1458,6 +1465,9 @@ impl PyMap {
         }
         if let Some(verge_width) = verge_width {
             config.surfaces.verge_width = verge_width;
+        }
+        if let Some(ground_extent) = ground_extent {
+            config.surfaces.ground_extent = ground_extent;
         }
         Ok(config)
     }

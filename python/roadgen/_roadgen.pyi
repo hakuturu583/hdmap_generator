@@ -145,6 +145,7 @@ class Map:
         use_carla_materials: Optional[bool] = None,
         kerb_height: Optional[float] = None,
         verge_width: Optional[float] = None,
+        ground_extent: Optional[float] = None,
     ) -> list[str]: ...
     def osm_warnings(self) -> list[str]: ...
     def sumo_warnings(self) -> list[str]: ...
@@ -182,6 +183,7 @@ class Map:
         use_carla_materials: Optional[bool] = None,
         kerb_height: Optional[float] = None,
         verge_width: Optional[float] = None,
+        ground_extent: Optional[float] = None,
     ) -> dict[str, Any]: ...
     def to_gpudrive_json(
         self,

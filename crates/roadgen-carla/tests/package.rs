@@ -188,11 +188,17 @@ fn the_surface_stands_where_the_road_network_says_it_does() {
     let config = PackageConfig::for_map(&map);
     let meshes = roadgen_carla::to_meshes(&map, &config);
 
-    let xs: Vec<f64> = meshes
+    // The road's own surfaces, without the ground that is written out past them
+    // for a lidar to reach; that one is the ground module's own business.
+    let street: Vec<&roadgen_carla::Mesh> = meshes
+        .iter()
+        .filter(|mesh| mesh.role != roadgen_carla::Role::Ground)
+        .collect();
+    let xs: Vec<f64> = street
         .iter()
         .flat_map(|mesh| mesh.positions.iter().map(|point| point.x))
         .collect();
-    let ys: Vec<f64> = meshes
+    let ys: Vec<f64> = street
         .iter()
         .flat_map(|mesh| mesh.positions.iter().map(|point| point.y))
         .collect();

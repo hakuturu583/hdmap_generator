@@ -59,6 +59,7 @@
 pub mod error;
 pub mod facades;
 pub mod fbx;
+pub mod ground;
 pub mod materials;
 pub mod mesh;
 pub mod package;
@@ -399,7 +400,16 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
         }
     }
 
-    if config.surfaces.verge_width > 0.0 {
+    if config.surfaces.ground_extent > 0.0 {
+        warnings.push(format!(
+            "the ground past the {:.0} m verge is a grid at the roads' own heights, \
+             out to {:.0} m beyond the network: flat where the roads are flat and \
+             sloping between roads at different heights, because a road network says \
+             nothing more about the land it runs through. Hills are CARLA's editor's \
+             to add",
+            config.surfaces.verge_width, config.surfaces.ground_extent
+        ));
+    } else if config.surfaces.verge_width > 0.0 {
         warnings.push(format!(
             "the ground is a {:.0} m verge either side of each road and nothing \
              further: a road network says nothing about the shape of the land it runs \
