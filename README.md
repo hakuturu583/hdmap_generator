@@ -1038,8 +1038,12 @@ they do not quite meet: the strips of neighbouring roads cross at a junction, a 
 round a tight corner folds over itself, and a lidar return or a wheel finds every
 seam. A road through a junction has land on one side of it at most — the side that
 faces away from the junction — and a raised pavement facing the junction gets a kerb
-face down to the road level instead, which the land meets at the foot. The land is
-tagged `Terrain` and is the one mesh of that class.
+face down to the road level instead, which the land meets at the foot. And a vertex
+of the land goes in only where it really is a verge's width from every road's edge,
+which is the one rule that keeps ledges out of it: the toe of a verge on the inside
+of a bend tighter than the verge is wide, or pushed out from a road in a junction
+into the pavement round the corner, is nearer than that to some edge and is left
+out. The land is tagged `Terrain` and is the one mesh of that class.
 
 ### Pedestrians
 

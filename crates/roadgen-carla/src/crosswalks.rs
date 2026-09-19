@@ -68,19 +68,14 @@ fn bars(
 
     // The carriageway at that station: from the outer edge of the outermost driving
     // lane on one side to the other. The cuts run left to right.
-    let section = (0..road.sections.len()).find(|&index| {
-        road.section_range(index)
-            .is_ok_and(|(start, end)| station >= start && station <= end)
-    })?;
-    let layout = Layout::of(map, road, section, config)?;
+    let layout = Layout::of(map, road, road.section_at(station)?, config)?;
     let (outer_left, outer_right) = layout.carriageway(station)?;
 
     let sampling = map.metadata.sampling;
-    let frame_at = |s: f64| {
-        let sample = road.reference_line.sample_at(s, sampling).ok()?;
-        Some(sample.frame().ok()?.banked(road.superelevation.evaluate(s)))
-    };
-    let (start, end) = (frame_at(from)?, frame_at(to)?);
+    let (start, end) = (
+        road.frame_at(from, sampling).ok()?,
+        road.frame_at(to, sampling).ok()?,
+    );
     let rise = config.marking_rise;
 
     let mut mesh = Mesh::new(

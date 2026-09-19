@@ -115,7 +115,7 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
     let mut ordinal = Ordinals::default();
     // The roads first, then the land round them: the land is one surface built
     // out from every road's edge, so it needs every edge before it can start.
-    let mut land = crate::terrain::Land::new(config.verge_width);
+    let mut land = crate::terrain::Land::default();
     let all_rungs: Vec<Option<Vec<Rung>>> = map.roads.iter().map(|road| rungs(map, road)).collect();
     let centres = junction_centres(map, &all_rungs);
     for (road, rungs) in map.roads.iter().zip(&all_rungs) {
@@ -139,8 +139,8 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             }
             layout.surfaces(&within, map_name, &mut ordinal, &mut meshes);
             layout.markings(&within, map_name, config, &mut ordinal, &mut meshes);
-            if let Some((left, right)) =
-                layout.flanks(&within, facing, config, map_name, &mut ordinal, &mut meshes)
+            if let Some([left, right]) =
+                layout.flanks(&within, facing, map_name, &mut ordinal, &mut meshes)
             {
                 land.section(left, right);
             }
@@ -148,7 +148,7 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
     }
     crate::crosswalks::paint(map, map_name, config, &mut ordinal, &mut meshes);
     let field = crate::ground::Field::under(map, &meshes, config);
-    if let Some(terrain) = land.mesh(field.as_ref(), map_name, &mut ordinal) {
+    if let Some(terrain) = land.mesh(field.as_ref(), config.verge_width, map_name, &mut ordinal) {
         meshes.push(terrain);
     }
     meshes.retain(|mesh| !mesh.is_empty());
@@ -170,14 +170,11 @@ fn junction_centres(
         };
         let middle = rungs[rungs.len() / 2].frame.origin;
         let (sum, count) = sums.entry(junction.clone()).or_insert((Vector3::ZERO, 0.0));
-        *sum = *sum + Vector3::new(middle.x, middle.y, middle.z);
+        *sum = *sum + middle.to_vector();
         *count += 1.0;
     }
     sums.into_iter()
-        .map(|(junction, (sum, count))| {
-            let mean = sum * (1.0 / count);
-            (junction, Point3::new(mean.x, mean.y, mean.z))
-        })
+        .map(|(junction, (sum, count))| (junction, Point3::ORIGIN + sum * (1.0 / count)))
         .collect()
 }
 
@@ -231,19 +228,10 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
     let stations = map.vertex_stations(&road.id).ok()?;
     let mut rungs = Vec::with_capacity(stations.len());
     for station in stations {
-        let Ok(sample) = road
-            .reference_line
-            .sample_at(station, map.metadata.sampling)
-        else {
+        let Ok(frame) = road.frame_at(station, map.metadata.sampling) else {
             continue;
         };
-        let Ok(frame) = sample.frame() else {
-            continue;
-        };
-        rungs.push(Rung {
-            station,
-            frame: frame.banked(road.superelevation.evaluate(station)),
-        });
+        rungs.push(Rung { station, frame });
     }
     (rungs.len() >= 2).then_some(rungs)
 }
@@ -606,16 +594,14 @@ impl<'a> Layout<'a> {
     /// raised band there gets a kerb face down to the road level instead of a
     /// verge, which the land then meets at the foot. `None` when nothing on the
     /// section is surfaced.
-    #[allow(clippy::too_many_arguments)]
     fn flanks(
         &self,
         rungs: &[&Rung],
         facing: Option<Point3>,
-        config: &SurfaceConfig,
         map_name: &str,
         ordinals: &mut Ordinals,
         out: &mut Vec<Mesh>,
-    ) -> Option<(crate::terrain::Flank, crate::terrain::Flank)> {
+    ) -> Option<[crate::terrain::Flank; 2]> {
         let first = self
             .lanes
             .iter()
@@ -624,9 +610,9 @@ impl<'a> Layout<'a> {
             .lanes
             .iter()
             .rposition(|lane| Self::role_of(lane).is_some())?;
-        let rises = [
-            self.rise_of(self.lanes[first]),
-            self.rise_of(self.lanes[last]),
+        let edges = [
+            (first, self.rise_of(self.lanes[first])),
+            (last + 1, self.rise_of(self.lanes[last])),
         ];
         // Which side the land is on, when only one is: the side whose edge, halfway
         // along, is farther from the junction.
@@ -635,63 +621,32 @@ impl<'a> Layout<'a> {
             Some(centre) => {
                 let rung = rungs[rungs.len() / 2];
                 let cuts = self.cuts(rung.station);
-                let left = rung
-                    .at(cuts[first], rises[0])
-                    .horizontal_distance_to(centre);
-                let right = rung
-                    .at(cuts[last + 1], rises[1])
-                    .horizontal_distance_to(centre);
+                let [left, right] = edges
+                    .map(|(cut, rise)| rung.at(cuts[cut], rise).horizontal_distance_to(centre));
                 [left >= right, right > left]
             }
         };
-        // A verge is a strip of fixed width, and a strip of fixed width on the
-        // inside of a bend folds over itself where the bend is tighter than the
-        // strip's outer edge is far from the road's centre. On the inside it is
-        // drawn out only as far as the bend's radius allows.
-        let limit = bend_limits(rungs);
-        let width = config.verge_width.max(0.0);
+        let width = self.config.verge_width;
 
-        let mut flanks = Vec::with_capacity(2);
-        for (side, (cut, rise)) in [(first, rises[0]), (last + 1, rises[1])]
-            .into_iter()
-            .enumerate()
-        {
-            // Rail and toe, outwards: to the left on the left side, the right on
-            // the right.
+        let flanks = [0, 1].map(|side| {
+            let (cut, rise) = edges[side];
+            // Outwards: to the left on the left side, the right on the right.
             let sign = if side == 0 { 1.0 } else { -1.0 };
-            let (rail, toe): (Vec<Point3>, Vec<Option<Point3>>) = rungs
+            let (rail, toe): (Vec<Point3>, Vec<Point3>) = rungs
                 .iter()
-                .enumerate()
-                .map(|(index, rung)| {
-                    let cuts = self.cuts(rung.station);
-                    let edge = cuts[cut];
-                    let reach = if side == 0 {
-                        limit[index].0
-                    } else {
-                        limit[index].1
-                    };
-                    // A toe only where the whole verge fits — a toe pulled in
-                    // towards the rail is a ledge the land steps down — and
-                    // never in a junction, whose roads have the pavements round
-                    // its corners for neighbours rather than open land.
-                    let room = land[side]
-                        && facing.is_none()
-                        && width > 0.0
-                        && reach - sign * edge >= width;
+                .map(|rung| {
+                    let edge = self.cuts(rung.station)[cut];
                     let rail_rise = if land[side] { rise } else { 0.0 };
-                    (
-                        rung.at(edge, rail_rise),
-                        room.then(|| rung.at(edge + sign * width, 0.0)),
-                    )
+                    (rung.at(edge, rail_rise), rung.at(edge + sign * width, 0.0))
                 })
                 .unzip();
-            if !land[side] && rise > 0.0 {
+            if land[side] {
+                return crate::terrain::Flank { rail, toe };
+            }
+            if rise > 0.0 {
                 // The kerb face, anticlockwise seen from the junction: the low
                 // rail on the outside of the face.
-                let (low, high) = match side {
-                    0 => (0.0, rise),
-                    _ => (rise, 0.0),
-                };
+                let (low, high) = if side == 0 { (0.0, rise) } else { (rise, 0.0) };
                 self.band(
                     rungs,
                     move |cuts| cuts[cut],
@@ -705,11 +660,12 @@ impl<'a> Layout<'a> {
                     out,
                 );
             }
-            flanks.push(crate::terrain::Flank { rail, toe });
-        }
-        let right = flanks.pop()?;
-        let left = flanks.pop()?;
-        Some((left, right))
+            crate::terrain::Flank {
+                rail,
+                toe: Vec::new(),
+            }
+        });
+        Some(flanks)
     }
 
     /// The line a cut traces through space, with the lateral direction at each point.
@@ -726,45 +682,6 @@ impl<'a> Layout<'a> {
             })
             .collect()
     }
-}
-
-/// How far out of each rung a rail can be laid to the left and to the right before
-/// it folds: a rail offset `d` to the inside of a bend of radius `r` runs backwards
-/// once `d` passes `r`, so on the inside it stops short of that, and on the outside —
-/// and on a straight — there is no limit.
-fn bend_limits(rungs: &[&Rung]) -> Vec<(f64, f64)> {
-    // Leave the bend some rail to run along rather than collapsing it to a point.
-    const KEEP: f64 = 0.8;
-    (0..rungs.len())
-        .map(|index| {
-            let mut limit = (f64::INFINITY, f64::INFINITY);
-            // The signed curvature at this rung, from the turn to its neighbour on
-            // each side: positive turning left, where the inside is the left.
-            for (a, b) in [(index.wrapping_sub(1), index), (index, index + 1)] {
-                let (Some(a), Some(b)) = (rungs.get(a), rungs.get(b)) else {
-                    continue;
-                };
-                let ta = a.frame.tangent.get();
-                let tb = b.frame.tangent.get();
-                let run = a.frame.origin.horizontal_distance_to(b.frame.origin);
-                if run < 1e-9 {
-                    continue;
-                }
-                let turn = (ta.x * tb.y - ta.y * tb.x).atan2(ta.x * tb.x + ta.y * tb.y);
-                let curvature = turn / run;
-                if curvature.abs() < 1e-9 {
-                    continue;
-                }
-                let radius = KEEP / curvature.abs();
-                if curvature > 0.0 {
-                    limit.0 = limit.0.min(radius);
-                } else {
-                    limit.1 = limit.1.min(radius);
-                }
-            }
-            limit
-        })
-        .collect()
 }
 
 /// Two gutters out of one lane, cut back until they leave some lane behind them.

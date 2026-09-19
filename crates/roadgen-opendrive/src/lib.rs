@@ -1092,7 +1092,6 @@ impl<'a> Exporter<'a> {
                         values.clone().fold(f64::NEG_INFINITY, f64::max)
                             - values.fold(f64::INFINITY, f64::min)
                     };
-                    let position = centre;
                     Object {
                         dynamic: Some(false),
                         hdg: Some(Angle::new::<radian>(std::f64::consts::FRAC_PI_2)),
@@ -1107,13 +1106,13 @@ impl<'a> Exporter<'a> {
                         pitch: None,
                         radius: None,
                         roll: None,
-                        s: Length::new::<meter>(position.s),
+                        s: Length::new::<meter>(centre.s),
                         subtype: None,
-                        t: Length::new::<meter>(position.t),
+                        t: Length::new::<meter>(centre.t),
                         r#type: Some(ObjectType::Crosswalk),
                         valid_length: None,
                         width: Some(Length::new::<meter>(extent(|p| p.s))),
-                        z_offset: Length::new::<meter>(position.height),
+                        z_offset: Length::new::<meter>(centre.height),
                         repeat: Vec::new(),
                         outline: Some(Outline {
                             closed: Some(true),

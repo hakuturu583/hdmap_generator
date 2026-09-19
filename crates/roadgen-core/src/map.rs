@@ -11,7 +11,9 @@ use std::collections::HashSet;
 use crate::arena::Arena;
 use crate::buildings::{Building, BuildingPart};
 use crate::error::GeometryError;
-use crate::geometry::{Curve3, Point3, Poly3Profile, Polyline3, SamplingConfig, WidthProfile};
+use crate::geometry::{
+    Curve3, Frame3, Point3, Poly3Profile, Polyline3, SamplingConfig, WidthProfile,
+};
 use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
 use crate::topology::{
@@ -235,6 +237,28 @@ impl Road {
             None => self.horizontal_length()?,
         };
         Ok((start, end))
+    }
+
+    /// The index of the section `station` falls in, or `None` off the road's ends.
+    pub fn section_at(&self, station: f64) -> Option<usize> {
+        (0..self.sections.len()).find(|&index| {
+            self.section_range(index)
+                .is_ok_and(|(start, end)| station >= start && station <= end)
+        })
+    }
+
+    /// The road's frame at `station`, banked by its superelevation there: the
+    /// frame a cross-section is laid out in, with its lateral axis along the
+    /// road's surface rather than the horizontal.
+    pub fn frame_at(
+        &self,
+        station: f64,
+        sampling: SamplingConfig,
+    ) -> Result<Frame3, GeometryError> {
+        let sample = self.reference_line.sample_at(station, sampling)?;
+        Ok(sample
+            .frame()?
+            .banked(self.superelevation.evaluate(station)))
     }
 }
 

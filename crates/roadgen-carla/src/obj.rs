@@ -24,13 +24,9 @@ use crate::tags::Role;
 
 /// The `.obj`, as text.
 pub fn document(meshes: &[Mesh], map: &Map) -> String {
-    let mut out = String::from("# Written by roadgen for CARLA's navigation builder.\n");
-    let mut vertices = 0usize;
-    // Map (x east, y north, z up) to CARLA's (x, -y, z), and that to Recast's y-up
-    // (x, z, -y).
-    let vertex = |out: &mut String, vertices: &mut usize, point: Point3| {
-        let _ = writeln!(out, "v {:.4} {:.4} {:.4}", point.x, point.z, -point.y);
-        *vertices += 1;
+    let mut out = Writer {
+        text: String::from("# Written by roadgen for CARLA's navigation builder.\n"),
+        vertices: 0,
     };
 
     // In order of precedence, lowest first. The builder stamps each triangle's
@@ -43,21 +39,7 @@ pub fn document(meshes: &[Mesh], map: &Map) -> String {
         let Some(material) = material_of(mesh.role) else {
             continue;
         };
-        let _ = writeln!(out, "o {}", mesh.name);
-        let first = vertices + 1;
-        for point in &mesh.positions {
-            vertex(&mut out, &mut vertices, *point);
-        }
-        let _ = writeln!(out, "usemtl {material}");
-        for [a, b, c] in &mesh.triangles {
-            let _ = writeln!(
-                out,
-                "f {} {} {}",
-                first + *a as usize,
-                first + *b as usize,
-                first + *c as usize
-            );
-        }
+        out.object(&mesh.name, &mesh.positions, &mesh.triangles, material);
     }
 
     // The crossings, as the IR holds them: a rectangle each, kerb to kerb and a
@@ -69,21 +51,51 @@ pub fn document(meshes: &[Mesh], map: &Map) -> String {
         let ObjectGeometry::Band { left, right } = &object.geometry else {
             continue;
         };
-        let _ = writeln!(out, "o {}", object.id);
-        let first = vertices + 1;
-        for point in [
+        let corners = [
             left.start_point(),
             left.end_point(),
             right.end_point(),
             right.start_point(),
-        ] {
-            vertex(&mut out, &mut vertices, point);
-        }
-        let _ = writeln!(out, "usemtl crosswalk");
-        let _ = writeln!(out, "f {} {} {}", first, first + 1, first + 2);
-        let _ = writeln!(out, "f {} {} {}", first, first + 2, first + 3);
+        ];
+        out.object(
+            &object.id.to_string(),
+            &corners,
+            &[[0, 1, 2], [0, 2, 3]],
+            "crosswalk",
+        );
     }
-    out
+    out.text
+}
+
+/// The document being written, and how many vertices it holds so far: an `.obj`
+/// numbers its vertices from one across the whole file.
+struct Writer {
+    text: String,
+    vertices: usize,
+}
+
+impl Writer {
+    /// One object: its vertices, then its material, then its faces.
+    fn object(&mut self, name: &str, positions: &[Point3], triangles: &[[u32; 3]], material: &str) {
+        let _ = writeln!(self.text, "o {name}");
+        let first = self.vertices + 1;
+        for point in positions {
+            // Map (x east, y north, z up) to CARLA's (x, -y, z), and that to
+            // Recast's y-up (x, z, -y).
+            let _ = writeln!(self.text, "v {:.4} {:.4} {:.4}", point.x, point.z, -point.y);
+        }
+        self.vertices += positions.len();
+        let _ = writeln!(self.text, "usemtl {material}");
+        for [a, b, c] in triangles {
+            let _ = writeln!(
+                self.text,
+                "f {} {} {}",
+                first + *a as usize,
+                first + *b as usize,
+                first + *c as usize
+            );
+        }
+    }
 }
 
 /// Which surfaces are written over which: the ground under everything, then the

@@ -25,7 +25,7 @@ pub const DROP: f64 = 0.05;
 /// How far apart the reference line is sampled for the ground, metres.
 const SAMPLE_SPACING: f64 = 2.0;
 
-/// The ground as a height field: a grid, with the triangulation the mesh will have.
+/// The ground as a height field: a grid of heights, read between its vertices.
 pub struct Field {
     x0: f64,
     y0: f64,
@@ -168,9 +168,9 @@ impl Field {
         )
     }
 
-    /// The ground's height at a position, interpolated on the triangles the mesh
-    /// is made of, so that a point laid at this height is on the mesh and not
-    /// merely near it. Beyond the grid, the edge's height.
+    /// The ground's height at a position, interpolated within the grid's cells so
+    /// that a point between vertices reads a height between theirs. Beyond the
+    /// grid, the edge's height.
     pub fn height(&self, x: f64, y: f64) -> f64 {
         let fx = ((x - self.x0) / self.cell).clamp(0.0, self.columns as f64 - 1e-9);
         let fy = ((y - self.y0) / self.cell).clamp(0.0, self.rows as f64 - 1e-9);
@@ -309,17 +309,10 @@ mod tests {
         for point in vertices.iter().step_by(7) {
             assert!((field.height(point.x, point.y) - point.z).abs() < 1e-9);
         }
-        // And between vertices it is on the cell's own two triangles: a point on
-        // the first cell's diagonal, and one on each edge, read back exactly.
-        let stride = field.columns + 1;
-        for (a, b) in [
-            (vertices[stride], vertices[1]),
-            (vertices[0], vertices[1]),
-            (vertices[0], vertices[stride]),
-        ] {
-            let between = a.lerp(b, 0.3);
-            assert!((field.height(between.x, between.y) - between.z).abs() < 1e-9);
-        }
+        // And between two vertices, a height between theirs.
+        let (a, b) = (vertices[0], vertices[1]);
+        let between = field.height(a.x * 0.7 + b.x * 0.3, a.y);
+        assert!(between >= a.z.min(b.z) - 1e-9 && between <= a.z.max(b.z) + 1e-9);
     }
 
     #[test]

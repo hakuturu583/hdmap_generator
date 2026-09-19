@@ -64,13 +64,7 @@ pub fn locate(map: &Map, road: &Road, point: Point3) -> Option<RoadPosition> {
     let mut station = best?.0;
     let mut local = [0.0; 3];
     for _ in 0..2 {
-        let frame = road
-            .reference_line
-            .sample_at(station, config)
-            .ok()?
-            .frame()
-            .ok()?
-            .banked(road.superelevation.evaluate(station));
+        let frame = road.frame_at(station, config).ok()?;
         local = frame.to_local(point);
         station = (station + local[0]).clamp(0.0, road.horizontal_length().ok()?);
     }

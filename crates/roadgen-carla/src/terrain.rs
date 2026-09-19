@@ -13,13 +13,22 @@
 //!
 //! It is a constrained Delaunay triangulation of three kinds of point. The **rails**
 //! are the outer edges of every road section, vertex for vertex the same points the
-//! road surface ends on, and they are the constraints: no triangle crosses a road's
-//! edge. The **toes** are those edges pushed `verge_width` out on the side that has
-//! land, at the ground's height there, so the grass slopes down from the road the
-//! way a verge does. And the **grid** is the ground's own height field past the
-//! verges, out to `ground_extent`. What is inside a road's outline is cut away
-//! afterwards, so the junction's roads and the pavements round it sit in a hole cut
-//! to their shape, and everything else is one surface.
+//! road surface ends on, and with the cuts across each section's two ends they are
+//! the constraints: no triangle crosses a road's outline. The **toes** are those
+//! edges pushed `verge_width` out on the side that has land, at the ground's height
+//! there, so the grass slopes down from the road the way a verge does. And the
+//! **grid** is the ground's own height field past the verges, out to
+//! `ground_extent`. What is inside a road's outline is cut away afterwards, so the
+//! junction's roads and the pavements round it sit in a hole cut to their shape, and
+//! everything else is one surface.
+//!
+//! A toe or a grid vertex goes in only where it really is a verge's width from
+//! every road's edge. That one test is what keeps the land off the roads and free
+//! of ledges: a toe on the inside of a bend tighter than the verge is wide has
+//! folded back over its own rail and is nearer than a verge to it; a toe pushed
+//! out from a road in a junction lands beside the next road, or the pavement round
+//! the corner, and is nearer than a verge to that; a grid vertex just past a kerb
+//! would make the slope down from it a step.
 
 use std::collections::HashMap;
 
@@ -38,33 +47,25 @@ pub struct Flank {
     /// The road's edge, at the height the land meets it: the top of a pavement
     /// that faces land, the foot of one that faces a junction.
     pub rail: Vec<Point3>,
-    /// The verge's outer edge, one entry per rail vertex: `verge_width` out from
-    /// the rail on the side that has land, and `None` where there is no room for
-    /// it — on a side that faces a junction, or on the inside of a bend tighter
-    /// than the verge is wide, where a toe would fold back over the rail. The
-    /// heights are the land's to set.
-    pub toe: Vec<Option<Point3>>,
+    /// The verge's outer edge: `verge_width` out from the rail on the side that
+    /// has land, one point per rail vertex, and empty on a side that faces a
+    /// junction. The heights are the land's to set, and so is whether each point
+    /// is used.
+    pub toe: Vec<Point3>,
 }
 
 /// What the land is built round: every road section's two flanks and its outline.
+#[derive(Default)]
 pub struct Land {
-    /// How far from a road's edge the grid keeps back, so that the slope down from
-    /// the edge is the verge's and not whatever the nearest grid vertex makes it.
-    verge: f64,
     flanks: Vec<Flank>,
     /// Each section's outline in plan, which the land is cut out of.
     footprints: Vec<Polygon>,
+    /// The cut across each section's two ends, from one rail to the other, which
+    /// closes its outline.
+    ends: Vec<[Point3; 2]>,
 }
 
 impl Land {
-    pub fn new(verge_width: f64) -> Land {
-        Land {
-            verge: verge_width.max(0.0),
-            flanks: Vec::new(),
-            footprints: Vec::new(),
-        }
-    }
-
     /// Adds one road section: its left and right flanks, whose rails also bound
     /// its footprint.
     pub fn section(&mut self, left: Flank, right: Flank) {
@@ -75,61 +76,65 @@ impl Land {
             .map(|point| [point.x, point.y])
             .collect();
         self.footprints.push(Polygon::new(outline));
+        if let (Some(&a), Some(&b), Some(&c), Some(&d)) = (
+            left.rail.first(),
+            right.rail.first(),
+            left.rail.last(),
+            right.rail.last(),
+        ) {
+            self.ends.push([a, b]);
+            self.ends.push([c, d]);
+        }
         self.flanks.push(left);
         self.flanks.push(right);
     }
 
-    /// The land as one mesh, tagged as terrain. `None` when there is no road to
-    /// build it round.
+    /// The land as one mesh, tagged as terrain, with the ground's height `verge`
+    /// metres out from every road. `None` when there is no road to build it round.
     pub fn mesh(
         &self,
         field: Option<&Field>,
+        verge: f64,
         map_name: &str,
         ordinals: &mut Ordinals,
     ) -> Option<Mesh> {
-        if self.flanks.iter().all(|flank| flank.rail.len() < 2) {
+        if self.flanks.is_empty() {
             return None;
         }
         let roads = Index::new(&self.footprints);
-        // The grid keeps a verge's width back from every rail as well as out of
-        // the roads, so the grass gets its slope from the toes — or, where a rail
-        // has none, from grid vertices a verge away — rather than from whichever
-        // grid vertex happens to be nearest a kerb.
-        let rails = Rails::new(
-            self.flanks.iter().map(|flank| flank.rail.as_slice()),
-            self.verge,
-        );
+        // A verge's width, less a hair for a toe's own rail: a toe stands exactly a
+        // verge from the rung it was pushed out from, and a little less from the
+        // chord to the next rung on a bend.
+        let reach = verge.max(0.0) * 0.99;
+        let rails = Rails::new(self.flanks.iter().map(|flank| flank.rail.as_slice()), reach);
+        let free =
+            |point: &Point3| !roads.contains(point.x, point.y) && !rails.within(point.x, point.y);
 
-        let mut cdt: ConstrainedDelaunayTriangulation<Vertex> =
-            ConstrainedDelaunayTriangulation::new();
-        // Free points first and the rails last, so that a rail that lands on the
-        // same spot as a grid or toe point keeps its own height: the road's edge is
-        // the one height here that is not negotiable.
+        // The free points first, in bulk, and the rails inserted after them, so
+        // that a rail that lands on the same spot as a grid or toe point keeps its
+        // own height: the road's edge is the one height here that is not
+        // negotiable.
+        let mut points: Vec<Vertex> = Vec::new();
         if let Some(field) = field {
-            for point in field.vertices() {
-                if !roads.contains(point.x, point.y) && !rails.within(point.x, point.y, self.verge)
-                {
-                    let _ = cdt.insert(Vertex::from(point));
-                }
-            }
+            points.extend(field.vertices().filter(free).map(Vertex));
         }
         for flank in &self.flanks {
-            for point in flank.toe.iter().flatten() {
-                if roads.contains(point.x, point.y) {
-                    continue;
-                }
+            points.extend(flank.toe.iter().filter(|point| free(point)).map(|point| {
                 let z = field.map_or(point.z, |field| field.height(point.x, point.y));
-                let _ = cdt.insert(Vertex {
-                    x: point.x,
-                    y: point.y,
-                    z,
-                });
-            }
+                Vertex(Point3::new(point.x, point.y, z))
+            }));
         }
-        for flank in &self.flanks {
+        let mut cdt: ConstrainedDelaunayTriangulation<Vertex> =
+            ConstrainedDelaunayTriangulation::bulk_load(points).ok()?;
+        let rails = self
+            .flanks
+            .iter()
+            .map(|flank| flank.rail.as_slice())
+            .chain(self.ends.iter().map(|end| end.as_slice()));
+        for rail in rails {
             let mut previous: Option<(FixedVertexHandle, Point3)> = None;
-            for &point in &flank.rail {
-                let Ok(handle) = cdt.insert(Vertex::from(point)) else {
+            for &point in rail {
+                let Ok(handle) = cdt.insert(Vertex(point)) else {
                     continue;
                 };
                 if let Some((from, start)) = previous {
@@ -138,19 +143,18 @@ impl Land {
                         // they do, both are split at the crossing, which takes the
                         // height of the rail being added at that point.
                         cdt.add_constraint_and_split(from, handle, |at| {
-                            let run = start.horizontal_distance_to(point);
-                            let t = if run < 1e-12 {
+                            let along = point - start;
+                            let run = along.x * along.x + along.y * along.y;
+                            let t = if run < 1e-24 {
                                 0.0
                             } else {
-                                ((at.x - start.x) * (point.x - start.x)
-                                    + (at.y - start.y) * (point.y - start.y))
-                                    / (run * run)
+                                ((at.x - start.x) * along.x + (at.y - start.y) * along.y) / run
                             };
-                            Vertex {
-                                x: at.x,
-                                y: at.y,
-                                z: start.z + (point.z - start.z) * t.clamp(0.0, 1.0),
-                            }
+                            Vertex(Point3::new(
+                                at.x,
+                                at.y,
+                                start.lerp(point, t.clamp(0.0, 1.0)).z,
+                            ))
                         });
                     }
                 }
@@ -159,9 +163,9 @@ impl Land {
         }
 
         // Every triangle outside the roads, with the vertices it needs and no other.
-        let mut positions = Vec::new();
-        let mut renumbered: HashMap<usize, u32> = HashMap::new();
-        let mut triangles = Vec::new();
+        let mut positions = Vec::with_capacity(cdt.num_vertices());
+        let mut renumbered = vec![u32::MAX; cdt.num_vertices()];
+        let mut triangles = Vec::with_capacity(cdt.num_inner_faces());
         for face in cdt.inner_faces() {
             let corners = face.vertices();
             let centre = corners.iter().fold([0.0, 0.0], |sum, corner| {
@@ -174,11 +178,12 @@ impl Land {
             // Spade winds an inner face anticlockwise in the plane, which is
             // anticlockwise seen from above: the face is up.
             let triangle = corners.map(|corner| {
-                *renumbered.entry(corner.fix().index()).or_insert_with(|| {
-                    let vertex = corner.data();
-                    positions.push(Point3::new(vertex.x, vertex.y, vertex.z));
-                    positions.len() as u32 - 1
-                })
+                let slot = &mut renumbered[corner.fix().index()];
+                if *slot == u32::MAX {
+                    *slot = positions.len() as u32;
+                    positions.push(corner.data().0);
+                }
+                *slot
             });
             triangles.push(triangle);
         }
@@ -195,27 +200,14 @@ impl Land {
     }
 }
 
-struct Vertex {
-    x: f64,
-    y: f64,
-    z: f64,
-}
-
-impl From<Point3> for Vertex {
-    fn from(point: Point3) -> Vertex {
-        Vertex {
-            x: point.x,
-            y: point.y,
-            z: point.z,
-        }
-    }
-}
+/// A point of the land, as spade sees it: its plan position is the vertex.
+struct Vertex(Point3);
 
 impl HasPosition for Vertex {
     type Scalar = f64;
 
     fn position(&self) -> Point2<f64> {
-        Point2::new(self.x, self.y)
+        Point2::new(self.0.x, self.0.y)
     }
 }
 
@@ -260,123 +252,128 @@ impl Polygon {
     }
 }
 
-/// Every rail's segments, bucketed by cell, so that a point can ask how near the
-/// nearest road edge is without measuring itself against every edge on the map.
-struct Rails {
+/// Things bucketed by the cells their boxes cover, so that a point is tested
+/// against the few near it rather than all of them.
+struct Buckets<T> {
     cell: f64,
-    buckets: HashMap<(i64, i64), Vec<Segment>>,
+    buckets: HashMap<(i64, i64), Vec<T>>,
+}
+
+impl<T> Buckets<T> {
+    fn new(cell: f64) -> Buckets<T> {
+        Buckets {
+            cell,
+            buckets: HashMap::new(),
+        }
+    }
+
+    /// Files `item` under every cell its box touches.
+    fn insert(&mut self, min: [f64; 2], max: [f64; 2], item: T)
+    where
+        T: Clone,
+    {
+        if !min[0].is_finite() || !max[0].is_finite() {
+            return;
+        }
+        let (x0, x1) = (self.index(min[0]), self.index(max[0]));
+        let (y0, y1) = (self.index(min[1]), self.index(max[1]));
+        for i in x0..=x1 {
+            for j in y0..=y1 {
+                self.buckets.entry((i, j)).or_default().push(item.clone());
+            }
+        }
+    }
+
+    fn index(&self, value: f64) -> i64 {
+        (value / self.cell).floor() as i64
+    }
+
+    /// The items filed under the point's own cell.
+    fn at(&self, x: f64, y: f64) -> impl Iterator<Item = &T> {
+        self.buckets
+            .get(&(self.index(x), self.index(y)))
+            .into_iter()
+            .flatten()
+    }
+
+    /// The items filed under the point's cell and the eight round it.
+    fn around(&self, x: f64, y: f64) -> impl Iterator<Item = &T> {
+        let (i, j) = (self.index(x), self.index(y));
+        (i - 1..=i + 1).flat_map(move |i| {
+            (j - 1..=j + 1).flat_map(move |j| self.buckets.get(&(i, j)).into_iter().flatten())
+        })
+    }
 }
 
 /// One straight piece of a rail, in plan.
 type Segment = ([f64; 2], [f64; 2]);
 
+/// Every rail's segments, bucketed so that a point can ask whether a road's edge
+/// is within `reach` of it without measuring itself against every edge on the map.
+struct Rails {
+    reach: f64,
+    buckets: Buckets<Segment>,
+}
+
 impl Rails {
-    /// `reach` is the farthest any query will ask about, and sizes the cells so
-    /// that a query never has to look past the cells round its own.
     fn new<'a>(rails: impl Iterator<Item = &'a [Point3]>, reach: f64) -> Rails {
-        let cell = reach.max(1.0);
-        let mut buckets: HashMap<(i64, i64), Vec<Segment>> = HashMap::new();
+        // Cells no smaller than the reach, so that a query never has to look past
+        // the cells round its own.
+        let mut buckets = Buckets::new(reach.max(1.0));
         for rail in rails {
             for pair in rail.windows(2) {
                 let (a, b) = ([pair[0].x, pair[0].y], [pair[1].x, pair[1].y]);
-                let (x0, x1) = (
-                    (a[0].min(b[0]) / cell).floor() as i64,
-                    (a[0].max(b[0]) / cell).floor() as i64,
+                buckets.insert(
+                    [a[0].min(b[0]), a[1].min(b[1])],
+                    [a[0].max(b[0]), a[1].max(b[1])],
+                    (a, b),
                 );
-                let (y0, y1) = (
-                    (a[1].min(b[1]) / cell).floor() as i64,
-                    (a[1].max(b[1]) / cell).floor() as i64,
-                );
-                for i in x0..=x1 {
-                    for j in y0..=y1 {
-                        buckets.entry((i, j)).or_default().push((a, b));
-                    }
-                }
             }
         }
-        Rails { cell, buckets }
+        Rails { reach, buckets }
     }
 
-    /// Whether any rail passes within `distance` of the point, for a distance no
-    /// more than the reach the rails were bucketed for.
-    fn within(&self, x: f64, y: f64, distance: f64) -> bool {
-        if distance <= 0.0 {
+    /// Whether any rail passes within the reach of the point.
+    fn within(&self, x: f64, y: f64) -> bool {
+        if self.reach <= 0.0 {
             return false;
         }
-        debug_assert!(distance <= self.cell);
-        let (i, j) = (
-            (x / self.cell).floor() as i64,
-            (y / self.cell).floor() as i64,
-        );
-        let square = distance * distance;
-        (i - 1..=i + 1).any(|i| {
-            (j - 1..=j + 1).any(|j| {
-                self.buckets.get(&(i, j)).is_some_and(|segments| {
-                    segments.iter().any(|&(a, b)| {
-                        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-                        let length = dx * dx + dy * dy;
-                        let t = if length < 1e-18 {
-                            0.0
-                        } else {
-                            (((x - a[0]) * dx + (y - a[1]) * dy) / length).clamp(0.0, 1.0)
-                        };
-                        let (px, py) = (a[0] + dx * t - x, a[1] + dy * t - y);
-                        px * px + py * py < square
-                    })
-                })
-            })
+        let square = self.reach * self.reach;
+        self.buckets.around(x, y).any(|&(a, b)| {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let length = dx * dx + dy * dy;
+            let t = if length < 1e-18 {
+                0.0
+            } else {
+                (((x - a[0]) * dx + (y - a[1]) * dy) / length).clamp(0.0, 1.0)
+            };
+            let (px, py) = (a[0] + dx * t - x, a[1] + dy * t - y);
+            px * px + py * py < square
         })
     }
 }
 
-/// Polygons bucketed by the cells their boxes cover, so that a point is tested
-/// against the few near it rather than all of them.
+/// Polygons bucketed by the cells their boxes cover.
 struct Index<'a> {
     polygons: &'a [Polygon],
-    cell: f64,
-    buckets: HashMap<(i64, i64), Vec<usize>>,
+    buckets: Buckets<usize>,
 }
 
 impl<'a> Index<'a> {
     const CELL: f64 = 25.0;
 
     fn new(polygons: &'a [Polygon]) -> Index<'a> {
-        let cell = Self::CELL;
-        let mut buckets: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        let mut buckets = Buckets::new(Self::CELL);
         for (index, polygon) in polygons.iter().enumerate() {
-            if !polygon.min[0].is_finite() {
-                continue;
-            }
-            let (x0, x1) = (
-                (polygon.min[0] / cell).floor() as i64,
-                (polygon.max[0] / cell).floor() as i64,
-            );
-            let (y0, y1) = (
-                (polygon.min[1] / cell).floor() as i64,
-                (polygon.max[1] / cell).floor() as i64,
-            );
-            for i in x0..=x1 {
-                for j in y0..=y1 {
-                    buckets.entry((i, j)).or_default().push(index);
-                }
-            }
+            buckets.insert(polygon.min, polygon.max, index);
         }
-        Index {
-            polygons,
-            cell,
-            buckets,
-        }
+        Index { polygons, buckets }
     }
 
     fn contains(&self, x: f64, y: f64) -> bool {
-        let key = (
-            (x / self.cell).floor() as i64,
-            (y / self.cell).floor() as i64,
-        );
-        self.buckets.get(&key).is_some_and(|near| {
-            near.iter()
-                .any(|&index| self.polygons[index].contains(x, y))
-        })
+        self.buckets
+            .at(x, y)
+            .any(|&index| self.polygons[index].contains(x, y))
     }
 }
 
@@ -385,11 +382,10 @@ mod tests {
     use super::*;
 
     fn flank(rail: Vec<Point3>, toe: Option<Vec<Point3>>) -> Flank {
-        let toe = match toe {
-            Some(toe) => toe.into_iter().map(Some).collect(),
-            None => vec![None; rail.len()],
-        };
-        Flank { rail, toe }
+        Flank {
+            rail,
+            toe: toe.unwrap_or_default(),
+        }
     }
 
     fn straight_road() -> Land {
@@ -399,7 +395,7 @@ mod tests {
                 .map(|i| Point3::new(i as f64 * 10.0, y, 0.0))
                 .collect()
         };
-        let mut land = Land::new(8.0);
+        let mut land = Land::default();
         land.section(
             flank(rail(4.0), Some(rail(12.0))),
             flank(rail(-4.0), Some(rail(-12.0))),
@@ -411,7 +407,7 @@ mod tests {
     fn the_land_meets_the_road_at_every_edge_vertex_and_has_nothing_under_it() {
         let land = straight_road();
         let mesh = land
-            .mesh(None, "t", &mut Ordinals::default())
+            .mesh(None, 8.0, "t", &mut Ordinals::default())
             .expect("a terrain");
         for i in 0..=4 {
             for y in [4.0, -4.0] {
@@ -449,13 +445,10 @@ mod tests {
     fn the_rails_know_what_is_near_them() {
         let rail = vec![Point3::new(0.0, 0.0, 0.0), Point3::new(100.0, 0.0, 0.0)];
         let rails = Rails::new(std::iter::once(rail.as_slice()), 8.0);
-        assert!(rails.within(50.0, 7.9, 8.0));
-        assert!(!rails.within(50.0, 8.1, 8.0));
-        assert!(
-            rails.within(-3.0, 0.0, 8.0),
-            "the end of a rail is part of it"
-        );
-        assert!(!rails.within(50.0, 30.0, 8.0));
+        assert!(rails.within(50.0, 7.9));
+        assert!(!rails.within(50.0, 8.1));
+        assert!(rails.within(-3.0, 0.0), "the end of a rail is part of it");
+        assert!(!rails.within(50.0, 30.0));
     }
 
     #[test]
@@ -472,11 +465,11 @@ mod tests {
                 .map(|i| Point3::new(x, i as f64 * 10.0 - 20.0, 0.0))
                 .collect()
         };
-        let mut land = Land::new(8.0);
+        let mut land = Land::default();
         land.section(flank(along(4.0), None), flank(along(-4.0), None));
         land.section(flank(across(-4.0), None), flank(across(4.0), None));
         let mesh = land
-            .mesh(None, "t", &mut Ordinals::default())
+            .mesh(None, 8.0, "t", &mut Ordinals::default())
             .expect("a terrain");
         for triangle in &mesh.triangles {
             let [a, b, c] = triangle.map(|i| mesh.positions[i as usize]);

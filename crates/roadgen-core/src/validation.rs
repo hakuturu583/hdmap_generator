@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::ops::Deref;
 
 use crate::error::{ValidationError, ValidationIssue};
-use crate::map::{Map, Projection};
+use crate::map::{Lane, Map, Projection};
 use crate::semantics::LaneType;
 use crate::topology::{LaneEnd, RoadEnd, RoadLinkTarget};
 
@@ -424,12 +424,7 @@ fn cross_section_direction(
     station: f64,
 ) -> Option<crate::geometry::UnitVector3> {
     let road = map.roads.get(&lane.road)?;
-    let sample = road
-        .reference_line
-        .sample_at(station, map.metadata.sampling)
-        .ok()?;
-    let frame = sample.frame().ok()?;
-    Some(frame.banked(road.superelevation.evaluate(station)).left)
+    Some(road.frame_at(station, map.metadata.sampling).ok()?.left)
 }
 
 fn check_road_links(map: &Map, config: ValidationConfig, issues: &mut Vec<ValidationIssue>) {
@@ -533,7 +528,7 @@ fn check_connections(map: &Map, config: ValidationConfig, issues: &mut Vec<Valid
 
         // A connection has to leave by the end traffic actually leaves by — unless
         // it joins two pavements, which have no direction of travel to leave by.
-        let footway = from.lane_type == LaneType::Sidewalk && to.lane_type == LaneType::Sidewalk;
+        let footway = is_footway(from, to);
         if !footway && connection.from.end != from.direction.exit_end() {
             issues.push(ValidationIssue::InconsistentTravelDirection {
                 connection: connection.id.clone(),
@@ -618,26 +613,27 @@ fn boundary_gap(
     // narrower overlap has to line up, so compare the gap against the width
     // difference where they actually meet.
     let slack = (from.exit_width() - to.entry_width()).abs();
-    let pairing = |left: bool| {
-        if left {
-            from_left
-                .distance_to(to_left)
-                .max(from_right.distance_to(to_right))
-        } else {
-            from_left
-                .distance_to(to_right)
-                .max(from_right.distance_to(to_left))
-        }
-    };
+    let straight = from_left
+        .distance_to(to_left)
+        .max(from_right.distance_to(to_right));
+    let crossed = from_left
+        .distance_to(to_right)
+        .max(from_right.distance_to(to_left));
     // Two pavements meet whichever way round: a footway has no direction, so its
     // left may be the other's right.
-    let footway = from.lane_type == LaneType::Sidewalk && to.lane_type == LaneType::Sidewalk;
-    let gap = if footway {
-        pairing(true).min(pairing(false))
+    let gap = if is_footway(from, to) {
+        straight.min(crossed)
     } else {
-        pairing(true)
+        straight
     };
     Ok((gap - slack).max(0.0))
+}
+
+/// Whether a connection joins two pavements, which have no direction of travel:
+/// a pedestrian walks a pavement either way, so neither its ends nor its sides
+/// are checked against a direction it does not have.
+fn is_footway(from: &Lane, to: &Lane) -> bool {
+    from.lane_type == LaneType::Sidewalk && to.lane_type == LaneType::Sidewalk
 }
 
 fn check_junctions(map: &Map, issues: &mut Vec<ValidationIssue>) {

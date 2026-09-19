@@ -14,7 +14,7 @@ use crate::geometry::{
     Taper, UnitVector3, Vector3, WidthProfile,
 };
 use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
-use crate::map::{CrossSection, Lane, Map, MapMetadata, Road, TravelGeometry};
+use crate::map::{CrossSection, Lane, Map, MapMetadata, Road};
 use crate::semantics::{
     BoundaryMarking, LaneType, MapObject, MapObjectKind, ObjectGeometry, RoadMarking, RoadType,
     TrafficRule,
@@ -1583,20 +1583,27 @@ impl Generator {
     /// sidewalk on that side gets no pavement there, and a junction of one arm
     /// has no corners.
     fn pave_corners(&mut self) -> Result<(), BuildError> {
+        // Every road end that arrives at each junction, with the heading it points
+        // away from it.
+        let mut arms_of: HashMap<JunctionId, Vec<(RoadId, RoadEnd, f64)>> = HashMap::new();
+        for draft in &self.builder.roads {
+            for end in [RoadEnd::Start, RoadEnd::End] {
+                let Some(RoadLinkTarget::Junction(junction)) = draft.link.at(end) else {
+                    continue;
+                };
+                let outward = horizontal(-into_joint(&draft.spec.reference_line, end)?)?;
+                arms_of.entry(junction.clone()).or_default().push((
+                    draft.id.clone(),
+                    end,
+                    outward.heading(),
+                ));
+            }
+        }
         let mut walkways = Vec::new();
         for junction in &self.builder.junctions {
-            // Every road end that arrives at this junction, with the direction it
-            // points away from it.
-            let mut arms: Vec<(RoadId, RoadEnd, f64)> = Vec::new();
-            for draft in &self.builder.roads {
-                for end in [RoadEnd::Start, RoadEnd::End] {
-                    if draft.link.at(end) != Some(&RoadLinkTarget::Junction(junction.id.clone())) {
-                        continue;
-                    }
-                    let outward = -into_joint(&draft.spec.reference_line, end)?;
-                    arms.push((draft.id.clone(), end, outward.y.atan2(outward.x)));
-                }
-            }
+            let Some(arms) = arms_of.get_mut(&junction.id) else {
+                continue;
+            };
             if arms.len() < 2 {
                 continue;
             }
@@ -1667,40 +1674,7 @@ impl Generator {
     ) -> Result<(), BuildError> {
         let from_lane = self.lane(&from.0)?.clone();
         let to_lane = self.lane(&to.0)?.clone();
-        // Out of the first road and into the second, in reference-line terms: a
-        // road's start is left against its direction and entered along it.
-        let leaving = |lane: &Lane,
-                       end: RoadEnd|
-         -> Result<(Point3, crate::geometry::UnitVector3), BuildError> {
-            Ok(match end {
-                RoadEnd::End => (lane.centerline.end_point(), lane.centerline.end_tangent()?),
-                RoadEnd::Start => (
-                    lane.centerline.start_point(),
-                    lane.centerline.start_tangent()?.reversed(),
-                ),
-            })
-        };
-        let (start, start_tangent) = leaving(&from_lane, from.1)?;
-        let (end, end_tangent) = leaving(&to_lane, to.1)?;
-        let end_tangent = end_tangent.reversed();
-        let sign = |end: RoadEnd| if end == RoadEnd::End { 1.0 } else { -1.0 };
-        let width = |lane: &Lane, end: RoadEnd| match end {
-            RoadEnd::Start => lane.width_at(lane.station_range.0),
-            RoadEnd::End => lane.width_at(lane.station_range.1),
-        };
-        self.build_junction_road(
-            junction,
-            &from_lane,
-            &to_lane,
-            (
-                start,
-                start_tangent,
-                from.1,
-                sign(from.1),
-                width(&from_lane, from.1),
-            ),
-            (end, end_tangent, to.1, -sign(to.1), width(&to_lane, to.1)),
-        )
+        self.build_junction_road(junction, &from_lane, from.1, &to_lane, to.1)
     }
 
     fn lane(&self, reference: &LaneRef) -> Result<&Lane, BuildError> {
@@ -1742,64 +1716,49 @@ impl Generator {
         from: &LaneRef,
         to: &LaneRef,
     ) -> Result<(), BuildError> {
-        let config = self.config();
         let from_lane = self.lane(from)?.clone();
         let to_lane = self.lane(to)?.clone();
-        let from_travel: TravelGeometry = from_lane.travel_geometry(config)?;
-        let to_travel: TravelGeometry = to_lane.travel_geometry(config)?;
         let from_end = road_end_of(from_lane.direction.exit_end());
         let to_end = road_end_of(to_lane.direction.entry_end());
-        self.build_junction_road(
-            junction,
-            &from_lane,
-            &to_lane,
-            (
-                from_travel.centerline.end_point(),
-                from_travel.centerline.end_tangent()?,
-                from_end,
-                from_lane.direction.sign(),
-                from_lane.exit_width(),
-            ),
-            (
-                to_travel.centerline.start_point(),
-                to_travel.centerline.start_tangent()?,
-                to_end,
-                to_lane.direction.sign(),
-                to_lane.entry_width(),
-            ),
-        )
+        self.build_junction_road(junction, &from_lane, from_end, &to_lane, to_end)
     }
 
-    /// Draws a road through a junction from one lane to another, given where and
-    /// how it leaves the first and arrives at the second.
+    /// Draws a road through a junction, out of the `from_end` end of one lane and
+    /// into the `to_end` end of another.
     ///
-    /// Each end is the point and tangent the road passes through, which end of the
-    /// lane's road that is, the sign of the road's lateral there relative to the
-    /// new road's own (`+1` when both run the same way), and the lane's width there.
-    /// The new road is a Hermite curve between the two, one lane wide, tapering from
-    /// the first width to the second, of the first lane's type.
-    #[allow(clippy::type_complexity)]
+    /// The new road is a Hermite curve between the two ends, leaving the first lane
+    /// along it and arriving at the second along it, one lane wide, tapering from
+    /// the first lane's width there to the second's, of the first lane's type. A
+    /// traffic connector leaves a lane at its exit end and enters one at its entry
+    /// end; a pavement round a corner has no such ends, and is given them.
     fn build_junction_road(
         &mut self,
         junction: &JunctionId,
         from_lane: &Lane,
+        from_end: RoadEnd,
         to_lane: &Lane,
-        (start, start_tangent, from_end, start_sign, start_width): (
-            Point3,
-            crate::geometry::UnitVector3,
-            RoadEnd,
-            f64,
-            f64,
-        ),
-        (end, end_tangent, to_end, end_sign, end_width): (
-            Point3,
-            crate::geometry::UnitVector3,
-            RoadEnd,
-            f64,
-            f64,
-        ),
+        to_end: RoadEnd,
     ) -> Result<(), BuildError> {
         let config = self.config();
+        // Out through `from_end` and in through `to_end`, in the reference line's
+        // own terms: a road's start is left against its direction and entered
+        // along it. The sign says whether the new road runs with the lane's
+        // reference line there (`+1`) or against it.
+        let start = endpoint(&from_lane.centerline, from_end);
+        let start_tangent = horizontal(into_joint(&from_lane.centerline, from_end)?)?;
+        let end = endpoint(&to_lane.centerline, to_end);
+        let end_tangent = horizontal(into_joint(&to_lane.centerline, to_end)?)?.reversed();
+        let sign = |end: RoadEnd| match end {
+            RoadEnd::End => 1.0,
+            RoadEnd::Start => -1.0,
+        };
+        let (start_sign, end_sign) = (sign(from_end), -sign(to_end));
+        let width_at = |lane: &Lane, end: RoadEnd| match end {
+            RoadEnd::Start => lane.width_at(lane.station_range.0),
+            RoadEnd::End => lane.width_at(lane.station_range.1),
+        };
+        let (start_width, end_width) = (width_at(from_lane, from_end), width_at(to_lane, to_end));
+
         // The connector is realised at the map's resolution, which is fixed into the
         // curve: a Bézier's length is its vertices walked end to end, so the
         // resolution has to be settled before anything asks how long it is.
@@ -1911,13 +1870,13 @@ impl Generator {
 
         self.push_connection(
             Some(junction),
-            LaneEndpoint::new(from_lane.id.clone(), lane_end_of(from_end)),
+            LaneEndpoint::new(from_lane.id.clone(), from_end.as_lane_end()),
             LaneEndpoint::new(connector_lane.clone(), LaneEnd::Start),
         )?;
         self.push_connection(
             Some(junction),
             LaneEndpoint::new(connector_lane, LaneEnd::End),
-            LaneEndpoint::new(to_lane.id.clone(), lane_end_of(to_end)),
+            LaneEndpoint::new(to_lane.id.clone(), to_end.as_lane_end()),
         )?;
         Ok(())
     }
@@ -1950,14 +1909,7 @@ impl Generator {
                         .map
                         .road(&lane.road)
                         .ok_or_else(|| BuildError::UnknownRoad(lane.road.clone()))
-                        .and_then(|road| {
-                            let sample = road.reference_line.sample_at(station, config)?;
-                            Ok(sample
-                                .frame()?
-                                .banked(road.superelevation.evaluate(station))
-                                .up
-                                .scaled(height))
-                        })?;
+                        .and_then(|road| Ok(road.frame_at(station, config)?.up.scaled(height)))?;
                     let raise = |point: Point3| point + up;
                     MapObject {
                         id: id.clone(),
@@ -1986,12 +1938,8 @@ impl Generator {
                     let length = entry.horizontal_length()?;
                     let half = (width / 2.0).min(length / 2.0);
                     let station = station.clamp(half, length - half);
-                    let sample = entry.reference_line.sample_at(station, config)?;
-                    let lateral = sample
-                        .frame()?
-                        .banked(entry.superelevation.evaluate(station))
-                        .left
-                        .get();
+                    let frame = entry.frame_at(station, config)?;
+                    let lateral = frame.left.get();
                     // How far the road reaches at *this* station, which a tapering
                     // cross-section makes a different question at every one.
                     let extent = self.layouts[&road]
@@ -2001,9 +1949,9 @@ impl Generator {
                         })
                         .map(|layout| layout.extent(station))
                         .fold(0.0_f64, f64::max);
-                    let along = sample.tangent.scaled(width / 2.0);
+                    let along = frame.tangent.scaled(width / 2.0);
                     let edge = |sign: f64| -> Result<Curve3, GeometryError> {
-                        let center = sample.point + along * sign;
+                        let center = frame.origin + along * sign;
                         Curve3::polyline([center + lateral * extent, center - lateral * extent])
                     };
                     MapObject {
@@ -2068,13 +2016,6 @@ fn road_end_of(end: LaneEnd) -> RoadEnd {
     match end {
         LaneEnd::Start => RoadEnd::Start,
         LaneEnd::End => RoadEnd::End,
-    }
-}
-
-fn lane_end_of(end: RoadEnd) -> LaneEnd {
-    match end {
-        RoadEnd::Start => LaneEnd::Start,
-        RoadEnd::End => LaneEnd::End,
     }
 }
 
