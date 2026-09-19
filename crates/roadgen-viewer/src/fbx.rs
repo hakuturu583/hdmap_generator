@@ -60,13 +60,23 @@ pub fn draw(text: &str) -> Result<Drawing, ViewError> {
         *classes.entry(label.as_str()).or_default() += 1;
         let kind = kind_of(label, mesh);
 
-        let loops = mesh.silhouette();
-        if loops.is_empty() {
+        // A closed solid has no silhouette and is drawn as its faces; an open
+        // surface is drawn as its outline. A mesh can be both — a building is its
+        // closed shell and the windows standing off it — and gets both, less the
+        // outlines that are lines in plan, which is what a window is from above.
+        let closed = mesh.closed_polygons();
+        let loops: Vec<Vec<Point>> = mesh
+            .silhouette()
+            .into_iter()
+            .filter(|outline| plan_area(outline) > 1e-6)
+            .collect();
+        if !closed.is_empty() {
             solids += 1;
-            for triangle in mesh.triangles() {
-                drawing.area(kind, triangle);
+            for face in closed {
+                drawing.area(kind, face);
             }
-        } else {
+        }
+        if !loops.is_empty() {
             silhouettes += 1;
             for outline in loops {
                 drawing.area(kind, outline);
@@ -186,25 +196,7 @@ impl Mesh {
     /// question "is this surface closed" a question about the shape rather than about
     /// how the file happened to be written.
     pub fn silhouette(&self) -> Vec<Vec<Point>> {
-        let mut welded: BTreeMap<[i64; 3], usize> = BTreeMap::new();
-        let mut of: Vec<usize> = Vec::with_capacity(self.vertices.len());
-        for vertex in &self.vertices {
-            let key = vertex.map(|value| (value * WELD).round() as i64);
-            let next = welded.len();
-            of.push(*welded.entry(key).or_insert(next));
-        }
-
-        let mut counts: BTreeMap<(usize, usize), usize> = BTreeMap::new();
-        for polygon in &self.polygons {
-            for index in 0..polygon.len() {
-                let a = of[polygon[index]];
-                let b = of[polygon[(index + 1) % polygon.len()]];
-                if a == b {
-                    continue;
-                }
-                *counts.entry(edge(a, b)).or_default() += 1;
-            }
-        }
+        let (of, counts) = self.edge_counts();
 
         // A vertex's unused-once neighbours. Chaining through these walks the border.
         let mut neighbours: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -225,10 +217,7 @@ impl Mesh {
         let mut walked: BTreeMap<(usize, usize), bool> = BTreeMap::new();
         let starts: Vec<usize> = neighbours.keys().copied().collect();
         for start in starts {
-            loop {
-                let Some(next) = unwalked(&neighbours, &walked, start) else {
-                    break;
-                };
+            while let Some(next) = unwalked(&neighbours, &walked, start) {
                 let mut chain = vec![start];
                 let mut at = next;
                 walked.insert(edge(start, at), true);
@@ -254,6 +243,61 @@ impl Mesh {
         }
         loops
     }
+}
+
+impl Mesh {
+    /// Every vertex's welded position, and how many polygons use each welded edge.
+    fn edge_counts(&self) -> (Vec<usize>, BTreeMap<(usize, usize), usize>) {
+        let mut welded: BTreeMap<[i64; 3], usize> = BTreeMap::new();
+        let mut of: Vec<usize> = Vec::with_capacity(self.vertices.len());
+        for vertex in &self.vertices {
+            let key = vertex.map(|value| (value * WELD).round() as i64);
+            let next = welded.len();
+            of.push(*welded.entry(key).or_insert(next));
+        }
+        let mut counts: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for polygon in &self.polygons {
+            for index in 0..polygon.len() {
+                let a = of[polygon[index]];
+                let b = of[polygon[(index + 1) % polygon.len()]];
+                if a == b {
+                    continue;
+                }
+                *counts.entry(edge(a, b)).or_default() += 1;
+            }
+        }
+        (of, counts)
+    }
+
+    /// The polygons that are part of a closed surface: every edge of each is shared
+    /// with one other polygon. A building's shell is made of these; the window quads
+    /// standing off its walls are not, and neither is a road.
+    pub fn closed_polygons(&self) -> Vec<Vec<Point>> {
+        let (of, counts) = self.edge_counts();
+        self.polygons
+            .iter()
+            .filter(|polygon| {
+                (0..polygon.len()).all(|index| {
+                    let a = of[polygon[index]];
+                    let b = of[polygon[(index + 1) % polygon.len()]];
+                    a == b || counts.get(&edge(a, b)) == Some(&2)
+                })
+            })
+            .map(|polygon| polygon.iter().map(|&index| self.plan(index)).collect())
+            .collect()
+    }
+}
+
+/// Twice the signed area of a plan-view ring, which is zero for a ring that is
+/// really a line — a vertical quad seen from above.
+fn plan_area(ring: &[Point]) -> f64 {
+    (0..ring.len())
+        .map(|index| {
+            let (a, b) = (ring[index], ring[(index + 1) % ring.len()]);
+            a.x * b.y - b.x * a.y
+        })
+        .sum::<f64>()
+        .abs()
 }
 
 fn edge(a: usize, b: usize) -> (usize, usize) {
