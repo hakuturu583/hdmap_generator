@@ -2,7 +2,7 @@
 
 `Map.export_carla()` writes a package that *references* its textures and does not
 hold them: the FBX points at `Textures/asphalt_02_diff_2k.jpg`, and beside it is
-`Textures/polyhaven.json` saying exactly which Poly Haven asset that file is and at
+`Textures/polyhaven.manifest` saying exactly which Poly Haven asset that file is and at
 what resolution. This module is the other half — it reads that manifest and downloads
 what it lists.
 
@@ -38,7 +38,7 @@ import urllib.request
 __all__ = ["fetch_textures", "texture_manifest", "TextureError"]
 
 #: Where the manifest sits inside a map's folder.
-MANIFEST = os.path.join("Textures", "polyhaven.json")
+MANIFEST = os.path.join("Textures", "polyhaven.manifest")
 
 #: How long to wait on one request, seconds. A texture is a few megabytes and a
 #: fetcher that hangs on a dead connection is worse than one that fails.

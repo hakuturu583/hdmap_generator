@@ -1603,7 +1603,7 @@ def test_fetching_textures_reports_every_asset_it_could_not_get(tmp_path):
     m.export_carla(tmp_path / "Import")
     package = tmp_path / "Import" / "Town01"
 
-    manifest_path = package / "Textures" / "polyhaven.json"
+    manifest_path = package / "Textures" / "polyhaven.manifest"
     manifest = json.loads(manifest_path.read_text())
     manifest["api"] = "http://127.0.0.1:1"
     manifest_path.write_text(json.dumps(manifest))
@@ -1615,7 +1615,7 @@ def test_fetching_textures_reports_every_asset_it_could_not_get(tmp_path):
         assert slug in message
     # And it says where the list it was working from is, because that file is the
     # thing to edit when an asset has been renamed.
-    assert "polyhaven.json" in message
+    assert "polyhaven.manifest" in message
 
 
 def test_fetching_textures_leaves_alone_what_is_already_there(tmp_path):
@@ -1628,7 +1628,7 @@ def test_fetching_textures_leaves_alone_what_is_already_there(tmp_path):
     for entry in manifest["files"]:
         (package / entry["path"]).write_bytes(b"not really a jpeg")
 
-    manifest_path = package / "Textures" / "polyhaven.json"
+    manifest_path = package / "Textures" / "polyhaven.manifest"
     unreachable = json.loads(manifest_path.read_text())
     unreachable["api"] = "http://127.0.0.1:1"
     manifest_path.write_text(json.dumps(unreachable))

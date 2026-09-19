@@ -15,10 +15,9 @@
 //! because a package has to build on Windows too. It does what a careful hand
 //! would: it copies the package into CARLA's `Import/` unless it is already there;
 //! it moves every other `.json` under `Import/` out of the way while `Import.py`
-//! runs, because that script imports every descriptor it finds — including this
-//! package's own texture manifest, which it would take for a package called
-//! `polyhaven` — and puts them back afterwards, whatever happened; and it says how
-//! to start the server at the end rather than starting it, unless asked.
+//! runs, because that script imports every descriptor it finds, and puts them back
+//! afterwards, whatever happened; and it says how to start the server at the end
+//! rather than starting it, unless asked.
 
 use crate::PackageConfig;
 
@@ -119,9 +118,8 @@ def main(argv=None):
             print("warning: no RecastBuilder under %s/Build, so no pedestrian navigation will be built" % carla, file=sys.stderr)
     shutil.copy2(import_dir / MAP / (MAP + ".obj"), dist / (MAP + ".obj"))
 
-    # Import.py imports every .json it finds under Import/ — other packages, and
-    # this one's texture manifest, which it would take for a package called
-    # `polyhaven`. Everything but this descriptor steps aside until it is done.
+    # Import.py imports every .json it finds under Import/, other packages'
+    # descriptors included. Everything but this one steps aside until it is done.
     descriptor = import_dir / (PACKAGE + ".json")
     aside = [path for path in import_dir.rglob("*.json") if path != descriptor]
     for path in aside:

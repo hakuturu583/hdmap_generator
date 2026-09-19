@@ -305,7 +305,7 @@ pub fn write(
     let entries = materials::manifest(&wanted);
     let manifest = TextureManifest::new(entries.clone());
     write_text(
-        &textures.join("polyhaven.json"),
+        &textures.join("polyhaven.manifest"),
         &manifest
             .to_json()
             .map_err(|error| ExportError::Json(error.to_string()))?,

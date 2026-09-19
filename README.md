@@ -904,15 +904,15 @@ Import/
     ├── Town01.xodr             the road network — same name, which CARLA insists on
     ├── Town01.obj              the surface again, for the pedestrian navigation mesh
     └── Textures/
-        ├── polyhaven.json      what to fetch, and where each file goes
+        ├── polyhaven.manifest  what to fetch, and where each file goes (JSON)
         └── CREDITS.md
 ```
 
 Getting from that folder to a level that runs is half a dozen steps in the right
 order with the right environment — fetch the textures, copy the package into CARLA's
-`Import/`, stage the pedestrian navigation builder, keep every other descriptor there
-out of `Import.py`'s way (it imports every `.json` it finds, this package's texture
-manifest included), run `Import.py`, give the level a sky — so the exporter writes
+`Import/`, stage the pedestrian navigation builder, keep every other package's
+descriptor there out of `Import.py`'s way (it imports every `.json` it finds), run
+`Import.py`, give the level a sky — so the exporter writes
 them down as a Python script beside the descriptor, with what it knows baked in:
 
 ```python
