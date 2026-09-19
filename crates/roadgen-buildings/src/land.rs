@@ -159,7 +159,7 @@ fn corridor_edges(map: &Map, road: &Road, margin: f64) -> Option<Vec<(Point3, Po
 /// Read off the generated lanes rather than off the road's spec, so a road that
 /// tapers, gains a lane or carries a lane offset is measured where it actually is.
 fn section_edges(map: &Map, road: &Road, station: f64) -> Option<(f64, f64)> {
-    let section = section_at(road, station)?;
+    let section = road.section_at(station)?;
     let mut left = 0.0;
     let mut right = 0.0;
     for lane in road.lanes.iter().filter_map(|id| map.lanes.get(id)) {
@@ -173,15 +173,6 @@ fn section_edges(map: &Map, road: &Road, station: f64) -> Option<(f64, f64)> {
     }
     let centre = road.lane_offset.evaluate(station);
     Some((centre + left, centre - right))
-}
-
-/// Which cross-section covers `station`: the last one that starts at or before it.
-///
-/// `None` only for a station before the road begins, which nothing here asks for.
-fn section_at(road: &Road, station: f64) -> Option<usize> {
-    road.sections
-        .iter()
-        .rposition(|section| section.station <= station + 1e-9)
 }
 
 /// Cuts every road's two frontages into lots, in the map's own order.

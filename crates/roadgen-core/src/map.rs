@@ -239,12 +239,15 @@ impl Road {
         Ok((start, end))
     }
 
-    /// The index of the section `station` falls in, or `None` off the road's ends.
+    /// The index of the section that covers `station`: the last one that starts
+    /// at or before it, a hair's tolerance allowed at a boundary so that the
+    /// station a section starts at is that section's. `None` only before the road
+    /// begins; past its end, the last section, which is where the road's geometry
+    /// stops too.
     pub fn section_at(&self, station: f64) -> Option<usize> {
-        (0..self.sections.len()).find(|&index| {
-            self.section_range(index)
-                .is_ok_and(|(start, end)| station >= start && station <= end)
-        })
+        self.sections
+            .iter()
+            .rposition(|section| section.station <= station + 1e-9)
     }
 
     /// The road's frame at `station`, banked by its superelevation there: the
@@ -666,6 +669,38 @@ impl Map {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_station_belongs_to_the_last_section_that_starts_at_or_before_it() {
+        let road = Road {
+            id: RoadId::new("r"),
+            name: None,
+            reference_line: Curve3::line(Point3::ORIGIN, Point3::new(100.0, 0.0, 0.0)).unwrap(),
+            lane_offset: Poly3Profile::default(),
+            lanes: Vec::new(),
+            sections: [0.0, 40.0, 70.0]
+                .into_iter()
+                .map(|station| CrossSection {
+                    station,
+                    lanes: Vec::new(),
+                })
+                .collect(),
+            junction: None,
+            link: RoadLink::default(),
+            road_type: RoadType::Town,
+            speed_limit: None,
+            superelevation: Poly3Profile::default(),
+        };
+        assert_eq!(road.section_at(0.0), Some(0));
+        assert_eq!(road.section_at(39.9), Some(0));
+        // The station a section starts at is that section's, a hair either way.
+        assert_eq!(road.section_at(40.0), Some(1));
+        assert_eq!(road.section_at(40.0 - 1e-10), Some(1));
+        assert_eq!(road.section_at(69.9), Some(1));
+        // Past the end, the last section; before the start, none.
+        assert_eq!(road.section_at(150.0), Some(2));
+        assert_eq!(road.section_at(-1.0), None);
+    }
 
     #[test]
     fn handedness_decides_which_side_a_forward_lane_lands_on() {
