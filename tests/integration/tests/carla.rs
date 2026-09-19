@@ -120,7 +120,8 @@ fn the_surface_covers_the_road_network_it_was_built_from() {
     );
     // And not by an unbounded amount: past the verge there is the ground, written
     // out to a stated distance for a lidar to reach, and nothing beyond that.
-    let reach = config.surfaces.ground_extent + config.surfaces.ground_cell;
+    let reach =
+        config.surfaces.ground_extent + config.surfaces.verge_width + config.surfaces.ground_cell;
     assert!(surface.min.x >= network.min.x - reach);
     assert!(surface.max.x <= network.max.x + reach);
     // Without it, the verge is the only thing beyond the road.
@@ -150,8 +151,9 @@ fn the_ground_goes_out_as_far_as_a_lidar_does() {
         .iter()
         .map(|point| point.x)
         .fold(f64::NEG_INFINITY, f64::max);
+    let edge = network.max.x + config.surfaces.verge_width + config.surfaces.ground_extent;
     assert!(
-        (far - (network.max.x + config.surfaces.ground_extent)).abs() < config.surfaces.ground_cell,
+        far >= edge && far < edge + config.surfaces.ground_cell,
         "the ground reaches x = {far}, the network ends at {}",
         network.max.x
     );
@@ -415,5 +417,66 @@ fn two_roads_that_meet_at_an_angle_share_one_edge() {
         missing.is_empty(),
         "the surface does not pass through the lane boundaries at the joint:\n  {}",
         missing.join("\n  ")
+    );
+}
+
+#[test]
+fn the_ground_stays_under_every_road_everywhere() {
+    // Not just the highest ground under the lowest road: at every vertex of every
+    // road surface, the ground directly beneath it is lower. A ground that comes up
+    // through a road anywhere is a road a vehicle falls through.
+    for (name, map) in [
+        ("joined", scenarios::two_roads_joined()),
+        ("graded", scenarios::graded_road()),
+        ("crossroads", scenarios::crossroads()),
+        ("banked", scenarios::banked_curve()),
+        ("spiral", scenarios::spiral_transition_road()),
+    ] {
+        ground_stays_under(name, &map);
+    }
+}
+
+fn ground_stays_under(name: &str, map: &ValidatedMap) {
+    let config = PackageConfig::for_map(map);
+    let meshes = roadgen_carla::to_meshes(map, &config);
+    let ground = meshes
+        .iter()
+        .find(|mesh| mesh.role == Role::Ground)
+        .expect("a ground mesh");
+    let height_under = |x: f64, y: f64| -> Option<f64> {
+        for triangle in &ground.triangles {
+            let [a, b, c] = triangle.map(|index| ground.positions[index as usize]);
+            let det = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let u = ((x - a.x) * (c.y - a.y) - (c.x - a.x) * (y - a.y)) / det;
+            let v = ((b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y)) / det;
+            if u >= -1e-9 && v >= -1e-9 && u + v <= 1.0 + 1e-9 {
+                return Some(a.z + u * (b.z - a.z) + v * (c.z - a.z));
+            }
+        }
+        None
+    };
+    // Roads and verges both: the verge is the ground's neighbour, and the one a
+    // vehicle drives onto first.
+    let mut worst: Option<(f64, Point3)> = None;
+    for mesh in meshes
+        .iter()
+        .filter(|mesh| mesh.role == Role::Road || mesh.role == Role::Terrain)
+    {
+        for point in &mesh.positions {
+            let under = height_under(point.x, point.y).expect("ground under every road vertex");
+            let clearance = point.z - under;
+            if worst.is_none_or(|(c, _)| clearance < c) {
+                worst = Some((clearance, *point));
+            }
+        }
+    }
+    let (clearance, at) = worst.expect("road vertices");
+    assert!(
+        clearance > 0.0,
+        "{name}: the ground is {} m above the surface at {at:?}",
+        -clearance
     );
 }

@@ -108,8 +108,13 @@ impl Default for SurfaceConfig {
 pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
     let mut meshes = Vec::new();
     let mut ordinal = Ordinals::default();
-    for road in map.roads.iter() {
-        let Some(rungs) = rungs(map, road) else {
+    // The roads first, then the ground under them, then the verges laid down from
+    // each road's edge onto that ground — so the order the roads come in is the
+    // order their surfaces are written, and the verges and the ground follow.
+    let mut sections: Vec<(Layout, Vec<&Rung>)> = Vec::new();
+    let all_rungs: Vec<Option<Vec<Rung>>> = map.roads.iter().map(|road| rungs(map, road)).collect();
+    for (road, rungs) in map.roads.iter().zip(&all_rungs) {
+        let Some(rungs) = rungs else {
             continue;
         };
         for section in 0..road.sections.len() {
@@ -125,10 +130,23 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             }
             layout.surfaces(&within, map_name, &mut ordinal, &mut meshes);
             layout.markings(&within, map_name, config, &mut ordinal, &mut meshes);
-            layout.verges(&within, map_name, config, &mut ordinal, &mut meshes);
+            sections.push((layout, within));
         }
     }
-    meshes.extend(crate::ground::ground(map, map_name, config, &mut ordinal));
+    let field = crate::ground::Field::under(map, &meshes, config);
+    for (layout, within) in &sections {
+        layout.verges(
+            within,
+            map_name,
+            config,
+            field.as_ref(),
+            &mut ordinal,
+            &mut meshes,
+        );
+    }
+    if let Some(field) = field {
+        meshes.push(field.mesh(map_name, &mut ordinal));
+    }
     meshes.retain(|mesh| !mesh.is_empty());
     meshes
 }
@@ -593,6 +611,7 @@ impl<'a> Layout<'a> {
         rungs: &[&Rung],
         map_name: &str,
         config: &SurfaceConfig,
+        ground: Option<&crate::ground::Field>,
         ordinals: &mut Ordinals,
         out: &mut Vec<Mesh>,
     ) {
@@ -616,29 +635,53 @@ impl<'a> Layout<'a> {
         let left_rise = self.rise_of(self.lanes[first]);
         let right_rise = self.rise_of(self.lanes[last]);
 
-        self.band(
-            rungs,
-            move |cuts| cuts[first] + width,
-            move |cuts| cuts[first],
+        // The verge's inner edge is the road's; its outer edge is on the ground,
+        // when there is one, so the grass slopes down to the land rather than
+        // stopping on a ledge above it.
+        let onto_ground = |point: Point3| -> Point3 {
+            match ground {
+                Some(field) => Point3::new(
+                    point.x,
+                    point.y,
+                    field.height(point.x, point.y) + crate::ground::LIFT,
+                ),
+                None => point,
+            }
+        };
+        let mut lay = |outer: &dyn Fn(&[f64]) -> f64,
+                       inner: &dyn Fn(&[f64]) -> f64,
+                       rise: f64,
+                       outer_is_left: bool| {
+            let mut outer_rail = Vec::with_capacity(rungs.len());
+            let mut inner_rail = Vec::with_capacity(rungs.len());
+            for rung in rungs {
+                let cuts = self.cuts(rung.station);
+                outer_rail.push(onto_ground(rung.at(outer(&cuts), rise)));
+                inner_rail.push(rung.at(inner(&cuts), rise));
+            }
+            let mut mesh = Mesh::new(
+                mesh_name(map_name, Role::Terrain, ordinals.take(Role::Terrain)),
+                Role::Terrain,
+                materials::GRASS,
+            );
+            if outer_is_left {
+                mesh.strip(&outer_rail, &inner_rail, 0);
+            } else {
+                mesh.strip(&inner_rail, &outer_rail, 0);
+            }
+            out.push(mesh);
+        };
+        lay(
+            &|cuts: &[f64]| cuts[first] + width,
+            &|cuts: &[f64]| cuts[first],
             left_rise,
-            left_rise,
-            Role::Terrain,
-            materials::GRASS,
-            map_name,
-            ordinals,
-            out,
+            true,
         );
-        self.band(
-            rungs,
-            move |cuts| cuts[last + 1],
-            move |cuts| cuts[last + 1] - width,
+        lay(
+            &|cuts: &[f64]| cuts[last + 1] - width,
+            &|cuts: &[f64]| cuts[last + 1],
             right_rise,
-            right_rise,
-            Role::Terrain,
-            materials::GRASS,
-            map_name,
-            ordinals,
-            out,
+            false,
         );
     }
 

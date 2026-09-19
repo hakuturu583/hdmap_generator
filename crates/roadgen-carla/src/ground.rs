@@ -5,13 +5,16 @@
 //! than that: a lidar reaches a hundred metres or more, and a vehicle that leaves
 //! the verge should land on something. So the surface is finished with a **ground**
 //! — one mesh, a grid over the network's extent plus a margin, whose height at each
-//! vertex is taken from the nearest stretches of road. It is not terrain, and it is
-//! not pretending to be: it is the flattest thing that meets every road at the
+//! vertex is taken from the roads near it. It is not terrain, and it is not
+//! pretending to be: it is the flattest thing that stays under every road at the
 //! road's own height, which is what a road network *does* say about its land.
 //!
-//! It sits a couple of centimetres under the verges and the roads, so the two never
-//! fight for the same depth value, and the step at the verge's edge is smaller than
-//! anything a sensor resolves.
+//! Two things keep it under the roads rather than through them. Each ground vertex
+//! takes the *lowest* road vertex within a cell's reach of it, a little under —
+//! never an average, because an average of a road climbing away from a vertex sits
+//! above the road at that vertex. And the verges are laid down *onto* it: a verge's
+//! inner edge is the road's, its outer edge is on the ground, and the grass slopes
+//! between the two, so there is no ledge where the verge ends and the land begins.
 
 use roadgen_core::geometry::Point3;
 use roadgen_core::map::Map;
@@ -21,98 +24,172 @@ use crate::mesh::Mesh;
 use crate::surfaces::{Ordinals, SurfaceConfig};
 use crate::tags::{mesh_name, Role};
 
-/// How far under the roads the ground sits, metres.
-pub const DROP: f64 = 0.02;
-/// How many road samples a ground vertex takes its height from.
-const NEIGHBOURS: usize = 6;
+/// How far under the roads the ground sits, metres: more than a road can bend
+/// under the chord between two ground vertices.
+pub const DROP: f64 = 0.05;
+/// How far above the ground a verge's outer edge is laid, so that the two meet
+/// without fighting for the same depth value.
+pub const LIFT: f64 = 0.01;
+/// How far apart the reference line is sampled for the ground, metres.
+const SAMPLE_SPACING: f64 = 2.0;
 
-/// The ground mesh, or `None` when the map has no road to take a height from or
-/// the configuration asks for none.
-pub fn ground(
-    map: &Map,
-    map_name: &str,
-    config: &SurfaceConfig,
-    ordinals: &mut Ordinals,
-) -> Option<Mesh> {
-    if config.ground_extent <= 0.0 || config.ground_cell <= 0.0 {
-        return None;
-    }
-    let sampling = map.metadata.sampling;
-    let mut samples: Vec<Point3> = Vec::new();
-    for road in map.roads.iter() {
-        if let Ok(points) = road.reference_line.samples(sampling) {
-            samples.extend(points.into_iter().map(|sample| sample.point));
+/// The ground as a height field: a grid, with the triangulation the mesh will have.
+pub struct Field {
+    x0: f64,
+    y0: f64,
+    cell: f64,
+    columns: usize,
+    rows: usize,
+    /// Row-major from the south-west corner, `(columns + 1) * (rows + 1)` of them.
+    heights: Vec<f64>,
+}
+
+impl Field {
+    /// Lays the field out under `surface` — the roads built so far — reaching
+    /// `config.ground_extent` past them and past every building. `None` when there
+    /// is nothing to lay it under or the configuration asks for none.
+    pub fn under(map: &Map, surface: &[Mesh], config: &SurfaceConfig) -> Option<Field> {
+        if config.ground_extent <= 0.0 || config.ground_cell <= 0.0 {
+            return None;
         }
-    }
-    if samples.is_empty() {
-        return None;
-    }
-
-    // The extent: every road and every building, and the margin beyond them.
-    let mut min = [f64::INFINITY; 2];
-    let mut max = [f64::NEG_INFINITY; 2];
-    let mut widen = |point: &Point3| {
-        min[0] = min[0].min(point.x);
-        min[1] = min[1].min(point.y);
-        max[0] = max[0].max(point.x);
-        max[1] = max[1].max(point.y);
-    };
-    samples.iter().for_each(&mut widen);
-    for part in map.building_parts.iter() {
-        part.solid.footprint.points().iter().for_each(&mut widen);
-    }
-    let margin = config.ground_extent;
-    let (x0, y0) = (min[0] - margin, min[1] - margin);
-    let (x1, y1) = (max[0] + margin, max[1] + margin);
-    let cell = config.ground_cell;
-    let columns = ((x1 - x0) / cell).ceil().max(1.0) as usize;
-    let rows = ((y1 - y0) / cell).ceil().max(1.0) as usize;
-
-    let height = |x: f64, y: f64| -> f64 {
-        // Inverse-distance weighting over the nearest few samples: smooth between
-        // roads at different heights, and exactly a road's height on the road.
-        let mut nearest: Vec<(f64, f64)> = samples
+        // Every vertex a vehicle drives on: the roads and the gutters. Pavements
+        // stand above the road beside them and are left out, or the ground under
+        // a pavement would come up through the road.
+        let mut samples: Vec<Point3> = surface
             .iter()
-            .map(|point| ((point.x - x).powi(2) + (point.y - y).powi(2), point.z))
+            .filter(|mesh| matches!(mesh.role, Role::Road | Role::Gutter))
+            .flat_map(|mesh| mesh.positions.iter().copied())
             .collect();
-        let keep = NEIGHBOURS.min(nearest.len());
-        if keep < nearest.len() {
-            nearest.select_nth_unstable_by(keep - 1, |a, b| a.0.total_cmp(&b.0));
-            nearest.truncate(keep);
+        if samples.is_empty() {
+            return None;
         }
-        let mut weighted = 0.0;
-        let mut weights = 0.0;
-        for (distance_squared, z) in nearest {
-            let weight = 1.0 / (distance_squared + 1e-6);
-            weighted += weight * z;
-            weights += weight;
+        // And the reference lines, densely: a straight road's surface has vertices
+        // at its two ends and nowhere between, and a ground that read only those
+        // would take the road's far end's height all the way along it.
+        let sampling = map.metadata.sampling;
+        for road in map.roads.iter() {
+            let Ok(length) = road.reference_line.horizontal_length() else {
+                continue;
+            };
+            let steps = (length / SAMPLE_SPACING).ceil().max(1.0) as usize;
+            for step in 0..=steps {
+                let station = length * step as f64 / steps as f64;
+                if let Ok(sample) = road.reference_line.sample_at(station, sampling) {
+                    samples.push(sample.point);
+                }
+            }
         }
-        weighted / weights - DROP
-    };
 
-    // Rows of vertices, south to north; each pair of rows is one strip. The
-    // northern row is the strip's left rail so that the surface faces up.
-    let row = |j: usize| -> Vec<Point3> {
-        let y = y0 + (y1 - y0) * j as f64 / rows as f64;
-        (0..=columns)
-            .map(|i| {
-                let x = x0 + (x1 - x0) * i as f64 / columns as f64;
-                Point3::new(x, y, height(x, y))
-            })
-            .collect()
-    };
-    let mut mesh = Mesh::new(
-        mesh_name(map_name, Role::Ground, ordinals.take(Role::Ground)),
-        Role::Ground,
-        materials::GRASS,
-    );
-    let mut south = row(0);
-    for j in 1..=rows {
-        let north = row(j);
-        mesh.strip(&north, &south, 0);
-        south = north;
+        let mut min = [f64::INFINITY; 2];
+        let mut max = [f64::NEG_INFINITY; 2];
+        let mut widen = |point: &Point3| {
+            min[0] = min[0].min(point.x);
+            min[1] = min[1].min(point.y);
+            max[0] = max[0].max(point.x);
+            max[1] = max[1].max(point.y);
+        };
+        samples.iter().for_each(&mut widen);
+        for part in map.building_parts.iter() {
+            part.solid.footprint.points().iter().for_each(&mut widen);
+        }
+        // The verge is what the ground is drawn up to, and it reaches past the road.
+        let margin = config.ground_extent + config.verge_width;
+        let cell = config.ground_cell;
+        let x0 = min[0] - margin;
+        let y0 = min[1] - margin;
+        let columns = ((max[0] + margin - x0) / cell).ceil().max(1.0) as usize;
+        let rows = ((max[1] + margin - y0) / cell).ceil().max(1.0) as usize;
+
+        // A ground vertex governs the triangles around it, which reach a cell's
+        // diagonal; every road vertex that could be over one of them is looked at,
+        // and the lowest wins. With none that close, the nearest road vertex.
+        let reach = (cell * cell * 2.0).max(1.0);
+        let mut heights = Vec::with_capacity((columns + 1) * (rows + 1));
+        for j in 0..=rows {
+            let y = y0 + cell * j as f64;
+            for i in 0..=columns {
+                let x = x0 + cell * i as f64;
+                let mut nearest = (f64::INFINITY, 0.0);
+                let mut lowest = f64::INFINITY;
+                for point in &samples {
+                    let d = (point.x - x).powi(2) + (point.y - y).powi(2);
+                    if d < nearest.0 {
+                        nearest = (d, point.z);
+                    }
+                    if d <= reach {
+                        lowest = lowest.min(point.z);
+                    }
+                }
+                let z = if lowest.is_finite() {
+                    lowest
+                } else {
+                    nearest.1
+                };
+                heights.push(z - DROP);
+            }
+        }
+        Some(Field {
+            x0,
+            y0,
+            cell,
+            columns,
+            rows,
+            heights,
+        })
     }
-    (!mesh.is_empty()).then_some(mesh)
+
+    fn vertex(&self, i: usize, j: usize) -> Point3 {
+        Point3::new(
+            self.x0 + self.cell * i as f64,
+            self.y0 + self.cell * j as f64,
+            self.heights[j * (self.columns + 1) + i],
+        )
+    }
+
+    /// The ground's height at a position, interpolated on the triangles the mesh
+    /// is made of, so that a point laid at this height is on the mesh and not
+    /// merely near it. Beyond the grid, the edge's height.
+    pub fn height(&self, x: f64, y: f64) -> f64 {
+        let fx = ((x - self.x0) / self.cell).clamp(0.0, self.columns as f64 - 1e-9);
+        let fy = ((y - self.y0) / self.cell).clamp(0.0, self.rows as f64 - 1e-9);
+        let (i, j) = (fx.floor() as usize, fy.floor() as usize);
+        let (u, v) = (fx - i as f64, fy - j as f64);
+        // The strip splits each cell along the diagonal from its north-west corner
+        // to its south-east one; see `mesh`.
+        let (sw, se, nw, ne) = (
+            self.vertex(i, j).z,
+            self.vertex(i + 1, j).z,
+            self.vertex(i, j + 1).z,
+            self.vertex(i + 1, j + 1).z,
+        );
+        if u + v <= 1.0 {
+            // South-west of the diagonal: the triangle sw, se, nw.
+            sw + (se - sw) * u + (nw - sw) * v
+        } else {
+            // North-east of it: the triangle ne, nw, se.
+            ne + (nw - ne) * (1.0 - u) + (se - ne) * (1.0 - v)
+        }
+    }
+
+    /// The ground as one mesh, tagged as terrain.
+    pub fn mesh(&self, map_name: &str, ordinals: &mut Ordinals) -> Mesh {
+        let mut mesh = Mesh::new(
+            mesh_name(map_name, Role::Ground, ordinals.take(Role::Ground)),
+            Role::Ground,
+            materials::GRASS,
+        );
+        // Rows of vertices, south to north; each pair of rows is one strip, with
+        // the northern row as the strip's left rail so that the surface faces up.
+        let row =
+            |j: usize| -> Vec<Point3> { (0..=self.columns).map(|i| self.vertex(i, j)).collect() };
+        let mut south = row(0);
+        for j in 1..=self.rows {
+            let north = row(j);
+            mesh.strip(&north, &south, 0);
+            south = north;
+        }
+        mesh
+    }
 }
 
 #[cfg(test)]
@@ -150,20 +227,29 @@ mod tests {
         }
     }
 
+    fn build(map: &ValidatedMap, config: &SurfaceConfig) -> Option<Mesh> {
+        crate::surfaces::build(map, "g", config)
+            .into_iter()
+            .find(|mesh| mesh.role == Role::Ground)
+    }
+
     #[test]
     fn the_ground_reaches_the_margin_past_the_network() {
         let map = map();
-        let mesh = ground(&map, "g", &config(), &mut Ordinals::default()).expect("a ground");
-        let xs: Vec<f64> = mesh.positions.iter().map(|p| p.x).collect();
-        let ys: Vec<f64> = mesh.positions.iter().map(|p| p.y).collect();
-        let span = |v: &[f64]| {
+        let mesh = build(&map, &config()).expect("a ground");
+        let span = |pick: fn(&Point3) -> f64| {
+            let values: Vec<f64> = mesh.positions.iter().map(pick).collect();
             (
-                v.iter().cloned().fold(f64::MAX, f64::min),
-                v.iter().cloned().fold(f64::MIN, f64::max),
+                values.iter().cloned().fold(f64::MAX, f64::min),
+                values.iter().cloned().fold(f64::MIN, f64::max),
             )
         };
-        assert_eq!(span(&xs), (-100.0, 300.0));
-        assert_eq!(span(&ys), (-100.0, 100.0));
+        let verge = config().verge_width;
+        let (x_min, x_max) = span(|p| p.x);
+        let (y_min, y_max) = span(|p| p.y);
+        // The one lane is on the right of the reference line: y from 0 to -3.5.
+        assert!((x_min - (-100.0 - verge)).abs() < 1e-9 && x_max >= 300.0 + verge);
+        assert!((y_min - (-100.0 - 3.5 - verge)).abs() < 1e-9 && y_max >= 100.0 + verge);
         assert_eq!(mesh.role, Role::Ground);
         assert!(mesh.name.starts_with("g_Terrain_Land_"));
         assert_eq!(crate::tags::label_of(&mesh.name), crate::Label::Terrain);
@@ -176,26 +262,68 @@ mod tests {
     #[test]
     fn the_ground_meets_each_road_just_under_its_own_height() {
         let map = map();
-        let mesh = ground(&map, "g", &config(), &mut Ordinals::default()).expect("a ground");
-        // Under the road at x = 100 the road is at z = 15; the ground a hair below.
+        let mesh = build(&map, &config()).expect("a ground");
+        // Under the road near x = 100 the road is at z = 15; the ground a little
+        // under the lowest road vertex within a cell's reach, which on a 5 % grade
+        // is up to 14 m back down the road.
         let under = mesh
             .positions
             .iter()
-            .find(|p| (p.x - 100.0).abs() < 1e-6 && p.y.abs() < 1e-6)
-            .expect("a vertex on the road's line");
+            .min_by(|a, b| {
+                ((a.x - 100.0).abs() + (a.y + 1.75).abs())
+                    .total_cmp(&((b.x - 100.0).abs() + (b.y + 1.75).abs()))
+            })
+            .expect("a vertex under the road");
         assert!(
-            (under.z - (15.0 - DROP)).abs() < 0.05,
-            "ground at {}",
-            under.z
+            under.z <= 15.0 - DROP + 0.5 && under.z >= 15.0 - DROP - 1.0,
+            "ground at {:?}",
+            under
         );
         // Far from it the ground holds the nearest road's height rather than
         // dropping to zero or drifting off.
         let far = mesh
             .positions
             .iter()
-            .find(|p| (p.x - 100.0).abs() < 1e-6 && (p.y - 100.0).abs() < 1e-6)
+            .filter(|p| (p.x - under.x).abs() < 1e-6)
+            .max_by(|a, b| a.y.total_cmp(&b.y))
             .unwrap();
         assert!(far.z > 13.0 && far.z < 17.0, "ground far out at {}", far.z);
+    }
+
+    #[test]
+    fn the_field_reads_back_the_height_its_mesh_has() {
+        let map = map();
+        let config = config();
+        let roads = crate::surfaces::build(
+            &map,
+            "g",
+            &SurfaceConfig {
+                ground_extent: 0.0,
+                ..config
+            },
+        );
+        let field = Field::under(&map, &roads, &config).expect("a field");
+        let mesh = field.mesh("g", &mut Ordinals::default());
+        for point in mesh.positions.iter().step_by(7) {
+            assert!((field.height(point.x, point.y) - point.z).abs() < 1e-9);
+        }
+        // And between vertices it is on the mesh's own triangles: a point on the
+        // first cell's diagonal is on both, one off it is on only the right one.
+        for (a, b) in [
+            (mesh.positions[0], mesh.positions[3]),
+            (mesh.positions[0], mesh.positions[1]),
+            (mesh.positions[2], mesh.positions[3]),
+        ] {
+            let between = a.lerp(b, 0.3);
+            assert!((field.height(between.x, between.y) - between.z).abs() < 1e-9);
+        }
+        let [a, b, c] = mesh.triangles[0].map(|i| mesh.positions[i as usize]);
+        let inside = Point3::new(
+            (a.x + b.x + c.x) / 3.0,
+            (a.y + b.y + c.y) / 3.0,
+            (a.z + b.z + c.z) / 3.0,
+        );
+        assert!((field.height(inside.x, inside.y) - inside.z).abs() < 1e-9);
     }
 
     #[test]
@@ -204,6 +332,6 @@ mod tests {
             ground_extent: 0.0,
             ..SurfaceConfig::default()
         };
-        assert!(ground(&map(), "g", &config, &mut Ordinals::default()).is_none());
+        assert!(build(&map(), &config).is_none());
     }
 }
