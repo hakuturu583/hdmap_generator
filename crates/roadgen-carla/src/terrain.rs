@@ -31,9 +31,7 @@
 //! the pavement round the corner, and is nearer than a verge to that; a grid
 //! vertex just past a kerb would make the slope down from it a step.
 
-use std::collections::HashMap;
-
-use roadgen_core::geometry::Point3;
+use roadgen_core::geometry::{Grid, Point3};
 use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation};
 
 use crate::ground::Field;
@@ -291,59 +289,6 @@ impl Polygon {
     }
 }
 
-/// Things bucketed by the cells their boxes cover, so that a point is tested
-/// against the few near it rather than all of them.
-struct Buckets<T> {
-    cell: f64,
-    buckets: HashMap<(i64, i64), Vec<T>>,
-}
-
-impl<T> Buckets<T> {
-    fn new(cell: f64) -> Buckets<T> {
-        Buckets {
-            cell,
-            buckets: HashMap::new(),
-        }
-    }
-
-    /// Files `item` under every cell its box touches.
-    fn insert(&mut self, min: [f64; 2], max: [f64; 2], item: T)
-    where
-        T: Clone,
-    {
-        if !min[0].is_finite() || !max[0].is_finite() {
-            return;
-        }
-        let (x0, x1) = (self.index(min[0]), self.index(max[0]));
-        let (y0, y1) = (self.index(min[1]), self.index(max[1]));
-        for i in x0..=x1 {
-            for j in y0..=y1 {
-                self.buckets.entry((i, j)).or_default().push(item.clone());
-            }
-        }
-    }
-
-    fn index(&self, value: f64) -> i64 {
-        (value / self.cell).floor() as i64
-    }
-
-    /// The items filed under the point's own cell.
-    fn at(&self, x: f64, y: f64) -> impl Iterator<Item = &T> {
-        self.buckets
-            .get(&(self.index(x), self.index(y)))
-            .into_iter()
-            .flatten()
-    }
-
-    /// The items filed under the point's cell and the eight round it.
-    fn around(&self, x: f64, y: f64) -> impl Iterator<Item = &T> {
-        let (i, j) = (self.index(x), self.index(y));
-        (i - 1..=i + 1).flat_map(move |i| {
-            (j - 1..=j + 1).flat_map(move |j| self.buckets.get(&(i, j)).into_iter().flatten())
-        })
-    }
-}
-
 /// One edge of a section's outline, in plan, with the section and the two ring
 /// vertices it joins.
 type Edge = ([f64; 2], [f64; 2], (usize, usize, usize));
@@ -352,14 +297,14 @@ type Edge = ([f64; 2], [f64; 2], (usize, usize, usize));
 /// is within `reach` of it without measuring itself against every edge on the map.
 struct Edges {
     reach: f64,
-    buckets: Buckets<Edge>,
+    grid: Grid<Edge>,
 }
 
 impl Edges {
     fn new(sections: &[Section], reach: f64) -> Edges {
         // Cells no smaller than the reach, so that a query never has to look past
         // the cells round its own. No reach, no index: nothing is ever within it.
-        let mut buckets = Buckets::new(reach.max(1.0));
+        let mut grid = Grid::new(reach);
         if reach > 0.0 {
             for (index, section) in sections.iter().enumerate() {
                 let count = section.ring.len();
@@ -367,7 +312,7 @@ impl Edges {
                     let next = (vertex + 1) % count;
                     let to = section.ring[next];
                     let (a, b) = ([from.x, from.y], [to.x, to.y]);
-                    buckets.insert(
+                    grid.insert(
                         [a[0].min(b[0]), a[1].min(b[1])],
                         [a[0].max(b[0]), a[1].max(b[1])],
                         (a, b, (index, vertex, next)),
@@ -375,7 +320,7 @@ impl Edges {
                 }
             }
         }
-        Edges { reach, buckets }
+        Edges { reach, grid }
     }
 
     /// Whether any outline passes within the reach of the point — leaving out,
@@ -390,45 +335,43 @@ impl Edges {
         // A whisker under the reach, so that a toe's own vertex, on an edge that
         // is not skipped, does not count as within it.
         let square = self.reach * self.reach * (1.0 - 1e-9);
-        self.buckets
-            .around(x, y)
-            .any(|&(a, b, (section, from, to))| {
-                if own.is_some_and(|(own_section, own_vertex)| {
-                    section == own_section && (from == own_vertex || to == own_vertex)
-                }) {
-                    return false;
-                }
-                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-                let t = fraction_along(
-                    Point3::new(a[0], a[1], 0.0),
-                    Point3::new(b[0], b[1], 0.0),
-                    [x, y],
-                );
-                let (px, py) = (a[0] + dx * t - x, a[1] + dy * t - y);
-                px * px + py * py < square
-            })
+        self.grid.around(x, y).any(|&(a, b, (section, from, to))| {
+            if own.is_some_and(|(own_section, own_vertex)| {
+                section == own_section && (from == own_vertex || to == own_vertex)
+            }) {
+                return false;
+            }
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let t = fraction_along(
+                Point3::new(a[0], a[1], 0.0),
+                Point3::new(b[0], b[1], 0.0),
+                [x, y],
+            );
+            let (px, py) = (a[0] + dx * t - x, a[1] + dy * t - y);
+            px * px + py * py < square
+        })
     }
 }
 
 /// Polygons bucketed by the cells their boxes cover.
 struct Index<'a> {
     polygons: &'a [&'a Polygon],
-    buckets: Buckets<usize>,
+    grid: Grid<usize>,
 }
 
 impl<'a> Index<'a> {
     const CELL: f64 = 25.0;
 
     fn new(polygons: &'a [&'a Polygon]) -> Index<'a> {
-        let mut buckets = Buckets::new(Self::CELL);
+        let mut grid = Grid::new(Self::CELL);
         for (index, polygon) in polygons.iter().enumerate() {
-            buckets.insert(polygon.min, polygon.max, index);
+            grid.insert(polygon.min, polygon.max, index);
         }
-        Index { polygons, buckets }
+        Index { polygons, grid }
     }
 
     fn contains(&self, x: f64, y: f64) -> bool {
-        self.buckets
+        self.grid
             .at(x, y)
             .any(|&index| self.polygons[index].contains(x, y))
     }
