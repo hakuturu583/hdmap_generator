@@ -184,6 +184,10 @@ class Map:
         kerb_height: Optional[float] = None,
         verge_width: Optional[float] = None,
         ground_extent: Optional[float] = None,
+        carla_root: Optional[str] = None,
+        engine: Optional[str] = None,
+        sun_altitude: Optional[float] = None,
+        sun_azimuth: Optional[float] = None,
     ) -> dict[str, Any]: ...
     def to_gpudrive_json(
         self,

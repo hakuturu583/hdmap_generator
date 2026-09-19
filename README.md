@@ -239,7 +239,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
-| `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=)` | write a CARLA UE5 package; returns what was written and what each mesh will be tagged |
+| `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=, carla_root=, engine=, sun_altitude=, sun_azimuth=)` | write a CARLA UE5 package and the script that imports it; returns what was written and what each mesh will be tagged |
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
 | `carla_sky(carla_root, package, map_name, engine=, sun_altitude=, sun_azimuth=)` | after `Import.py`: give the imported level a daylight sky, with the editor's own scripting |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
@@ -874,13 +874,12 @@ m.export_carla("Import/", name="Town01")
 for warning in m.carla_warnings(name="Town01"):
     print(warning)
 roadgen.fetch_textures("Import/Town01")     # optional; see Textures below
-# … Util/Tools/Import.py --package Town01Package, in the CARLA checkout, then:
-roadgen.carla_sky("/opt/carla", "Town01Package", "Town01")   # see The sky, below
 ```
 
 ```text
 Import/
 ├── Town01Package.json          what CARLA's Import.py reads
+├── Town01Package.py            the build script: everything below, in order
 └── Town01/
     ├── Town01.fbx              the surface
     ├── Town01.xodr             the road network — same name, which CARLA insists on
@@ -888,6 +887,27 @@ Import/
         ├── polyhaven.json      what to fetch, and where each file goes
         └── CREDITS.md
 ```
+
+Getting from that folder to a level that runs is half a dozen steps in the right
+order with the right environment — fetch the textures, copy the package into CARLA's
+`Import/`, keep every other descriptor there out of `Import.py`'s way (it imports
+every `.json` it finds, this package's texture manifest included), run `Import.py`,
+give the level a sky — so the exporter writes them down as a Python script beside
+the descriptor, with what it knows baked in:
+
+```python
+m.export_carla("out/", name="Town01",
+               carla_root="/opt/carla", engine="/opt/UE_5.5")   # or CARLA_ROOT / CARLA_UNREAL_ENGINE_PATH
+```
+
+```sh
+python out/Town01Package.py            # imports it, adds the sky, says how to run it
+python out/Town01Package.py --launch   # and starts the server on it
+```
+
+Run it with the interpreter that has `roadgen` and CARLA's own `carla` module, which
+`Import.py` needs. `--carla` and `--engine` override what was baked in, `--no-sky`
+and `--no-textures` skip those steps.
 
 The `.fbx` and the `.xodr` share a name because CARLA requires it in three separate
 places: `Import.py` pairs them by name when it generates a descriptor itself, it copies

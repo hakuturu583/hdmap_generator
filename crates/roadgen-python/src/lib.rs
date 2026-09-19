@@ -1113,6 +1113,10 @@ impl PyMap {
         kerb_height = None,
         verge_width = None,
         ground_extent = None,
+        carla_root = None,
+        engine = None,
+        sun_altitude = None,
+        sun_azimuth = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn export_carla(
@@ -1126,8 +1130,12 @@ impl PyMap {
         kerb_height: Option<f64>,
         verge_width: Option<f64>,
         ground_extent: Option<f64>,
+        carla_root: Option<String>,
+        engine: Option<String>,
+        sun_altitude: Option<f64>,
+        sun_azimuth: Option<f64>,
     ) -> PyResult<Py<PyDict>> {
-        let config = self.carla_config(
+        let mut config = self.carla_config(
             name,
             package,
             buildings,
@@ -1136,11 +1144,22 @@ impl PyMap {
             verge_width,
             ground_extent,
         )?;
+        // What the package's script imports into, when the caller says now rather
+        // than when running it.
+        config.carla_root = carla_root.or_else(|| std::env::var("CARLA_ROOT").ok());
+        config.engine = engine.or_else(|| std::env::var("CARLA_UNREAL_ENGINE_PATH").ok());
+        if let Some(sun_altitude) = sun_altitude {
+            config.sun_altitude = sun_altitude;
+        }
+        if let Some(sun_azimuth) = sun_azimuth {
+            config.sun_azimuth = sun_azimuth;
+        }
         let map = self.built.as_ref().expect("just built");
         let written = roadgen_carla::write(map, directory, &config).map_err(runtime_error)?;
 
         let report = PyDict::new(py);
         report.set_item("descriptor", written.descriptor.to_string_lossy())?;
+        report.set_item("script", written.script.to_string_lossy())?;
         report.set_item("fbx", written.fbx.to_string_lossy())?;
         report.set_item("xodr", written.xodr.to_string_lossy())?;
         report.set_item(

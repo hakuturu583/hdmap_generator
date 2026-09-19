@@ -13,6 +13,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import textwrap
 import xml.etree.ElementTree as ET
 
@@ -1664,3 +1665,30 @@ def test_the_package_has_a_sky_command(capsys):
     with pytest.raises(SystemExit):
         commands.main(["sky", "--help"])
     assert "python -m roadgen sky" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        commands.main(["textures", "--help"])
+    assert "python -m roadgen textures" in capsys.readouterr().out
+
+
+def test_a_package_comes_with_the_script_that_imports_it(tmp_path):
+    m = roadgen.Map(name="Scripted")
+    m.add_road(start=(0.0, 0.0, 0.0), end=(100.0, 0.0, 0.0), lanes=[roadgen.Lane(width=3.5)])
+    written = m.export_carla(
+        str(tmp_path), package="ScriptedPkg", carla_root="/opt/carla", engine="/opt/ue5",
+        use_carla_materials=False, sun_altitude=30.0,
+    )
+    script = pathlib.Path(written["script"])
+    assert script == tmp_path / "ScriptedPkg.py"
+    text = script.read_text()
+    assert 'CARLA_ROOT = "/opt/carla"' in text and 'ENGINE = "/opt/ue5"' in text
+    assert 'PACKAGE = "ScriptedPkg"' in text and 'MAP = "Scripted"' in text
+    assert "OWN_TEXTURES = True" in text and "SUN_ALTITUDE = 30" in text
+    # It is Python that compiles, and its help works without CARLA around.
+    compile(text, str(script), "exec")
+    result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True)
+    assert result.returncode == 0 and "--carla" in result.stdout and "--launch" in result.stdout
+    # And with nowhere to import into, it says so rather than doing anything.
+    result = subprocess.run(
+        [sys.executable, str(script), "--carla", str(tmp_path / "nowhere")], capture_output=True, text=True
+    )
+    assert result.returncode != 0 and "CarlaUnreal.uproject" in result.stderr

@@ -63,6 +63,7 @@ pub mod ground;
 pub mod materials;
 pub mod mesh;
 pub mod package;
+pub mod script;
 pub mod surfaces;
 pub mod tags;
 
@@ -126,6 +127,14 @@ pub struct PackageConfig {
     pub use_carla_materials: bool,
     pub buildings: BuildingPlacement,
     pub surfaces: SurfaceConfig,
+    /// The CARLA checkout the package's script imports into, when the caller said.
+    /// Otherwise the script takes it from its arguments or the environment.
+    pub carla_root: Option<String>,
+    /// The Unreal Engine that checkout was built against, likewise.
+    pub engine: Option<String>,
+    /// Where the script puts the sun, in degrees, the way CARLA's weather spells it.
+    pub sun_altitude: f64,
+    pub sun_azimuth: f64,
 }
 
 impl Default for PackageConfig {
@@ -143,6 +152,10 @@ impl PackageConfig {
             use_carla_materials: true,
             buildings: BuildingPlacement::InMap,
             surfaces: SurfaceConfig::default(),
+            carla_root: None,
+            engine: None,
+            sun_altitude: 45.0,
+            sun_azimuth: -50.0,
         }
     }
 
@@ -169,6 +182,13 @@ impl PackageConfig {
         self.use_carla_materials = use_carla_materials;
         self
     }
+
+    /// Bakes the CARLA checkout and its engine into the package's script.
+    pub fn with_carla(mut self, carla_root: impl Into<String>, engine: impl Into<String>) -> Self {
+        self.carla_root = Some(carla_root.into());
+        self.engine = Some(engine.into());
+        self
+    }
 }
 
 /// What a package turned out to be.
@@ -188,6 +208,8 @@ pub struct Package {
     pub labels: BTreeMap<Label, usize>,
     /// The texture files the package expects and does not yet have.
     pub textures: Vec<materials::Entry>,
+    /// The script that imports the package into CARLA and gives it a sky.
+    pub script: PathBuf,
 }
 
 /// Builds the meshes a map's FBX is made of, without writing anything.
@@ -259,6 +281,9 @@ pub fn write(
             .to_json()
             .map_err(|error| ExportError::Json(error.to_string()))?,
     )?;
+    let script_path = root.join(format!("{}.py", config.package));
+    write_text(&script_path, &script::script(config))?;
+    make_executable(&script_path)?;
 
     let wanted: Vec<usize> = {
         let mut wanted: Vec<usize> = meshes
@@ -285,6 +310,7 @@ pub fn write(
     }
 
     Ok(Package {
+        script: script_path,
         descriptor: descriptor_path,
         fbx: fbx_path,
         xodr: xodr_path,
@@ -308,6 +334,23 @@ fn creator() -> &'static str {
 /// A path inside the package, the way the descriptor spells one.
 fn relative(map: &str, file: &str) -> String {
     format!("./{map}/{file}")
+}
+
+/// Marks a written script runnable, where the file system has such a thing.
+fn make_executable(path: &Path) -> Result<(), ExportError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)
+            .map_err(|error| ExportError::Io(error.to_string()))?
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        fs::set_permissions(path, permissions)
+            .map_err(|error| ExportError::Io(error.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn write_text(path: &Path, text: &str) -> Result<(), ExportError> {

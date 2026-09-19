@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 
 __all__ = ["carla_sky", "CarlaSkyError"]
 
@@ -96,24 +97,28 @@ def carla_sky(
         "-nosourcecontrol",
         "-nopause",
     ]
-    process = subprocess.Popen(
-        command,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-    )
+    # The editor's output goes to a file rather than a pipe: the editor leaves a
+    # trace daemon behind that inherits its stdout, and a pipe read to its end
+    # would wait for that daemon to close it, long after the editor has gone.
+    with tempfile.TemporaryFile(mode="w+", errors="replace") as output:
+        process = subprocess.run(
+            command,
+            env=environment,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output.seek(0)
+        lines = output.read().splitlines()
     succeeded = False
     changed = None
-    for line in process.stdout:
+    for line in lines:
         if log is not None:
-            log(line.rstrip("\n"))
+            log(line)
         if "Python script executed successfully" in line:
             succeeded = True
         if "roadgen-sky: saved" in line:
             changed = "True" in line
-    process.wait()
     if not succeeded:
         raise CarlaSkyError(
             "the editor did not run the sky script to completion (exit %s); "
