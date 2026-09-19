@@ -1160,6 +1160,7 @@ impl PyMap {
         let report = PyDict::new(py);
         report.set_item("descriptor", written.descriptor.to_string_lossy())?;
         report.set_item("script", written.script.to_string_lossy())?;
+        report.set_item("obj", written.obj.to_string_lossy())?;
         report.set_item("fbx", written.fbx.to_string_lossy())?;
         report.set_item("xodr", written.xodr.to_string_lossy())?;
         report.set_item(

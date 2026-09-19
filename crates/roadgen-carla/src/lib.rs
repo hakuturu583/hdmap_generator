@@ -56,12 +56,14 @@
 //! # }
 //! ```
 
+pub mod crosswalks;
 pub mod error;
 pub mod facades;
 pub mod fbx;
 pub mod ground;
 pub mod materials;
 pub mod mesh;
+pub mod obj;
 pub mod package;
 pub mod script;
 pub mod surfaces;
@@ -210,6 +212,8 @@ pub struct Package {
     pub textures: Vec<materials::Entry>,
     /// The script that imports the package into CARLA and gives it a sky.
     pub script: PathBuf,
+    /// The `.obj` CARLA's navigation builder makes the pedestrians' mesh from.
+    pub obj: PathBuf,
 }
 
 /// Builds the meshes a map's FBX is made of, without writing anything.
@@ -239,6 +243,9 @@ pub fn write(
     let meshes = to_meshes(map, config);
     let fbx_path = folder.join(format!("{}.fbx", config.map));
     write_text(&fbx_path, &fbx::document(&meshes, creator()))?;
+    // The same surfaces once more, for the pedestrians' navigation mesh.
+    let obj_path = folder.join(format!("{}.obj", config.map));
+    write_text(&obj_path, &obj::document(&meshes, map))?;
 
     // The OpenDRIVE is written by the OpenDRIVE exporter, not by this one. A CARLA
     // map is a mesh and a road network and they have to be the same road network;
@@ -311,6 +318,7 @@ pub fn write(
 
     Ok(Package {
         script: script_path,
+        obj: obj_path,
         descriptor: descriptor_path,
         fbx: fbx_path,
         xodr: xodr_path,
@@ -494,19 +502,6 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
              That is the right way round — CARLA spawns its own from the OpenDRIVE, \
              and a mesh named for one would be dropped by ValidateStaticMesh anyway — \
              but nothing in the mesh marks where they stand"
-        ));
-    }
-
-    let crossings = map
-        .objects
-        .iter()
-        .filter(|object| matches!(object.kind, MapObjectKind::Crosswalk))
-        .count();
-    if crossings > 0 {
-        warnings.push(format!(
-            "{crossings} crosswalks are in the .xodr but are not painted on the \
-             surface: a crossing is an object in the IR rather than a lane boundary, \
-             and this exporter paints boundaries"
         ));
     }
 

@@ -103,6 +103,22 @@ def main(argv=None):
         shutil.copytree(here / MAP, import_dir / MAP)
         shutil.copy2(here / (PACKAGE + ".json"), import_dir / (PACKAGE + ".json"))
 
+    # Pedestrians. Import.py builds their navigation mesh with RecastBuilder, from
+    # an .obj of the map, in Util/DockerUtils/dist — where the UE5 branch's build
+    # puts neither the tool nor the converter that made the .obj from the FBX. The
+    # package brings its own .obj; the tool is found where CMake built it.
+    dist = carla / "Util" / "DockerUtils" / "dist"
+    recast = dist / "RecastBuilder"
+    if not recast.exists():
+        built = sorted(carla.glob("Build/*/_deps/recastnavigation-build/RecastBuilder/RecastBuilder*"))
+        built = [path for path in built if path.is_file() and os.access(str(path), os.X_OK)]
+        if built:
+            shutil.copy2(built[0], recast)
+            print("staged %s" % built[0])
+        else:
+            print("warning: no RecastBuilder under %s/Build, so no pedestrian navigation will be built" % carla, file=sys.stderr)
+    shutil.copy2(import_dir / MAP / (MAP + ".obj"), dist / (MAP + ".obj"))
+
     # Import.py imports every .json it finds under Import/ — other packages, and
     # this one's texture manifest, which it would take for a package called
     # `polyhaven`. Everything but this descriptor steps aside until it is done.
@@ -117,6 +133,12 @@ def main(argv=None):
     finally:
         for path in aside:
             path.with_name(path.name + ".roadgen-aside").rename(path)
+
+    nav = carla / "Unreal" / "CarlaUnreal" / "Content" / PACKAGE / "Maps" / MAP / "Nav" / (MAP + ".bin")
+    if nav.exists():
+        print("pedestrian navigation built: %s" % nav)
+    else:
+        print("warning: no pedestrian navigation was built (%s is missing)" % nav, file=sys.stderr)
 
     if not args.no_sky:
         print("adding a sky to %s" % MAP)

@@ -226,6 +226,15 @@ enum ConnectOp {
         from: LaneRef,
         to: LaneRef,
     },
+    /// A pavement round the corner of a junction, from the sidewalk of one arm to
+    /// the sidewalk of the next arm round. Made by the generator rather than the
+    /// caller, and with no direction: a footway has none, so the ends are named
+    /// by which end of each road they are.
+    Walkway {
+        junction: JunctionId,
+        from: (LaneRef, RoadEnd),
+        to: (LaneRef, RoadEnd),
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -522,6 +531,14 @@ impl MapBuilder {
             };
             let to_lane = LaneRef::new(to.clone(), to_index);
 
+            // A pavement does not go through a junction: it goes round its corner,
+            // which the generator lays for every junction on its own.
+            if junction.is_some()
+                && (self.lane_spec(&from_lane)?.lane_type == LaneType::Sidewalk
+                    || self.lane_spec(&to_lane)?.lane_type == LaneType::Sidewalk)
+            {
+                continue;
+            }
             let from_flow = self.lane_spec(&from_lane)?.direction.sign() * from_sense;
             let to_flow = self.lane_spec(&to_lane)?.direction.sign() * to_sense;
             // `from` emits into the joint and `to` accepts from it, or the mirror
@@ -958,6 +975,7 @@ impl Generator {
         self.build_reference_geometry()?;
         self.mitre_joints()?;
         self.build_roads()?;
+        self.pave_corners()?;
         self.build_connections()?;
         self.build_objects()?;
         self.build_rules()?;
@@ -1548,9 +1566,141 @@ impl Generator {
                 ConnectOp::ViaJunction { junction, from, to } => {
                     self.build_connector(&junction, &from, &to)?
                 }
+                ConnectOp::Walkway { junction, from, to } => {
+                    self.build_walkway(&junction, &from, &to)?
+                }
             }
         }
         Ok(())
+    }
+
+    /// Lays a pavement round every corner of every junction.
+    ///
+    /// The arms of a junction are taken in the order they stand round it, and
+    /// between each arm and the next the outermost sidewalk on the side facing the
+    /// corner is joined to the next arm's on its facing side — the pavement a
+    /// pedestrian walks round rather than the road they cross. An arm with no
+    /// sidewalk on that side gets no pavement there, and a junction of one arm
+    /// has no corners.
+    fn pave_corners(&mut self) -> Result<(), BuildError> {
+        let mut walkways = Vec::new();
+        for junction in &self.builder.junctions {
+            // Every road end that arrives at this junction, with the direction it
+            // points away from it.
+            let mut arms: Vec<(RoadId, RoadEnd, f64)> = Vec::new();
+            for draft in &self.builder.roads {
+                for end in [RoadEnd::Start, RoadEnd::End] {
+                    if draft.link.at(end) != Some(&RoadLinkTarget::Junction(junction.id.clone())) {
+                        continue;
+                    }
+                    let outward = -into_joint(&draft.spec.reference_line, end)?;
+                    arms.push((draft.id.clone(), end, outward.y.atan2(outward.x)));
+                }
+            }
+            if arms.len() < 2 {
+                continue;
+            }
+            arms.sort_by(|a, b| a.2.total_cmp(&b.2));
+            for index in 0..arms.len() {
+                let (a_road, a_end, _) = &arms[index];
+                let (b_road, b_end, _) = &arms[(index + 1) % arms.len()];
+                // Looking out along `a`, the next arm anticlockwise is on its left;
+                // looking out along `b`, `a` is on its right. In each road's own
+                // terms that is its left when it starts at the junction and its
+                // right when it ends there, and the other way round for `b`.
+                let a_side = match a_end {
+                    RoadEnd::Start => LateralSide::Left,
+                    RoadEnd::End => LateralSide::Right,
+                };
+                let b_side = match b_end {
+                    RoadEnd::Start => LateralSide::Right,
+                    RoadEnd::End => LateralSide::Left,
+                };
+                let (Some(from), Some(to)) = (
+                    self.outer_sidewalk(a_road, *a_end, a_side)?,
+                    self.outer_sidewalk(b_road, *b_end, b_side)?,
+                ) else {
+                    continue;
+                };
+                walkways.push(ConnectOp::Walkway {
+                    junction: junction.id.clone(),
+                    from: (from, *a_end),
+                    to: (to, *b_end),
+                });
+            }
+        }
+        self.builder.operations.extend(walkways);
+        Ok(())
+    }
+
+    /// The outermost sidewalk lane at one end of a road, on one of its sides.
+    fn outer_sidewalk(
+        &self,
+        road: &RoadId,
+        end: RoadEnd,
+        side: LateralSide,
+    ) -> Result<Option<LaneRef>, BuildError> {
+        let section = self.builder.section_at_end(road, end)?;
+        let mut outermost: Option<(usize, LaneRef)> = None;
+        for index in self.builder.lanes_of_section(road, section)? {
+            let lane = LaneRef::new(road.clone(), index);
+            if self.builder.lane_spec(&lane)?.lane_type != LaneType::Sidewalk
+                || self.builder.lane_side(&lane)? != side
+            {
+                continue;
+            }
+            let ordinal = self.builder.lane_ordinal(&lane)?;
+            if outermost.as_ref().is_none_or(|(rank, _)| ordinal > *rank) {
+                outermost = Some((ordinal, lane));
+            }
+        }
+        Ok(outermost.map(|(_, lane)| lane))
+    }
+
+    /// Draws the pavement round one corner of a junction: from the sidewalk `from`
+    /// at its `from.1` end to the sidewalk `to` at its `to.1` end.
+    fn build_walkway(
+        &mut self,
+        junction: &JunctionId,
+        from: &(LaneRef, RoadEnd),
+        to: &(LaneRef, RoadEnd),
+    ) -> Result<(), BuildError> {
+        let from_lane = self.lane(&from.0)?.clone();
+        let to_lane = self.lane(&to.0)?.clone();
+        // Out of the first road and into the second, in reference-line terms: a
+        // road's start is left against its direction and entered along it.
+        let leaving = |lane: &Lane,
+                       end: RoadEnd|
+         -> Result<(Point3, crate::geometry::UnitVector3), BuildError> {
+            Ok(match end {
+                RoadEnd::End => (lane.centerline.end_point(), lane.centerline.end_tangent()?),
+                RoadEnd::Start => (
+                    lane.centerline.start_point(),
+                    lane.centerline.start_tangent()?.reversed(),
+                ),
+            })
+        };
+        let (start, start_tangent) = leaving(&from_lane, from.1)?;
+        let (end, end_tangent) = leaving(&to_lane, to.1)?;
+        let end_tangent = end_tangent.reversed();
+        let sign = |end: RoadEnd| if end == RoadEnd::End { 1.0 } else { -1.0 };
+        let width = |lane: &Lane, end: RoadEnd| match end {
+            RoadEnd::Start => lane.width_at(lane.station_range.0),
+            RoadEnd::End => lane.width_at(lane.station_range.1),
+        };
+        self.build_junction_road(
+            junction,
+            &from_lane,
+            &to_lane,
+            (
+                start,
+                start_tangent,
+                from.1,
+                sign(from.1),
+                width(&from_lane, from.1),
+            ),
+            (end, end_tangent, to.1, -sign(to.1), width(&to_lane, to.1)),
+        )
     }
 
     fn lane(&self, reference: &LaneRef) -> Result<&Lane, BuildError> {
@@ -1597,11 +1747,59 @@ impl Generator {
         let to_lane = self.lane(to)?.clone();
         let from_travel: TravelGeometry = from_lane.travel_geometry(config)?;
         let to_travel: TravelGeometry = to_lane.travel_geometry(config)?;
+        let from_end = road_end_of(from_lane.direction.exit_end());
+        let to_end = road_end_of(to_lane.direction.entry_end());
+        self.build_junction_road(
+            junction,
+            &from_lane,
+            &to_lane,
+            (
+                from_travel.centerline.end_point(),
+                from_travel.centerline.end_tangent()?,
+                from_end,
+                from_lane.direction.sign(),
+                from_lane.exit_width(),
+            ),
+            (
+                to_travel.centerline.start_point(),
+                to_travel.centerline.start_tangent()?,
+                to_end,
+                to_lane.direction.sign(),
+                to_lane.entry_width(),
+            ),
+        )
+    }
 
-        let start = from_travel.centerline.end_point();
-        let start_tangent = from_travel.centerline.end_tangent()?;
-        let end = to_travel.centerline.start_point();
-        let end_tangent = to_travel.centerline.start_tangent()?;
+    /// Draws a road through a junction from one lane to another, given where and
+    /// how it leaves the first and arrives at the second.
+    ///
+    /// Each end is the point and tangent the road passes through, which end of the
+    /// lane's road that is, the sign of the road's lateral there relative to the
+    /// new road's own (`+1` when both run the same way), and the lane's width there.
+    /// The new road is a Hermite curve between the two, one lane wide, tapering from
+    /// the first width to the second, of the first lane's type.
+    #[allow(clippy::type_complexity)]
+    fn build_junction_road(
+        &mut self,
+        junction: &JunctionId,
+        from_lane: &Lane,
+        to_lane: &Lane,
+        (start, start_tangent, from_end, start_sign, start_width): (
+            Point3,
+            crate::geometry::UnitVector3,
+            RoadEnd,
+            f64,
+            f64,
+        ),
+        (end, end_tangent, to_end, end_sign, end_width): (
+            Point3,
+            crate::geometry::UnitVector3,
+            RoadEnd,
+            f64,
+            f64,
+        ),
+    ) -> Result<(), BuildError> {
+        let config = self.config();
         // The connector is realised at the map's resolution, which is fixed into the
         // curve: a Bézier's length is its vertices walked end to end, so the
         // resolution has to be settled before anything asks how long it is.
@@ -1623,16 +1821,11 @@ impl Generator {
         let mut geometry =
             RoadGeometry::new(&reference_line, &Poly3Profile::default(), config, &[])?;
         // Adopt the lateral direction of each road it meets, so the connector's
-        // boundary endpoints land exactly on theirs.
-        let from_end = road_end_of(from_lane.direction.exit_end());
-        let to_end = road_end_of(to_lane.direction.entry_end());
-        // The banked direction, not the plan one: the connector's boundary endpoints
-        // have to land on the approach's, which a banked road lifts off the
-        // horizontal.
-        let start_lateral =
-            self.geometry[&from_lane.road].banked_lateral_at(from_end) * from_lane.direction.sign();
-        let end_lateral =
-            self.geometry[&to_lane.road].banked_lateral_at(to_end) * to_lane.direction.sign();
+        // boundary endpoints land exactly on theirs. The banked direction, not the
+        // plan one: the endpoints have to land on the approach's, which a banked road
+        // lifts off the horizontal.
+        let start_lateral = self.geometry[&from_lane.road].banked_lateral_at(from_end) * start_sign;
+        let end_lateral = self.geometry[&to_lane.road].banked_lateral_at(to_end) * end_sign;
         let last = geometry.laterals.len() - 1;
         geometry.laterals[0] = start_lateral;
         geometry.laterals[last] = end_lateral;
@@ -1641,13 +1834,11 @@ impl Generator {
         // The connector carries the source lane's width into the target's. Where the
         // two differ — a slip road feeding a wider carriageway — it tapers between
         // them rather than stopping short of one of its neighbours.
-        let entry = PositiveWidth::new(from_lane.exit_width())?;
-        let exit = PositiveWidth::new(to_lane.entry_width())?;
         let width = WidthProfile::tapered(
             0.0,
             reference_line.horizontal_length()?,
-            entry,
-            exit,
+            PositiveWidth::new(start_width)?,
+            PositiveWidth::new(end_width)?,
             Taper::Linear,
         )?;
         // The lane straddles the connector's reference line. It goes on the side a
@@ -1720,13 +1911,13 @@ impl Generator {
 
         self.push_connection(
             Some(junction),
-            LaneEndpoint::new(from_lane.id.clone(), from_lane.direction.exit_end()),
+            LaneEndpoint::new(from_lane.id.clone(), lane_end_of(from_end)),
             LaneEndpoint::new(connector_lane.clone(), LaneEnd::Start),
         )?;
         self.push_connection(
             Some(junction),
             LaneEndpoint::new(connector_lane, LaneEnd::End),
-            LaneEndpoint::new(to_lane.id.clone(), to_lane.direction.entry_end()),
+            LaneEndpoint::new(to_lane.id.clone(), lane_end_of(to_end)),
         )?;
         Ok(())
     }
@@ -1877,6 +2068,13 @@ fn road_end_of(end: LaneEnd) -> RoadEnd {
     match end {
         LaneEnd::Start => RoadEnd::Start,
         LaneEnd::End => RoadEnd::End,
+    }
+}
+
+fn lane_end_of(end: RoadEnd) -> LaneEnd {
+    match end {
+        RoadEnd::Start => LaneEnd::Start,
+        RoadEnd::End => LaneEnd::End,
     }
 }
 
@@ -2235,6 +2433,82 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("90.0°"), "{error}");
+    }
+
+    #[test]
+    fn a_junction_gets_a_pavement_round_each_corner_and_none_across_it() {
+        // Four arms with a pavement on each side, joined through a junction. The
+        // pavements do not go through the junction with the traffic: each goes
+        // round the corner to the next arm's, so a pedestrian keeps to the kerb and
+        // crosses only where a crosswalk is put.
+        let mut builder = MapBuilder::default();
+        let street = || {
+            vec![
+                LaneSpec::new(width(3.5), Direction::Backward),
+                LaneSpec::new(width(2.0), Direction::Backward).with_type(LaneType::Sidewalk),
+                LaneSpec::new(width(3.5), Direction::Forward),
+                LaneSpec::new(width(2.0), Direction::Forward).with_type(LaneType::Sidewalk),
+            ]
+        };
+        let junction = builder.add_junction(Some("x"));
+        let mut arm = |name: &str, from: (f64, f64), to: (f64, f64)| {
+            builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(from.0, from.1, 0.0),
+                        Point3::new(to.0, to.1, 0.0),
+                        street(),
+                    )
+                    .unwrap()
+                    .with_name(name),
+                )
+                .unwrap()
+        };
+        let w = arm("w", (-60.0, 0.0), (-12.0, 0.0));
+        let e = arm("e", (12.0, 0.0), (60.0, 0.0));
+        let n = arm("n", (0.0, 12.0), (0.0, 60.0));
+        let s = arm("s", (0.0, -60.0), (0.0, -12.0));
+        for (from, to) in [(&w, &e), (&s, &n), (&w, &n), (&s, &e)] {
+            builder.connect_via(&junction, from, to).unwrap();
+        }
+        let map = builder.finish().unwrap().validate().unwrap();
+
+        let pavements: Vec<&Road> = map
+            .roads
+            .iter()
+            .filter(|road| {
+                road.is_connector()
+                    && map
+                        .lanes_of_section(&road.id, 0)
+                        .iter()
+                        .all(|lane| lane.lane_type == LaneType::Sidewalk)
+            })
+            .collect();
+        assert_eq!(pavements.len(), 4, "one pavement per corner");
+        for road in &pavements {
+            // Each hugs its corner: its middle is well off both arms' centrelines
+            // and outside the carriageway, on the diagonal.
+            let middle = road
+                .reference_line
+                .sample_at(
+                    road.horizontal_length().unwrap() / 2.0,
+                    SamplingConfig::default(),
+                )
+                .unwrap()
+                .point;
+            assert!(
+                middle.x.abs() > 5.0 && middle.y.abs() > 5.0,
+                "{} runs through the junction at {middle:?}",
+                road.id
+            );
+        }
+        // And the movements through the junction are the traffic's alone.
+        let connectors = map.roads.iter().filter(|road| road.is_connector()).count();
+        assert_eq!(
+            connectors - pavements.len(),
+            8,
+            "two carriageways × four movements"
+        );
     }
 
     #[test]

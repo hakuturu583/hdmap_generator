@@ -397,6 +397,19 @@ Get this wrong and nothing complains — the map validates and both files are wr
 but the connectors run to the far tips of the approaches rather than across the
 junction, so it is worth reading the connector lengths once.
 
+### Pavements go round the corner, not across
+
+A `sidewalk` lane is never connected *through* a junction: a pedestrian does not walk
+across a crossroads the way a car drives across it. Instead, at every junction, each
+pair of arms that are neighbours round the junction gets a connector between their
+outer sidewalks — a **pavement round the corner**, a single sidewalk lane drawn as
+the same tangent-pinned curve a traffic connector is. A crossroads with pavements on
+all four arms comes out with eight traffic connectors and four corner pavements, and
+the only ways across the carriageway are the crosswalks the caller put down. The
+corner pavements are ordinary roads in the junction — connecting roads in OpenDRIVE,
+lanelets in Lanelet2, a surface in CARLA — so a pedestrian network is walkable in
+every format without any of them having to know it was made differently.
+
 ## Traffic control
 
 Lights, signs, stop lines and crosswalks are IR objects — a position and the lanes they
@@ -407,7 +420,7 @@ govern — and both formats get them:
 | Traffic light | `<signal dynamic="true">` with `<validity>` | `traffic_light` way + `traffic_light` regulatory element |
 | Traffic sign | `<signal>` carrying the caller's catalogue code | `traffic_sign` way, code as its subtype |
 | Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` |
-| Crosswalk | `<object type="crosswalk">` with its four corners | a lanelet of subtype `crosswalk` |
+| Crosswalk | `<object type="crosswalk">` with its outline as `<cornerLocal>` corners | a lanelet of subtype `crosswalk` |
 | Right of way | `<junction><priority high low>` | `right_of_way` regulatory element |
 
 OpenDRIVE places an object at `(s, t, zOffset)` in one road's own coordinates, so the
@@ -415,6 +428,12 @@ exporter projects the IR's position through the road local frame — a nearest-p
 search for the station, then `Frame3::to_local`. Height is measured away from the road
 surface rather than straight up, which is what "five metres above the road" means on a
 slope and what `zOffset` carries.
+
+A crosswalk's outline is written as `<cornerLocal>` corners in the object's own frame
+— the object lying across the road, its `hdg` a quarter turn from the road's, the
+first corner repeated to close the ring — rather than as `<cornerRoad>` corners in
+road coordinates, which the standard also allows. CARLA reads only the first kind
+into its pedestrian navigation; a crossing it cannot read is one nobody crosses at.
 
 A signal's `type` is a code from a *country's* catalogue rather than a name of its own,
 so a traffic sign passes the caller's code straight through, and a traffic light is
@@ -883,6 +902,7 @@ Import/
 └── Town01/
     ├── Town01.fbx              the surface
     ├── Town01.xodr             the road network — same name, which CARLA insists on
+    ├── Town01.obj              the surface again, for the pedestrian navigation mesh
     └── Textures/
         ├── polyhaven.json      what to fetch, and where each file goes
         └── CREDITS.md
@@ -890,10 +910,10 @@ Import/
 
 Getting from that folder to a level that runs is half a dozen steps in the right
 order with the right environment — fetch the textures, copy the package into CARLA's
-`Import/`, keep every other descriptor there out of `Import.py`'s way (it imports
-every `.json` it finds, this package's texture manifest included), run `Import.py`,
-give the level a sky — so the exporter writes them down as a Python script beside
-the descriptor, with what it knows baked in:
+`Import/`, stage the pedestrian navigation builder, keep every other descriptor there
+out of `Import.py`'s way (it imports every `.json` it finds, this package's texture
+manifest included), run `Import.py`, give the level a sky — so the exporter writes
+them down as a Python script beside the descriptor, with what it knows baked in:
 
 ```python
 m.export_carla("out/", name="Town01",
@@ -1006,8 +1026,34 @@ different heights. It is there because a lidar reaches that far and a vehicle th
 leaves the verge should land on something; it is not terrain, and it is not pretending
 to be — a road network says nothing about the shape of the country it runs through,
 and generating hills here would be inventing a terrain model rather than deriving one.
-It sits two centimetres under the roads, so nothing z-fights, and is tagged `Terrain`
+It sits five centimetres under the roads, so nothing z-fights, and is tagged `Terrain`
 like the verges. CARLA's editor is still where a map gets hills.
+
+### Pedestrians
+
+CARLA's walkers go where its navigation mesh says they can, and that mesh is not
+built from the level: `Import.py` runs `RecastBuilder` over an `.obj` of the map, in
+which every triangle is labelled by the material it wears — `road`, `sidewalk`,
+`crosswalk`, `grass`, or a block — and a walker spawns on a sidewalk, crosses at a
+crosswalk, and keeps off the rest. So the package carries the surface twice: the
+`.fbx` the level is built from, and a `<name>.obj` in CARLA's frame (y up, the
+roadgen y negated) whose materials are those labels. The tool that reads it is one the
+UE5 branch builds but does not put where `Import.py` looks, so the build script
+finds it under `Build/` and stages it, with the `.obj`, into `Util/DockerUtils/dist/`;
+the navigation comes out as `Content/<Package>/Maps/<name>/Nav/<name>.bin`, which the
+server hands to clients and `world.get_random_location_from_navigation()` draws on.
+
+Two things about that `.obj` are not obvious and both were found the hard way. The
+loader labels triangles in file order and the last label wins, so the meshes are
+written in order of precedence — buildings and kerbs first, then the ground, the
+roads, the sidewalks and last the markings — or a ground grid written last would
+relabel everything under it as grass. And the crosswalk bands in it are not the
+painted stripes: they are one quad per crossing, `crosswalk` from kerb to kerb,
+because the stripes are what a camera sees and the band is what a walker needs.
+
+Crosswalks *are* painted, too — a bar and a gap of half a metre each, across the
+carriageway, from the crossing objects in the IR — tagged `RoadLines` like every
+other marking, so the walkers cross on something the cameras can see.
 
 ### Where the town goes, and why it is a choice
 
@@ -1143,8 +1189,6 @@ trade the town was exported under:
   way round — CARLA spawns its own from the OpenDRIVE, and a mesh named for one would be
   dropped by `ValidateStaticMesh` anyway — but nothing in the surface marks where they
   stand.
-- **Crosswalks are not painted.** A crossing is an object in the IR rather than a lane
-  boundary, and this exporter paints boundaries.
 - **Roughness maps are fetched but not wired up.** FBX's material model is Phong, which
   has a shininess exponent and no roughness map. The files are in the package for a
   material rebuilt in the editor.

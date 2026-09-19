@@ -15,6 +15,7 @@ use std::ops::Deref;
 
 use crate::error::{ValidationError, ValidationIssue};
 use crate::map::{Map, Projection};
+use crate::semantics::LaneType;
 use crate::topology::{LaneEnd, RoadEnd, RoadLinkTarget};
 
 /// How far apart two things may be before they count as disconnected.
@@ -530,8 +531,10 @@ fn check_connections(map: &Map, config: ValidationConfig, issues: &mut Vec<Valid
             continue;
         };
 
-        // A connection has to leave by the end traffic actually leaves by.
-        if connection.from.end != from.direction.exit_end() {
+        // A connection has to leave by the end traffic actually leaves by — unless
+        // it joins two pavements, which have no direction of travel to leave by.
+        let footway = from.lane_type == LaneType::Sidewalk && to.lane_type == LaneType::Sidewalk;
+        if !footway && connection.from.end != from.direction.exit_end() {
             issues.push(ValidationIssue::InconsistentTravelDirection {
                 connection: connection.id.clone(),
                 detail: format!(
@@ -543,7 +546,7 @@ fn check_connections(map: &Map, config: ValidationConfig, issues: &mut Vec<Valid
                 ),
             });
         }
-        if connection.to.end != to.direction.entry_end() {
+        if !footway && connection.to.end != to.direction.entry_end() {
             issues.push(ValidationIssue::InconsistentTravelDirection {
                 connection: connection.id.clone(),
                 detail: format!(
@@ -615,9 +618,25 @@ fn boundary_gap(
     // narrower overlap has to line up, so compare the gap against the width
     // difference where they actually meet.
     let slack = (from.exit_width() - to.entry_width()).abs();
-    let gap = from_left
-        .distance_to(to_left)
-        .max(from_right.distance_to(to_right));
+    let pairing = |left: bool| {
+        if left {
+            from_left
+                .distance_to(to_left)
+                .max(from_right.distance_to(to_right))
+        } else {
+            from_left
+                .distance_to(to_right)
+                .max(from_right.distance_to(to_left))
+        }
+    };
+    // Two pavements meet whichever way round: a footway has no direction, so its
+    // left may be the other's right.
+    let footway = from.lane_type == LaneType::Sidewalk && to.lane_type == LaneType::Sidewalk;
+    let gap = if footway {
+        pairing(true).min(pairing(false))
+    } else {
+        pairing(true)
+    };
     Ok((gap - slack).max(0.0))
 }
 

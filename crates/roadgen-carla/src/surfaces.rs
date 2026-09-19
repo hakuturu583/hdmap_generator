@@ -132,6 +132,7 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             sections.push((layout, within));
         }
     }
+    crate::crosswalks::paint(map, map_name, config, &mut ordinal, &mut meshes);
     let field = crate::ground::Field::under(map, &meshes, config);
     for (layout, within) in &sections {
         layout.verges(
@@ -218,7 +219,7 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
 }
 
 /// What one cross-section of one road is made of, left to right.
-struct Layout<'a> {
+pub(crate) struct Layout<'a> {
     range: (f64, f64),
     /// The road's lateral offset profile, which the cuts are measured from.
     lane_offset: &'a roadgen_core::geometry::Poly3Profile,
@@ -228,7 +229,7 @@ struct Layout<'a> {
 }
 
 impl<'a> Layout<'a> {
-    fn of(
+    pub(crate) fn of(
         map: &'a Map,
         road: &'a Road,
         section: usize,
@@ -261,6 +262,21 @@ impl<'a> Layout<'a> {
             lanes: left,
             config: *config,
         })
+    }
+
+    /// The lateral extent of the carriageway at `station`: the outer edges of the
+    /// outermost lanes that carry vehicles, left then right. `None` when there is
+    /// no such lane.
+    pub(crate) fn carriageway(&self, station: f64) -> Option<(f64, f64)> {
+        let cuts = self.cuts(station);
+        let first = self
+            .lanes
+            .iter()
+            .position(|lane| matches!(Self::role_of(lane), Some((Role::Road | Role::Gutter, _))))?;
+        let last = self.lanes.iter().rposition(|lane| {
+            matches!(Self::role_of(lane), Some((Role::Road | Role::Gutter, _)))
+        })?;
+        Some((cuts[first], cuts[last + 1]))
     }
 
     fn covers(&self, station: f64) -> bool {

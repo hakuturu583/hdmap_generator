@@ -546,7 +546,11 @@ def test_traffic_control_reaches_opendrive_too():
     kinds = {obj.get("type") for obj in objects}
     assert kinds == {"roadMark", "crosswalk"}
     crosswalk = next(obj for obj in objects if obj.get("type") == "crosswalk")
-    assert len(crosswalk.findall("outline/cornerRoad")) == 4
+    # Written the way CARLA reads a crosswalk: local corners about a pivot turned a
+    # quarter turn, the ring closed by repeating its first corner.
+    corners = crosswalk.findall("outline/cornerLocal")
+    assert len(corners) == 5 and corners[0].attrib == corners[-1].attrib
+    assert float(crosswalk.get("hdg")) == pytest.approx(math.pi / 2)
 
     # And the right-of-way rule becomes a junction priority.
     assert root.findall("junction/priority")
