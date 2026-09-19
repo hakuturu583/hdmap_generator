@@ -531,11 +531,13 @@ impl MapBuilder {
             };
             let to_lane = LaneRef::new(to.clone(), to_index);
 
-            // A pavement does not go through a junction: it goes round its corner,
-            // which the generator lays for every junction on its own.
+            // Only a lane that carries a movement goes through a junction. A
+            // shoulder, a parking lane or a border stops at the arm; a pavement goes
+            // round the corner, which the generator lays for every junction on its
+            // own.
             if junction.is_some()
-                && (self.lane_spec(&from_lane)?.lane_type == LaneType::Sidewalk
-                    || self.lane_spec(&to_lane)?.lane_type == LaneType::Sidewalk)
+                && !(self.lane_spec(&from_lane)?.lane_type.is_drivable()
+                    && self.lane_spec(&to_lane)?.lane_type.is_drivable())
             {
                 continue;
             }
@@ -2368,6 +2370,55 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("90.0°"), "{error}");
+    }
+
+    #[test]
+    fn only_a_lane_that_carries_traffic_goes_through_a_junction() {
+        // A road with a driving lane, a parking lane and a shoulder either side
+        // meets another such road through a junction. The driving lanes get their
+        // connector each way; the parking lanes and shoulders stop at the arm,
+        // because nothing moves along them to be carried through.
+        let mut builder = MapBuilder::default();
+        let street = || {
+            vec![
+                LaneSpec::new(width(2.0), Direction::Backward).with_type(LaneType::Shoulder),
+                LaneSpec::new(width(2.5), Direction::Backward).with_type(LaneType::Parking),
+                LaneSpec::new(width(3.5), Direction::Backward),
+                LaneSpec::new(width(3.5), Direction::Forward),
+                LaneSpec::new(width(2.5), Direction::Forward).with_type(LaneType::Parking),
+                LaneSpec::new(width(2.0), Direction::Forward).with_type(LaneType::Shoulder),
+            ]
+        };
+        let junction = builder.add_junction(Some("j"));
+        let a = builder
+            .add_road(
+                RoadSpec::line(Point3::ORIGIN, Point3::new(100.0, 0.0, 0.0), street()).unwrap(),
+            )
+            .unwrap();
+        let b = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(120.0, 0.0, 0.0),
+                    Point3::new(220.0, 0.0, 0.0),
+                    street(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        builder.connect_via(&junction, &a, &b).unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+
+        let connectors: Vec<&Road> = map
+            .roads
+            .iter()
+            .filter(|road| road.is_connector())
+            .collect();
+        assert_eq!(connectors.len(), 2, "one connector per driving lane");
+        for road in connectors {
+            for lane in map.lanes_of_section(&road.id, 0) {
+                assert_eq!(lane.lane_type, LaneType::Driving);
+            }
+        }
     }
 
     #[test]
