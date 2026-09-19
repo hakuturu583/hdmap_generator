@@ -399,8 +399,11 @@ junction, so it is worth reading the connector lengths once.
 
 ### Pavements go round the corner, not across
 
-A `sidewalk` lane is never connected *through* a junction: a pedestrian does not walk
-across a crossroads the way a car drives across it. Instead, at every junction, each
+Only a lane that carries a movement — `driving` or `biking` — is connected *through*
+a junction; a shoulder, a parking lane or a border stops at the arm, because nothing
+moves along it to be carried across. A `sidewalk` lane is never connected through
+either: a pedestrian does not walk across a crossroads the way a car drives across
+it. Instead, at every junction, each
 pair of arms that are neighbours round the junction gets a connector between their
 outer sidewalks — a **pavement round the corner**, a single sidewalk lane drawn as
 the same tangent-pinned curve a traffic connector is. A crossroads with pavements on
