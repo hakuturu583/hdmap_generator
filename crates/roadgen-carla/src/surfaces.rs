@@ -130,9 +130,16 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             let Some(layout) = Layout::of(map, road, section, config) else {
                 continue;
             };
-            let within: Vec<&Rung> = rungs
+            // Every rung of the section, with its cuts worked out once: every band,
+            // line and flank of the section reads them, and there are a dozen or so
+            // of those per lane.
+            let within: Vec<Cross> = rungs
                 .iter()
                 .filter(|rung| layout.covers(rung.station))
+                .map(|rung| Cross {
+                    rung,
+                    cuts: layout.cuts(rung.station),
+                })
                 .collect();
             if within.len() < 2 {
                 continue;
@@ -201,7 +208,7 @@ impl Ordinals {
     }
 }
 
-/// One station of a road, with its frame and the lateral cuts of its cross-section.
+/// One station of a road, with its banked frame.
 struct Rung {
     station: f64,
     frame: Frame3,
@@ -216,6 +223,13 @@ impl Rung {
     fn at(&self, lateral: f64, rise: f64) -> Point3 {
         self.frame.to_global([0.0, lateral, rise])
     }
+}
+
+/// One rung of one section, with the lateral cuts of its cross-section there.
+struct Cross<'a> {
+    rung: &'a Rung,
+    /// From the leftmost cut to the rightmost: one more than there are lanes.
+    cuts: Vec<f64>,
 }
 
 /// Every station a road is sampled at, with its banked frame.
@@ -350,7 +364,7 @@ impl<'a> Layout<'a> {
     /// The drivable surface, the pavements, the kerbs and the gutters.
     fn surfaces(
         &self,
-        rungs: &[&Rung],
+        rungs: &[Cross],
         map_name: &str,
         ordinals: &mut Ordinals,
         out: &mut Vec<Mesh>,
@@ -458,13 +472,13 @@ impl<'a> Layout<'a> {
     /// point is then in the middle. A gutter wider than the lane it came out of turns
     /// the carriageway band inside out, which is a road surface with its triangles
     /// facing down.
-    fn gutter_against(&self, index: usize, side: Neighbour, rungs: &[&Rung]) -> f64 {
+    fn gutter_against(&self, index: usize, side: Neighbour, rungs: &[Cross]) -> f64 {
         if self.kerb_against_neighbour(index, side).is_none() {
             return 0.0;
         }
         let narrowest = rungs
             .iter()
-            .map(|rung| self.lanes[index].width_at(rung.station))
+            .map(|cross| self.lanes[index].width_at(cross.rung.station))
             .fold(f64::INFINITY, f64::min);
         self.config.gutter_width.min(narrowest / 2.0).max(0.0)
     }
@@ -500,7 +514,7 @@ impl<'a> Layout<'a> {
     #[allow(clippy::too_many_arguments)]
     fn band(
         &self,
-        rungs: &[&Rung],
+        rungs: &[Cross],
         left: impl Fn(&[f64]) -> f64,
         right: impl Fn(&[f64]) -> f64,
         left_rise: f64,
@@ -513,10 +527,9 @@ impl<'a> Layout<'a> {
     ) {
         let mut left_rail = Vec::with_capacity(rungs.len());
         let mut right_rail = Vec::with_capacity(rungs.len());
-        for rung in rungs {
-            let cuts = self.cuts(rung.station);
-            left_rail.push(rung.at(left(&cuts), left_rise));
-            right_rail.push(rung.at(right(&cuts), right_rise));
+        for cross in rungs {
+            left_rail.push(cross.rung.at(left(&cross.cuts), left_rise));
+            right_rail.push(cross.rung.at(right(&cross.cuts), right_rise));
         }
         let mut mesh = Mesh::new(
             mesh_name(map_name, role, ordinals.take(role)),
@@ -534,7 +547,7 @@ impl<'a> Layout<'a> {
     /// same mesh.
     fn markings(
         &self,
-        rungs: &[&Rung],
+        rungs: &[Cross],
         map_name: &str,
         config: &SurfaceConfig,
         ordinals: &mut Ordinals,
@@ -596,7 +609,7 @@ impl<'a> Layout<'a> {
     /// section is surfaced.
     fn flanks(
         &self,
-        rungs: &[&Rung],
+        rungs: &[Cross],
         facing: Option<Point3>,
         map_name: &str,
         ordinals: &mut Ordinals,
@@ -619,10 +632,13 @@ impl<'a> Layout<'a> {
         let land = match facing {
             None => [true, true],
             Some(centre) => {
-                let rung = rungs[rungs.len() / 2];
-                let cuts = self.cuts(rung.station);
-                let [left, right] = edges
-                    .map(|(cut, rise)| rung.at(cuts[cut], rise).horizontal_distance_to(centre));
+                let middle = &rungs[rungs.len() / 2];
+                let [left, right] = edges.map(|(cut, rise)| {
+                    middle
+                        .rung
+                        .at(middle.cuts[cut], rise)
+                        .horizontal_distance_to(centre)
+                });
                 [left >= right, right > left]
             }
         };
@@ -635,11 +651,11 @@ impl<'a> Layout<'a> {
             let rail_rise = if land[side] { rise } else { 0.0 };
             let mut rail = Vec::with_capacity(rungs.len());
             let mut toe = Vec::with_capacity(if land[side] { rungs.len() } else { 0 });
-            for rung in rungs {
-                let edge = self.cuts(rung.station)[cut];
-                rail.push(rung.at(edge, rail_rise));
+            for cross in rungs {
+                let edge = cross.cuts[cut];
+                rail.push(cross.rung.at(edge, rail_rise));
                 if land[side] {
-                    toe.push(rung.at(edge + sign * width, 0.0));
+                    toe.push(cross.rung.at(edge + sign * width, 0.0));
                 }
             }
             if !land[side] && rise > 0.0 {
@@ -669,12 +685,14 @@ impl<'a> Layout<'a> {
     /// The direction comes along so that a dash can be cut anywhere between two
     /// stations: a painted line has to be given a width perpendicular to itself, and
     /// halfway through a rung there is no frame to ask.
-    fn rail(&self, rungs: &[&Rung], cut: usize, rise: f64, shift: f64) -> Vec<(Point3, Vector3)> {
+    fn rail(&self, rungs: &[Cross], cut: usize, rise: f64, shift: f64) -> Vec<(Point3, Vector3)> {
         rungs
             .iter()
-            .map(|rung| {
-                let cuts = self.cuts(rung.station);
-                (rung.at(cuts[cut] + shift, rise), rung.frame.left.get())
+            .map(|cross| {
+                (
+                    cross.rung.at(cross.cuts[cut] + shift, rise),
+                    cross.rung.frame.left.get(),
+                )
             })
             .collect()
     }
