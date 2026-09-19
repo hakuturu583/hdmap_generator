@@ -239,9 +239,15 @@ impl Numbering {
         for (index, road) in map.roads.iter().enumerate() {
             roads.insert(road.id.clone(), index.to_string());
         }
+        // Junctions are numbered after the roads rather than from zero, so that no
+        // junction shares a number with a road. The standard keeps the two in
+        // separate spaces, but CARLA does not: a road's successor is taken for a
+        // junction only if no road has that number, so a junction numbered like a
+        // road is a road whose lanes lead nowhere, and every vehicle that reaches
+        // it is a vehicle the traffic manager removes.
         let mut junctions = HashMap::new();
         for (index, junction) in map.junctions.iter().enumerate() {
-            junctions.insert(junction.id.clone(), index.to_string());
+            junctions.insert(junction.id.clone(), (map.roads.len() + index).to_string());
         }
         let mut lanes = HashMap::new();
         for lane in map.lanes.iter() {
