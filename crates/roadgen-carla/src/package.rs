@@ -12,7 +12,7 @@
 //!       ├── <Map>.xodr          the road network — same name, which CARLA insists on
 //!       ├── <Map>_Props.fbx     the town, when it is exported as props
 //!       └── Textures/
-//!           ├── polyhaven.json  what to fetch, and where each file goes
+//!           ├── polyhaven.manifest  what to fetch, and where each file goes
 //!           ├── CREDITS.md
 //!           └── …               the pictures, once they have been fetched
 //! ```

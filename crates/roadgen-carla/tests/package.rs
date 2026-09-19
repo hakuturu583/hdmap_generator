@@ -271,7 +271,7 @@ fn the_textures_are_listed_rather_than_fetched() {
     let config = PackageConfig::for_map(&map);
     let package = roadgen_carla::write(&map, directory.path(), &config).expect("a package");
 
-    let manifest = directory.path().join("Town01/Textures/polyhaven.json");
+    let manifest = directory.path().join("Town01/Textures/polyhaven.manifest");
     let listed: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest).expect("the manifest"))
             .expect("the manifest should be JSON");
@@ -282,6 +282,16 @@ fn the_textures_are_listed_rather_than_fetched() {
     // Nothing has been fetched, so every one of them is still outstanding.
     assert_eq!(package.textures.len(), files.len());
     assert!(directory.path().join("Town01/Textures/CREDITS.md").exists());
+
+    // The manifest is JSON but is not called `.json`: CARLA's `Import.py` imports
+    // every `.json` it finds under `Import/` as a package, and a manifest so named
+    // becomes an empty package called `polyhaven` beside the map. The descriptor
+    // is the one `.json` a package carries.
+    let jsons: Vec<_> = walk(directory.path())
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(jsons, vec![package.descriptor.clone()], "{jsons:?}");
 
     // And the FBX refers to them where they will be, by a relative path.
     let text = fs::read_to_string(&package.fbx).expect("the mesh file");
@@ -391,4 +401,18 @@ fn the_same_map_exported_twice_is_the_same_bytes() {
     let (_first, one) = write();
     let (_second, two) = write();
     assert_eq!(one, two);
+}
+
+/// Every file under `root`, recursively.
+fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root).expect("a directory") {
+        let path = entry.expect("an entry").path();
+        if path.is_dir() {
+            files.extend(walk(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
 }

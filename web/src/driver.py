@@ -171,7 +171,7 @@ def _carla_package(path):
         for name in sorted(os.listdir(os.path.dirname(folder) or "."))
         if name.endswith(".json")
     ]
-    wanted += [os.path.join(folder, "Textures", "polyhaven.json")]
+    wanted += [os.path.join(folder, "Textures", "polyhaven.manifest")]
     return [_entry(one) for one in wanted if os.path.isfile(one)]
 
 

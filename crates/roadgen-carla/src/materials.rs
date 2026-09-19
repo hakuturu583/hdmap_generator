@@ -353,7 +353,7 @@ pub fn credits(entries: &[Entry]) -> String {
          public domain, no attribution required. This note is here so that the \
          package says where its surfaces came from, not because it has to.\n\n\
          They are fetched rather than shipped. `roadgen.fetch_textures()` reads \
-         `polyhaven.json` beside this file and downloads exactly what is listed \
+         `polyhaven.manifest` beside this file and downloads exactly what is listed \
          there; until it has run, the materials fall back to the flat colours \
          written into the FBX.\n\n",
     );
