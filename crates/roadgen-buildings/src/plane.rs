@@ -10,6 +10,8 @@
 //! arrangement: the only question asked is whether two convex shapes overlap, and the
 //! only shapes asked about are triangles and the ground plan of a box.
 
+use roadgen_core::geometry::Grid;
+
 /// A point in the horizontal plane, metres.
 pub type Point2 = [f64; 2];
 
@@ -141,27 +143,22 @@ fn cross(a: Point2, b: Point2, c: Point2) -> f64 {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 }
 
-/// A uniform grid over convex shapes, so that "does this outline hit anything?" costs
-/// the shapes nearby rather than all of them.
-///
-/// A generated town asks that question once per candidate building against every
-/// stretch of every road, which is a product big enough to notice and small enough
-/// that a grid is the whole answer — there is no tree here, and no need for one.
+/// Convex shapes on a grid, so that "does this outline hit anything?" costs the
+/// shapes nearby rather than all of them: a generated town asks it once per
+/// candidate building against every stretch of every road.
 #[derive(Debug, Clone)]
 pub struct Index {
-    cell: f64,
     /// Each shape with the box around it, which is what a query is filtered on.
     shapes: Vec<(Bounds, Vec<Point2>)>,
-    buckets: std::collections::HashMap<(i64, i64), Vec<usize>>,
+    grid: Grid<usize>,
 }
 
 impl Index {
     /// An empty index whose cells are `cell` metres across.
     pub fn new(cell: f64) -> Index {
         Index {
-            cell: cell.max(1.0),
             shapes: Vec::new(),
-            buckets: std::collections::HashMap::new(),
+            grid: Grid::new(cell),
         }
     }
 
@@ -174,50 +171,23 @@ impl Index {
         if shape.len() < 3 {
             return;
         }
-        let index = self.shapes.len();
         let bounds = Bounds::of(&shape);
-        for key in self.cells(&bounds) {
-            self.buckets.entry(key).or_default().push(index);
-        }
+        self.grid.insert(bounds.min, bounds.max, self.shapes.len());
         self.shapes.push((bounds, shape));
     }
 
     /// Whether `shape` overlaps anything in the index.
     pub fn hits(&self, shape: &[Point2]) -> bool {
         let bounds = Bounds::of(shape);
-        for key in self.cells(&bounds) {
-            let Some(bucket) = self.buckets.get(&key) else {
-                continue;
-            };
-            for candidate in bucket {
-                let (around, other) = &self.shapes[*candidate];
+        self.grid
+            .covering(bounds.min, bounds.max)
+            .any(|&candidate| {
+                let (around, other) = &self.shapes[candidate];
                 // Two shapes sharing a cell usually miss, and the boxes say so for
                 // the price of four comparisons. It is also why a shape met twice —
                 // once per cell it spans — needs no bookkeeping to skip.
-                if bounds.overlaps(around) && convex_overlap(shape, other) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn cells(&self, bounds: &Bounds) -> Vec<(i64, i64)> {
-        let (x0, x1) = (
-            (bounds.min[0] / self.cell).floor() as i64,
-            (bounds.max[0] / self.cell).floor() as i64,
-        );
-        let (y0, y1) = (
-            (bounds.min[1] / self.cell).floor() as i64,
-            (bounds.max[1] / self.cell).floor() as i64,
-        );
-        let mut cells = Vec::new();
-        for x in x0..=x1 {
-            for y in y0..=y1 {
-                cells.push((x, y));
-            }
-        }
-        cells
+                bounds.overlaps(around) && convex_overlap(shape, other)
+            })
     }
 }
 
