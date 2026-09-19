@@ -12,7 +12,7 @@ use crate::arena::Arena;
 use crate::buildings::{Building, BuildingPart};
 use crate::error::GeometryError;
 use crate::geometry::{
-    Curve3, Frame3, Point3, Poly3Profile, Polyline3, SamplingConfig, WidthProfile,
+    Curve3, Frame3, Point3, Poly3Profile, Polyline3, Sample, SamplingConfig, WidthProfile,
 };
 use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
@@ -473,6 +473,21 @@ impl Map {
     /// is what lets a caller line a boundary's points up with positions along the
     /// reference line.
     pub fn vertex_stations(&self, road: &RoadId) -> Result<Vec<f64>, GeometryError> {
+        Ok(self
+            .vertex_samples(road)?
+            .into_iter()
+            .map(|sample| sample.station)
+            .collect())
+    }
+
+    /// The reference line at every station of [`Map::vertex_stations`]: the
+    /// station, the point and the tangent there.
+    ///
+    /// One pass along the curve for all of them. Asking the curve for each station
+    /// on its own is a pass along the curve per station for a polyline or a
+    /// Bézier, which is what a road from OpenStreetMap or a connector through a
+    /// junction is.
+    pub fn vertex_samples(&self, road: &RoadId) -> Result<Vec<Sample>, GeometryError> {
         let Some(entry) = self.roads.get(road) else {
             return Ok(Vec::new());
         };
@@ -482,12 +497,9 @@ impl Map {
             lanes.iter().map(|lane| &lane.width),
             self.metadata.sampling,
         );
-        Ok(entry
+        entry
             .reference_line
-            .samples_including(self.metadata.sampling, &required)?
-            .into_iter()
-            .map(|sample| sample.station)
-            .collect())
+            .samples_including(self.metadata.sampling, &required)
     }
 
     /// Lanes of one cross-section of a road.

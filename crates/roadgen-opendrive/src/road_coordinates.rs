@@ -27,8 +27,8 @@ pub struct RoadPosition {
 /// geometry.
 pub fn locate(map: &Map, road: &Road, point: Point3) -> Option<RoadPosition> {
     let config = map.metadata.sampling;
-    let stations = map.vertex_stations(&road.id).ok()?;
-    if stations.len() < 2 {
+    let samples = map.vertex_samples(&road.id).ok()?;
+    if samples.len() < 2 {
         return None;
     }
 
@@ -36,14 +36,9 @@ pub fn locate(map: &Map, road: &Road, point: Point3) -> Option<RoadPosition> {
     // search is enough to pick the segment; the station within it comes from
     // projecting onto the chord, and the frame refines the rest.
     let mut best: Option<(f64, f64)> = None;
-    for pair in stations.windows(2) {
-        let (from, to) = (pair[0], pair[1]);
-        let (Ok(a), Ok(b)) = (
-            road.reference_line.sample_at(from, config),
-            road.reference_line.sample_at(to, config),
-        ) else {
-            continue;
-        };
+    for pair in samples.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let (from, to) = (a.station, b.station);
         let along = b.point - a.point;
         let length_squared = along.dot(along);
         let u = if length_squared > 0.0 {
