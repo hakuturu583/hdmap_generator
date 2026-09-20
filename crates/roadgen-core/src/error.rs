@@ -84,6 +84,12 @@ pub enum BuildError {
         to: LaneId,
         reason: String,
     },
+    /// Two roads were joined and a movement between them was possible, yet no lane
+    /// of one paired with a lane of the other.
+    NoLanePairs {
+        from: RoadId,
+        to: RoadId,
+    },
     /// A road end already carries an incompatible link.
     ConflictingRoadLink {
         road: RoadId,
@@ -127,6 +133,15 @@ impl fmt::Display for BuildError {
             BuildError::IncompatibleConnection { from, to, reason } => {
                 write!(f, "cannot connect {from} to {to}: {reason}")
             }
+            BuildError::NoLanePairs { from, to } => write!(
+                f,
+                "no lane of {from} pairs with a lane of {to}, though traffic could pass \
+                 between them: lanes are paired by side and by rank outwards from the \
+                 reference line, so the two cross-sections do not correspond — check \
+                 that each road's lanes are listed outwards from the reference line on \
+                 each side (carriageway before pavement), or join the lanes you mean \
+                 with connect_lanes"
+            ),
             BuildError::ConflictingRoadLink { road, detail } => {
                 write!(f, "conflicting link on road {road}: {detail}")
             }

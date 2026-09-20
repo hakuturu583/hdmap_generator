@@ -520,13 +520,23 @@ impl MapBuilder {
             to_by_slot.insert((side, self.lane_ordinal(&lane)?), index);
         }
 
-        // Record the adjacency first: two roads that meet are adjacent even when no
-        // through movement pairs up, and both exporters need to know it.
-        self.set_link(from, from_end, to, to_end, junction)?;
-
+        // Which lanes pair up, and whether any movement was possible at all. A
+        // movement needs a lane emitting into the joint on one side and one
+        // accepting from it on the other; two arms that both only feed a junction
+        // have none, and joining them records their adjacency and nothing else.
         let mut created = Vec::new();
+        let mut operations = Vec::new();
+        let mut emits = [false, false];
+        let mut accepts = [false, false];
         for index in from_indices {
             let from_lane = LaneRef::new(from.clone(), index);
+            let from_spec = self.lane_spec(&from_lane)?.clone();
+            let counts = junction.is_none() || from_spec.lane_type.is_drivable();
+            let from_flow = from_spec.direction.sign() * from_sense;
+            if counts {
+                emits[0] |= from_flow > 0.0;
+                accepts[0] |= from_flow < 0.0;
+            }
             let slot = (self.lane_side(&from_lane)?, self.lane_ordinal(&from_lane)?);
             let Some(&to_index) = to_by_slot.get(&slot) else {
                 continue;
@@ -538,12 +548,11 @@ impl MapBuilder {
             // round the corner, which the generator lays for every junction on its
             // own.
             if junction.is_some()
-                && !(self.lane_spec(&from_lane)?.lane_type.is_drivable()
+                && !(from_spec.lane_type.is_drivable()
                     && self.lane_spec(&to_lane)?.lane_type.is_drivable())
             {
                 continue;
             }
-            let from_flow = self.lane_spec(&from_lane)?.direction.sign() * from_sense;
             let to_flow = self.lane_spec(&to_lane)?.direction.sign() * to_sense;
             // `from` emits into the joint and `to` accepts from it, or the mirror
             // image of that for the opposing carriageway.
@@ -556,6 +565,36 @@ impl MapBuilder {
                 continue;
             };
             created.push((source.lane_id(), target.lane_id()));
+            operations.push((source, target));
+        }
+        for index in self.lanes_of_section(to, to_section)? {
+            let to_lane = LaneRef::new(to.clone(), index);
+            let spec = self.lane_spec(&to_lane)?;
+            if junction.is_some() && !spec.lane_type.is_drivable() {
+                continue;
+            }
+            let to_flow = spec.direction.sign() * to_sense;
+            accepts[1] |= to_flow > 0.0;
+            emits[1] |= to_flow < 0.0;
+        }
+        let possible = (emits[0] && accepts[1]) || (emits[1] && accepts[0]);
+        if created.is_empty() && possible {
+            // Nothing paired although something could have: the two cross-sections
+            // do not correspond slot for slot — the usual cause is a lane list
+            // written left to right instead of outwards from the reference line,
+            // which puts a pavement in the rank a driving lane holds on the other
+            // road. Said here, at the call, rather than left for validation to
+            // trip over three steps later.
+            return Err(BuildError::NoLanePairs {
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
+
+        // Record the adjacency: two roads that meet are adjacent even when no
+        // through movement pairs up, and both exporters need to know it.
+        self.set_link(from, from_end, to, to_end, junction)?;
+        for (source, target) in operations {
             self.push_operation(source, target, junction)?;
         }
         Ok(created)
@@ -1653,6 +1692,12 @@ impl Generator {
             let Some(arms) = arms_of.get_mut(&junction.id) else {
                 continue;
             };
+            // Only between arms the junction knows as its own. An arm is listed when
+            // a movement was connected through it; a pavement between arms nothing
+            // else joins would be a connection into a junction that does not list
+            // its roads, which validation rightly refuses — and would blame the
+            // pavement for whatever left the arm unconnected.
+            arms.retain(|(road, _, _)| junction.incoming_roads.contains(road));
             if arms.len() < 2 {
                 continue;
             }
@@ -2521,6 +2566,85 @@ mod tests {
                 assert_eq!(lane.lane_type, LaneType::Driving);
             }
         }
+    }
+
+    #[test]
+    fn a_join_that_could_carry_traffic_but_pairs_no_lanes_is_refused() {
+        // The lane list is read outwards from the reference line on each side. Write
+        // it left to right instead — pavement, carriageway, carriageway, pavement —
+        // and the pavement takes the first rank on its side, so slot for slot the
+        // two arms do not correspond and nothing pairs. That used to pass in
+        // silence and fail validation later, blaming the corner pavements.
+        let mut builder = MapBuilder::default();
+        let inside_out = || {
+            vec![
+                LaneSpec::new(width(2.0), Direction::Backward).with_type(LaneType::Sidewalk),
+                LaneSpec::new(width(3.5), Direction::Backward),
+                LaneSpec::new(width(3.5), Direction::Forward),
+                LaneSpec::new(width(2.0), Direction::Forward).with_type(LaneType::Sidewalk),
+            ]
+        };
+        let junction = builder.add_junction(Some("x"));
+        let w = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(-60.0, 0.0, 0.0),
+                    Point3::new(-12.0, 0.0, 0.0),
+                    inside_out(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let s = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, -60.0, 0.0),
+                    Point3::new(0.0, -12.0, 0.0),
+                    inside_out(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let error = builder
+            .connect_ends(&w, RoadEnd::End, &s, RoadEnd::End, Some(&junction))
+            .unwrap_err();
+        assert!(
+            matches!(&error, BuildError::NoLanePairs { from, to } if from == &w && to == &s),
+            "{error:?}"
+        );
+        assert!(error
+            .to_string()
+            .contains("outwards from the reference line"));
+
+        // Two one-way arms that both feed the junction have no movement between
+        // them, and joining them is not a mistake: adjacency, and nothing else.
+        let mut builder = MapBuilder::default();
+        let junction = builder.add_junction(Some("y"));
+        let one_way = || vec![LaneSpec::new(width(3.5), Direction::Forward)];
+        let a = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(-60.0, 0.0, 0.0),
+                    Point3::new(-12.0, 0.0, 0.0),
+                    one_way(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let b = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, -60.0, 0.0),
+                    Point3::new(0.0, -12.0, 0.0),
+                    one_way(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(builder
+            .connect_ends(&a, RoadEnd::End, &b, RoadEnd::End, Some(&junction))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
