@@ -285,6 +285,31 @@ def test_a_polyline_road_keeps_its_gradient():
     assert heights[-1] == pytest.approx(6.0)
 
 
+def test_a_polyline_that_bends_is_rounded_where_it_bends():
+    # A vertex of a `points=` road is a corner, and a corner is what OpenDRIVE cannot
+    # hold: it is rounded into an arc the way two roads meeting at an angle are.
+    m = roadgen.Map()
+    m.add_road(
+        points=[(0.0, 0.0, 0.0), (60.0, 0.0, 1.0), (100.0, 30.0, 2.0), (160.0, 30.0, 3.0)],
+        lanes=two_way(),
+        name="wiggle",
+    )
+    m.add_crosswalk(m.add_road(start=(0.0, 100.0, 0.0), end=(50.0, 100.0, 0.0), lanes=two_way()), fraction=0.5)
+    root = ET.fromstring(m.to_opendrive_xml())
+    kinds = [list(geometry)[0].tag for geometry in root.find("road").iter("geometry")]
+    assert kinds == ["line", "arc", "line", "arc", "line"]
+    # The ends stay put; the bends are where the road leaves the chords.
+    centre = m.lane_centerline("lane/wiggle/0")
+    assert centre[0] == pytest.approx((0.0, -1.75, 0.0))
+    assert centre[-1][0] == pytest.approx(160.0)
+
+    # Too tight a corner for the road's width is refused, naming the vertex.
+    m = roadgen.Map()
+    m.add_road(points=[(0.0, 0.0, 0.0), (3.0, 0.0, 0.0), (3.0, 3.0, 0.0), (6.0, 3.0, 0.0)], lanes=two_way())
+    with pytest.raises(ValueError, match="vertex 1"):
+        m.validate()
+
+
 def test_left_hand_traffic_puts_the_forward_lane_on_the_left():
     left = roadgen.Map(handedness="lht")
     left.add_road(

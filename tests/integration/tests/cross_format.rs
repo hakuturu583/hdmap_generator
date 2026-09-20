@@ -3,8 +3,10 @@
 //! points in space — by reading each of them back with its own parser.
 
 use ll2_core::map::as_lanelet;
+use roadgen_core::builder::CORNER_INNER_RADIUS;
 use roadgen_core::map::Lane;
 use roadgen_core::prelude::*;
+use roadgen_core::BuildError;
 use roadgen_integration_tests::opendrive_eval::{Position, RoadEvaluator};
 use roadgen_integration_tests::scenarios;
 use roadgen_integration_tests::{reload_lanelet2, reparse_opendrive, routing_edges};
@@ -175,6 +177,7 @@ fn both_formats_carry_the_same_movements() {
         ("merge", scenarios::merge()),
         ("crossroads", scenarios::crossroads()),
         ("graded", scenarios::graded_road()),
+        ("bent polyline", scenarios::bent_polyline()),
         ("spiral", scenarios::spiral_transition_road()),
         ("banked", scenarios::banked_curve()),
         ("lane drop", scenarios::lane_drop()),
@@ -268,6 +271,9 @@ fn both_formats_put_the_lanes_in_the_same_place() {
         // section, and lands on the IR's vertices.
         ("lane drop", scenarios::lane_drop()),
         ("widening", scenarios::widening_road()),
+        // A polyline that bends is rounded at every vertex into an arc, so it too is
+        // tangent-continuous by the time it is written.
+        ("bent polyline", scenarios::bent_polyline()),
     ] {
         let worst = largest_centerline_disagreement(&map);
         assert!(
@@ -491,4 +497,96 @@ fn lanelet2_heights_are_the_maps_own_however_far_from_the_origin() {
             );
         }
     }
+}
+
+#[test]
+fn a_polyline_that_bends_is_rounded_at_every_vertex() {
+    // The same wedge-and-overlap a kink between two roads makes, made inside one
+    // road by a `points=` polyline — and rounded the same way: an arc at each bend,
+    // tangent to both chords, the chords cut back to meet it.
+    let map = scenarios::bent_polyline();
+    let road = map.road(&RoadId::new("wiggle")).unwrap();
+    let Curve3::Composite(pieces) = &road.reference_line else {
+        panic!(
+            "a bent polyline becomes a chain, not {:?}",
+            road.reference_line
+        )
+    };
+    let kinds: Vec<&str> = pieces
+        .iter()
+        .map(|piece| match piece {
+            Curve3::Line(_) => "line",
+            Curve3::Arc(_) => "arc",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["line", "arc", "line", "arc", "line", "arc", "line"],
+        "three bends, three arcs"
+    );
+    // Tangent-continuous at every seam.
+    for pair in pieces.windows(2) {
+        let leaving = pair[0].end_tangent().unwrap();
+        let arriving = pair[1].start_tangent().unwrap();
+        let (a, b) = (leaving.get(), arriving.get());
+        let planar = (a.x * b.x + a.y * b.y) / (a.x.hypot(a.y) * b.x.hypot(b.y));
+        assert!(planar > 1.0 - 1e-9, "{leaving:?} vs {arriving:?}");
+        assert!(pair[0].end_point().is_close(pair[1].start_point(), 1e-6));
+    }
+    // The ends did not move, and the heights are still the polyline's.
+    assert!(road
+        .reference_line
+        .start_point()
+        .is_close(Point3::new(0.0, 0.0, 0.0), 1e-9));
+    assert!(road
+        .reference_line
+        .end_point()
+        .is_close(Point3::new(200.0, -10.0, 4.0), 1e-9));
+    // Each arc's radius is the inside half-width plus the standard inner radius,
+    // measured to the reference line: 3.5 m of lane inside the turn, plus 6.
+    for piece in pieces {
+        if let Curve3::Arc(arc) = piece {
+            assert!(
+                (1.0 / arc.curvature().abs() - (3.5 + CORNER_INNER_RADIUS)).abs() < 1e-9,
+                "radius {}",
+                1.0 / arc.curvature().abs()
+            );
+        }
+    }
+    // And OpenDRIVE gets the arcs as arcs, not a chord chain with a kink at each
+    // vertex.
+    let document = reparse_opendrive(&map);
+    let arcs = document.road[0]
+        .plan_view
+        .geometry
+        .iter()
+        .filter(|geometry| {
+            matches!(
+                geometry.r#type,
+                opendrive::road::geometry::geometry_type::GeometryType::Arc(_)
+            )
+        })
+        .count();
+    assert_eq!(arcs, 3);
+
+    // A bend with no room to be rounded is refused, and says which vertex.
+    let mut builder = MapBuilder::new(scenarios::metadata("cramped"));
+    let error = builder
+        .add_road(RoadSpec::new(
+            Curve3::polyline([
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(3.0, 0.0, 0.0),
+                Point3::new(3.0, 3.0, 0.0),
+                Point3::new(6.0, 3.0, 0.0),
+            ])
+            .unwrap(),
+            scenarios::one_way(1),
+        ))
+        .and_then(|_| builder.finish())
+        .unwrap_err();
+    assert!(
+        matches!(error, BuildError::VertexTooSharp { vertex: 1, .. }),
+        "{error:?}"
+    );
 }
