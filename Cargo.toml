@@ -24,16 +24,16 @@ repository = "https://github.com/hakuturu583/hdmap_generator"
 homepage = "https://github.com/hakuturu583/hdmap_generator"
 
 [workspace.dependencies]
-roadgen-core = { path = "crates/roadgen-core", version = "0.1.0" }
-roadgen-buildings = { path = "crates/roadgen-buildings", version = "0.1.0" }
-roadgen-carla = { path = "crates/roadgen-carla", version = "0.1.0" }
-roadgen-opendrive = { path = "crates/roadgen-opendrive", version = "0.1.0" }
-roadgen-lanelet2 = { path = "crates/roadgen-lanelet2", version = "0.1.0" }
-roadgen-clipgt = { path = "crates/roadgen-clipgt", version = "0.1.0" }
-roadgen-gpudrive = { path = "crates/roadgen-gpudrive", version = "0.1.0" }
-roadgen-osm = { path = "crates/roadgen-osm", version = "0.1.0" }
-roadgen-sumo = { path = "crates/roadgen-sumo", version = "0.1.0" }
-roadgen-viewer = { path = "crates/roadgen-viewer", version = "0.1.0" }
+roadgen-core = { path = "crates/roadgen-core" }
+roadgen-buildings = { path = "crates/roadgen-buildings" }
+roadgen-carla = { path = "crates/roadgen-carla" }
+roadgen-opendrive = { path = "crates/roadgen-opendrive" }
+roadgen-lanelet2 = { path = "crates/roadgen-lanelet2" }
+roadgen-clipgt = { path = "crates/roadgen-clipgt" }
+roadgen-gpudrive = { path = "crates/roadgen-gpudrive" }
+roadgen-osm = { path = "crates/roadgen-osm" }
+roadgen-sumo = { path = "crates/roadgen-sumo" }
+roadgen-viewer = { path = "crates/roadgen-viewer" }
 
 # OpenDRIVE 1.7 data model, parser and writer. MIT, which an Apache-2.0 project may
 # redistribute. Used so that neither the XML schema nor its serializer is rewritten

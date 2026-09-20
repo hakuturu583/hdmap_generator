@@ -1,0 +1,310 @@
+# Cuts releases and publishes them to PyPI.
+#
+# There are three ways in, and the first is the everyday one:
+#
+#   push to main   the auto-release mechanism (the one simple_lanelet2 uses, borrowed
+#                  from tier4/splatsim). When a merged PR carries exactly one
+#                  `release:major|minor|patch` label, the `release` job bumps the
+#                  version, tags it `vX.Y.Z`, and the tag is built and published --
+#                  all in this one run.
+#   push a v* tag  a hand-cut tag (a hotfix, or the very first release at the version
+#                  the files already carry) is built and published directly; the
+#                  `release` job is skipped.
+#   workflow_dispatch   builds the wheels and sdist without tagging or publishing, to
+#                  eyeball a release before committing to it.
+#
+# The publish happens as a follow-up job here rather than in a separate `on: push:
+# tags` workflow *on purpose*: the auto-release tag is pushed with GITHUB_TOKEN, and a
+# token-pushed tag does not start new workflow runs. Keeping every path in one file
+# means one place to trust.
+#
+# Authentication to PyPI is Trusted Publishing, so there is no API token in this
+# repository's secrets. That is configured once on PyPI's side -- Publishing -> add a
+# pending publisher with owner `hakuturu583`, repository `hdmap_generator`, workflow
+# `release.yml`, environment `pypi`. Until that exists the publish step fails and the
+# wheels are still available as artifacts, which is the right way round: nothing
+# reaches PyPI without a deliberate action outside this repository.
+#
+# A version can never be replaced on PyPI, so the tests run again here rather than
+# trusting that CI was green on the same commit.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Read the release label off the merged PR and, if there is one, bump the version
+  # and push the tag. Runs only on a push to main; a tag push or a manual dispatch
+  # skips it and falls straight through to the build.
+  release:
+    name: cut the release tag
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      bump: ${{ steps.pr.outputs.bump }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - name: read the release label off the merged PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr_json=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }}/pulls \
+            --jq '.[0] // empty' 2>/dev/null || true)
+          if [ -z "$pr_json" ]; then
+            echo "No PR associated with this push -- nothing to release"
+            echo "bump=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          labels=$(echo "$pr_json" | jq -r '[.labels[].name] | join(",")')
+          bump=none
+          count=0
+          for lvl in major minor patch; do
+            if echo ",$labels," | grep -q ",release:${lvl},"; then
+              bump=$lvl
+              count=$((count + 1))
+            fi
+          done
+          if [ "$count" -gt 1 ]; then
+            echo "::error::More than one release label on the PR -- pick exactly one"
+            exit 1
+          fi
+          echo "bump=${bump}" >> "$GITHUB_OUTPUT"
+          echo "Resolved bump level: ${bump}"
+
+      - uses: actions/checkout@v4
+        if: steps.pr.outputs.bump != 'none'
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: bump pyproject, Cargo.toml and Cargo.lock together
+        if: steps.pr.outputs.bump != 'none'
+        id: bump
+        run: |
+          set -euo pipefail
+          next=$(python3 tools/bump_version.py "${{ steps.pr.outputs.bump }}")
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${next}" >> "$GITHUB_OUTPUT"
+          echo "Bumped to ${next} (${{ steps.pr.outputs.bump }})"
+
+      - name: fail if the tag already exists
+        if: steps.pr.outputs.bump != 'none'
+        run: |
+          if git rev-parse "refs/tags/${{ steps.bump.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.bump.outputs.tag }} already exists" >&2
+            exit 1
+          fi
+
+      - name: commit, tag and push
+        if: steps.pr.outputs.bump != 'none'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml Cargo.toml Cargo.lock
+          git commit -m "chore(release): ${{ steps.bump.outputs.tag }}"
+          git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
+          git push origin "HEAD:main"
+          git push origin "${{ steps.bump.outputs.tag }}"
+
+      - name: GitHub release with generated notes
+        if: steps.pr.outputs.bump != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.bump.outputs.tag }}" \
+            --title "${{ steps.bump.outputs.tag }}" \
+            --generate-notes
+
+  # One place to work out, for all three entry points, which commit to build and
+  # whether it may be published. Runs even when `release` is skipped (tag push,
+  # dispatch).
+  resolve:
+    name: resolve what to build
+    needs: [release]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.r.outputs.proceed }}
+      ref: ${{ steps.r.outputs.ref }}
+      publish: ${{ steps.r.outputs.publish }}
+      version: ${{ steps.r.outputs.version }}
+    steps:
+      - id: r
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          BUMP: ${{ needs.release.outputs.bump }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          proceed=false; publish=false; ref="$REF_NAME"
+          if [ "$EVENT" = "push" ] && [[ "$REF" == refs/tags/v* ]]; then
+            # A hand-cut tag: build and publish it.
+            proceed=true; publish=true; ref="$REF_NAME"
+          elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
+            # The auto-release path: build and publish only if a tag was cut.
+            if [ "$BUMP" != "none" ] && [ -n "$TAG" ]; then
+              proceed=true; publish=true; ref="$TAG"
+            fi
+          elif [ "$EVENT" = "workflow_dispatch" ]; then
+            # A dry run: build the artifacts, publish nothing.
+            proceed=true; publish=false; ref="$REF_NAME"
+          fi
+          version=""
+          if [ "$publish" = true ]; then version="${ref#v}"; fi
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT ref=$ref proceed=$proceed publish=$publish version=$version"
+
+  # The same checks CI runs, on the commit that is about to be published: SUMO is
+  # installed so the SUMO export is checked by SUMO itself, and pandas and pyarrow so
+  # the ClipGT export is read the way a Cosmos reader reads it.
+  verify:
+    name: test the tagged commit
+    needs: [resolve]
+    if: needs.resolve.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # `resolve` already stripped the `v`; stripping it again here would be a
+      # second implementation of the tag scheme in the same file.
+      - name: the version in the tag must be the version in the package
+        if: needs.resolve.outputs.publish == 'true'
+        run: |
+          PKG=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+          CRATE=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "tag=$TAG pyproject=$PKG cargo=$CRATE"
+          test "$TAG" = "$PKG" && test "$TAG" = "$CRATE"
+          # And the lock file, which `cargo --locked` would reject if it lagged.
+          cargo metadata --locked --format-version 1 >/dev/null
+        env:
+          TAG: ${{ needs.resolve.outputs.version }}
+
+      - name: Install SUMO
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sumo
+
+      - run: cargo test --workspace --locked
+        env:
+          ROADGEN_REQUIRE_SUMO: "1"
+
+      - name: the Python front end, from a wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin pytest pandas pyarrow sumolib
+          maturin build --release --out dist
+          pip install --find-links dist roadgen
+          python -m pytest tests/python -q
+        env:
+          ROADGEN_REQUIRE_SUMO: "1"
+
+  # Built once per architecture rather than once per Python version: abi3-py39 tags
+  # the wheel for the stable ABI, so one wheel serves 3.9 through 3.13. The feature
+  # is passed here rather than set in pyproject.toml because the demo page's Pyodide
+  # wheel is built from the same manifest and Pyodide does not load abi3 wheels.
+  wheels:
+    name: wheel (${{ matrix.target }})
+    needs: [resolve, verify]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --locked --features pyo3/abi3-py39
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist
+
+  # Only Linux wheels are built, because Linux is where the exports have been
+  # verified against their consumers. The sdist is what lets anyone else build it --
+  # it needs a Rust toolchain, which maturin bootstraps.
+  sdist:
+    name: sdist
+    needs: [resolve, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    name: publish to PyPI
+    needs: [resolve, wheels, sdist]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/roadgen
+    permissions:
+      id-token: write   # Trusted Publishing; no token in secrets.
+    steps:
+      # Named explicitly rather than "everything in the run", so that nothing but
+      # the wheels and the sdist lands in `dist/`.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - run: ls -l dist
+
+      # PyPI rejects an upload whose metadata names a file the archive does not
+      # contain, and it does so after the artifacts are built and the OIDC exchange
+      # has succeeded -- so the same check runs here first, where failing costs
+      # nothing.
+      - name: check the metadata before uploading
+        run: pipx run twine check --strict dist/*
+
+      # PyPI refuses to replace a file but accepts new ones for an existing release,
+      # so skipping what is already there lets a re-run add what an earlier attempt
+      # failed to upload.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

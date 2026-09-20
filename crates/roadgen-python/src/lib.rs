@@ -590,21 +590,23 @@ impl PyMap {
     /// only `ends` can say.
     ///
     /// Returns the movements it created, as `(from_lane_id, to_lane_id)` pairs.
-    #[pyo3(signature = (a, b, junction = None, ends = ("end", "start")))]
+    // Owned strings rather than `&str`, because a borrowed `str` cannot be pulled
+    // out of a tuple under the stable ABI the wheels are built for.
+    #[pyo3(signature = (a, b, junction = None, ends = ("end".to_owned(), "start".to_owned())))]
     fn connect(
         &mut self,
         a: &PyRoad,
         b: &PyRoad,
         junction: Option<&PyJunction>,
-        ends: (&str, &str),
+        ends: (String, String),
     ) -> PyResult<Vec<(String, String)>> {
         let movements = self
             .builder_mut()?
             .connect_ends(
                 &a.id,
-                parse_road_end(ends.0)?,
+                parse_road_end(&ends.0)?,
                 &b.id,
-                parse_road_end(ends.1)?,
+                parse_road_end(&ends.1)?,
                 junction.map(|junction| &junction.id),
             )
             .map_err(value_error)?;

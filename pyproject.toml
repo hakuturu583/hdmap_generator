@@ -1,31 +1,54 @@
 [build-system]
-requires = ["maturin>=1.5,<2.0"]
+requires = ["maturin>=1.9,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "roadgen"
+# Bumped by tools/bump_version.py together with Cargo.toml and Cargo.lock; the
+# release workflow refuses to publish unless the three agree with the tag.
 version = "0.1.0"
-description = "Generate 3D road networks and write them as OpenDRIVE, Autoware Lanelet2, OpenStreetMap, SUMO and ClipGT"
+description = "Generate 3D road networks and write them as OpenDRIVE, Autoware Lanelet2, OpenStreetMap, SUMO, CARLA, ClipGT and GPUDrive"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
-keywords = ["opendrive", "lanelet2", "autoware", "sumo", "hd-map", "road-network"]
+license = { text = "Apache-2.0" }
+keywords = ["opendrive", "lanelet2", "autoware", "sumo", "carla", "hd-map", "road-network"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: GIS",
 ]
 
 [project.urls]
 Homepage = "https://github.com/hakuturu583/hdmap_generator"
 Repository = "https://github.com/hakuturu583/hdmap_generator"
+Issues = "https://github.com/hakuturu583/hdmap_generator/issues"
+Demo = "https://hakuturu583.github.io/hdmap_generator/"
 
 [tool.maturin]
 manifest-path = "crates/roadgen-python/Cargo.toml"
 module-name = "roadgen._roadgen"
 python-source = "python"
 features = ["pyo3/extension-module"]
+# The sdist is built from what cargo would package, and cargo packages a crate rather
+# than the repository, so files at the root are not in it. The metadata declares
+# License-File regardless, and PyPI rejects an upload whose metadata names a file the
+# archive does not contain.
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "NOTICE", format = "sdist" },
+]
+strip = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
