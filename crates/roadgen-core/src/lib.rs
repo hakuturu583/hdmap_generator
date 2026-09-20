@@ -62,6 +62,7 @@ pub mod buildings;
 pub mod error;
 pub mod geometry;
 pub mod id;
+pub mod layout;
 pub mod map;
 pub mod semantics;
 pub mod topology;

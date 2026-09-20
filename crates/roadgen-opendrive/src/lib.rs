@@ -19,6 +19,11 @@
 //!   Right of way      → <junction>/<priority>
 //! ```
 //!
+//! The same table is read the other way by [`read()`]: an OpenDRIVE document becomes
+//! an [`UnvalidatedMap`](roadgen_core::validation::UnvalidatedMap), with its lane
+//! boundaries laid out by the builder's own layout code and a note for everything
+//! the IR holds less exactly than the file did.
+//!
 //! # Buildings, which belong to no road
 //!
 //! Every OpenDRIVE object hangs off a `<road>` and is placed in that road's own
@@ -141,11 +146,13 @@ use roadgen_core::GeometryError;
 pub mod controllers;
 mod error;
 pub mod options;
+pub mod read;
 pub mod road_coordinates;
 
 pub use controllers::{signal_groups, SignalGroup};
-pub use error::ExportError;
+pub use error::{ExportError, ImportError};
 pub use options::{Options, SignalCatalogue, SignalPlacement};
+pub use read::{from_xml, from_xml_with, read, read_with, Imported, ReadOptions};
 pub use road_coordinates::RoadPosition;
 
 /// Width of a painted lane marking, metres. OpenDRIVE wants a number; this is the
@@ -164,6 +171,19 @@ const STOP_LINE_DEPTH: f64 = 0.4;
 /// export.
 const TRAFFIC_LIGHT_TYPE: &str = "1000001";
 const TRAFFIC_LIGHT_SUBTYPE: &str = "-1";
+
+/// The `subtype` a stop line is written with, on a `roadMark` object — the one
+/// string that tells a reader a stop line from any other paint.
+const STOP_LINE_SUBTYPE: &str = "stopLine";
+
+/// The number OpenDRIVE gives a lane: positive to the left of the reference line,
+/// negative to the right, counting outwards from 1, with 0 reserved for the centre.
+pub fn lane_number(side: LateralSide, ordinal: usize) -> i64 {
+    match side {
+        LateralSide::Left => ordinal as i64,
+        LateralSide::Right => -(ordinal as i64),
+    }
+}
 
 /// Turns a validated map into an OpenDRIVE document.
 pub fn to_opendrive(map: &ValidatedMap) -> Result<OpenDrive, ExportError> {
@@ -343,13 +363,7 @@ impl Numbering {
         }
         let mut lanes = HashMap::new();
         for lane in map.lanes.iter() {
-            // OpenDRIVE numbers lanes outwards from the reference line: positive to
-            // the left, negative to the right, with 0 reserved for the centre.
-            let id = match lane.side {
-                LateralSide::Left => lane.ordinal as i64,
-                LateralSide::Right => -(lane.ordinal as i64),
-            };
-            lanes.insert(lane.id.clone(), id);
+            lanes.insert(lane.id.clone(), lane_number(lane.side, lane.ordinal));
         }
         let mut objects = HashMap::new();
         for (index, object) in map.objects.iter().enumerate() {
@@ -995,43 +1009,53 @@ impl<'a> Exporter<'a> {
         let Some(entry) = self.map.junction(junction) else {
             return Ok(None);
         };
+        // One `<connection>` per approach road and contact point of each
+        // connector, carrying every lane link that enters the connector there. A
+        // generated connector is one lane entered at its start from one road, so
+        // that is one connection; a connector that was read from a document may be
+        // several lanes, entered from either end.
         let mut connections = Vec::new();
-        for (index, connector_id) in entry.connecting_roads.iter().enumerate() {
+        for connector_id in &entry.connecting_roads {
             let Some(connector) = self.map.road(connector_id) else {
                 continue;
             };
-            let Some(RoadLinkTarget::Road(incoming)) = &connector.link.predecessor else {
-                continue;
-            };
-            // The connector's single lane, and the approach lane that feeds it.
-            let Some(connector_lane) = connector.lanes.first() else {
-                continue;
-            };
-            let lane_link = self
-                .map
-                .connections_to(connector_lane)
-                .into_iter()
-                .map(|connection| {
-                    Ok(JunctionLaneLink {
+            let mut groups: Vec<((RoadId, LaneEnd), Vec<JunctionLaneLink>)> = Vec::new();
+            for connector_lane in &connector.lanes {
+                for connection in self.map.connections_to(connector_lane) {
+                    let Some(from) = self.map.lanes.get(&connection.from.lane) else {
+                        continue;
+                    };
+                    // A movement from another connector is that connector's business.
+                    if self.map.road(&from.road).is_some_and(Road::is_connector) {
+                        continue;
+                    }
+                    let key = (from.road.clone(), connection.to.end);
+                    let link = JunctionLaneLink {
                         from: self.lane_id(&connection.from.lane)?,
                         to: self.lane_id(connector_lane)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, ExportError>>()?;
-
-            connections.push(Connection {
-                predecessor: None,
-                successor: None,
-                lane_link,
-                connecting_road: Some(self.road_id(connector_id)?.to_owned()),
-                // Every generated connector runs forwards from the approach, so
-                // traffic always enters it at its start.
-                contact_point: Some(ContactPoint::Start),
-                id: index.to_string(),
-                incoming_road: Some(self.road_id(&incoming.road)?.to_owned()),
-                linked_road: None,
-                r#type: None,
-            });
+                    };
+                    match groups.iter_mut().find(|(held, _)| *held == key) {
+                        Some((_, links)) => links.push(link),
+                        None => groups.push((key, vec![link])),
+                    }
+                }
+            }
+            for ((incoming, contact), lane_link) in groups {
+                connections.push(Connection {
+                    predecessor: None,
+                    successor: None,
+                    lane_link,
+                    connecting_road: Some(self.road_id(connector_id)?.to_owned()),
+                    contact_point: Some(match contact {
+                        LaneEnd::Start => ContactPoint::Start,
+                        LaneEnd::End => ContactPoint::End,
+                    }),
+                    id: connections.len().to_string(),
+                    incoming_road: Some(self.road_id(&incoming)?.to_owned()),
+                    linked_road: None,
+                    r#type: None,
+                });
+            }
         }
 
         let Ok(connection) = Vec1::try_from_vec(connections) else {
@@ -1251,14 +1275,16 @@ impl<'a> Exporter<'a> {
                         height: None,
                         id: self.object_id(&object.id)?.to_owned(),
                         length: Some(Length::new::<meter>(STOP_LINE_DEPTH)),
-                        name: Some("stopLine".to_owned()),
+                        // Its own identifier, as every signal and crosswalk carries;
+                        // the subtype is what says it is a stop line.
+                        name: Some(object.id.to_string()),
                         orientation: Some(self.orientation(object)),
                         perp_to_road: None,
                         pitch: None,
                         radius: None,
                         roll: None,
                         s: Length::new::<meter>(position.s),
-                        subtype: Some("stopLine".to_owned()),
+                        subtype: Some(STOP_LINE_SUBTYPE.to_owned()),
                         t: Length::new::<meter>(position.t),
                         r#type: Some(ObjectType::RoadMark),
                         valid_length: None,
@@ -1623,13 +1649,14 @@ fn wrap_angle(angle: f64) -> f64 {
     }
 }
 
-/// The elevation of the reference line, as one linear polynomial per sampled span.
+/// The elevation of the reference line, as one linear polynomial per run of sampled
+/// spans that climb at one grade.
 ///
 /// This is where the third dimension of the IR's reference line goes: OpenDRIVE
 /// keeps the plan view and the elevation in separate elements, so the lowering has
 /// to split what the IR holds as one 3D curve.
 fn elevation_profile(samples: &[Sample]) -> ElevationProfile {
-    let mut elevation = Vec::new();
+    let mut elevation: Vec<Elevation> = Vec::new();
     for pair in samples.windows(2) {
         let (here, next) = (pair[0], pair[1]);
         let run = next.station - here.station;
@@ -1638,6 +1665,15 @@ fn elevation_profile(samples: &[Sample]) -> ElevationProfile {
         } else {
             0.0
         };
+        // A span that carries on the previous row's grade needs no row of its
+        // own: the row already describes it. A road of constant grade is one row.
+        if let Some(last) = elevation.last() {
+            let continues = (slope - last.b).abs() < 1e-9
+                && (last.a + last.b * (here.station - last.s) - here.point.z).abs() < 1e-9;
+            if continues {
+                continue;
+            }
+        }
         elevation.push(Elevation {
             a: here.point.z,
             b: slope,

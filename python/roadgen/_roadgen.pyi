@@ -134,6 +134,7 @@ class Map:
     def validate(self) -> None: ...
     def issues(self) -> list[str]: ...
     def mgrs_grid(self) -> Optional[str]: ...
+    def read_warnings(self) -> list[str]: ...
     def format_warnings(self) -> list[str]: ...
     def clipgt_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def gpudrive_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
@@ -229,6 +230,16 @@ def building_presets() -> list[str]:
 
 def building_rules(name: Optional[str] = None) -> str:
     """A built-in rule set, as the CGA grammar it is; the default one with no name."""
+
+def read_opendrive(
+    path: str,
+    sampling: float = 2.0,
+    origin: Optional[Point] = None,
+    projection: str = "local_cartesian",
+) -> Map:
+    """The OpenDRIVE file at `path`, read as a map that exports like any other and
+    cannot be added to. `Map.read_warnings()` says what the file stated that the map
+    could not keep."""
 
 def render_opendrive(path: str) -> str:
     """The OpenDRIVE file at `path`, drawn as an SVG document."""

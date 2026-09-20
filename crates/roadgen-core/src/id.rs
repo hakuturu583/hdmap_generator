@@ -117,6 +117,15 @@ impl LaneId {
     }
 }
 
+impl ObjectId {
+    /// The part after the `object/` prefix.
+    pub fn local_name(&self) -> &str {
+        self.as_str()
+            .strip_prefix("object/")
+            .unwrap_or_else(|| self.as_str())
+    }
+}
+
 impl BuildingId {
     /// The part after the `building/` prefix.
     pub fn local_name(&self) -> &str {

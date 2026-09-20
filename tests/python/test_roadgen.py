@@ -11,6 +11,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -1276,6 +1277,56 @@ def test_drawing_a_file_that_is_not_the_format_says_so(tmp_path):
     path.write_text("<not-opendrive/>")
     with pytest.raises(RuntimeError):
         roadgen.render_opendrive(str(path))
+
+
+# --------------------------------------------------------------------------- #
+# Reading an OpenDRIVE file back
+# --------------------------------------------------------------------------- #
+
+
+def test_an_opendrive_file_reads_back_as_the_map_that_wrote_it(joined, tmp_path):
+    joined.export_opendrive(tmp_path / "map.xodr")
+    back = roadgen.read_opendrive(str(tmp_path / "map.xodr"))
+    # The same roads, lanes and movements — named after the file's ids now, since
+    # a road's own name is not in the file — and the same file again, byte for
+    # byte; the one warning is that a PROJ string has no altitude in it.
+    assert back.road_ids() == ["road/0", "road/1"]
+    assert len(back.lane_ids()) == len(joined.lane_ids())
+    assert len(back.connections()) == len(joined.connections())
+    # Byte for byte but for the last digits of a station recomputed along a bend.
+    def rounded(xml):
+        return re.sub(r"-?\d\.\d+e-?\d+", lambda m: f"{float(m.group()):.9g}", xml)
+
+    assert rounded(back.to_opendrive_xml()) == rounded(joined.to_opendrive_xml())
+    assert back.read_warnings() == [
+        "a PROJ string carries no altitude, so the origin is read at 0 m; the map's "
+        "own heights are unaffected"
+    ]
+    # And it exports like any other map.
+    back.export_lanelet2(tmp_path / "map.osm")
+    assert (tmp_path / "map.osm").stat().st_size > 0
+
+
+def test_a_map_read_from_a_file_cannot_be_added_to(joined, tmp_path):
+    joined.export_opendrive(tmp_path / "map.xodr")
+    back = roadgen.read_opendrive(str(tmp_path / "map.xodr"))
+    with pytest.raises(ValueError, match="read from a file"):
+        back.add_road(start=(0.0, 0.0, 0.0), end=(10.0, 0.0, 0.0), lanes=two_way())
+    with pytest.raises(ValueError, match="read from a file"):
+        back.add_junction()
+
+
+def test_a_built_map_has_nothing_to_warn_about_reading(joined):
+    assert joined.read_warnings() == []
+
+
+def test_reading_a_file_that_is_not_opendrive_says_so(tmp_path):
+    path = tmp_path / "map.xodr"
+    path.write_text("<not-opendrive/>")
+    with pytest.raises(ValueError):
+        roadgen.read_opendrive(str(path))
+    with pytest.raises(ValueError):
+        roadgen.read_opendrive(str(tmp_path / "nothing.xodr"))
 
 
 # --------------------------------------------------------------------------- #

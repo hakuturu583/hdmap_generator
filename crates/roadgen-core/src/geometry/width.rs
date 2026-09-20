@@ -64,6 +64,12 @@ impl WidthProfile {
 
     /// A width passing through each knot in turn, held flat before the first and
     /// after the last.
+    ///
+    /// The knots are kept canonical: one that only repeats its neighbours' width
+    /// changes nothing — the profile is flat there with or without it — and is
+    /// dropped, and knots that all agree are the one knot of a constant profile.
+    /// So two profiles that describe the same width are the same profile, whichever
+    /// way they were written.
     pub fn new(
         knots: impl IntoIterator<Item = (f64, PositiveWidth)>,
         taper: Taper,
@@ -80,7 +86,28 @@ impl WidthProfile {
                 .partial_cmp(&right.0)
                 .expect("stations were checked to be finite")
         });
-        Ok(WidthProfile { knots, taper })
+        let same = |a: PositiveWidth, b: PositiveWidth| (a.metres() - b.metres()).abs() < 1e-12;
+        if knots.iter().all(|(_, width)| same(*width, knots[0].1)) {
+            return Ok(WidthProfile::constant(knots[0].1));
+        }
+        // A knot is redundant when the profile is the same width on both sides of
+        // it: before the first knot it holds the first width, after the last the
+        // last, so an end knot goes when its one neighbour agrees with it.
+        let kept: Vec<(f64, PositiveWidth)> = knots
+            .iter()
+            .enumerate()
+            .filter(|(index, (_, width))| {
+                let before = index
+                    .checked_sub(1)
+                    .is_none_or(|i| same(knots[i].1, *width));
+                let after = knots
+                    .get(index + 1)
+                    .is_none_or(|(_, next)| same(*next, *width));
+                !(before && after)
+            })
+            .map(|(_, knot)| *knot)
+            .collect();
+        Ok(WidthProfile { knots: kept, taper })
     }
 
     pub fn taper(&self) -> Taper {
@@ -212,6 +239,33 @@ mod tests {
             assert!((profile.evaluate(station).metres() - 3.5).abs() < 1e-12);
         }
         assert!((profile.narrowest().metres() - 3.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn knots_that_change_nothing_are_not_kept() {
+        // Flat, then a taper, then flat: the two knots that only repeat their
+        // neighbours go, and the ones that shape the width stay.
+        let profile = WidthProfile::new(
+            [
+                (0.0, w(2.0)),
+                (30.0, w(2.0)),
+                (60.0, w(2.0)),
+                (100.0, w(5.0)),
+                (160.0, w(5.0)),
+                (200.0, w(5.0)),
+            ],
+            Taper::Linear,
+        )
+        .unwrap();
+        let stations: Vec<f64> = profile.knots().iter().map(|(s, _)| *s).collect();
+        assert_eq!(stations, vec![60.0, 100.0]);
+        assert!((profile.evaluate(0.0).metres() - 2.0).abs() < 1e-12);
+        assert!((profile.evaluate(80.0).metres() - 3.5).abs() < 1e-12);
+        assert!((profile.evaluate(200.0).metres() - 5.0).abs() < 1e-12);
+
+        // Two knots of one width are a constant profile, however far apart.
+        let flat = WidthProfile::tapered(0.0, 50.0, w(3.5), w(3.5), Taper::Smooth).unwrap();
+        assert_eq!(flat, WidthProfile::constant(w(3.5)));
     }
 
     #[test]
