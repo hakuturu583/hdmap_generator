@@ -19,6 +19,13 @@ on:
 permissions:
   contents: read
 
+# A push and a label change can arrive together and start two runs that read two
+# different label sets; only the latest event's answer is the PR's. One run per PR,
+# the newer cancelling the older.
+concurrency:
+  group: release-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   label:
     name: the PR carries exactly one release label
