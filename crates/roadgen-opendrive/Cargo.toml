@@ -10,6 +10,7 @@ description = "Lowers the roadgen canonical IR onto an OpenDRIVE document"
 
 [dependencies]
 roadgen-core.workspace = true
+ll2-projection.workspace = true
 opendrive.workspace = true
 uom.workspace = true
 vec1.workspace = true

@@ -121,6 +121,7 @@ use uom::si::f64::{Angle, Curvature, Length};
 use uom::si::length::meter;
 use vec1::Vec1;
 
+use ll2_projection::utmups;
 use roadgen_core::buildings::{Building, BuildingPart};
 use roadgen_core::geometry::{Curve3, Point3, Sample};
 use roadgen_core::id::ObjectId;
@@ -131,6 +132,7 @@ use roadgen_core::semantics::{
     TrafficRule,
 };
 use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd, RoadLinkTarget};
+use roadgen_core::units::GeoOrigin;
 use roadgen_core::validation::ValidatedMap;
 use roadgen_core::GeometryError;
 
@@ -198,6 +200,29 @@ pub fn write_with(
     let xml = to_xml_with(map, options)?;
     std::fs::write(path.as_ref(), xml)
         .map_err(|error| ExportError::Io(format!("{}: {error}", path.as_ref().display())))
+}
+
+/// A `<geoReference>` that names the map's origin as `+lat_0`/`+lon_0`, whatever the
+/// projection.
+///
+/// For a `local_cartesian` or `mgrs` map this is what the exporter writes anyway.
+/// For a `utm` map the exporter writes the zone's transverse Mercator with the
+/// origin folded into the false origin, which PROJ reads exactly but which puts the
+/// zone's central meridian in `+lon_0` — and a consumer that reads only those two
+/// numbers as "where `(0, 0)` is" (CARLA's GNSS sensor) would be a few degrees out.
+/// This string is for that consumer, through [`Options::geo_reference`]: it places
+/// the origin right and describes a UTM map's metres only to within the grid
+/// convergence.
+pub fn origin_proj_string(map: &ValidatedMap) -> String {
+    proj_string_about(map.metadata.origin)
+}
+
+fn proj_string_about(origin: GeoOrigin) -> String {
+    format!(
+        "+proj=tmerc +lat_0={} +lon_0={} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
+        origin.latitude(),
+        origin.longitude()
+    )
 }
 
 /// The id a signal is written with, which is what a consumer knows the object by.
@@ -444,7 +469,7 @@ impl<'a> Exporter<'a> {
             west: Some(Length::new::<meter>(west)),
             vendor: Some("roadgen".into()),
             geo_reference: Some(GeoReference {
-                proj: Some(self.proj_string()),
+                proj: Some(self.proj_string()?),
                 additional_data: AdditionalData::default(),
             }),
             offset: None,
@@ -454,31 +479,46 @@ impl<'a> Exporter<'a> {
 
     /// The PROJ description of the map's coordinates.
     ///
+    /// The coordinates in the file are always the map's own metres about its origin,
+    /// whatever the projection — that is what keeps this file in the same frame as
+    /// the SUMO, ClipGT, GPUDrive and CARLA exports — so the string here has to
+    /// describe *those* metres, not the frame they were derived from.
+    ///
     /// PROJ has no exact local east/north/up projection, so a local-Cartesian map is
     /// described as a transverse Mercator at the same origin with unit scale — which
     /// agrees with it to well under a millimetre over the size of a generated map,
-    /// and is what consumers of OpenDRIVE expect to find here.
-    fn proj_string(&self) -> String {
+    /// and is what consumers of OpenDRIVE expect to find here. A UTM map's metres are
+    /// UTM eastings and northings less the origin's, so it is the zone's transverse
+    /// Mercator with the origin's easting and northing folded into the false origin:
+    /// a bare `+proj=utm` would place the file's `(0, 0)` on the equator.
+    fn proj_string(&self) -> Result<String, ExportError> {
+        if let Some(reference) = &self.options.geo_reference {
+            return Ok(reference.clone());
+        }
         let origin = self.map.metadata.origin;
-        match self.map.metadata.projection {
+        Ok(match self.map.metadata.projection {
             // MGRS changes how the *Lanelet2* export reports a node's metric
             // position; the map's own coordinates are still metres about its origin,
             // so this file describes them the same way either way.
-            Projection::LocalCartesian | Projection::Mgrs => format!(
-                "+proj=tmerc +lat_0={} +lon_0={} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
-                origin.latitude(),
-                origin.longitude()
-            ),
+            Projection::LocalCartesian | Projection::Mgrs => proj_string_about(origin),
             Projection::Utm => {
-                let zone = (((origin.longitude() + 180.0) / 6.0).floor() as i32 + 1).clamp(1, 60);
-                let south = if origin.latitude() < 0.0 {
-                    " +south"
-                } else {
-                    ""
-                };
-                format!("+proj=utm +zone={zone}{south} +datum=WGS84 +units=m +no_defs")
+                let (zone, northern, easting, northing) =
+                    utmups::forward(origin.latitude(), origin.longitude())
+                        .map_err(|error| ExportError::Projection(error.message().to_owned()))?;
+                // UTM is a transverse Mercator on the zone's central meridian at
+                // scale 0.9996 with a false easting of 500 km and, south of the
+                // equator, a false northing of 10 000 km. Subtracting the origin's
+                // easting and northing from those false values makes the projection
+                // hand back the file's own metres.
+                let false_northing = if northern { 0.0 } else { 10_000_000.0 };
+                format!(
+                    "+proj=tmerc +lat_0=0 +lon_0={} +k=0.9996 +x_0={} +y_0={} +datum=WGS84 +units=m +no_defs",
+                    utmups::central_meridian(zone),
+                    500_000.0 - easting,
+                    false_northing - northing
+                )
             }
-        }
+        })
     }
 
     fn samples(&self, road: &Road) -> Result<Vec<Sample>, GeometryError> {

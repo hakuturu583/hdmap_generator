@@ -682,6 +682,15 @@ the easting and northing modulo 100 km, so a map running over the edge would sil
 come back on the other side; `format_warnings()` reports it instead, and exporting
 fails rather than writing it.
 
+The OpenDRIVE file's coordinates are the map's own metres under every projection, and
+its `<geoReference>` describes *those* metres: a transverse Mercator about the origin
+for `local_cartesian` and `mgrs`, and for `utm` the zone's transverse Mercator with the
+origin's easting and northing folded into the false origin, so that a PROJ consumer
+reading the file lands on the latitudes the Lanelet2 export wrote. The CARLA package's
+`.xodr` is the one exception: CARLA's GNSS sensor reads only `+lat_0`/`+lon_0` from
+the string, as where `(0, 0)` stands, so that file names the origin there whatever the
+projection.
+
 ## OpenStreetMap
 
 `export_lanelet2` and `export_osm` both write `.osm`, and they are **not

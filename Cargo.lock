@@ -1351,6 +1351,7 @@ dependencies = [
 name = "roadgen-opendrive"
 version = "0.1.0"
 dependencies = [
+ "ll2-projection",
  "opendrive",
  "roadgen-core",
  "uom",
