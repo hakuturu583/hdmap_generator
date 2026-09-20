@@ -700,6 +700,13 @@ longitude**, not by shifting the whole map by the origin's grid position: a metr
 local east is not a metre of UTM easting, and over a few kilometres the difference
 shows. `Map.mgrs_grid()` gives the square's reference for `map_projector_info`.
 
+Heights are the map's own under every projection: a Lanelet2 node's `ele` is its `z`,
+the same number OpenDRIVE, SUMO, ClipGT, CARLA and the plain OSM export carry — and the
+number Autoware's MGRS, UTM and local projectors use as `z` when they load the map. It
+is not the ellipsoidal height of the point (which a local Cartesian frame puts d²/2R
+above the tangent plane, already 3 m at 6 km from the origin); a consumer that wants
+that has the latitude, the longitude and the origin's altitude to compute it from.
+
 A map with MGRS coordinates has to fit inside one square. `ll2`'s MGRS projector takes
 the easting and northing modulo 100 km, so a map running over the edge would silently
 come back on the other side; `format_warnings()` reports it instead, and exporting

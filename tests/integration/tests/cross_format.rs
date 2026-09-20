@@ -349,3 +349,87 @@ fn the_same_input_produces_the_same_identifiers_and_the_same_files() {
         .any(|connection| connection.id.to_string()
             == "connection/fork/trunk_0/fork_trunk_0_straight_on_0_0"));
 }
+
+#[test]
+fn lanelet2_heights_are_the_maps_own_however_far_from_the_origin() {
+    // A local Cartesian projection's reverse gives the ellipsoidal height of an
+    // east/north/up point: the origin's altitude, plus z, plus d²/2R for the
+    // ellipsoid falling away under the tangent plane — 2.7 m at 5.8 km. Every other
+    // export carries the map's z; so does `ele`, or an Autoware map would float
+    // that far above the CARLA road built from the same IR.
+    for projection in [
+        Projection::LocalCartesian,
+        Projection::Mgrs,
+        Projection::Utm,
+    ] {
+        let mut builder = MapBuilder::new(MapMetadata {
+            name: Some("far".into()),
+            origin: GeoOrigin::new(35.68, 139.76, 30.0).unwrap(),
+            projection,
+            ..MapMetadata::default()
+        });
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(5000.0, 3000.0, 30.0),
+                    Point3::new(5400.0, 3100.0, 40.0),
+                    scenarios::two_way(),
+                )
+                .unwrap()
+                .with_name("far"),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+
+        // The IR's vertices, by position, so a node can be looked up by where it is.
+        let vertices: Vec<Point3> = map
+            .lanes
+            .iter()
+            .flat_map(|lane| {
+                [&lane.left_boundary, &lane.right_boundary]
+                    .into_iter()
+                    .flat_map(|curve| {
+                        curve
+                            .to_polyline(map.metadata.sampling)
+                            .unwrap()
+                            .points()
+                            .to_vec()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Written: the heights in the file are exactly the heights in the IR — the
+        // same set of values, one per distinct vertex height, none of them lifted.
+        let mut heights: Vec<f64> = vertices.iter().map(|vertex| vertex.z).collect();
+        heights.sort_by(f64::total_cmp);
+        heights.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        let xml = roadgen_lanelet2::to_osm_xml(&map).unwrap();
+        let (document, _) = ll2_io::osm::parse(&xml).unwrap();
+        let mut written: Vec<f64> = document.nodes.values().map(|node| node.ele).collect();
+        written.sort_by(f64::total_cmp);
+        written.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        assert_eq!(written.len(), heights.len(), "{projection:?}");
+        for (found, wanted) in written.iter().zip(&heights) {
+            assert!(
+                (found - wanted).abs() < 1e-6,
+                "{projection:?}: ele {found} where the map has z {wanted}"
+            );
+        }
+
+        // Read back through the same projector, the points have the map's z again.
+        let reloaded = reload_lanelet2(&map);
+        for primitive in reloaded.points.all() {
+            let Some(point) = ll2_core::map::as_point(&primitive) else {
+                continue;
+            };
+            assert!(
+                vertices
+                    .iter()
+                    .any(|vertex| (vertex.z - point.z()).abs() < 1e-6),
+                "{projection:?}: a reloaded point is at z {}",
+                point.z()
+            );
+        }
+    }
+}
