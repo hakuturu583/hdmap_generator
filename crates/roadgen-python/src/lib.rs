@@ -615,40 +615,50 @@ impl PyMap {
         Ok(id.to_string())
     }
 
-    /// Adds a stop line across a lane.
-    #[pyo3(signature = (lane, end = "end"))]
-    fn add_stop_line(&mut self, lane: &PyLaneRef, end: &str) -> PyResult<String> {
+    /// Adds a stop line across a lane, `setback` metres back from the end named —
+    /// before the crosswalk at a junction mouth, say.
+    #[pyo3(signature = (lane, end = "end", setback = 0.0))]
+    fn add_stop_line(&mut self, lane: &PyLaneRef, end: &str, setback: f64) -> PyResult<String> {
         let id = self
             .builder
-            .add_stop_line(&lane.reference, parse_end(end)?)
+            .add_stop_line_at(&lane.reference, parse_end(end)?, setback)
             .map_err(value_error)?;
         self.invalidate();
         Ok(id.to_string())
     }
 
-    /// Adds a traffic light bar above a lane.
-    #[pyo3(signature = (lane, end = "end", height = 5.0))]
-    fn add_traffic_light(&mut self, lane: &PyLaneRef, end: &str, height: f64) -> PyResult<String> {
+    /// Adds a traffic light bar above a lane, `setback` metres back from the end
+    /// named.
+    #[pyo3(signature = (lane, end = "end", height = 5.0, setback = 0.0))]
+    fn add_traffic_light(
+        &mut self,
+        lane: &PyLaneRef,
+        end: &str,
+        height: f64,
+        setback: f64,
+    ) -> PyResult<String> {
         let id = self
             .builder
-            .add_traffic_light(&lane.reference, parse_end(end)?, height)
+            .add_traffic_light_at(&lane.reference, parse_end(end)?, height, setback)
             .map_err(value_error)?;
         self.invalidate();
         Ok(id.to_string())
     }
 
-    /// Adds a traffic sign beside a lane. `code` becomes the sign's subtype.
-    #[pyo3(signature = (lane, code, end = "end", height = 2.5))]
+    /// Adds a traffic sign beside a lane, `setback` metres back from the end named.
+    /// `code` becomes the sign's subtype.
+    #[pyo3(signature = (lane, code, end = "end", height = 2.5, setback = 0.0))]
     fn add_traffic_sign(
         &mut self,
         lane: &PyLaneRef,
         code: String,
         end: &str,
         height: f64,
+        setback: f64,
     ) -> PyResult<String> {
         let id = self
             .builder
-            .add_traffic_sign(&lane.reference, parse_end(end)?, code, height)
+            .add_traffic_sign_at(&lane.reference, parse_end(end)?, code, height, setback)
             .map_err(value_error)?;
         self.invalidate();
         Ok(id.to_string())
@@ -1104,6 +1114,13 @@ impl PyMap {
     /// `use_carla_materials` lets CARLA replace this package's materials with its own,
     /// which is what its documentation recommends and what its own maps do. Turn it
     /// off to see the Poly Haven textures the package ships.
+    ///
+    /// `furniture` builds the traffic lights and signs — a pole on the pavement, a
+    /// mast arm reaching over the lanes it governs, a head over each — as props,
+    /// with the manifest the package's script places them from and the
+    /// `map_logic` that makes CARLA adopt them as its own lights. On by default;
+    /// off, CARLA spawns its own blueprints at the signals, which the `.xodr` then
+    /// places where the IR put the bar: over the middle of the lane.
     #[pyo3(signature = (
         directory,
         name = None,
@@ -1113,6 +1130,7 @@ impl PyMap {
         kerb_height = None,
         verge_width = None,
         ground_extent = None,
+        furniture = None,
         carla_root = None,
         engine = None,
         sun_altitude = None,
@@ -1130,6 +1148,7 @@ impl PyMap {
         kerb_height: Option<f64>,
         verge_width: Option<f64>,
         ground_extent: Option<f64>,
+        furniture: Option<bool>,
         carla_root: Option<String>,
         engine: Option<String>,
         sun_altitude: Option<f64>,
@@ -1143,6 +1162,7 @@ impl PyMap {
             kerb_height,
             verge_width,
             ground_extent,
+            furniture,
         )?;
         // What the package's script imports into, when the caller says now rather
         // than when running it.
@@ -1167,6 +1187,22 @@ impl PyMap {
             "props",
             written.props.as_ref().map(|path| path.to_string_lossy()),
         )?;
+        report.set_item(
+            "furniture",
+            written
+                .furniture
+                .as_ref()
+                .map(|path| path.to_string_lossy()),
+        )?;
+        report.set_item(
+            "map_logic",
+            written
+                .map_logic
+                .as_ref()
+                .map(|path| path.to_string_lossy()),
+        )?;
+        report.set_item("lights", written.lights)?;
+        report.set_item("signs", written.signs)?;
         report.set_item("meshes", written.meshes)?;
         report.set_item("triangles", written.triangles)?;
         // Keyed by the tag a segmentation camera reports, because that is the name
@@ -1202,6 +1238,7 @@ impl PyMap {
         kerb_height = None,
         verge_width = None,
         ground_extent = None,
+        furniture = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn carla_warnings(
@@ -1213,6 +1250,7 @@ impl PyMap {
         kerb_height: Option<f64>,
         verge_width: Option<f64>,
         ground_extent: Option<f64>,
+        furniture: Option<bool>,
     ) -> PyResult<Vec<String>> {
         let config = self.carla_config(
             name,
@@ -1222,6 +1260,7 @@ impl PyMap {
             kerb_height,
             verge_width,
             ground_extent,
+            furniture,
         )?;
         let map = self.built.as_ref().expect("just built");
         Ok(roadgen_carla::check(map, &config))
@@ -1452,6 +1491,7 @@ impl PyMap {
         kerb_height: Option<f64>,
         verge_width: Option<f64>,
         ground_extent: Option<f64>,
+        furniture: Option<bool>,
     ) -> PyResult<roadgen_carla::PackageConfig> {
         self.ensure_built()?;
         let map = self.built.as_ref().expect("just built");
@@ -1488,6 +1528,9 @@ impl PyMap {
         }
         if let Some(ground_extent) = ground_extent {
             config.surfaces.ground_extent = ground_extent;
+        }
+        if furniture == Some(false) {
+            config.furniture = None;
         }
         Ok(config)
     }

@@ -239,12 +239,14 @@ enum ConnectOp {
 
 #[derive(Debug, Clone)]
 enum ObjectSpec {
-    /// A line across a lane at one of its ends, raised by `height` metres.
+    /// A line across a lane at one of its ends, raised by `height` metres, or
+    /// `setback` metres back along the lane from that end.
     AcrossLane {
         kind: MapObjectKind,
         lane: LaneRef,
         end: LaneEnd,
         height: f64,
+        setback: f64,
         lanes: Vec<LaneRef>,
     },
     /// A band across a whole road at a station along it.
@@ -661,6 +663,17 @@ impl MapBuilder {
 
     /// Adds a stop line across `lane` at one of its ends.
     pub fn add_stop_line(&mut self, lane: &LaneRef, end: LaneEnd) -> Result<ObjectId, BuildError> {
+        self.add_stop_line_at(lane, end, 0.0)
+    }
+
+    /// Adds a stop line across `lane`, `setback` metres back along the lane from
+    /// one of its ends — before the crosswalk at a junction mouth, say.
+    pub fn add_stop_line_at(
+        &mut self,
+        lane: &LaneRef,
+        end: LaneEnd,
+        setback: f64,
+    ) -> Result<ObjectId, BuildError> {
         self.lane_spec(lane)?;
         self.push_object(
             format!("stopline/{}/{}", lane.lane_id().local_name(), end.as_str()),
@@ -669,6 +682,7 @@ impl MapBuilder {
                 lane: lane.clone(),
                 end,
                 height: 0.0,
+                setback: setback.max(0.0),
                 lanes: vec![lane.clone()],
             },
         )
@@ -680,6 +694,18 @@ impl MapBuilder {
         lane: &LaneRef,
         end: LaneEnd,
         height: f64,
+    ) -> Result<ObjectId, BuildError> {
+        self.add_traffic_light_at(lane, end, height, 0.0)
+    }
+
+    /// Adds a traffic light bar above `lane`, `setback` metres back from one of its
+    /// ends.
+    pub fn add_traffic_light_at(
+        &mut self,
+        lane: &LaneRef,
+        end: LaneEnd,
+        height: f64,
+        setback: f64,
     ) -> Result<ObjectId, BuildError> {
         self.lane_spec(lane)?;
         self.push_object(
@@ -693,6 +719,7 @@ impl MapBuilder {
                 lane: lane.clone(),
                 end,
                 height,
+                setback: setback.max(0.0),
                 lanes: vec![lane.clone()],
             },
         )
@@ -705,6 +732,19 @@ impl MapBuilder {
         end: LaneEnd,
         code: impl Into<String>,
         height: f64,
+    ) -> Result<ObjectId, BuildError> {
+        self.add_traffic_sign_at(lane, end, code, height, 0.0)
+    }
+
+    /// Adds a traffic sign beside `lane`, `setback` metres back from one of its
+    /// ends.
+    pub fn add_traffic_sign_at(
+        &mut self,
+        lane: &LaneRef,
+        end: LaneEnd,
+        code: impl Into<String>,
+        height: f64,
+        setback: f64,
     ) -> Result<ObjectId, BuildError> {
         self.lane_spec(lane)?;
         let code = code.into();
@@ -720,6 +760,7 @@ impl MapBuilder {
                 lane: lane.clone(),
                 end,
                 height,
+                setback: setback.max(0.0),
                 lanes: vec![lane.clone()],
             },
         )
@@ -1889,18 +1930,28 @@ impl Generator {
                     lane,
                     end,
                     height,
+                    setback,
                     lanes,
                 } => {
                     let lane = self.lane(&lane)?.clone();
                     let travel = lane.travel_geometry(config)?;
-                    let (left, right) = match end == lane.direction.exit_end() {
-                        true => (travel.left.end_point(), travel.right.end_point()),
-                        false => (travel.left.start_point(), travel.right.start_point()),
+                    let at_exit = end == lane.direction.exit_end();
+                    // `setback` metres back into the lane from the end, measured
+                    // along each boundary; the lane's own polyline is the truth about
+                    // where a point that far back is, curve or no curve.
+                    let back = |curve: &Curve3| -> Result<Point3, BuildError> {
+                        let polyline = curve.to_polyline(config)?;
+                        Ok(point_back_from_end(&polyline, at_exit, setback))
                     };
+                    let (left, right) = (back(&travel.left)?, back(&travel.right)?);
                     // Height is measured away from the road surface, not straight up:
                     // that is what "five metres above the road" means on a slope, and
                     // it is the quantity OpenDRIVE's `zOffset` carries.
-                    let station = lane.station_at_end(end);
+                    let (start, finish) = lane.station_range;
+                    let station = match end {
+                        LaneEnd::End => (finish - setback).max(start),
+                        LaneEnd::Start => (start + setback).min(finish),
+                    };
                     let up = self
                         .map
                         .road(&lane.road)
@@ -2181,6 +2232,32 @@ impl RoadSpec {
             self.superelevation = profile;
         }
     }
+}
+
+/// The point `distance` metres back along `polyline` from one of its ends: from
+/// the last vertex when `from_last`, else from the first. Clamped to the other end.
+fn point_back_from_end(polyline: &Polyline3, from_last: bool, distance: f64) -> Point3 {
+    let points = polyline.points();
+    let ordered: Vec<Point3> = if from_last {
+        points.iter().rev().copied().collect()
+    } else {
+        points.to_vec()
+    };
+    let mut remaining = distance.max(0.0);
+    for pair in ordered.windows(2) {
+        let length = pair[0].distance_to(pair[1]);
+        if remaining <= length {
+            return if length > 0.0 {
+                pair[0].lerp(pair[1], remaining / length)
+            } else {
+                pair[0]
+            };
+        }
+        remaining -= length;
+    }
+    *ordered
+        .last()
+        .expect("a polyline has at least two vertices")
 }
 
 #[cfg(test)]

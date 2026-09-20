@@ -222,7 +222,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `add_junction(name)` | a junction to route movements through |
 | `connect(a, b, junction=None, ends=("end", "start"))` | joins two roads by the named ends, pairing lanes |
 | `connect_lanes(from_lane, to_lane, junction=None)` | one specific movement |
-| `add_stop_line`, `add_traffic_light`, `add_traffic_sign`, `add_crosswalk` | road furniture |
+| `add_stop_line`, `add_traffic_light`, `add_traffic_sign`, `add_crosswalk` | road furniture; the first three take `setback=` metres back from the lane end |
 | `generate_buildings(enabled=True, rules=None, seed=0)` | a town beside the roads, on or off, by the rules you give it |
 | `building_ids()`, `building_kind(id)`, `building_frontage(id)`, `building_parts(id)` | what it generated |
 | `building_footprint(part)`, `building_part_shape(part)`, `building_part_kind(part)`, `building_shell(part)` | one part's outline, its heights and roof, what it is, and the faces that bound it |
@@ -239,9 +239,10 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
-| `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=, carla_root=, engine=, sun_altitude=, sun_azimuth=)` | write a CARLA UE5 package and the script that imports it; returns what was written and what each mesh will be tagged |
+| `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=, furniture=, carla_root=, engine=, sun_altitude=, sun_azimuth=)` | write a CARLA UE5 package and the script that imports it; returns what was written and what each mesh will be tagged |
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
 | `carla_sky(carla_root, package, map_name, engine=, sun_altitude=, sun_azimuth=)` | after `Import.py`: give the imported level a daylight sky, with the editor's own scripting |
+| `carla_furniture(carla_root, package, map_name, engine=, manifest=)` | after `Import.py`: stand the package's traffic lights, signs and props town in the level, and make CARLA adopt the lights and signs |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 | `render_opendrive(path)` / `render_sumo(directory)` / `render_carla(path)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
@@ -426,6 +427,11 @@ govern — and both formats get them:
 | Crosswalk | `<object type="crosswalk">` with its outline as `<cornerLocal>` corners | a lanelet of subtype `crosswalk` |
 | Right of way | `<junction><priority high low>` | `right_of_way` regulatory element |
 
+A light, a sign or a stop line goes at one end of a lane, or `setback` metres back
+along the lane from it — `m.add_stop_line(lane, setback=8.0)` — which is where a
+stop line belongs when a crosswalk lies between it and the junction, and where a
+stop sign stands beside it.
+
 OpenDRIVE places an object at `(s, t, zOffset)` in one road's own coordinates, so the
 exporter projects the IR's position through the road local frame — a nearest-point
 search for the station, then `Frame3::to_local`. Height is measured away from the road
@@ -439,10 +445,15 @@ road coordinates, which the standard also allows. CARLA reads only the first kin
 into its pedestrian navigation; a crossing it cannot read is one nobody crosses at.
 
 A signal's `type` is a code from a *country's* catalogue rather than a name of its own,
-so a traffic sign passes the caller's code straight through, and a traffic light is
+so a traffic sign passes the caller's code straight through (the CARLA package is the
+one exception, and says which codes it recognises), and a traffic light is
 written as the German catalogue's three-colour light (`1000001`) — the value OpenDRIVE
 tooling expects in a generated map, and one a caller with another catalogue can rewrite
-after export.
+after export. Every light is also in a `<controller>`: the lights of one traffic-light
+rule are one controller, a light no rule names shares one with the other unnamed
+lights on its approach, and each junction names the controllers that lead into it.
+That is OpenDRIVE's only way of saying which lights switch together, and what a
+consumer running the junction looks for.
 
 ## Buildings
 
@@ -633,7 +644,7 @@ part/high_street/left/3/0/1        ← the one standing on it
 | --- | --- |
 | **OpenStreetMap** | [Simple 3D Buildings](https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings): the outline as a closed `building=<kind>` way, a `building:part=yes` way per part where there is more than one, with `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and `roof:direction`. The solid survives; the frontage, a sloping base and the union of several parts' outlines do not, and `check` says so. |
 | **OpenDRIVE** | one `<object type="building">` carrying an `<outline>` per part, corners as `<cornerLocal>`. The massing survives; the roof shape does not, and `format_warnings()` says how many were flattened. |
-| **CARLA** | actual walls and roofs, from `Solid::shell()`. The whole solid survives — it is the only export that draws the roof rather than describing it — but CARLA's import will tag it `Terrain` unless the town is exported as [props](#where-the-town-goes-and-why-it-is-a-choice), in which case it is tagged and not placed. |
+| **CARLA** | actual walls and roofs, from `Solid::shell()`. The whole solid survives — it is the only export that draws the roof rather than describing it — but CARLA's import will tag it `Terrain` unless the town is exported as [props](#where-the-town-goes-and-why-it-is-a-choice), in which case it is tagged and the package's script places it. |
 | Lanelet2, SUMO, ClipGT, GPUDrive | nothing; each one's warnings say how many were dropped. |
 
 OSM measures a roof's direction clockwise from north, as a bearing; the IR measures it
@@ -906,6 +917,10 @@ Import/
     ├── Town01.fbx              the surface
     ├── Town01.xodr             the road network — same name, which CARLA insists on
     ├── Town01.obj              the surface again, for the pedestrian navigation mesh
+    ├── Town01_TrafficLights.fbx  the lights, as props tagged TrafficLight
+    ├── Town01_TrafficSigns.fbx   the signs, as props tagged TrafficSign
+    ├── furniture.manifest      where each light and sign stands (JSON)
+    ├── map_logic.carla         CARLA's map_logic.json, to be copied beside the .xodr
     └── Textures/
         ├── polyhaven.manifest  what to fetch, and where each file goes (JSON)
         └── CREDITS.md
@@ -915,8 +930,8 @@ Getting from that folder to a level that runs is half a dozen steps in the right
 order with the right environment — fetch the textures, copy the package into CARLA's
 `Import/`, stage the pedestrian navigation builder, keep every other package's
 descriptor there out of `Import.py`'s way (it imports every `.json` it finds), run
-`Import.py`, give the level a sky — so the exporter writes
-them down as a Python script beside the descriptor, with what it knows baked in:
+`Import.py`, give the level a sky, stand the lights and signs in it — so the exporter
+writes them down as a Python script beside the descriptor, with what it knows baked in:
 
 ```python
 m.export_carla("out/", name="Town01",
@@ -928,9 +943,16 @@ python out/Town01Package.py            # imports it, adds the sky, says how to r
 python out/Town01Package.py --launch   # and starts the server on it
 ```
 
+It removes what an earlier import of the same package left under
+`Content/<Package>/` first: Unreal will not create a map's mesh assets in a folder
+that already holds a level of the map's name, so a second `Import.py` over the first
+fails the whole map group — logged, in the middle of a few thousand lines — while the
+props, the `.xodr` and the level are all replaced, and what runs is the old road under
+new everything else.
+
 Run it with the interpreter that has `roadgen` and CARLA's own `carla` module, which
-`Import.py` needs. `--carla` and `--engine` override what was baked in, `--no-sky`
-and `--no-textures` skip those steps.
+`Import.py` needs. `--carla` and `--engine` override what was baked in, `--no-sky`,
+`--no-furniture` and `--no-textures` skip those steps.
 
 The `.fbx` and the `.xodr` share a name because CARLA requires it in three separate
 places: `Import.py` pairs them by name when it generates a descriptor itself, it copies
@@ -1073,8 +1095,10 @@ painted stripes: they are one quad per crossing, `crosswalk` from kerb to kerb,
 because the stripes are what a camera sees and the band is what a walker needs.
 
 Crosswalks *are* painted, too — a bar and a gap of half a metre each, across the
-carriageway, from the crossing objects in the IR — tagged `RoadLines` like every
-other marking, so the walkers cross on something the cameras can see.
+carriageway, from the crossing objects in the IR — and so are stop lines, as a bar
+across the lane on the traffic's side of the line. Both are tagged `RoadLines` like
+every other marking, so the walkers cross, and the vehicles halt, on something the
+cameras can see.
 
 ### Where the town goes, and why it is a choice
 
@@ -1082,7 +1106,7 @@ CARLA's map import has exactly six names in it. `UMoveAssetsCommandlet` sorts a 
 meshes into `Road`, `RoadLine`, `SideWalk` and `Terrain` and nothing else, and then
 `UPrepareAssetsForCookingCommandlet` places into the world exactly what it finds in
 those four folders. **A building can be in the map or correctly tagged, and the import
-pipeline will not do both.**
+pipeline will not do both** — so the package's script does the placing itself.
 
 ```python
 m.export_carla("Import/", buildings="in_map")   # the default
@@ -1090,16 +1114,19 @@ m.export_carla("Import/", buildings="props")
 m.export_carla("Import/", buildings="omitted")
 ```
 
-| | In the level | Tagged |
+| | Placed by | Tagged |
 | --- | --- | --- |
-| `in_map` | yes | `Terrain` (10) |
-| `props` | no | `Buildings` (3) |
+| `in_map` | `Import.py` | `Terrain` (10) |
+| `props` | `roadgen.carla_furniture` | `Buildings` (3) |
 
-`in_map` is the default, because a CARLA map with no town in it is not a town, and a
-wrong label on a building is recoverable in the editor while a missing town is a
-re-export. `props` writes a second `.fbx` and declares it in the descriptor's `props`
+`in_map` is the default, because a wrong label on a building is recoverable in the
+editor while a town that depends on one more step is a town that is sometimes not
+there. `props` writes a second `.fbx` and declares it in the descriptor's `props`
 array with `tag: "Building"` — which is the one place in the whole pipeline where a tag
-is *stated* rather than spelled into a mesh name.
+is *stated* rather than spelled into a mesh name — and lists every building in
+`furniture.manifest`, so the same editor run that stands the traffic lights stands
+the town, tagged as a town. The pedestrians' navigation mesh carries the buildings
+either way.
 
 ### Facades
 
@@ -1142,6 +1169,85 @@ and without it a physical sun is a white frame. Running it twice changes nothing
 hook the sky into `set_weather()`, which will store its parameters and move nothing:
 the only sky that API knows how to move is the one the towns have. The sun's position
 is an argument here instead.
+
+### Traffic lights and signs, which CARLA would otherwise put in the road
+
+CARLA spawns traffic lights of its own. Its `ATrafficLightManager` reads every
+`<signal>` in the `.xodr` and, for each light, puts a `BP_TLOpenDrive` blueprint at
+the signal's position — and a signal written where the IR holds the light is five
+metres over the middle of the lane, so what appears is a pole in the carriageway. The
+stop, yield and speed-limit signs get the same treatment with `BP_Stop01` and its
+kin. And a light mesh of one's own in the map's FBX never arrives: `ValidateStaticMesh`
+drops any mesh whose name holds `light` or `sign` before it is placed.
+
+So the furniture is built, and it is built to the road: a pole on the pavement,
+`kerb_setback` in from the kerb on the side the governed traffic keeps to; a mast arm
+from there, perpendicular to the road, long enough to reach `arm_overhang` past the
+middle of the farthest lane the light governs, at the height the IR gave the bar; a
+three-lamp head hung from it over the middle of every governed lane, facing the
+traffic. A sign is a post on the same pavement, `sign_setback_along` before the line
+it applies to, with an octagon, a triangle, a disc or a square on it for what the
+code says it is. A road with no pavement stands both on the verge instead.
+
+Then three files have to agree, and the exporter writes all three:
+
+- **The props.** `Town01_TrafficLights.fbx` and `Town01_TrafficSigns.fbx`, declared in
+  the descriptor with the tags `TrafficLight` and `TrafficSign`. That is what a
+  segmentation camera reports them as (7 and 8), and it is also why they are props:
+  the import's four map folders have no such class. A light is two meshes in that
+  file — the post, with the arm and the heads' housings, and the three lamps of each
+  head on their own — for a reason given below.
+- **The `.xodr`.** Each signal is written at the foot of its post — `t`, `zOffset`
+  and a `<positionInertial>` — with its `s` where it *applies*: at the stop line of
+  the rule that names it, else at the bar. CARLA builds a light's stop boxes three
+  metres before `s`, so a light whose rule has a stop line set back from the mouth
+  halts traffic at that line rather than under its own heads. Every light is in a
+  `<controller>`, one per traffic-light rule (the lights of a rule switch together)
+  and, for a light no rule names, one per approach; each junction names the
+  controllers that are its own. A stop, yield or speed-limit sign is written in the
+  German catalogue CARLA reads (`206`, `205`, `274` with the limit as its subtype and
+  value), whatever spelling it was added with — `stop`, `de205`, `de274-50`,
+  `speed_limit_50`, `R1-1`. Any other code goes through verbatim.
+- **`map_logic.carla`.** CARLA's `map_logic.json`, which its `InitializeTrafficLights`
+  looks for beside the `.xodr`: with it there, CARLA spawns no lights of its own and
+  instead turns the actor within fifty centimetres of each listed signal into a
+  working `ADigitalTwinsTrafficLight` — the signal's id, the junction's controller,
+  the stop boxes, and lamps driven through any material named `TrafficLight` that
+  has an `Emissive Intensity`. It is carried under another name because `Import.py`
+  takes every `.json` under `Import/` for a package descriptor.
+
+`Import.py` imports the props and places nothing, so the package's script runs the
+editor once more:
+
+```python
+roadgen.carla_furniture("/opt/carla", "Town01Package", "Town01")   # after Import.py
+```
+
+reads `furniture.manifest`, spawns each prop at the foot of its post facing its
+traffic, copies `map_logic.carla` beside the `.xodr` as `map_logic.json`, gives the
+lights' lamp slots instances of CARLA's own `M_TrafficLights` so they switch, sets
+each prop to collide as its triangles rather than as the convex hull the importer
+generated (the hull of a pole and an arm is a wedge across the lane), and — for each
+stop, yield and speed-limit sign — stands a bare `ATrafficSignBase` in the matching
+state at the post, which is what CARLA's `SpawnSignals` looks for before spawning a
+plate of its own. Running it twice places once. `python -m roadgen furniture …` is
+the same from a shell.
+
+Two details of CARLA's adoption decide how the props are placed. It rebuilds the
+actor it adopts by copying each mesh component's *relative* transform onto a new
+actor at the old one's location, so a `StaticMeshActor` — whose mesh is its root —
+would be placed twice over; every prop is therefore a bare actor with a scene root
+and the mesh as a child. And the copy is made after CARLA has tagged the level, so
+the adopted mesh segments as nothing: hence the split, with the lamps standing
+exactly at the signal as the actor CARLA finds, and the post a metre outside its
+search, untouched and tagged. Only the lamps go unlabelled.
+
+`export_carla(furniture=False)` leaves all of it out: the signals stay where the IR
+put them and CARLA improvises, which `carla_warnings()` says. Two things it also says
+that are CARLA's rather than this exporter's: a light on a lane that leads into no
+junction gets a controller of its own that CARLA runs alone, logging that it cannot
+apply the timing; and a 110 km/h sign gets CARLA's plate spawned beside ours, since
+CARLA has a model for that limit and no sign state to match a placed one against.
 
 ### Textures
 
@@ -1206,10 +1312,9 @@ trade the town was exported under:
   connector road per turn, and each carries its own carriageway, so the middle of a
   junction is coplanar with itself and will z-fight. CARLA's own maps have a single
   junction surface, which a road network has no way to describe.
-- **Traffic lights and signs are in the `.xodr` and not in the mesh.** That is the right
-  way round — CARLA spawns its own from the OpenDRIVE, and a mesh named for one would be
-  dropped by `ValidateStaticMesh` anyway — but nothing in the surface marks where they
-  stand.
+- **The furniture is placed by the script, not by the import.** Until
+  `carla_furniture` has run, the level has the signals and none of the meshes; and
+  the sign codes CARLA has no meaning for stand, segment as signs and govern nothing.
 - **Roughness maps are fetched but not wired up.** FBX's material model is Phong, which
   has a shininess exponent and no roughness map. The files are in the package for a
   material rebuilt in the editor.

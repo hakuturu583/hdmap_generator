@@ -314,6 +314,63 @@ impl<'a> Layout<'a> {
         Some((cuts[first], cuts[last + 1]))
     }
 
+    /// Where a post stands beside the carriageway on `side`: its lateral offset
+    /// from the reference line and how far above the road plane its foot is.
+    ///
+    /// On the pavement, `setback` in from the kerb face, when there is a pavement
+    /// on that side — no further in than the pavement's middle, so a narrow one
+    /// still has the post on it. On the verge, `setback` out from the carriageway's
+    /// edge, when there is not. `None` when the cross-section carries no vehicles
+    /// at all, since there is then no road for a post to stand beside.
+    pub(crate) fn post_position(
+        &self,
+        station: f64,
+        side: LateralSide,
+        setback: f64,
+    ) -> Option<(f64, f64)> {
+        let cuts = self.cuts(station);
+        let (left_edge, right_edge) = self.carriageway(station)?;
+        // The cuts run left to right and the lateral offset falls with them, so
+        // "outwards" on the right is down the list and down in value, and on the
+        // left the reverse.
+        let (edge, outward): (f64, f64) = match side {
+            LateralSide::Left => (left_edge, 1.0),
+            LateralSide::Right => (right_edge, -1.0),
+        };
+        let pavement = self.lanes.iter().enumerate().find(|(index, lane)| {
+            let (inner, outer) = match side {
+                LateralSide::Left => (cuts[index + 1], cuts[*index]),
+                LateralSide::Right => (cuts[*index], cuts[index + 1]),
+            };
+            let beyond = (inner - edge) * outward >= -1e-9;
+            matches!(Self::role_of(lane), Some((Role::Sidewalk, _)))
+                && beyond
+                && (outer - inner).abs() > 1e-9
+        });
+        match pavement {
+            Some((index, lane)) => {
+                let (inner, outer) = match side {
+                    LateralSide::Left => (cuts[index + 1], cuts[index]),
+                    LateralSide::Right => (cuts[index], cuts[index + 1]),
+                };
+                let width = (outer - inner).abs();
+                Some((
+                    inner + outward * setback.min(width / 2.0),
+                    self.rise_of(lane),
+                ))
+            }
+            None => Some((edge + outward * setback, 0.0)),
+        }
+    }
+
+    /// The lateral offset of the middle of `lane` at `station`, if the lane is one
+    /// of this cross-section's.
+    pub(crate) fn lane_centre(&self, station: f64, lane: &roadgen_core::id::LaneId) -> Option<f64> {
+        let index = self.lanes.iter().position(|held| held.id == *lane)?;
+        let cuts = self.cuts(station);
+        Some((cuts[index] + cuts[index + 1]) / 2.0)
+    }
+
     fn covers(&self, station: f64) -> bool {
         station >= self.range.0 - 1e-9 && station <= self.range.1 + 1e-9
     }

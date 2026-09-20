@@ -70,6 +70,13 @@ importing one is `m.carla_warnings()`. The textures are listed rather than shipp
 CARLA's importer builds the map on a level with no sky. After `Import.py` has run,
 `roadgen.carla_sky(carla_root, package, name)` opens the level it made and gives it
 one — a sun, an atmosphere and exposure — using the editor's own scripting.
+
+The traffic lights and signs are built to the road — a pole on the pavement, an arm
+long enough to reach over the lanes it governs — and written as props, which
+`Import.py` imports but does not place. `roadgen.carla_furniture(carla_root, package,
+name)` places them, and does the bookkeeping that makes CARLA adopt them as its own
+lights and signs rather than spawn a second set over the middle of the road. The
+script written beside the package does both.
 """
 
 from ._roadgen import (
@@ -88,6 +95,7 @@ from ._roadgen import (
     render_opendrive,
     render_sumo,
 )
+from .furniture import CarlaFurnitureError, carla_furniture
 from .sky import CarlaSkyError, carla_sky
 from .textures import TextureError, fetch_textures, texture_manifest
 
@@ -105,6 +113,8 @@ __all__ = [
     "building_presets",
     "building_rules",
     "fetch_textures",
+    "carla_furniture",
+    "CarlaFurnitureError",
     "carla_sky",
     "CarlaSkyError",
     "render_carla",

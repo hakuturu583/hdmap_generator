@@ -78,6 +78,119 @@ fn a_traffic_light_becomes_a_signal_where_the_ir_put_it() {
 }
 
 #[test]
+fn a_traffic_light_is_in_a_controller_its_junction_owns() {
+    // OpenDRIVE's only way of saying which lights switch together, and the thing a
+    // consumer running the junction looks for: a signal in no controller is a light
+    // with no junction behind it.
+    let map = scenarios::controlled_crossroads();
+    let document = reparse_opendrive(&map);
+
+    assert_eq!(
+        document.controller.len(),
+        1,
+        "one light, one rule, one controller"
+    );
+    let controller = &document.controller[0];
+    let light = document
+        .road
+        .iter()
+        .flat_map(|road| {
+            road.signals
+                .iter()
+                .flat_map(|signals| signals.signal.iter())
+        })
+        .next()
+        .unwrap();
+    assert_eq!(controller.control.len(), 1);
+    assert_eq!(controller.control[0].signal_id, light.id);
+    assert_eq!(
+        controller.name.as_deref(),
+        Some("object/trafficlight/north_0/end")
+    );
+
+    // The junction names it, which is how a consumer knows whose it is.
+    assert_eq!(document.junction.len(), 1);
+    assert_eq!(document.junction[0].controller.len(), 1);
+    assert_eq!(document.junction[0].controller[0].id, controller.id);
+
+    // And the same grouping is available without the document, for a consumer that
+    // writes its own file beside the .xodr.
+    let groups = roadgen_opendrive::signal_groups(&map);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].id, controller.id);
+    assert_eq!(groups[0].junction, Some(JunctionId::new("x")));
+    assert_eq!(
+        roadgen_opendrive::signal_id(&map, &groups[0].lights[0]).as_deref(),
+        Some(light.id.as_str())
+    );
+}
+
+#[test]
+fn a_placed_signal_stands_where_the_caller_said_and_applies_where_the_ir_did() {
+    // The exporter's caller can know where the post is when the IR only knows where
+    // the bar is. The signal's `s` stays with the bar — that is where it applies —
+    // and its `t`, its `zOffset` and its inertial position go to the post.
+    let map = scenarios::controlled_crossroads();
+    let light = map
+        .objects
+        .iter()
+        .find(|object| object.kind == MapObjectKind::TrafficLight)
+        .unwrap();
+    let mut options = roadgen_opendrive::Options::default();
+    // Six metres east of the north approach's reference line at its end — to its
+    // left, since the road runs south — on the ground, facing back up the road.
+    let post = Point3::new(6.0, 14.0, 0.0);
+    options.signals.insert(
+        light.id.clone(),
+        roadgen_opendrive::SignalPlacement {
+            position: post,
+            applies_at: None,
+            heading: Some(std::f64::consts::FRAC_PI_2),
+            catalogue: None,
+        },
+    );
+    let xml = roadgen_opendrive::to_xml_with(&map, &options).unwrap();
+    let document = opendrive::core::OpenDrive::from_xml_str(&xml).unwrap();
+    let signal = document
+        .road
+        .iter()
+        .flat_map(|road| {
+            road.signals
+                .iter()
+                .flat_map(|signals| signals.signal.iter())
+        })
+        .next()
+        .unwrap();
+    let length = map
+        .road(&RoadId::new("north"))
+        .unwrap()
+        .horizontal_length()
+        .unwrap();
+    assert!(
+        (signal.s.value - length).abs() < 1e-6,
+        "s={}",
+        signal.s.value
+    );
+    assert!((signal.t.value - 6.0).abs() < 1e-6, "t={}", signal.t.value);
+    assert!(
+        signal.z_offset.value.abs() < 1e-6,
+        "z={}",
+        signal.z_offset.value
+    );
+    // The road runs south, so facing north is half a turn from its heading.
+    let h_offset = signal.h_offset.unwrap().value;
+    assert!(
+        (h_offset.abs() - std::f64::consts::PI).abs() < 1e-6,
+        "hOffset={h_offset}"
+    );
+    let Some(opendrive::signal::position::Position::Inertial(inertial)) = &signal.choice else {
+        panic!("no inertial position");
+    };
+    assert!((inertial.x.value - 6.0).abs() < 1e-9 && (inertial.y.value - 14.0).abs() < 1e-9);
+    assert!((inertial.hdg.value - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+}
+
+#[test]
 fn a_traffic_sign_carries_the_callers_own_catalogue_code() {
     let mut builder = MapBuilder::new(scenarios::metadata("signed"));
     let road = builder

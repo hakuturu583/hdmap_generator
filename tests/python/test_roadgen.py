@@ -1533,9 +1533,13 @@ def test_a_town_is_placed_or_tagged_and_never_both(tmp_path):
     # names and none of them is a building.
     assert in_map["props"] is None
     assert "Buildings" not in in_map["labels"]
-    # As props, they are tagged — and not in the level, so the map has fewer meshes.
+    # As props, they are tagged, out of the map's own meshes, and listed for the
+    # package's script to stand in the level.
     assert as_props["props"] is not None
     assert as_props["meshes"] < in_map["meshes"]
+    manifest = json.loads(pathlib.Path(as_props["furniture"]).read_text())
+    assert len(manifest["buildings"]) == len(m.building_ids())
+    assert in_map["furniture"] is None
 
     for placement in ("in_map", "props"):
         warnings = m.carla_warnings(name="Town01", buildings=placement)
@@ -1543,6 +1547,58 @@ def test_a_town_is_placed_or_tagged_and_never_both(tmp_path):
 
     with pytest.raises(ValueError):
         m.carla_warnings(buildings="somewhere else")
+
+
+def test_a_stop_line_can_stand_back_from_the_lane_end():
+    """`setback` puts a stop line (or a light, or a sign) metres back along the
+    lane from the end named, which is where one goes when a crosswalk lies
+    between it and the junction."""
+    m = roadgen.Map()
+    road = m.add_road(start=(0.0, 0.0, 0.0), end=(100.0, 0.0, 0.0), lanes=two_way())
+    m.add_stop_line(road.lane(0))
+    m.add_stop_line(road.lane(1), setback=8.0)
+    root = ET.fromstring(m.to_opendrive_xml())
+    stations = sorted(float(obj.get("s")) for obj in root.findall("road/objects/object"))
+    assert [round(s, 6) for s in stations] == [92.0, 100.0]
+
+
+def test_the_furniture_is_built_placed_and_tied_to_the_road_network(tmp_path):
+    """A light is a pole on the pavement with an arm over its lane, and CARLA is
+    told, in three files that have to agree, to use it rather than its own."""
+    m = clipgt_map()
+    report = m.export_carla(tmp_path / "Import", name="Town01")
+    assert (report["lights"], report["signs"]) == (1, 1)
+    assert report["labels"]["TrafficLight"] == 1
+    assert report["labels"]["TrafficSigns"] == 1
+
+    # Props, in the folders that tag them.
+    descriptor = json.loads(pathlib.Path(report["descriptor"]).read_text())
+    assert [prop["tag"] for prop in descriptor["props"]] == ["TrafficLight", "TrafficSign"]
+    manifest = json.loads(pathlib.Path(report["furniture"]).read_text())
+    assert not report["furniture"].endswith(".json"), "Import.py would take it for a package"
+    light = manifest["lights"][0]
+    assert light["asset"].startswith("/Game/Town01Package/Static/TrafficLight/")
+    # The north approach's forward lane is on the west, so the pole is west of the
+    # road, at its end, on the verge — there is no pavement — at the road's height.
+    x, y, z = light["position"]
+    assert x < -3.5 and abs(y - 14.0) < 0.1 and abs(z - 1.0) < 1e-6
+    assert light["arm_length"] > 2.0
+    assert manifest["signs"][0]["carla_state"] == "STOP_SIGN"
+
+    # The .xodr puts each signal at its post and groups the light in a controller
+    # the junction owns; map_logic names both.
+    xodr = pathlib.Path(report["xodr"]).read_text()
+    assert "<positionInertial" in xodr and "<controller" in xodr
+    assert 'type="206"' in xodr, "the stop sign is written in the catalogue CARLA reads"
+    logic = json.loads(pathlib.Path(report["map_logic"]).read_text())
+    assert logic["TrafficLights"][0]["SignalID"] == light["signal"]
+    assert 'id="%s"' % logic["TrafficLights"][0]["TrafficLightGroupID"] in xodr
+
+    # Without furniture, nothing of this — and the report says CARLA will improvise.
+    bare = m.export_carla(tmp_path / "bare", name="Town01", furniture=False)
+    assert bare["lights"] == 0 and bare["furniture"] is None
+    assert any("CARLA spawns its own" in w for w in m.carla_warnings(name="Town01", furniture=False))
+    assert any("placed by the package's script" in w for w in m.carla_warnings(name="Town01"))
 
 
 def test_the_textures_are_listed_rather_than_shipped(tmp_path):
