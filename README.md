@@ -1837,12 +1837,18 @@ a failure, which is what CI does.
 
 ## Releasing
 
-A release is a merged pull request with a label on it. Put exactly one of
-`release:major`, `release:minor` or `release:patch` on the PR; when it lands on
-`main`, the [release workflow](.github/workflows/release.yml) bumps the version,
-commits `chore(release): vX.Y.Z`, tags it, writes a GitHub release with generated
-notes, runs the tests again on the tagged commit, builds the wheels and the sdist, and
-publishes them to PyPI. A PR with no release label changes nothing on PyPI.
+A release is a merged pull request with a label on it. Every PR carries exactly one
+of `release:major`, `release:minor`, `release:patch` or `release:none` — the
+[release-label check](.github/workflows/release-label.yml) fails without one, and it
+is a required check on `main`, so a PR cannot be merged until it says what it does
+to the version. When a PR lands on `main`, the
+[release workflow](.github/workflows/release.yml) looks at every PR merged since the
+last release: if any asked for one, it bumps the version by the highest level asked
+for, commits `chore(release): vX.Y.Z`, tags it, writes a GitHub release with
+generated notes, runs the tests again on the tagged commit, builds the wheels and the
+sdist, and publishes them to PyPI. Releases run one at a time, so two PRs that land
+together become one release rather than a race. `release:none` on every PR since the
+last release changes nothing on PyPI.
 
 The version lives in three files that have to agree — `pyproject.toml`, the
 `[workspace.package]` in `Cargo.toml` (which is what `roadgen.__version__` reports)
@@ -1867,6 +1873,15 @@ so there is no token in the repository's secrets. It is set up once on PyPI's si
 environment on the repository (Settings → Environments). Until that exists the
 publish step fails and the wheels are still there as workflow artifacts — nothing
 reaches PyPI without a deliberate step outside this repository.
+
+The release commit is pushed to `main` by the workflow itself, and `main` requires
+the label check on every update. A repository owned by a user cannot let the
+Actions app bypass a ruleset — only a repository role can — so the push is made
+with `RELEASE_TOKEN`, a fine-grained personal access token of the owner
+(*Settings → Developer settings → Fine-grained tokens*, this repository only,
+*Contents: read and write*) stored as a repository secret of that name; the owner
+is an admin, and the ruleset lets admins bypass it. Without the secret the release
+job stops and says so before anything is pushed.
 
 ## Licence
 

@@ -3,10 +3,19 @@
 # There are three ways in, and the first is the everyday one:
 #
 #   push to main   the auto-release mechanism (the one simple_lanelet2 uses, borrowed
-#                  from tier4/splatsim). When a merged PR carries exactly one
-#                  `release:major|minor|patch` label, the `release` job bumps the
-#                  version, tags it `vX.Y.Z`, and the tag is built and published --
-#                  all in this one run.
+#                  from tier4/splatsim). Every PR carries exactly one
+#                  `release:major|minor|patch|none` label -- release-label.yml
+#                  refuses to let one merge without. When the PRs merged since the
+#                  last release ask for one, the `release` job bumps the version by
+#                  the highest level any of them asked for, tags it `vX.Y.Z`, and
+#                  the tag is built and published -- all in this one run.
+#
+#                  "Since the last release" rather than "this PR" on purpose: runs
+#                  are serialised by the concurrency group below, and a run that was
+#                  cancelled while waiting, or one whose push lost to a neighbour, is
+#                  made good by whichever run goes next, because that one looks at
+#                  the same commits. Two PRs that land together become one release
+#                  rather than two, at the higher of their two levels.
 #   push a v* tag  a hand-cut tag (a hotfix, or the very first release at the version
 #                  the files already carry) is built and published directly; the
 #                  `release` job is skipped.
@@ -25,6 +34,15 @@
 # wheels are still available as artifacts, which is the right way round: nothing
 # reaches PyPI without a deliberate action outside this repository.
 #
+# The one secret is RELEASE_TOKEN: a fine-grained personal access token of the
+# repository's owner with `Contents: read and write`, used only to push the release
+# commit and tag. `main` requires the release-label check on every update, and on a
+# repository owned by a user GitHub does not let the Actions app bypass a ruleset --
+# only a repository role can. So the push is made as the owner, who is an admin and
+# does bypass it. A push made with a personal token starts workflow runs, unlike one
+# made with GITHUB_TOKEN, so the tag this job pushes starts a second run of this
+# file; `resolve` recognises an auto-cut tag and lets that run do nothing.
+#
 # A version can never be replaced on PyPI, so the tests run again here rather than
 # trusting that CI was green on the same commit.
 
@@ -39,58 +57,76 @@ on:
 permissions:
   contents: read
 
+# One release at a time. A second run that arrives while one is in progress waits
+# for it, then works from the main it left behind.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Read the release label off the merged PR and, if there is one, bump the version
-  # and push the tag. Runs only on a push to main; a tag push or a manual dispatch
-  # skips it and falls straight through to the build.
+  # Read the release labels off every PR merged since the last release and, if any
+  # asks for one, bump the version and push the tag. Runs only on a push to main; a
+  # tag push or a manual dispatch skips it and falls straight through to the build.
   release:
     name: cut the release tag
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read   # to list the PRs behind the commits
     outputs:
       bump: ${{ steps.pr.outputs.bump }}
       tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - name: read the release label off the merged PR
+      # The tip of main as it is now, not the commit that started this run: a run
+      # that waited its turn releases what the run before it left unreleased.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: read the release labels off the PRs merged since the last release
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          pr_json=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }}/pulls \
-            --jq '.[0] // empty' 2>/dev/null || true)
-          if [ -z "$pr_json" ]; then
-            echo "No PR associated with this push -- nothing to release"
-            echo "bump=none" >> "$GITHUB_OUTPUT"
-            exit 0
+          last=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          if [ -n "$last" ]; then
+            range="${last}..HEAD"
+          else
+            range="HEAD"
           fi
-
-          labels=$(echo "$pr_json" | jq -r '[.labels[].name] | join(",")')
+          echo "Commits on main since ${last:-the beginning}:"
+          rank() { case "$1" in major) echo 3 ;; minor) echo 2 ;; patch) echo 1 ;; *) echo 0 ;; esac; }
           bump=none
-          count=0
-          for lvl in major minor patch; do
-            if echo ",$labels," | grep -q ",release:${lvl},"; then
-              bump=$lvl
-              count=$((count + 1))
+          for sha in $(git log --first-parent --format=%H "$range"); do
+            # An API failure is a failure, not "no PR": the empty result that means
+            # "this commit came from no pull request" is an empty list.
+            labels=$(gh api "repos/${{ github.repository }}/commits/${sha}/pulls" \
+              --jq '[.[0].labels[]?.name] | join(",")')
+            asked=none
+            count=0
+            for lvl in major minor patch; do
+              if echo ",$labels," | grep -q ",release:${lvl},"; then
+                asked=$lvl
+                count=$((count + 1))
+              fi
+            done
+            if [ "$count" -gt 1 ]; then
+              echo "::error::More than one release label on the PR behind ${sha} -- keep exactly one"
+              exit 1
+            fi
+            echo "  ${sha:0:12} ${asked}"
+            if [ "$(rank "$asked")" -gt "$(rank "$bump")" ]; then
+              bump=$asked
             fi
           done
-          if [ "$count" -gt 1 ]; then
-            echo "::error::More than one release label on the PR -- pick exactly one"
-            exit 1
-          fi
           echo "bump=${bump}" >> "$GITHUB_OUTPUT"
           echo "Resolved bump level: ${bump}"
-
-      - uses: actions/checkout@v4
-        if: steps.pr.outputs.bump != 'none'
-        with:
-          ref: main
-          fetch-depth: 0
 
       - name: bump pyproject, Cargo.toml and Cargo.lock together
         if: steps.pr.outputs.bump != 'none'
@@ -110,17 +146,26 @@ jobs:
             exit 1
           fi
 
+      # One push for the commit and the tag together: either main gains the release
+      # commit *and* its tag, or neither, so a failure here leaves nothing half done
+      # for the next run to bump past.
       - name: commit, tag and push
         if: steps.pr.outputs.bump != 'none'
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::error::RELEASE_TOKEN is not set: add a fine-grained personal access token with Contents: read and write as a repository secret named RELEASE_TOKEN (see the comment at the top of this file)"
+            exit 1
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add pyproject.toml Cargo.toml Cargo.lock
           git commit -m "chore(release): ${{ steps.bump.outputs.tag }}"
           git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
-          git push origin "HEAD:main"
-          git push origin "${{ steps.bump.outputs.tag }}"
+          git push --atomic "https://x-access-token:${RELEASE_TOKEN}@github.com/${{ github.repository }}.git" \
+            "HEAD:main" "refs/tags/${{ steps.bump.outputs.tag }}"
 
       - name: GitHub release with generated notes
         if: steps.pr.outputs.bump != 'none'
@@ -145,6 +190,10 @@ jobs:
       publish: ${{ steps.r.outputs.publish }}
       version: ${{ steps.r.outputs.version }}
     steps:
+      # Only a tag push needs to look at the commit, to tell a hand-cut tag from one
+      # this workflow cut a moment ago.
+      - uses: actions/checkout@v4
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
       - id: r
         env:
           EVENT: ${{ github.event_name }}
@@ -156,8 +205,14 @@ jobs:
           set -euo pipefail
           proceed=false; publish=false; ref="$REF_NAME"
           if [ "$EVENT" = "push" ] && [[ "$REF" == refs/tags/v* ]]; then
-            # A hand-cut tag: build and publish it.
-            proceed=true; publish=true; ref="$REF_NAME"
+            if git log -1 --format=%s HEAD | grep -q '^chore(release): '; then
+              # The tag the auto-release path pushed with the owner's token, whose
+              # own run is already building and publishing it.
+              echo "Tag $REF_NAME was cut by the release job; its run publishes it"
+            else
+              # A hand-cut tag: build and publish it.
+              proceed=true; publish=true; ref="$REF_NAME"
+            fi
           elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
             # The auto-release path: build and publish only if a tag was cut.
             if [ "$BUMP" != "none" ] && [ -n "$TAG" ]; then

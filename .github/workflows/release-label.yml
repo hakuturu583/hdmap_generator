@@ -1,0 +1,41 @@
+# Every pull request says what it does to the version, before it can be merged.
+#
+# The release workflow reads a `release:major|minor|patch` label off a merged PR to
+# decide whether to cut a release and at what level, and a PR merged without one
+# releases nothing. Which is fine when it was meant and silent when it was not — a
+# feature that was supposed to ship and did not. So a label is required, and
+# `release:none` is how a PR says "nothing to release" on purpose: exactly one of the
+# four, or this check fails. It is a required status check on `main`, which is what
+# turns a failed check into a blocked merge.
+#
+# It re-runs when labels change, so fixing the label is enough; no new push needed.
+
+name: Release label
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  label:
+    name: the PR carries exactly one release label
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          found=()
+          for level in major minor patch none; do
+            if echo ",$LABELS," | grep -q ",release:${level},"; then
+              found+=("release:${level}")
+            fi
+          done
+          case "${#found[@]}" in
+            1) echo "Release label: ${found[0]}" ;;
+            0) echo "::error::Add exactly one of release:major, release:minor, release:patch or release:none to this pull request"; exit 1 ;;
+            *) echo "::error::More than one release label (${found[*]}) -- keep exactly one"; exit 1 ;;
+          esac
