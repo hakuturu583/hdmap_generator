@@ -14,6 +14,8 @@ pub enum ExportError {
     Empty(String),
     /// The map uses something OpenDRIVE cannot express.
     Unsupported(String),
+    /// The map's origin cannot be projected — off the UTM grid, say.
+    Projection(String),
     Serialization(String),
     Io(String),
 }
@@ -31,6 +33,9 @@ impl fmt::Display for ExportError {
             ExportError::Unknown(what) => write!(f, "no OpenDRIVE id was assigned to {what}"),
             ExportError::Empty(what) => write!(f, "{what}"),
             ExportError::Unsupported(what) => write!(f, "OpenDRIVE cannot express {what}"),
+            ExportError::Projection(detail) => {
+                write!(f, "the map's origin cannot be georeferenced: {detail}")
+            }
             ExportError::Serialization(detail) => {
                 write!(f, "the OpenDRIVE document could not be written: {detail}")
             }

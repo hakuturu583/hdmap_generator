@@ -283,7 +283,13 @@ pub fn write(
         .as_ref()
         .map(|settings| furniture::build(map, &config.map, &config.surfaces, settings))
         .unwrap_or_default();
-    let mut options = roadgen_opendrive::Options::default();
+    // CARLA's GNSS sensor takes the map's geographic origin from `+lat_0`/`+lon_0`
+    // in the header and reads nothing else of the string, so the header is written
+    // with the origin in those two places whatever the map's projection.
+    let mut options = roadgen_opendrive::Options {
+        geo_reference: Some(roadgen_opendrive::origin_proj_string(map)),
+        ..Default::default()
+    };
     for placed in furniture.iter() {
         options
             .signals

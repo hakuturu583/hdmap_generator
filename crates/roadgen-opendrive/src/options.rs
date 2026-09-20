@@ -20,6 +20,12 @@ use roadgen_core::id::ObjectId;
 pub struct Options {
     /// Where a signal physically stands, by the object it is written for.
     pub signals: HashMap<ObjectId, SignalPlacement>,
+    /// A `<geoReference>` to write in place of the exporter's own. The exporter's
+    /// describes the file's coordinates exactly, in PROJ's terms; a consumer that
+    /// reads only `+lat_0`/`+lon_0` out of the string and wants them to be the
+    /// place the file's `(0, 0)` stands — CARLA's GNSS sensor does — is given
+    /// [`crate::origin_proj_string`] here instead.
+    pub geo_reference: Option<String>,
 }
 
 /// Where one signal stands and what it is called.

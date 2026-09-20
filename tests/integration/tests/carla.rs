@@ -60,6 +60,33 @@ fn the_road_network_in_a_package_is_the_one_the_opendrive_export_writes() {
         let alone = roadgen_opendrive::to_xml(&map).expect("the map should export");
         assert_eq!(written, alone);
     }
+
+    // The one line the package changes is the `<geoReference>`, and only for a map
+    // whose exact georeference would not name the origin: CARLA's GNSS sensor reads
+    // `+lat_0`/`+lon_0` as where (0, 0) stands, so a UTM map — whose exact string
+    // carries the zone's central meridian there — is given the origin instead.
+    let mut builder = MapBuilder::new(MapMetadata {
+        projection: Projection::Utm,
+        ..scenarios::metadata("utm")
+    });
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(120.0, 0.0, 0.0),
+                scenarios::one_way(1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let config = PackageConfig::for_map(&map);
+    let (_directory, package) = write(&map, &config);
+    let written = std::fs::read_to_string(&package.xodr).expect("the road network");
+    assert!(written.contains("+lat_0=35.68 +lon_0=139.76"), "{written}");
+    assert!(!roadgen_opendrive::to_xml(&map)
+        .unwrap()
+        .contains("+lat_0=35.68 +lon_0=139.76"));
 }
 
 #[test]
