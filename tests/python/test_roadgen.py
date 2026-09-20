@@ -224,6 +224,43 @@ def test_the_default_still_joins_one_road_into_the_next():
     assert default.connections() == m.connections()
 
 
+def test_a_lane_list_written_left_to_right_is_caught_at_the_join():
+    # Lanes are listed outwards from the reference line on each side. Listed left to
+    # right instead, the pavement takes the rank next to the centre, no lane of one
+    # arm pairs with the other's, and `connect` says so at the call — rather than
+    # returning nothing and leaving validation to fail on the corner pavements.
+    def left_to_right():
+        return [
+            roadgen.Lane(width=2.0, direction="backward", type_="sidewalk"),
+            roadgen.Lane(width=3.5, direction="backward"),
+            roadgen.Lane(width=3.5, direction="forward"),
+            roadgen.Lane(width=2.0, direction="forward", type_="sidewalk"),
+        ]
+
+    m = roadgen.Map()
+    west = m.add_road(start=(-70.0, 0.0, 0.0), end=(-14.0, 0.0, 0.0), lanes=left_to_right())
+    south = m.add_road(start=(0.0, -70.0, 0.0), end=(0.0, -14.0, 0.0), lanes=left_to_right())
+    junction = m.add_junction("x")
+    with pytest.raises(ValueError, match="outwards from the reference line"):
+        m.connect(west, south, junction=junction, ends=("end", "end"))
+
+    # Written outwards, the same arms join and get their corner pavement.
+    def outwards():
+        return [
+            roadgen.Lane(width=3.5, direction="backward"),
+            roadgen.Lane(width=2.0, direction="backward", type_="sidewalk"),
+            roadgen.Lane(width=3.5, direction="forward"),
+            roadgen.Lane(width=2.0, direction="forward", type_="sidewalk"),
+        ]
+
+    m = roadgen.Map()
+    west = m.add_road(start=(-70.0, 0.0, 0.0), end=(-14.0, 0.0, 0.0), lanes=outwards())
+    south = m.add_road(start=(0.0, -70.0, 0.0), end=(0.0, -14.0, 0.0), lanes=outwards())
+    junction = m.add_junction("x")
+    assert len(m.connect(west, south, junction=junction, ends=("end", "end"))) == 2
+    assert m.issues() == []
+
+
 def test_an_unknown_road_end_is_refused():
     m = roadgen.Map()
     a = m.add_road(

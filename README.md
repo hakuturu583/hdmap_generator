@@ -259,6 +259,29 @@ Handedness decides which side of the reference line a `forward` lane lands on:
 `"rht"` (the default) puts it on the right, `"lht"` on the left. A lane can override
 it with `side=`.
 
+### The order of the lane list
+
+The `lanes=` list is **not** read left to right across the road. Each lane goes to
+its side by its direction, and within a side the lanes are stacked **outwards from
+the reference line in list order** — the first `forward` lane is the one against the
+centre, the next is outside it, and so on; the same for the `backward` lanes on the
+other side. So a two-way street with pavements is written carriageway first:
+
+```python
+lanes=[
+    roadgen.Lane(width=3.5, direction="backward"),                    # against the centre
+    roadgen.Lane(width=2.0, direction="backward", type_="sidewalk"),  # outside it
+    roadgen.Lane(width=3.5, direction="forward"),                     # against the centre
+    roadgen.Lane(width=2.0, direction="forward", type_="sidewalk"),   # outside it
+]
+```
+
+Written left to right instead — pavement, carriageway, carriageway, pavement — the
+backward pavement takes the rank against the centre and the road has a footway down
+its middle. Nothing about a single road can tell that was not meant; the first
+`connect()` can, because lanes are paired across a joint by side and rank, and two
+such roads pair nothing. It raises rather than returning an empty list.
+
 ## Alignments
 
 A road's reference line can be a straight, a polyline, or a chain of lines, bends and
