@@ -44,6 +44,14 @@
 //! carriageway, the paint on it, the pavements beside it, the kerb faces between them,
 //! the gutters at the foot of those, and the grass beyond. See [`surfaces`].
 //!
+//! # What stands beside it
+//!
+//! Traffic lights and signs, built to the cross-section — a pole on the pavement, an
+//! arm long enough to reach over the lanes it governs — and written as props with a
+//! placement manifest and a `map_logic.json`, so that CARLA adopts them as its own
+//! lights rather than spawning its blueprints over the middle of the road. See
+//! [`furniture`], which is also where the reasons are.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -60,6 +68,7 @@ pub mod crosswalks;
 pub mod error;
 pub mod facades;
 pub mod fbx;
+pub mod furniture;
 pub mod ground;
 pub mod materials;
 pub mod mesh;
@@ -78,6 +87,7 @@ use roadgen_core::semantics::MapObjectKind;
 use roadgen_core::ValidatedMap;
 
 pub use error::ExportError;
+pub use furniture::{FurnitureConfig, SignKind};
 pub use materials::Material;
 pub use mesh::Mesh;
 pub use package::{Descriptor, MapEntry, PropEntry, TextureManifest};
@@ -130,6 +140,9 @@ pub struct PackageConfig {
     pub use_carla_materials: bool,
     pub buildings: BuildingPlacement,
     pub surfaces: SurfaceConfig,
+    /// How the traffic lights and signs are built and placed, or `None` to leave
+    /// them to CARLA — which spawns its own from the `.xodr`, over the lanes.
+    pub furniture: Option<FurnitureConfig>,
     /// The CARLA checkout the package's script imports into, when the caller said.
     /// Otherwise the script takes it from its arguments or the environment.
     pub carla_root: Option<String>,
@@ -155,6 +168,7 @@ impl PackageConfig {
             use_carla_materials: true,
             buildings: BuildingPlacement::InMap,
             surfaces: SurfaceConfig::default(),
+            furniture: Some(FurnitureConfig::default()),
             carla_root: None,
             engine: None,
             sun_altitude: 45.0,
@@ -186,6 +200,11 @@ impl PackageConfig {
         self
     }
 
+    pub fn with_furniture(mut self, furniture: Option<FurnitureConfig>) -> Self {
+        self.furniture = furniture;
+        self
+    }
+
     /// Bakes the CARLA checkout and its engine into the package's script.
     pub fn with_carla(mut self, carla_root: impl Into<String>, engine: impl Into<String>) -> Self {
         self.carla_root = Some(carla_root.into());
@@ -203,6 +222,17 @@ pub struct Package {
     pub xodr: PathBuf,
     /// The props FBX, when the town went into one.
     pub props: Option<PathBuf>,
+    /// The lights' and the signs' FBX, when there were any.
+    pub lights_fbx: Option<PathBuf>,
+    pub signs_fbx: Option<PathBuf>,
+    /// The placement manifest the package's script reads, when there was any
+    /// furniture to place.
+    pub furniture: Option<PathBuf>,
+    /// CARLA's `map_logic.json`, written beside the `.xodr` when there are lights.
+    pub map_logic: Option<PathBuf>,
+    /// How many traffic lights and signs were built.
+    pub lights: usize,
+    pub signs: usize,
     /// How many meshes the map's FBX holds.
     pub meshes: usize,
     pub triangles: usize,
@@ -244,34 +274,69 @@ pub fn write(
     let meshes = to_meshes(map, config);
     let fbx_path = folder.join(format!("{}.fbx", config.map));
     write_text(&fbx_path, &fbx::document(&meshes, creator()))?;
-    // The same surfaces once more, for the pedestrians' navigation mesh.
-    let obj_path = folder.join(format!("{}.obj", config.map));
-    write_text(&obj_path, &obj::document(&meshes, map))?;
+
+    // The furniture before the OpenDRIVE, because the OpenDRIVE is told where it
+    // stands: a signal written anywhere but at the foot of its pole is a signal
+    // CARLA puts a pole of its own under.
+    let furniture = config
+        .furniture
+        .as_ref()
+        .map(|settings| furniture::build(map, &config.map, &config.surfaces, settings))
+        .unwrap_or_default();
+    let mut options = roadgen_opendrive::Options::default();
+    for placed in furniture.iter() {
+        options
+            .signals
+            .insert(placed.object.clone(), placed.signal.clone());
+    }
 
     // The OpenDRIVE is written by the OpenDRIVE exporter, not by this one. A CARLA
     // map is a mesh and a road network and they have to be the same road network;
     // writing a second one here would be two chances to be wrong about it.
     let xodr_path = folder.join(format!("{}.xodr", config.map));
-    roadgen_opendrive::write(map, &xodr_path)
+    roadgen_opendrive::write_with(map, &xodr_path, &options)
         .map_err(|error| ExportError::OpenDrive(error.to_string()))?;
 
     let mut props_path = None;
     let mut props = Vec::new();
+    let mut town = Vec::new();
     if config.buildings == BuildingPlacement::Props {
         let mut ordinals = surfaces::Ordinals::default();
-        let town = surfaces::buildings(map, &config.map, &mut ordinals);
+        town = surfaces::buildings(map, &config.map, &mut ordinals);
         if !town.is_empty() {
-            let path = folder.join(format!("{}_Props.fbx", config.map));
+            // Named after the prop, because the import names every mesh in the
+            // file `<file>_<node>` and the manifest has to say where each landed.
+            let prop = format!("{}_Buildings", config.map);
+            let file = format!("{prop}.fbx");
+            let path = folder.join(&file);
             write_text(&path, &fbx::document(&town, creator()))?;
             props.push(PropEntry {
-                name: format!("{}_Buildings", config.map),
-                source: relative(&config.map, &format!("{}_Props.fbx", config.map)),
+                name: prop,
+                source: relative(&config.map, &file),
                 size: "huge".to_owned(),
                 tag: Folder::Building.as_str().to_owned(),
             });
             props_path = Some(path);
         }
     }
+    let mut lights_fbx = None;
+    let mut signs_fbx = None;
+    let mut furniture_path = None;
+    let mut map_logic_path = None;
+    if !furniture.is_empty() || !town.is_empty() {
+        let written = write_furniture(map, &folder, config, &furniture, &town, &mut props)?;
+        lights_fbx = written.lights_fbx;
+        signs_fbx = written.signs_fbx;
+        furniture_path = Some(written.manifest);
+        map_logic_path = written.map_logic;
+    }
+
+    // The same surfaces once more, for the pedestrians' navigation mesh — with the
+    // town, wherever it went, since a pedestrian walks round a building whether it
+    // is a prop or part of the map.
+    let obj_path = folder.join(format!("{}.obj", config.map));
+    let walkable: Vec<Mesh> = meshes.iter().chain(town.iter()).cloned().collect();
+    write_text(&obj_path, &obj::document(&walkable, map))?;
 
     let descriptor = Descriptor {
         maps: vec![MapEntry {
@@ -290,7 +355,10 @@ pub fn write(
             .map_err(|error| ExportError::Json(error.to_string()))?,
     )?;
     let script_path = root.join(format!("{}.py", config.package));
-    write_text(&script_path, &script::script(config))?;
+    write_text(
+        &script_path,
+        &script::script(config, !furniture.is_empty() || !town.is_empty()),
+    )?;
     make_executable(&script_path)?;
 
     let wanted: Vec<usize> = {
@@ -317,6 +385,12 @@ pub fn write(
         *labels.entry(tags::label_of(&mesh.name)).or_default() += 1;
     }
 
+    for placed in furniture.iter() {
+        *labels
+            .entry(placed.role.intended_folder().label())
+            .or_default() += 1;
+    }
+
     Ok(Package {
         script: script_path,
         obj: obj_path,
@@ -324,6 +398,12 @@ pub fn write(
         fbx: fbx_path,
         xodr: xodr_path,
         props: props_path,
+        lights_fbx,
+        signs_fbx,
+        furniture: furniture_path,
+        map_logic: map_logic_path,
+        lights: furniture.lights.len(),
+        signs: furniture.signs.len(),
         meshes: meshes.len(),
         triangles: meshes.iter().map(Mesh::triangle_count).sum(),
         labels,
@@ -333,6 +413,169 @@ pub fn write(
             .into_iter()
             .filter(|entry| !folder.join(&entry.path).exists())
             .collect(),
+    })
+}
+
+/// What writing the furniture produced.
+struct WrittenFurniture {
+    lights_fbx: Option<PathBuf>,
+    signs_fbx: Option<PathBuf>,
+    manifest: PathBuf,
+    map_logic: Option<PathBuf>,
+}
+
+/// Writes the lights and the signs as props, the manifest that places them and
+/// the `map_logic.json` that makes CARLA adopt the lights.
+fn write_furniture(
+    map: &ValidatedMap,
+    folder: &Path,
+    config: &PackageConfig,
+    furniture: &furniture::Furniture,
+    town: &[Mesh],
+    props: &mut Vec<PropEntry>,
+) -> Result<WrittenFurniture, ExportError> {
+    let settings = config.furniture.unwrap_or_default();
+    let mut placements: [Vec<package::Placement>; 2] = [Vec::new(), Vec::new()];
+    let mut paths = [None, None];
+    for (index, (placed, role)) in [
+        (&furniture.lights, Role::TrafficLight),
+        (&furniture.signs, Role::TrafficSign),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if placed.is_empty() {
+            continue;
+        }
+        let tag = role.intended_folder();
+        let prop = format!("{}_{}s", config.map, tag.as_str());
+        let file = format!("{prop}.fbx");
+        let meshes: Vec<Mesh> = placed
+            .iter()
+            .flat_map(|placed| std::iter::once(&placed.mesh).chain(placed.lamps.as_ref()))
+            .cloned()
+            .collect();
+        let path = folder.join(&file);
+        write_text(&path, &fbx::document(&meshes, creator()))?;
+        props.push(PropEntry {
+            name: prop.clone(),
+            source: relative(&config.map, &file),
+            size: "medium".to_owned(),
+            tag: tag.as_str().to_owned(),
+        });
+        for placed in placed {
+            placements[index].push(package::Placement {
+                name: placed.mesh.name.clone(),
+                asset: package::prop_asset_path(
+                    &config.package,
+                    tag.as_str(),
+                    &prop,
+                    &placed.mesh.name,
+                ),
+                lamps_asset: placed.lamps.as_ref().map(|lamps| {
+                    package::prop_asset_path(&config.package, tag.as_str(), &prop, &lamps.name)
+                }),
+                object: placed.object.to_string(),
+                signal: roadgen_opendrive::signal_id(map, &placed.object).unwrap_or_default(),
+                position: [placed.position.x, placed.position.y, placed.position.z],
+                heading: placed.heading,
+                carla_state: match placed.role {
+                    Role::TrafficSign => placed.kind.carla_state().map(str::to_owned),
+                    _ => None,
+                },
+                arm_length: placed.arm_length,
+            });
+        }
+        paths[index] = Some(path);
+    }
+    let [lights, signs] = placements;
+    let [lights_fbx, signs_fbx] = paths;
+
+    let manifest = package::FurnitureManifest {
+        package: config.package.clone(),
+        map: config.map.clone(),
+        lamps: package::LampSlots {
+            red: materials::MATERIALS[materials::LAMP_RED].name.to_owned(),
+            amber: materials::MATERIALS[materials::LAMP_AMBER].name.to_owned(),
+            green: materials::MATERIALS[materials::LAMP_GREEN].name.to_owned(),
+        },
+        lights,
+        signs,
+        buildings: town
+            .iter()
+            .map(|mesh| package::BuildingProp {
+                name: mesh.name.clone(),
+                asset: package::prop_asset_path(
+                    &config.package,
+                    Folder::Building.as_str(),
+                    &format!("{}_Buildings", config.map),
+                    &mesh.name,
+                ),
+            })
+            .collect(),
+    };
+    // Neither of these can end in `.json`: `Import.py` takes every `.json` under
+    // `Import/` for a package descriptor and runs the import commandlets on it.
+    // CARLA wants the second as `map_logic.json`, but beside the `.xodr` in its
+    // content tree, which is where `roadgen.carla_furniture` copies it to.
+    let manifest_path = folder.join(package::FURNITURE_MANIFEST);
+    write_text(
+        &manifest_path,
+        &manifest
+            .to_json()
+            .map_err(|error| ExportError::Json(error.to_string()))?,
+    )?;
+
+    let mut map_logic = None;
+    if !furniture.lights.is_empty() {
+        let groups = roadgen_opendrive::signal_groups(map.as_map());
+        let mut entries = Vec::with_capacity(furniture.lights.len());
+        for placed in &furniture.lights {
+            let group = groups
+                .iter()
+                .find(|group| group.lights.contains(&placed.object));
+            let junction_id = group
+                .and_then(|group| group.junction.as_ref())
+                .and_then(|junction| roadgen_opendrive::junction_id(map, junction))
+                .and_then(|id| id.parse::<i64>().ok())
+                .unwrap_or(-1);
+            let lane_ids = placed
+                .lanes
+                .iter()
+                .filter_map(|lane| roadgen_opendrive::lane_id(map, lane))
+                .map(|(_, lane)| lane)
+                .collect();
+            entries.push(package::MapLogicLight {
+                actor_name: placed.mesh.name.clone(),
+                signal_id: roadgen_opendrive::signal_id(map, &placed.object).unwrap_or_default(),
+                junction_id,
+                group_id: group.map(|group| group.id.clone()).unwrap_or_default(),
+                timing: package::MapLogicTiming {
+                    red: settings.timing.red,
+                    green: settings.timing.green,
+                    amber: settings.timing.amber,
+                    amber_blink_interval: 0.25,
+                },
+                modules: vec![package::MapLogicModule { lane_ids }],
+            });
+        }
+        let path = folder.join(package::MAP_LOGIC);
+        write_text(
+            &path,
+            &package::MapLogic {
+                traffic_lights: entries,
+            }
+            .to_json()
+            .map_err(|error| ExportError::Json(error.to_string()))?,
+        )?;
+        map_logic = Some(path);
+    }
+
+    Ok(WrittenFurniture {
+        lights_fbx,
+        signs_fbx,
+        manifest: manifest_path,
+        map_logic,
     })
 }
 
@@ -433,17 +676,19 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
                  level — and CARLA will tag every one of them `Terrain` ({}) rather \
                  than `Buildings` ({}). Its MoveAssets commandlet knows six mesh names, \
                  none of them a building, and sorts everything else into Terrain. \
-                 Export them as props to be tagged correctly, at the cost of their \
-                 not being placed",
+                 Export them as props to be tagged correctly and stood in the level \
+                 by the package's script instead",
                 Label::Terrain.stencil(),
                 Label::Buildings.stencil()
             )),
             BuildingPlacement::Props => warnings.push(format!(
-                "{buildings} buildings are props, so they will be tagged `Buildings` \
-                 ({}) — and none of them will be in the level. CARLA places what it \
-                 finds in a map's four semantic folders and nothing else; a prop is \
-                 imported and waits in the content browser",
-                Label::Buildings.stencil()
+                "{buildings} buildings are props, tagged `Buildings` ({}) and stood in \
+                 the level by the package's script rather than by CARLA's importer, \
+                 which places what it finds in a map's four semantic folders and \
+                 nothing else: until `{}.py` has run `roadgen.carla_furniture`, the \
+                 town waits in the content browser",
+                Label::Buildings.stencil(),
+                config.package
             )),
             BuildingPlacement::Omitted => warnings.push(format!(
                 "{buildings} buildings were not written: the package has roads and no \
@@ -487,23 +732,99 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
         ));
     }
 
-    let furniture = map
+    let lights = map
         .objects
         .iter()
-        .filter(|object| {
-            matches!(
-                object.kind,
-                MapObjectKind::TrafficLight | MapObjectKind::TrafficSign { .. }
-            )
-        })
+        .filter(|object| object.kind == MapObjectKind::TrafficLight)
         .count();
-    if furniture > 0 {
-        warnings.push(format!(
-            "{furniture} traffic lights and signs are in the .xodr and not in the FBX. \
-             That is the right way round — CARLA spawns its own from the OpenDRIVE, \
-             and a mesh named for one would be dropped by ValidateStaticMesh anyway — \
-             but nothing in the mesh marks where they stand"
-        ));
+    let signs = map
+        .objects
+        .iter()
+        .filter(|object| matches!(object.kind, MapObjectKind::TrafficSign { .. }))
+        .count();
+    match &config.furniture {
+        None if lights + signs > 0 => warnings.push(format!(
+            "{lights} traffic lights and {signs} signs are in the .xodr and not in the \
+             FBX, so CARLA spawns its own: a BP_TLOpenDrive at every light's signal \
+             and a blueprint at every stop, yield and speed-limit sign's, each standing \
+             where the signal is — over the middle of the lane, for a signal written \
+             where the IR put it. Export the furniture to put poles on the pavement \
+             instead"
+        )),
+        Some(settings) if lights + signs > 0 => {
+            let built = furniture::build(map, &config.map, &config.surfaces, settings);
+            if built.lights.len() + built.signs.len() < lights + signs {
+                warnings.push(format!(
+                    "{} of the {} lights and signs could not be placed — each governs \
+                     no lane of a road with a carriageway to stand beside — and stay \
+                     as signals CARLA spawns its own furniture for",
+                    lights + signs - built.lights.len() - built.signs.len(),
+                    lights + signs
+                ));
+            }
+            if !built.is_empty() {
+                warnings.push(format!(
+                    "{} lights and {} signs are props, placed by the package's script \
+                     rather than by CARLA's importer: until `{}.py` has run \
+                     `roadgen.carla_furniture`, the level has their signals and none \
+                     of their meshes",
+                    built.lights.len(),
+                    built.signs.len(),
+                    config.package
+                ));
+            }
+            let groups = roadgen_opendrive::signal_groups(map);
+            let loose = groups
+                .iter()
+                .filter(|group| group.junction.is_none())
+                .map(|group| group.lights.len())
+                .sum::<usize>();
+            if loose > 0 {
+                warnings.push(format!(
+                    "{loose} lights govern lanes that lead into no junction, so their \
+                     controllers belong to none: CARLA runs each on its own and logs an \
+                     error for the timing in map_logic.json it cannot apply"
+                ));
+            }
+            let unknown = built
+                .signs
+                .iter()
+                .filter(|placed| placed.kind == SignKind::Other)
+                .count();
+            if unknown > 0 {
+                warnings.push(format!(
+                    "{unknown} signs have codes CARLA has no meaning for and are written \
+                     with them verbatim: they stand, segment as signs, and govern \
+                     nothing. CARLA knows stop, yield and a speed limit — `stop`, \
+                     `de205`, `de274-50`, `speed_limit_50`"
+                ));
+            }
+            let doubled = built
+                .signs
+                .iter()
+                .filter(|placed| placed.kind.doubled_by_carla())
+                .count();
+            if doubled > 0 {
+                warnings.push(format!(
+                    "{doubled} 110 km/h signs will get CARLA's own plate spawned beside \
+                     them: it has a model for that limit and no sign state to match a \
+                     placed one against"
+                ));
+            }
+            let long = built
+                .lights
+                .iter()
+                .filter(|placed| placed.arm_length > 12.0)
+                .count();
+            if long > 0 {
+                warnings.push(format!(
+                    "{long} lights have mast arms longer than 12 m, because the lane they \
+                     govern is that far from the nearest pavement; a real one would be \
+                     hung from a gantry or a second pole"
+                ));
+            }
+        }
+        _ => {}
     }
 
     if materials::manifest(&[materials::ASPHALT])

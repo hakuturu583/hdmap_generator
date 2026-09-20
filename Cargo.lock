@@ -1271,6 +1271,7 @@ dependencies = [
 name = "roadgen-carla"
 version = "0.1.0"
 dependencies = [
+ "opendrive",
  "roadgen-buildings",
  "roadgen-core",
  "roadgen-opendrive",

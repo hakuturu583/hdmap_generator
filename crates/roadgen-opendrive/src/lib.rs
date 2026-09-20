@@ -56,6 +56,7 @@ use opendrive::core::header::Header;
 use opendrive::core::OpenDrive;
 use opendrive::junction::connection::Connection;
 use opendrive::junction::contact_point::ContactPoint;
+use opendrive::junction::controller::Controller as JunctionController;
 use opendrive::junction::junction_type::JunctionType;
 use opendrive::junction::lane_link::LaneLink as JunctionLaneLink;
 use opendrive::junction::priority::Priority;
@@ -87,6 +88,7 @@ use opendrive::object::orientation::{ObjectType, Orientation};
 use opendrive::object::outline::Outline;
 use opendrive::object::outlines::Outlines;
 use opendrive::object::Object;
+use opendrive::road::country_code::CountryCode;
 use opendrive::road::element_type::ElementType;
 use opendrive::road::geometry::arc::Arc as OdArc;
 use opendrive::road::geometry::geometry_type::GeometryType;
@@ -105,7 +107,12 @@ use opendrive::road::road_type_e::RoadTypeE;
 use opendrive::road::rule::Rule;
 use opendrive::road::speed::{MaxSpeed, Speed as RoadSpeed};
 use opendrive::road::unit::SpeedUnit;
+use opendrive::road::unit::Unit;
 use opendrive::road::Road as OdRoad;
+use opendrive::signal::control::Control;
+use opendrive::signal::controller::Controller;
+use opendrive::signal::position::inertial::PositionInertial;
+use opendrive::signal::position::Position;
 use opendrive::signal::signals::Signals;
 use opendrive::signal::Signal;
 use uom::si::angle::radian;
@@ -127,10 +134,14 @@ use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd, RoadLinkT
 use roadgen_core::validation::ValidatedMap;
 use roadgen_core::GeometryError;
 
+pub mod controllers;
 mod error;
+pub mod options;
 pub mod road_coordinates;
 
+pub use controllers::{signal_groups, SignalGroup};
 pub use error::ExportError;
+pub use options::{Options, SignalCatalogue, SignalPlacement};
 pub use road_coordinates::RoadPosition;
 
 /// Width of a painted lane marking, metres. OpenDRIVE wants a number; this is the
@@ -152,21 +163,75 @@ const TRAFFIC_LIGHT_SUBTYPE: &str = "-1";
 
 /// Turns a validated map into an OpenDRIVE document.
 pub fn to_opendrive(map: &ValidatedMap) -> Result<OpenDrive, ExportError> {
-    Exporter::new(map).run()
+    to_opendrive_with(map, &Options::default())
+}
+
+/// Turns a validated map into an OpenDRIVE document, with what the caller knows
+/// beyond the map. See [`Options`].
+pub fn to_opendrive_with(map: &ValidatedMap, options: &Options) -> Result<OpenDrive, ExportError> {
+    Exporter::new(map, options).run()
 }
 
 /// Turns a validated map into OpenDRIVE XML.
 pub fn to_xml(map: &ValidatedMap) -> Result<String, ExportError> {
-    to_opendrive(map)?
+    to_xml_with(map, &Options::default())
+}
+
+/// Turns a validated map into OpenDRIVE XML, with [`Options`].
+pub fn to_xml_with(map: &ValidatedMap, options: &Options) -> Result<String, ExportError> {
+    to_opendrive_with(map, options)?
         .to_xml_string()
         .map_err(|error| ExportError::Serialization(error.to_string()))
 }
 
 /// Writes a validated map to an `.xodr` file.
 pub fn write(map: &ValidatedMap, path: impl AsRef<Path>) -> Result<(), ExportError> {
-    let xml = to_xml(map)?;
+    write_with(map, path, &Options::default())
+}
+
+/// Writes a validated map to an `.xodr` file, with [`Options`].
+pub fn write_with(
+    map: &ValidatedMap,
+    path: impl AsRef<Path>,
+    options: &Options,
+) -> Result<(), ExportError> {
+    let xml = to_xml_with(map, options)?;
     std::fs::write(path.as_ref(), xml)
         .map_err(|error| ExportError::Io(format!("{}: {error}", path.as_ref().display())))
+}
+
+/// The id a signal is written with, which is what a consumer knows the object by.
+///
+/// Returns `None` for an object that is not a signal — a stop line or a crosswalk
+/// is an `<object>`, numbered from the same sequence but found under a different
+/// element.
+pub fn signal_id(map: &ValidatedMap, object: &ObjectId) -> Option<String> {
+    let map = map.as_map();
+    let entry = map.objects.get(object)?;
+    matches!(
+        entry.kind,
+        MapObjectKind::TrafficLight | MapObjectKind::TrafficSign { .. }
+    )
+    .then(|| Numbering::new(map).objects.get(object).cloned())
+    .flatten()
+}
+
+/// The id a junction is written with.
+pub fn junction_id(map: &ValidatedMap, junction: &JunctionId) -> Option<String> {
+    Numbering::new(map.as_map())
+        .junctions
+        .get(junction)
+        .cloned()
+}
+
+/// The ids a lane is written with: its road's, and its own within that road.
+pub fn lane_id(map: &ValidatedMap, lane: &LaneId) -> Option<(String, i64)> {
+    let numbering = Numbering::new(map.as_map());
+    let entry = map.as_map().lanes.get(lane)?;
+    Some((
+        numbering.roads.get(&entry.road)?.clone(),
+        *numbering.lanes.get(lane)?,
+    ))
 }
 
 /// Constraints OpenDRIVE imposes that the IR does not.
@@ -279,7 +344,10 @@ impl Numbering {
 
 struct Exporter<'a> {
     map: &'a Map,
+    options: &'a Options,
     numbering: Numbering,
+    /// The controllers, worked out once: every junction asks which are its own.
+    groups: Vec<SignalGroup>,
     /// The buildings each road is written against, in the map's own order.
     ///
     /// Resolving one is a search when it names no frontage, so every building is
@@ -288,7 +356,7 @@ struct Exporter<'a> {
 }
 
 impl<'a> Exporter<'a> {
-    fn new(map: &'a ValidatedMap) -> Self {
+    fn new(map: &'a ValidatedMap, options: &'a Options) -> Self {
         let map = map.as_map();
         let mut buildings: HashMap<RoadId, Vec<&Building>> = HashMap::new();
         for building in map.buildings.iter() {
@@ -298,7 +366,9 @@ impl<'a> Exporter<'a> {
         }
         Exporter {
             numbering: Numbering::new(map),
+            groups: signal_groups(map),
             buildings,
+            options,
             map,
         }
     }
@@ -320,6 +390,25 @@ impl<'a> Exporter<'a> {
             if let Some(element) = self.junction(&junction.id)? {
                 drive.junction.push(element);
             }
+        }
+        for group in &self.groups {
+            let mut control = Vec::with_capacity(group.lights.len());
+            for light in &group.lights {
+                control.push(Control {
+                    signal_id: self.object_id(light)?.to_owned(),
+                    r#type: None,
+                });
+            }
+            let Ok(control) = Vec1::try_from_vec(control) else {
+                continue;
+            };
+            drive.controller.push(Controller {
+                control,
+                id: group.id.clone(),
+                name: Some(group.name.clone()),
+                sequence: None,
+                additional_data: AdditionalData::default(),
+            });
         }
         Ok(drive)
     }
@@ -869,7 +958,16 @@ impl<'a> Exporter<'a> {
         Ok(Some(OdJunction {
             connection,
             priority: self.priorities(junction)?,
-            controller: Vec::new(),
+            controller: self
+                .groups
+                .iter()
+                .filter(|group| group.junction.as_ref() == Some(junction))
+                .map(|group| JunctionController {
+                    id: group.id.clone(),
+                    sequence: None,
+                    r#type: None,
+                })
+                .collect(),
             surface: None,
             id: self.junction_id(junction)?.to_owned(),
             main_road: None,
@@ -950,7 +1048,7 @@ impl<'a> Exporter<'a> {
     fn signals(&self, road: &Road) -> Result<Option<Signals>, ExportError> {
         let mut signals = Vec::new();
         for object in self.objects_of(road) {
-            let (kind, subtype, dynamic) = match &object.kind {
+            let (mut kind, mut subtype, dynamic) = match &object.kind {
                 MapObjectKind::TrafficLight => (
                     TRAFFIC_LIGHT_TYPE.to_owned(),
                     TRAFFIC_LIGHT_SUBTYPE.to_owned(),
@@ -964,33 +1062,80 @@ impl<'a> Exporter<'a> {
             let Some((centre, width)) = self.span(object) else {
                 continue;
             };
-            let Some(position) = road_coordinates::locate(self.map, road, centre) else {
+            // Where the signal applies is the object's own geometry; where it
+            // stands is the caller's to say, and the caller's word puts the post
+            // where the `t` and the `zOffset` say and the `s` where the bar is.
+            let placement = self.options.signals.get(&object.id);
+            let applies_at = placement
+                .and_then(|placement| placement.applies_at)
+                .unwrap_or(centre);
+            let Some(applies) = road_coordinates::locate(self.map, road, applies_at) else {
                 continue;
             };
+            let stands = match placement {
+                Some(placement) => {
+                    road_coordinates::locate(self.map, road, placement.position).unwrap_or(applies)
+                }
+                None => applies,
+            };
+            let mut country = None;
+            let mut value = None;
+            let mut unit = None;
+            if let Some(catalogue) = placement.and_then(|placement| placement.catalogue.as_ref()) {
+                kind = catalogue.kind.clone();
+                subtype = catalogue.subtype.clone();
+                country = catalogue.country.clone().map(CountryCode::Iso3166alpha2);
+                if let Some(kph) = catalogue.speed_kph {
+                    value = Some(kph);
+                    unit = Some(Unit::Speed(SpeedUnit::KilometersPerHour));
+                }
+            }
+            let heading = placement.and_then(|placement| placement.heading);
+            let h_offset = match heading {
+                Some(heading) => {
+                    let frame = road
+                        .frame_at(applies.s, self.map.metadata.sampling)
+                        .map_err(ExportError::Geometry)?;
+                    let tangent = frame.tangent.get();
+                    Some(wrap_angle(heading - tangent.y.atan2(tangent.x)))
+                }
+                None => None,
+            };
+            let choice = placement.map(|placement| {
+                Position::Inertial(PositionInertial {
+                    hdg: Angle::new::<radian>(heading.unwrap_or(0.0)),
+                    pitch: None,
+                    roll: None,
+                    x: Length::new::<meter>(placement.position.x),
+                    y: Length::new::<meter>(placement.position.y),
+                    z: Length::new::<meter>(placement.position.z),
+                })
+            });
             signals.push(Signal {
                 validity: self.validity(object, road)?,
                 dependency: Vec::new(),
                 reference: Vec::new(),
-                choice: None,
-                country: None,
+                choice,
+                country,
                 country_revision: None,
                 dynamic,
                 height: None,
-                h_offset: None,
+                // Typed as a length by the schema crate; the attribute is radians.
+                h_offset: h_offset.map(Length::new::<meter>),
                 id: self.object_id(&object.id)?.to_owned(),
                 name: Some(object.id.to_string()),
                 orientation: self.orientation(object),
                 pitch: None,
                 roll: None,
-                s: Length::new::<meter>(position.s),
+                s: Length::new::<meter>(applies.s),
                 subtype,
-                t: Length::new::<meter>(position.t),
+                t: Length::new::<meter>(stands.t),
                 text: None,
                 r#type: kind,
-                unit: None,
-                value: None,
-                width: (width > 0.0).then(|| Length::new::<meter>(width)),
-                z_offset: Length::new::<meter>(position.height),
+                unit,
+                value,
+                width: (placement.is_none() && width > 0.0).then(|| Length::new::<meter>(width)),
+                z_offset: Length::new::<meter>(stands.height),
                 additional_data: AdditionalData::default(),
             });
         }
@@ -1382,6 +1527,16 @@ impl<'a> Exporter<'a> {
             .get(lane)
             .copied()
             .ok_or_else(|| ExportError::Unknown(lane.to_string()))
+    }
+}
+
+/// An angle brought into `(-π, π]`.
+fn wrap_angle(angle: f64) -> f64 {
+    let wrapped = angle.rem_euclid(std::f64::consts::TAU);
+    if wrapped > std::f64::consts::PI {
+        wrapped - std::f64::consts::TAU
+    } else {
+        wrapped
     }
 }
 

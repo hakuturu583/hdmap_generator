@@ -76,6 +76,8 @@ pub enum Label {
     Terrain,
     RoadLines,
     Ground,
+    TrafficLight,
+    TrafficSigns,
 }
 
 impl Label {
@@ -92,6 +94,8 @@ impl Label {
             Label::Terrain => 10,
             Label::RoadLines => 24,
             Label::Ground => 25,
+            Label::TrafficLight => 7,
+            Label::TrafficSigns => 8,
         }
     }
 
@@ -108,6 +112,8 @@ impl Label {
             Label::Terrain => "Terrain",
             Label::RoadLines => "RoadLines",
             Label::Ground => "Ground",
+            Label::TrafficLight => "TrafficLight",
+            Label::TrafficSigns => "TrafficSigns",
         }
     }
 }
@@ -130,6 +136,10 @@ pub enum Folder {
     SideWalk,
     Terrain,
     Building,
+    /// Only reachable as a prop's stated tag, like [`Folder::Building`] — and, like
+    /// it, the only way a traffic light segments as one.
+    TrafficLight,
+    TrafficSign,
 }
 
 impl Folder {
@@ -140,6 +150,8 @@ impl Folder {
             Folder::SideWalk => "SideWalk",
             Folder::Terrain => "Terrain",
             Folder::Building => "Building",
+            Folder::TrafficLight => "TrafficLight",
+            Folder::TrafficSign => "TrafficSign",
         }
     }
 
@@ -151,6 +163,8 @@ impl Folder {
             Folder::SideWalk => Label::Sidewalks,
             Folder::Terrain => Label::Terrain,
             Folder::Building => Label::Buildings,
+            Folder::TrafficLight => Label::TrafficLight,
+            Folder::TrafficSign => Label::TrafficSigns,
         }
     }
 
@@ -197,6 +211,11 @@ pub enum Role {
     Terrain,
     /// A part of a building.
     Building,
+    /// A traffic light: pole, mast arm and the heads hung from it. Never in a
+    /// map's FBX — see [`crate::furniture`].
+    TrafficLight,
+    /// A traffic sign on its post. Likewise.
+    TrafficSign,
 }
 
 impl Role {
@@ -213,6 +232,11 @@ impl Role {
             Role::Gutter => ("Road", "Gutter"),
             Role::Terrain => ("Terrain", "Ground"),
             Role::Building => ("Building", "Part"),
+            // Both hold a word `ValidateStaticMesh` rejects, which is fine for a
+            // prop — the check is run on a map's meshes and on nothing else — and
+            // is also why neither can ever go into a map's FBX.
+            Role::TrafficLight => ("TrafficLight", "Post"),
+            Role::TrafficSign => ("TrafficSign", "Post"),
         }
     }
 
@@ -228,6 +252,8 @@ impl Role {
             Role::Sidewalk | Role::Curb | Role::Gutter => Folder::SideWalk,
             Role::Terrain => Folder::Terrain,
             Role::Building => Folder::Building,
+            Role::TrafficLight => Folder::TrafficLight,
+            Role::TrafficSign => Folder::TrafficSign,
         }
     }
 
@@ -240,6 +266,8 @@ impl Role {
             Role::Gutter => "gutter",
             Role::Terrain => "terrain",
             Role::Building => "building",
+            Role::TrafficLight => "traffic light",
+            Role::TrafficSign => "traffic sign",
         }
     }
 }
@@ -469,6 +497,20 @@ mod tests {
         for role in [Role::Road, Role::Marking, Role::Sidewalk, Role::Terrain] {
             assert!(Folder::from_a_map().contains(&role.intended_folder()));
         }
+    }
+
+    #[test]
+    fn a_light_or_a_sign_is_named_so_that_a_map_would_reject_it() {
+        // Which is the point: they are props, tagged by the folder they are declared
+        // into, and a mesh with these words in its name inside a map's FBX would
+        // vanish. The name says which pipeline it belongs to.
+        for role in [Role::TrafficLight, Role::TrafficSign] {
+            let name = mesh_name("Town01", role, 0);
+            assert!(is_rejected_by_import(&name).is_some(), "{name}");
+            assert!(!Folder::from_a_map().contains(&role.intended_folder()));
+        }
+        assert_eq!(Folder::TrafficLight.label().stencil(), 7);
+        assert_eq!(Folder::TrafficSign.label().stencil(), 8);
     }
 
     #[test]

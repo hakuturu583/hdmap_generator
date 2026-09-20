@@ -16,5 +16,6 @@ serde_json.workspace = true
 spade.workspace = true
 
 [dev-dependencies]
+opendrive.workspace = true
 roadgen-buildings.workspace = true
 tempfile.workspace = true

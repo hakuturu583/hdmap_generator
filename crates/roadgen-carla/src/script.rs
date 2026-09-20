@@ -1,11 +1,12 @@
 //! The build script that takes a written package the rest of the way.
 //!
-//! A package is four things CARLA's importer reads and one it does not: the
+//! A package is four things CARLA's importer reads and two it does not: the
 //! descriptor, the `.fbx`, the `.xodr`, the texture manifest — and then the sky,
-//! which `Import.py` does not give a map and `roadgen.carla_sky()` does. Getting
-//! from the written folder to a level that runs is half a dozen steps in the right
-//! order with the right environment, and the second time through anyone would have
-//! scripted them. So the exporter writes the script, next to the descriptor, with
+//! which `Import.py` does not give a map and `roadgen.carla_sky()` does, and the
+//! furniture, which `Import.py` imports as props and leaves in the content browser
+//! and `roadgen.carla_furniture()` stands in the level. Getting from the written
+//! folder to a level that runs is half a dozen steps in the right order with the
+//! right environment, and the second time through anyone would have scripted them. So the exporter writes the script, next to the descriptor, with
 //! everything it knows baked in: the package and map names, the sun, whether the
 //! package wears its own textures, and — when the caller said — where CARLA and its
 //! engine are.
@@ -23,7 +24,8 @@ use crate::PackageConfig;
 
 /// The script, as text. `config.carla_root` and `config.engine` become its
 /// defaults; without them it takes both from its arguments or the environment.
-pub fn script(config: &PackageConfig) -> String {
+/// `furniture` is whether the package has any lights or signs to place.
+pub fn script(config: &PackageConfig, furniture: bool) -> String {
     let python_string = |value: Option<&str>| match value {
         Some(text) => format!("{text:?}"),
         None => "None".to_owned(),
@@ -59,6 +61,9 @@ SUN_AZIMUTH = {sun_azimuth}
 #: Whether the package wears its own textures rather than CARLA's materials, and
 #: so needs them fetched.
 OWN_TEXTURES = {own_textures}
+#: Whether the package has traffic lights, signs or a town of props to stand in
+#: the level.
+FURNITURE = {furniture}
 
 
 def main(argv=None):
@@ -67,6 +72,7 @@ def main(argv=None):
     parser.add_argument("--engine", default=os.environ.get("CARLA_UNREAL_ENGINE_PATH", ENGINE), help="the Unreal Engine directory")
     parser.add_argument("--no-textures", action="store_true", help="do not fetch the package's textures")
     parser.add_argument("--no-sky", action="store_true", help="leave the level without a sky")
+    parser.add_argument("--no-furniture", action="store_true", help="leave the lights and signs unplaced")
     parser.add_argument("--launch", action="store_true", help="start the CARLA server on the map afterwards")
     args = parser.parse_args(argv)
     if not args.carla or not args.engine:
@@ -101,6 +107,17 @@ def main(argv=None):
         shutil.rmtree(import_dir / MAP, ignore_errors=True)
         shutil.copytree(here / MAP, import_dir / MAP)
         shutil.copy2(here / (PACKAGE + ".json"), import_dir / (PACKAGE + ".json"))
+
+    # What an earlier import of this package left in CARLA's content tree. It has
+    # to go: Unreal will not create the map's mesh assets in a folder that already
+    # holds a level of the map's name, so a second Import.py over the first fails
+    # the whole map group — and logs it, in the middle of a few thousand lines,
+    # while the props, the .xodr and the level are all replaced. The result is a
+    # level whose road is the old one and whose everything else is new.
+    content = carla / "Unreal" / "CarlaUnreal" / "Content" / PACKAGE
+    if content.exists():
+        print("removing the previous import at %s" % content)
+        shutil.rmtree(content)
 
     # Pedestrians. Import.py builds their navigation mesh with RecastBuilder, from
     # an .obj of the map, in Util/DockerUtils/dist — where the UE5 branch's build
@@ -142,6 +159,13 @@ def main(argv=None):
         print("adding a sky to %s" % MAP)
         roadgen.carla_sky(str(carla), PACKAGE, MAP, engine=str(engine), sun_altitude=SUN_ALTITUDE, sun_azimuth=SUN_AZIMUTH)
 
+    # The lights and signs: props Import.py brought in and did not place, and the
+    # map_logic.json beside the .xodr that makes CARLA adopt them as its own.
+    if FURNITURE and not args.no_furniture:
+        print("standing the lights and signs in %s" % MAP)
+        lights, signs, buildings = roadgen.carla_furniture(str(carla), PACKAGE, MAP, engine=str(engine))
+        print("%d lights, %d signs and %d buildings placed" % (lights, signs, buildings))
+
     editor = engine / "Engine" / "Binaries" / ("Win64" if os.name == "nt" else "Linux") / "UnrealEditor"
     level = "/Game/%s/Maps/%s/%s" % (PACKAGE, MAP, MAP)
     command = [str(editor), str(uproject), level, "-game", "-vulkan", "-carla-rpc-port=2000", "-RenderOffScreen"]
@@ -168,6 +192,7 @@ if __name__ == "__main__":
         } else {
             "True"
         },
+        furniture = if furniture { "True" } else { "False" },
     )
 }
 
@@ -181,7 +206,7 @@ mod tests {
             .with_package("Pkg")
             .with_carla_materials(false)
             .with_carla("/opt/carla", "/opt/ue5");
-        let text = script(&config);
+        let text = script(&config, true);
         assert!(text.starts_with("#!/usr/bin/env python3\n"));
         assert!(text.contains("PACKAGE = \"Pkg\"") && text.contains("MAP = \"Town01\""));
         assert!(
@@ -189,19 +214,21 @@ mod tests {
         );
         assert!(text.contains("OWN_TEXTURES = True"));
         assert!(text.contains("SUN_ALTITUDE = 45") && text.contains("roadgen.carla_sky("));
+        assert!(text.contains("FURNITURE = True") && text.contains("roadgen.carla_furniture("));
     }
 
     #[test]
     fn a_package_in_carlas_materials_fetches_nothing_and_asks_where_carla_is() {
-        let text = script(&PackageConfig::new("Town01"));
+        let text = script(&PackageConfig::new("Town01"), false);
         assert!(text.contains("OWN_TEXTURES = False"));
+        assert!(text.contains("FURNITURE = False"));
         assert!(text.contains("CARLA_ROOT = None") && text.contains("ENGINE = None"));
     }
 
     #[test]
     fn a_windows_path_survives_as_a_python_string() {
         let config = PackageConfig::new("Town01").with_carla("C:\\carla", "C:\\UE_5.5");
-        let text = script(&config);
+        let text = script(&config, false);
         assert!(text.contains("CARLA_ROOT = \"C:\\\\carla\""), "{text}");
     }
 }

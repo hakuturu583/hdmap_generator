@@ -275,6 +275,58 @@ pub const MATERIALS: &[Material] = &[
         roughness: 0.6,
         texture: None,
     },
+    // Street furniture. None of it is photographed: a galvanised pole is a colour
+    // and a roughness, and a lamp is a colour that the editor script turns into an
+    // emissive CARLA material once the package is imported — see
+    // `_unreal_furniture.py`, which finds the three lamp slots by these names.
+    Material {
+        name: "M_Furniture_Steel",
+        color: [0.45, 0.46, 0.47],
+        roughness: 0.45,
+        texture: None,
+    },
+    Material {
+        name: "M_Furniture_Housing",
+        color: [0.06, 0.06, 0.06],
+        roughness: 0.7,
+        texture: None,
+    },
+    Material {
+        name: "M_Lamp_Red",
+        color: [0.90, 0.05, 0.05],
+        roughness: 0.2,
+        texture: None,
+    },
+    Material {
+        name: "M_Lamp_Amber",
+        color: [0.95, 0.55, 0.05],
+        roughness: 0.2,
+        texture: None,
+    },
+    Material {
+        name: "M_Lamp_Green",
+        color: [0.05, 0.80, 0.25],
+        roughness: 0.2,
+        texture: None,
+    },
+    Material {
+        name: "M_Plate_Red",
+        color: [0.75, 0.05, 0.05],
+        roughness: 0.4,
+        texture: None,
+    },
+    Material {
+        name: "M_Plate_White",
+        color: [0.92, 0.92, 0.90],
+        roughness: 0.4,
+        texture: None,
+    },
+    Material {
+        name: "M_Plate_Blue",
+        color: [0.05, 0.25, 0.70],
+        roughness: 0.4,
+        texture: None,
+    },
 ];
 
 pub const ASPHALT: usize = 0;
@@ -289,6 +341,14 @@ pub const ROOF_TILES: usize = 8;
 pub const GLAZING: usize = 9;
 pub const FRAME: usize = 10;
 pub const DOOR: usize = 11;
+pub const STEEL: usize = 12;
+pub const HOUSING: usize = 13;
+pub const LAMP_RED: usize = 14;
+pub const LAMP_AMBER: usize = 15;
+pub const LAMP_GREEN: usize = 16;
+pub const PLATE_RED: usize = 17;
+pub const PLATE_WHITE: usize = 18;
+pub const PLATE_BLUE: usize = 19;
 
 /// One texture file the package expects, and where it comes from.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
