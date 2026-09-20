@@ -165,6 +165,14 @@ order, and never flow back into the IR.
 ### Python
 
 ```bash
+pip install roadgen
+```
+
+Wheels are published for Linux, x86_64 and aarch64, on the stable ABI, so one wheel
+serves Python 3.9 through 3.13; anywhere else `pip` builds from the sdist, which
+needs a Rust toolchain. From a checkout:
+
+```bash
 pip install maturin
 maturin build --release          # or: maturin develop
 pip install target/wheels/roadgen-*.whl
@@ -1826,6 +1834,54 @@ it, so what they check is not the exporter's opinion of what it wrote. Install i
 with `apt install sumo` (and `pip install sumolib` for the Python side); without it
 those tests **skip**, saying so. Setting `ROADGEN_REQUIRE_SUMO=1` turns the skip into
 a failure, which is what CI does.
+
+## Releasing
+
+A release is a merged pull request with a label on it. Every PR carries exactly one
+of `release:major`, `release:minor`, `release:patch` or `release:none` — the
+[release-label check](.github/workflows/release-label.yml) fails without one, and it
+is a required check on `main`, so a PR cannot be merged until it says what it does
+to the version. When a PR lands on `main`, the
+[release workflow](.github/workflows/release.yml) looks at every PR merged since the
+last release: if any asked for one, it bumps the version by the highest level asked
+for, commits `chore(release): vX.Y.Z`, tags it, writes a GitHub release with
+generated notes, runs the tests again on the tagged commit, builds the wheels and the
+sdist, and publishes them to PyPI. Releases run one at a time, so two PRs that land
+together become one release rather than a race. `release:none` on every PR since the
+last release changes nothing on PyPI.
+
+The version lives in three files that have to agree — `pyproject.toml`, the
+`[workspace.package]` in `Cargo.toml` (which is what `roadgen.__version__` reports)
+and `Cargo.lock` — and `tools/bump_version.py` is the only thing that should edit
+them:
+
+```bash
+tools/bump_version.py patch      # 0.1.0 -> 0.1.1, printed to stdout
+tools/bump_version.py 0.4.2      # set exactly
+```
+
+Two other ways in. Pushing a `vX.Y.Z` tag by hand builds and publishes that commit
+directly — which is how the first release goes out at the version the files already
+carry, and how a hotfix does — and it fails unless the tag is the version in the
+files. Running the workflow by hand (`workflow_dispatch`) builds the wheels and the
+sdist as artifacts and publishes nothing, for looking at a release before making it.
+
+PyPI is reached through [Trusted Publishing](https://docs.pypi.org/trusted-publishers/),
+so there is no token in the repository's secrets. It is set up once on PyPI's side:
+*Publishing → Add a new pending publisher* with owner `hakuturu583`, repository
+`hdmap_generator`, workflow `release.yml` and environment `pypi`, and a `pypi`
+environment on the repository (Settings → Environments). Until that exists the
+publish step fails and the wheels are still there as workflow artifacts — nothing
+reaches PyPI without a deliberate step outside this repository.
+
+The release commit is pushed to `main` by the workflow itself, and `main` requires
+the label check on every update. A repository owned by a user cannot let the
+Actions app bypass a ruleset — only a repository role can — so the push is made
+with `RELEASE_TOKEN`, a fine-grained personal access token of the owner
+(*Settings → Developer settings → Fine-grained tokens*, this repository only,
+*Contents: read and write*) stored as a repository secret of that name; the owner
+is an admin, and the ruleset lets admins bypass it. Without the secret the release
+job stops and says so before anything is pushed.
 
 ## Licence
 

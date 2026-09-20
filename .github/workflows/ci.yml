@@ -25,6 +25,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends sumo
+      # The version is in three files and the release workflow refuses to publish
+      # unless they agree; better to hear about a lock file that lags here than on
+      # release day.
+      - name: The version files agree
+        run: |
+          PKG=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+          CRATE=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "$PKG" = "$CRATE"
+          cargo metadata --locked --format-version 1 >/dev/null
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
