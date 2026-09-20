@@ -102,8 +102,44 @@ impl<'a> RoadEvaluator<'a> {
                 }
                 (x, y, heading_at(ds))
             }
-            // Everything this project writes other than an arc or a spiral is a
-            // straight segment; a document using paramPoly3 would need more here.
+            GeometryType::ParamPoly3(poly) => {
+                // A parametric cubic in the frame of its start. Its parameter is not
+                // arc length, so the `p` at which the curve is `ds` metres along is
+                // found by solving for it: Newton's method on the arc-length
+                // integral, which is smooth and monotone. Written the way the
+                // specification says and not the way the exporter wrote it, so that
+                // this reads the file rather than the exporter's intent.
+                let normalized = matches!(
+                    poly.p_range,
+                    opendrive::road::geometry::param_poly_3_p_range::ParamPoly3pRange::Normalized
+                );
+                let range = if normalized {
+                    1.0
+                } else {
+                    geometry.length.value
+                };
+                let du = |p: f64| poly.b_u + 2.0 * poly.c_u * p + 3.0 * poly.d_u * p * p;
+                let dv = |p: f64| poly.b_v + 2.0 * poly.c_v * p + 3.0 * poly.d_v * p * p;
+                let speed = |p: f64| du(p).hypot(dv(p));
+                let arc_length = |to: f64| gauss_legendre(speed, 0.0, to, 64);
+                let mut p = range * ds / geometry.length.value.max(f64::EPSILON);
+                for _ in 0..50 {
+                    let residual = arc_length(p) - ds;
+                    let slope = speed(p);
+                    if slope <= 0.0 || residual.abs() < 1e-12 {
+                        break;
+                    }
+                    p = (p - residual / slope).clamp(0.0, range);
+                }
+                let (u, v) = (poly.u(p), poly.v(p));
+                let local_heading = dv(p).atan2(du(p));
+                (
+                    geometry.x.value + u * hdg.cos() - v * hdg.sin(),
+                    geometry.y.value + u * hdg.sin() + v * hdg.cos(),
+                    hdg + local_heading,
+                )
+            }
+            // Everything else this project writes is a straight segment.
             _ => (
                 geometry.x.value + ds * hdg.cos(),
                 geometry.y.value + ds * hdg.sin(),
@@ -246,20 +282,45 @@ impl<'a> RoadEvaluator<'a> {
         None
     }
 
+    /// The lateral offsets of the two edges of lane `id` at station `s`: the one
+    /// nearer the reference line first.
+    pub fn lane_edge_offsets(&self, id: i64, s: f64) -> Option<(f64, f64)> {
+        let mut offset = self.lane_offset_at(s);
+        for (lane_id, width) in self.widths(id > 0, s) {
+            let inner = offset;
+            offset += if id > 0 { width } else { -width };
+            if lane_id == id {
+                return Some((inner, offset));
+            }
+        }
+        None
+    }
+
     /// The centre of lane `id` at station `s`.
     pub fn lane_center(&self, id: i64, s: f64) -> Option<Position> {
+        Some(self.position_at(s, self.lane_center_offset(id, s)?))
+    }
+
+    /// The two edges of lane `id` at station `s`, the one nearer the reference line
+    /// first.
+    pub fn lane_edges(&self, id: i64, s: f64) -> Option<(Position, Position)> {
+        let (inner, outer) = self.lane_edge_offsets(id, s)?;
+        Some((self.position_at(s, inner), self.position_at(s, outer)))
+    }
+
+    /// The point `t` metres to the left of the reference line at station `s`.
+    pub fn position_at(&self, s: f64, t: f64) -> Position {
         let (x, y, heading) = self.reference_at(s);
-        let t = self.lane_center_offset(id, s)?;
         // Superelevation rolls the cross-section about the s-axis, so an offset `t`
         // to the left rises by t·sin(roll) and reaches only t·cos(roll) across.
         let roll = self.superelevation_at(s);
         let (across, rise) = (t * roll.cos(), t * roll.sin());
-        Some(Position {
+        Position {
             // `t` is positive to the left of the reference line.
             x: x - across * heading.sin(),
             y: y + across * heading.cos(),
             z: self.elevation_at(s) + rise,
-        })
+        }
     }
 
     pub fn length(&self) -> f64 {
@@ -280,4 +341,31 @@ impl<'a> RoadEvaluator<'a> {
             .map(|section| section.s)
             .collect()
     }
+}
+
+/// ∫ f over [from, to], by composite eight-point Gauss–Legendre quadrature in
+/// `intervals` pieces.
+fn gauss_legendre(f: impl Fn(f64) -> f64, from: f64, to: f64, intervals: usize) -> f64 {
+    const NODES: [f64; 4] = [
+        0.183_434_642_495_649_8,
+        0.525_532_409_916_329,
+        0.796_666_477_413_626_7,
+        0.960_289_856_497_536_3,
+    ];
+    const WEIGHTS: [f64; 4] = [
+        0.362_683_783_378_362,
+        0.313_706_645_877_887_3,
+        0.222_381_034_453_374_5,
+        0.101_228_536_290_376_3,
+    ];
+    let width = (to - from) / intervals as f64;
+    let mut total = 0.0;
+    for interval in 0..intervals {
+        let a = from + interval as f64 * width;
+        let (half, middle) = (width / 2.0, a + width / 2.0);
+        for (node, weight) in NODES.iter().zip(WEIGHTS) {
+            total += weight * half * (f(middle - half * node) + f(middle + half * node));
+        }
+    }
+    total
 }

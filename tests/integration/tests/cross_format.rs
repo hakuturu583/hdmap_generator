@@ -67,6 +67,56 @@ fn largest_centerline_disagreement(map: &ValidatedMap) -> f64 {
     worst
 }
 
+/// Compares every lane's two edges between the two documents, at the stations the
+/// IR sampled its reference line at — the check that catches a cross-section laid
+/// along the wrong heading, which a centreline comparison cannot: a connector's
+/// centreline is its reference line, and is right whatever the heading.
+fn largest_edge_disagreement(map: &ValidatedMap) -> f64 {
+    let document = reparse_opendrive(map);
+    let mut worst: f64 = 0.0;
+
+    for (index, road) in map.roads.iter().enumerate() {
+        let evaluator = RoadEvaluator::find(&document, &index.to_string())
+            .expect("the exporter numbers roads in the map's own order");
+        let stations = map
+            .vertex_stations(&road.id)
+            .expect("a road the map validated has geometry");
+
+        for lane in map.lanes_of(&road.id) {
+            // The IR's boundaries are in the reference line's terms; so are the
+            // evaluator's, which hands back the edge nearer the reference line first.
+            let (inner, outer) = match lane.side {
+                LateralSide::Left => (&lane.right_boundary, &lane.left_boundary),
+                LateralSide::Right => (&lane.left_boundary, &lane.right_boundary),
+            };
+            let inner = inner.to_polyline(map.metadata.sampling).unwrap();
+            let outer = outer.to_polyline(map.metadata.sampling).unwrap();
+            let (start, end) = lane.station_range;
+            let own: Vec<f64> = stations
+                .iter()
+                .copied()
+                .filter(|station| *station >= start - 1e-9 && *station <= end + 1e-9)
+                .collect();
+            assert_eq!(inner.len(), own.len());
+
+            for ((station, inner), outer) in own.iter().zip(inner.points()).zip(outer.points()) {
+                let (from_inner, from_outer) = evaluator
+                    .lane_edges(opendrive_lane_id(lane), station.min(end - 1e-9))
+                    .expect("the lane is in the document");
+                for (found, wanted) in [(from_inner, inner), (from_outer, outer)] {
+                    let wanted = Position {
+                        x: wanted.x,
+                        y: wanted.y,
+                        z: wanted.z,
+                    };
+                    worst = worst.max(found.distance_to(wanted));
+                }
+            }
+        }
+    }
+    worst
+}
+
 /// The Lanelet2 map's vertices, which are the IR's vertices by construction, so
 /// comparing the OpenDRIVE document against the IR compares it against both.
 fn lanelet2_agrees_with_the_ir(map: &ValidatedMap) {
@@ -223,6 +273,15 @@ fn both_formats_put_the_lanes_in_the_same_place() {
         assert!(
             worst < 1e-6,
             "{name}: the two formats disagree by {worst} m"
+        );
+        // And the edges, not only the centres. A junction connector's centreline is
+        // its reference line, so a cross-section laid along the wrong heading — the
+        // chord's rather than the tangent's, say — shows only here: as a lane edge
+        // rotated away from the arm's by a fraction of a metre at the mouth.
+        let worst = largest_edge_disagreement(&map);
+        assert!(
+            worst < 1e-6,
+            "{name}: the two formats' lane edges disagree by {worst} m"
         );
         lanelet2_agrees_with_the_ir(&map);
     }
