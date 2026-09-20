@@ -11,7 +11,7 @@ use roadgen_core::prelude::*;
 use roadgen_core::topology::RoadLinkTarget;
 use roadgen_integration_tests::opendrive_eval::RoadEvaluator;
 use roadgen_integration_tests::scenarios;
-use roadgen_opendrive::{from_xml, to_xml};
+use roadgen_opendrive::{from_xml, lane_number, to_xml};
 
 /// How far a lane edge may move on the way out and back, metres.
 ///
@@ -48,10 +48,7 @@ fn every_scenario() -> Vec<(&'static str, ValidatedMap)> {
 
 /// The OpenDRIVE id of a lane, as the exporter numbers it.
 fn od_lane(lane: &Lane) -> i64 {
-    match lane.side {
-        LateralSide::Left => lane.ordinal as i64,
-        LateralSide::Right => -(lane.ordinal as i64),
-    }
+    lane_number(lane.side, lane.ordinal)
 }
 
 /// Everything about a map that has to survive the round trip, in a form that does
@@ -141,27 +138,17 @@ fn signature(map: &Map) -> BTreeSet<String> {
                 outer.marking,
                 outer.color,
                 lane.speed_limit.map(|limit| (limit.mps() * 1000.0).round()),
-                // A profile whose knots all agree is a constant width however many
-                // knots it was written with.
-                if lane.width.is_constant() {
-                    vec![(0.0, (lane.width.narrowest().metres() * 1000.0).round())]
-                } else {
-                    lane.width
-                        .knots()
-                        .iter()
-                        .map(|(station, width)| {
-                            (
-                                (station * 1000.0).round(),
-                                (width.metres() * 1000.0).round(),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                },
-                if lane.width.is_constant() {
-                    Taper::Linear
-                } else {
-                    lane.width.taper()
-                },
+                lane.width
+                    .knots()
+                    .iter()
+                    .map(|(station, width)| {
+                        (
+                            (station * 1000.0).round(),
+                            (width.metres() * 1000.0).round(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                lane.width.taper(),
             ));
         }
     }
@@ -235,17 +222,15 @@ fn largest_edge_disagreement(first: &str, second: &str) -> f64 {
             .collect();
         stations.push(length - 1e-6);
         for section in road.lanes.lane_section.iter() {
-            let ids = section
+            let left = section
                 .left
                 .iter()
-                .flat_map(|left| left.lane.iter().map(|lane| lane.id))
-                .chain(
-                    section
-                        .right
-                        .iter()
-                        .flat_map(|right| right.lane.iter().map(|lane| lane.id)),
-                );
-            for id in ids {
+                .flat_map(|left| left.lane.iter().map(|l| l.id));
+            let right = section
+                .right
+                .iter()
+                .flat_map(|right| right.lane.iter().map(|l| l.id));
+            for id in left.chain(right) {
                 for &s in &stations {
                     let (Some(a), Some(b)) = (was.lane_edges(id, s), is.lane_edges(id, s)) else {
                         continue;

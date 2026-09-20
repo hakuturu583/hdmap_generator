@@ -32,9 +32,10 @@ use crate::units::SpeedLimit;
 pub struct SectionLayout {
     pub station_range: (f64, f64),
     pub lane_offset: Poly3Profile,
-    /// The rule that put each lane on its side, kept so that the lanes can be
-    /// built against the layout by the same rule.
-    pub handedness: TrafficHandedness,
+    /// Where each lane landed, in the order the lanes were given: its side and its
+    /// rank outwards on that side, counting from 1. Decided once, here, so that the
+    /// lanes built against the layout sit exactly where its widths were stacked.
+    pub slots: Vec<(LateralSide, usize)>,
     /// Widths of the left-hand lanes, ordinal 1 first.
     pub left: Vec<WidthProfile>,
     /// Widths of the right-hand lanes, ordinal 1 first.
@@ -56,15 +57,18 @@ impl SectionLayout {
         let mut layout = SectionLayout {
             station_range,
             lane_offset,
-            handedness,
+            slots: Vec::with_capacity(lanes.len()),
             left: Vec::new(),
             right: Vec::new(),
         };
         for lane in lanes {
-            match side_of(lane, handedness) {
-                LateralSide::Left => layout.left.push(lane.width.clone()),
-                LateralSide::Right => layout.right.push(lane.width.clone()),
-            }
+            let side = side_of(lane, handedness);
+            let stack = match side {
+                LateralSide::Left => &mut layout.left,
+                LateralSide::Right => &mut layout.right,
+            };
+            stack.push(lane.width.clone());
+            layout.slots.push((side, stack.len()));
         }
         layout
     }
@@ -213,22 +217,15 @@ pub fn section_lanes(
     layout: &SectionLayout,
     road_speed: Option<SpeedLimit>,
 ) -> Result<Vec<Lane>, GeometryError> {
-    let (mut left_count, mut right_count) = (0usize, 0usize);
     let mut built = Vec::with_capacity(lanes.len());
 
     for (position, lane_spec) in lanes.iter().enumerate() {
-        let side = side_of(lane_spec, layout.handedness);
+        let (side, ordinal) = layout.slots[position];
         // A lane spans one slot of the cross-section: the edges either side of
         // it, counted outwards from the origin.
-        let (left_edge, right_edge, ordinal) = match side {
-            LateralSide::Left => {
-                left_count += 1;
-                (left_count as i32, left_count as i32 - 1, left_count)
-            }
-            LateralSide::Right => {
-                right_count += 1;
-                (1 - right_count as i32, -(right_count as i32), right_count)
-            }
+        let (left_edge, right_edge) = match side {
+            LateralSide::Left => (ordinal as i32, ordinal as i32 - 1),
+            LateralSide::Right => (1 - ordinal as i32, -(ordinal as i32)),
         };
         let index = index_offset + position;
         built.push(Lane {

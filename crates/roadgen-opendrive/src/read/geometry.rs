@@ -43,7 +43,7 @@ pub fn reference_line(
     config: SamplingConfig,
     approximations: &mut Approximations,
 ) -> Result<Curve3, ImportError> {
-    let elevation = Elevation::of(road);
+    let elevation = Elevation::of(road)?;
     let mut pieces: Vec<Curve3> = Vec::new();
     let mut previous_end: Option<Point3> = None;
 
@@ -91,74 +91,83 @@ pub fn reference_line(
 }
 
 /// The elevation profile as a function of station.
+///
+/// The pieces are the profile's own, sorted by station; every question below is
+/// answered by a binary search for the governing piece rather than a scan, because
+/// a road written from the IR has a piece per change of grade and a foreign one
+/// may have one per metre.
 struct Elevation {
     profile: Poly3Profile,
-    /// Where each piece of it begins, ascending.
-    knots: Vec<f64>,
-    /// Whether each piece is straight: the ones that are not have to be walked.
-    straight: Vec<bool>,
 }
 
 impl Elevation {
-    fn of(road: &OdRoad) -> Elevation {
-        let rows: Vec<_> = road
+    fn of(road: &OdRoad) -> Result<Elevation, ImportError> {
+        let rows = road
             .elevation_profile
-            .as_ref()
-            .map(|profile| profile.elevation.clone())
-            .unwrap_or_default();
-        let mut sorted = rows;
-        sorted.sort_by(|left, right| left.s.total_cmp(&right.s));
-        let profile = Poly3Profile::new(
-            sorted
-                .iter()
-                .map(|row| Poly3Piece::new(row.s, row.a, row.b, row.c, row.d)),
-        )
-        .unwrap_or_default();
-        Elevation {
-            knots: sorted.iter().map(|row| row.s).collect(),
-            straight: sorted
-                .iter()
-                .map(|row| row.c.abs() < 1e-12 && row.d.abs() < 1e-12)
-                .collect(),
-            profile,
-        }
+            .iter()
+            .flat_map(|profile| profile.elevation.iter())
+            .map(|row| (row.s, row.a, row.b, row.c, row.d));
+        Ok(Elevation {
+            profile: super::profile(rows)?,
+        })
+    }
+
+    fn pieces(&self) -> &[Poly3Piece] {
+        self.profile.pieces()
+    }
+
+    /// The index of the piece that governs `station`: the last one starting at or
+    /// before it, a hair's tolerance allowed at a knot so that a knot's station is
+    /// its own piece's.
+    fn governing(&self, station: f64) -> usize {
+        self.pieces()
+            .partition_point(|piece| piece.station <= station + 1e-9)
+            .saturating_sub(1)
     }
 
     fn at(&self, station: f64) -> f64 {
-        self.profile.evaluate(station)
+        self.pieces()[self.governing(station)].evaluate(station)
     }
 
-    /// The knots strictly inside `(from, to)`.
-    fn knots_within(&self, from: f64, to: f64) -> Vec<f64> {
-        self.knots
-            .iter()
-            .copied()
-            .filter(|knot| *knot > from + 1e-9 && *knot < to - 1e-9)
-            .collect()
+    /// The knots strictly inside `(from, to)`, ascending.
+    fn knots_within(&self, from: f64, to: f64) -> impl Iterator<Item = f64> + '_ {
+        let pieces = self.pieces();
+        let lo = pieces.partition_point(|piece| piece.station <= from + 1e-9);
+        let hi = pieces.partition_point(|piece| piece.station < to - 1e-9);
+        pieces[lo..hi.max(lo)].iter().map(|piece| piece.station)
     }
 
-    /// Whether the elevation is a straight line over `(from, to)`: one straight
-    /// piece governs the whole span, or none does.
+    /// Whether one straight piece governs the whole of `(from, to)`.
     fn is_straight_over(&self, from: f64, to: f64) -> bool {
-        let governing = self.knots.iter().rposition(|knot| *knot <= from + 1e-9);
-        match governing {
-            Some(index) => self.straight[index] && self.knots_within(from, to).is_empty(),
-            None => self.knots_within(from, to).is_empty(),
-        }
+        self.pieces()[self.governing(from)].is_straight()
+            && self.knots_within(from, to).next().is_none()
     }
 
     /// Whether the elevation over `(from, to)` is one straight line, whether or not
     /// it is written as one piece: every piece in the span is straight, and every
     /// knot inside it lies on the line through the ends.
     fn is_linear_over(&self, from: f64, to: f64) -> bool {
-        let mut cuts = vec![from];
-        cuts.extend(self.knots_within(from, to));
-        cuts.push(to);
+        let cuts = self.cuts(from, to);
         cuts.windows(2)
             .all(|pair| self.is_straight_over(pair[0], pair[1]))
             && cuts[1..cuts.len() - 1]
                 .iter()
-                .all(|knot| collinear(self, from, *knot, to))
+                .all(|knot| self.collinear(from, *knot, to))
+    }
+
+    /// `from`, the knots inside, and `to`.
+    fn cuts(&self, from: f64, to: f64) -> Vec<f64> {
+        let mut cuts = vec![from];
+        cuts.extend(self.knots_within(from, to));
+        cuts.push(to);
+        cuts
+    }
+
+    /// Whether the height at `middle` lies on the straight line from `from` to `to`.
+    fn collinear(&self, from: f64, middle: f64, to: f64) -> bool {
+        let (z0, z1, z2) = (self.at(from), self.at(middle), self.at(to));
+        let expected = z0 + (z2 - z0) * (middle - from) / (to - from);
+        (z1 - expected).abs() < HEIGHT_TOLERANCE
     }
 }
 
@@ -198,9 +207,13 @@ impl<'a> Piece<'a> {
         match &self.entry.r#type {
             GeometryType::Line(_) | GeometryType::Arc(_) | GeometryType::Spiral(_) => {
                 let spans = self.grade_spans(elevation, config, road, approximations);
-                let mut pieces = Vec::with_capacity(spans.len());
+                let mut pieces: Vec<Curve3> = Vec::with_capacity(spans.len());
                 for (from, to) in spans {
-                    pieces.push(self.analytic(from, to, elevation, config)?);
+                    // Each sub-piece starts where the last one ended, so a spiral
+                    // is walked once from end to end rather than from its start
+                    // for every cut.
+                    let start = pieces.last().map(Curve3::end_point).unwrap_or(self.start);
+                    pieces.push(self.analytic(from, to, start, elevation)?);
                 }
                 Ok(pieces)
             }
@@ -220,16 +233,11 @@ impl<'a> Piece<'a> {
                     ParamPoly3pRange::Normalized => 1.0,
                     ParamPoly3pRange::ArcLength => self.length,
                 };
-                let (bu, cu, du) = (
-                    cubic.b_u * scale,
-                    cubic.c_u * scale * scale,
-                    cubic.d_u * scale * scale * scale,
-                );
-                let (bv, cv, dv) = (
-                    cubic.b_v * scale,
-                    cubic.c_v * scale * scale,
-                    cubic.d_v * scale * scale * scale,
-                );
+                let scaled = |b: f64, c: f64, d: f64| {
+                    (b * scale, c * scale * scale, d * scale * scale * scale)
+                };
+                let (bu, cu, du) = scaled(cubic.b_u, cubic.c_u, cubic.d_u);
+                let (bv, cv, dv) = scaled(cubic.b_v, cubic.c_v, cubic.d_v);
                 // Power basis to Bernstein: P₀ = a, P₁ = a + b/3, P₂ = a + 2b/3 + c/3,
                 // P₃ = a + b + c + d — the exporter's expansion run backwards.
                 let local = [
@@ -301,11 +309,7 @@ impl<'a> Piece<'a> {
         road: &str,
         approximations: &mut Approximations,
     ) -> Vec<(f64, f64)> {
-        let (from, to) = (self.station, self.end_station());
-        let mut cuts = vec![from];
-        cuts.extend(elevation.knots_within(from, to));
-        cuts.push(to);
-
+        let cuts = elevation.cuts(self.station, self.end_station());
         let mut spans: Vec<(f64, f64)> = Vec::new();
         for pair in cuts.windows(2) {
             let (a, b) = (pair[0], pair[1]);
@@ -318,13 +322,8 @@ impl<'a> Piece<'a> {
                      {{n}} stretches of it",
                     config.max_segment_length
                 ));
-                let steps = ((b - a) / config.max_segment_length).ceil().max(1.0) as usize;
-                for step in 0..steps {
-                    spans.push((
-                        a + (b - a) * step as f64 / steps as f64,
-                        a + (b - a) * (step + 1) as f64 / steps as f64,
-                    ));
-                }
+                let stations: Vec<f64> = config.stations_between(a, b).collect();
+                spans.extend(stations.windows(2).map(|pair| (pair[0], pair[1])));
             }
         }
 
@@ -333,40 +332,38 @@ impl<'a> Piece<'a> {
         let mut joined: Vec<(f64, f64)> = Vec::new();
         for span in spans {
             match joined.last_mut() {
-                Some(last) if collinear(elevation, last.0, last.1, span.1) => last.1 = span.1,
+                Some(last) if elevation.collinear(last.0, last.1, span.1) => last.1 = span.1,
                 _ => joined.push(span),
             }
         }
         joined
     }
 
-    /// The analytic sub-piece over `(from, to)`, taking its start from the entry's
-    /// own formula so that consecutive sub-pieces meet exactly.
+    /// The analytic sub-piece over `(from, to)`, starting at `start` — where the
+    /// previous sub-piece ended — with its heading and curvature taken from the
+    /// entry's own closed forms at that station.
     fn analytic(
         &self,
         from: f64,
         to: f64,
+        start: Point3,
         elevation: &Elevation,
-        config: SamplingConfig,
     ) -> Result<Curve3, ImportError> {
         let (offset, length) = (from - self.station, to - from);
+        let start = Point3::new(start.x, start.y, elevation.at(from));
         let end_z = elevation.at(to);
         Ok(match &self.entry.r#type {
             GeometryType::Line(_) => {
                 let (sin, cos) = self.heading.sin_cos();
-                let at =
-                    |d: f64, z: f64| Point3::new(self.start.x + d * cos, self.start.y + d * sin, z);
                 Curve3::Line(Line3::new(
-                    at(offset, elevation.at(from)),
-                    at(offset + length, end_z),
+                    start,
+                    Point3::new(start.x + length * cos, start.y + length * sin, end_z),
                 )?)
             }
             GeometryType::Arc(arc) => {
                 let curvature = arc.curvature.get::<radian_per_meter>();
-                let whole = Arc3::new(self.start, self.heading, curvature, self.length, end_z)?;
-                let sample = Curve3::Arc(whole).sample_at(offset, config)?;
                 Curve3::Arc(Arc3::new(
-                    Point3::new(sample.point.x, sample.point.y, elevation.at(from)),
+                    start,
                     self.heading + curvature * offset,
                     curvature,
                     length,
@@ -379,11 +376,11 @@ impl<'a> Piece<'a> {
                     spiral.curvature_end.get::<radian_per_meter>(),
                 );
                 let sharpness = (k1 - k0) / self.length;
-                let whole = Clothoid3::new(self.start, self.heading, k0, k1, self.length, end_z)?;
-                let sample = Curve3::Clothoid(whole).sample_at(offset, config)?;
+                // The heading of a clothoid is the integral of its curvature.
+                let heading = self.heading + k0 * offset + sharpness * offset * offset / 2.0;
                 Curve3::Clothoid(Clothoid3::new(
-                    Point3::new(sample.point.x, sample.point.y, elevation.at(from)),
-                    sample.tangent.heading(),
+                    start,
+                    heading,
                     k0 + sharpness * offset,
                     k0 + sharpness * (offset + length),
                     length,
@@ -393,14 +390,4 @@ impl<'a> Piece<'a> {
             _ => unreachable!("only the analytic kinds are cut"),
         })
     }
-}
-
-/// Whether the elevation at `middle` lies on the straight line from `from` to `to`.
-///
-/// Both spans are straight already, so this is the one question left: do they
-/// climb at the same rate.
-fn collinear(elevation: &Elevation, from: f64, middle: f64, to: f64) -> bool {
-    let (z0, z1, z2) = (elevation.at(from), elevation.at(middle), elevation.at(to));
-    let expected = z0 + (z2 - z0) * (middle - from) / (to - from);
-    (z1 - expected).abs() < HEIGHT_TOLERANCE
 }

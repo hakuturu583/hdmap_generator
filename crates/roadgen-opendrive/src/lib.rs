@@ -172,6 +172,19 @@ const STOP_LINE_DEPTH: f64 = 0.4;
 const TRAFFIC_LIGHT_TYPE: &str = "1000001";
 const TRAFFIC_LIGHT_SUBTYPE: &str = "-1";
 
+/// The `subtype` a stop line is written with, on a `roadMark` object — the one
+/// string that tells a reader a stop line from any other paint.
+const STOP_LINE_SUBTYPE: &str = "stopLine";
+
+/// The number OpenDRIVE gives a lane: positive to the left of the reference line,
+/// negative to the right, counting outwards from 1, with 0 reserved for the centre.
+pub fn lane_number(side: LateralSide, ordinal: usize) -> i64 {
+    match side {
+        LateralSide::Left => ordinal as i64,
+        LateralSide::Right => -(ordinal as i64),
+    }
+}
+
 /// Turns a validated map into an OpenDRIVE document.
 pub fn to_opendrive(map: &ValidatedMap) -> Result<OpenDrive, ExportError> {
     to_opendrive_with(map, &Options::default())
@@ -350,13 +363,7 @@ impl Numbering {
         }
         let mut lanes = HashMap::new();
         for lane in map.lanes.iter() {
-            // OpenDRIVE numbers lanes outwards from the reference line: positive to
-            // the left, negative to the right, with 0 reserved for the centre.
-            let id = match lane.side {
-                LateralSide::Left => lane.ordinal as i64,
-                LateralSide::Right => -(lane.ordinal as i64),
-            };
-            lanes.insert(lane.id.clone(), id);
+            lanes.insert(lane.id.clone(), lane_number(lane.side, lane.ordinal));
         }
         let mut objects = HashMap::new();
         for (index, object) in map.objects.iter().enumerate() {
@@ -1277,7 +1284,7 @@ impl<'a> Exporter<'a> {
                         radius: None,
                         roll: None,
                         s: Length::new::<meter>(position.s),
-                        subtype: Some("stopLine".to_owned()),
+                        subtype: Some(STOP_LINE_SUBTYPE.to_owned()),
                         t: Length::new::<meter>(position.t),
                         r#type: Some(ObjectType::RoadMark),
                         valid_length: None,
@@ -1642,13 +1649,14 @@ fn wrap_angle(angle: f64) -> f64 {
     }
 }
 
-/// The elevation of the reference line, as one linear polynomial per sampled span.
+/// The elevation of the reference line, as one linear polynomial per run of sampled
+/// spans that climb at one grade.
 ///
 /// This is where the third dimension of the IR's reference line goes: OpenDRIVE
 /// keeps the plan view and the elevation in separate elements, so the lowering has
 /// to split what the IR holds as one 3D curve.
 fn elevation_profile(samples: &[Sample]) -> ElevationProfile {
-    let mut elevation = Vec::new();
+    let mut elevation: Vec<Elevation> = Vec::new();
     for pair in samples.windows(2) {
         let (here, next) = (pair[0], pair[1]);
         let run = next.station - here.station;
@@ -1657,6 +1665,15 @@ fn elevation_profile(samples: &[Sample]) -> ElevationProfile {
         } else {
             0.0
         };
+        // A span that carries on the previous row's grade needs no row of its
+        // own: the row already describes it. A road of constant grade is one row.
+        if let Some(last) = elevation.last() {
+            let continues = (slope - last.b).abs() < 1e-9
+                && (last.a + last.b * (here.station - last.s) - here.point.z).abs() < 1e-9;
+            if continues {
+                continue;
+            }
+        }
         elevation.push(Elevation {
             a: here.point.z,
             b: slope,

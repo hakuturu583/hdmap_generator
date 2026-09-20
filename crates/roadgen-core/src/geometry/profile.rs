@@ -30,6 +30,11 @@ impl Poly3Piece {
         }
     }
 
+    /// Whether the piece is a straight line: no quadratic or cubic term.
+    pub fn is_straight(&self) -> bool {
+        self.c.abs() < 1e-12 && self.d.abs() < 1e-12
+    }
+
     pub fn evaluate(&self, station: f64) -> f64 {
         let ds = station - self.station;
         self.a + self.b * ds + self.c * ds * ds + self.d * ds * ds * ds

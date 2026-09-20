@@ -94,64 +94,18 @@ pub fn connect(reader: &mut Reader<'_>) -> Result<(), ImportError> {
         let road_id = RoadId::new(&road.id);
         let last = road.lanes.lane_section.len() - 1;
         for (section, entry) in road.lanes.lane_section.iter().enumerate() {
-            let lanes = entry
-                .left
-                .iter()
-                .flat_map(|left| left.lane.iter().map(|lane| (lane.id, &lane.base)))
-                .chain(
-                    entry
-                        .right
-                        .iter()
-                        .flat_map(|right| right.lane.iter().map(|lane| (lane.id, &lane.base))),
-                );
-            for (id, lane) in lanes {
+            for (id, lane) in super::numbered_lanes(entry) {
                 let Some(link) = &lane.link else {
                     continue;
                 };
-                let here = reader.lane_at(&road_id, section, id, "a lane link")?;
+                let here = reader.lane_at(&road_id, section, id, || "a lane link".to_owned())?;
                 for (end, targets) in [
-                    (LaneEnd::Start, &link.predecessor),
-                    (LaneEnd::End, &link.successor),
+                    (RoadEnd::Start, &link.predecessor),
+                    (RoadEnd::End, &link.successor),
                 ] {
-                    // Where the lane's neighbour at this end is: the next section
-                    // of the same road, or the section at the far end of the road
-                    // link. A link into a junction names no lane, so a lane there
-                    // has nothing to point at and the junction's connections say it.
-                    let at_road_end = match end {
-                        LaneEnd::Start => section == 0,
-                        LaneEnd::End => section == last,
-                    };
-                    let neighbour = if at_road_end {
-                        let road_end = match end {
-                            LaneEnd::Start => RoadEnd::Start,
-                            LaneEnd::End => RoadEnd::End,
-                        };
-                        let target = reader
-                            .map
-                            .roads
-                            .get(&road_id)
-                            .and_then(|entry| entry.link.at(road_end).cloned());
-                        match target {
-                            Some(RoadLinkTarget::Road(other)) => {
-                                let other_section = reader
-                                    .section_at_end(&other.road, other.end)
-                                    .ok_or_else(|| {
-                                    ImportError::Inconsistent(format!(
-                                        "road {} links to road {}, which was not read",
-                                        road.id, other.road
-                                    ))
-                                })?;
-                                Some((other.road.clone(), other_section, other.end.as_lane_end()))
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        match end {
-                            LaneEnd::Start => Some((road_id.clone(), section - 1, LaneEnd::End)),
-                            LaneEnd::End => Some((road_id.clone(), section + 1, LaneEnd::Start)),
-                        }
-                    };
-                    let Some((other_road, other_section, other_end)) = neighbour else {
+                    let Some((other_road, other_section, other_end)) =
+                        reader.neighbour_at(&road_id, section, last, end)?
+                    else {
                         if !targets.is_empty() {
                             reader.approximations.count(
                                 "{n} lane links point past a road end that leads to a junction \
@@ -162,13 +116,15 @@ pub fn connect(reader: &mut Reader<'_>) -> Result<(), ImportError> {
                         continue;
                     };
                     for target in targets {
-                        let there = reader.lane_at(
-                            &other_road,
-                            other_section,
-                            target.id,
-                            &format!("the link of lane {id} of road {}", road.id),
+                        let there =
+                            reader.lane_at(&other_road, other_section, target.id, || {
+                                format!("the link of lane {id} of road {}", road.id)
+                            })?;
+                        reader.record(
+                            &mut seen,
+                            (here.clone(), end.as_lane_end()),
+                            (there, other_end),
                         )?;
-                        reader.record(&mut seen, (here.clone(), end), (there, other_end))?;
                     }
                 }
             }
@@ -206,19 +162,10 @@ pub fn connect(reader: &mut Reader<'_>) -> Result<(), ImportError> {
             let incoming_section = reader
                 .section_at_end(&incoming, incoming_end)
                 .expect("the road was found a moment ago");
+            let referrer = || format!("connection {} of junction {}", connection.id, junction.id);
             for lane_link in &connection.lane_link {
-                let from = reader.lane_at(
-                    &incoming,
-                    incoming_section,
-                    lane_link.from,
-                    &format!("connection {} of junction {}", connection.id, junction.id),
-                )?;
-                let to = reader.lane_at(
-                    &connecting,
-                    connecting_section,
-                    lane_link.to,
-                    &format!("connection {} of junction {}", connection.id, junction.id),
-                )?;
+                let from = reader.lane_at(&incoming, incoming_section, lane_link.from, referrer)?;
+                let to = reader.lane_at(&connecting, connecting_section, lane_link.to, referrer)?;
                 reader.record(
                     &mut seen,
                     (from, incoming_end.as_lane_end()),
@@ -226,11 +173,7 @@ pub fn connect(reader: &mut Reader<'_>) -> Result<(), ImportError> {
                 )?;
             }
             // The arm is one of the junction's, whichever way its traffic runs.
-            if let Some(entry) = reader.map.junctions.get_mut(&junction_id) {
-                if !entry.incoming_roads.contains(&incoming) {
-                    entry.incoming_roads.push(incoming);
-                }
-            }
+            reader.add_arm(&junction_id, incoming);
         }
     }
 
@@ -253,16 +196,59 @@ pub fn connect(reader: &mut Reader<'_>) -> Result<(), ImportError> {
         })
         .collect();
     for (junction, road) in arms {
-        if let Some(entry) = reader.map.junctions.get_mut(&junction) {
-            if !entry.incoming_roads.contains(&road) {
-                entry.incoming_roads.push(road);
-            }
-        }
+        reader.add_arm(&junction, road);
     }
     Ok(())
 }
 
 impl Reader<'_> {
+    /// Where a lane's neighbour at one end of its section is: the next section of
+    /// the same road, or the section at the far end of the road link. A link into
+    /// a junction names no lane, so a lane there has nothing to point at and the
+    /// junction's connections say it.
+    fn neighbour_at(
+        &self,
+        road: &RoadId,
+        section: usize,
+        last: usize,
+        end: RoadEnd,
+    ) -> Result<Option<(RoadId, usize, LaneEnd)>, ImportError> {
+        let at_road_end = match end {
+            RoadEnd::Start => section == 0,
+            RoadEnd::End => section == last,
+        };
+        if !at_road_end {
+            return Ok(Some(match end {
+                RoadEnd::Start => (road.clone(), section - 1, LaneEnd::End),
+                RoadEnd::End => (road.clone(), section + 1, LaneEnd::Start),
+            }));
+        }
+        let target = self
+            .map
+            .roads
+            .get(road)
+            .and_then(|entry| entry.link.at(end).cloned());
+        let Some(RoadLinkTarget::Road(other)) = target else {
+            return Ok(None);
+        };
+        let other_section = self.section_at_end(&other.road, other.end).ok_or_else(|| {
+            ImportError::Inconsistent(format!(
+                "road {road} links to road {}, which was not read",
+                other.road
+            ))
+        })?;
+        Ok(Some((other.road, other_section, other.end.as_lane_end())))
+    }
+
+    /// Lists a road among a junction's arms, once.
+    fn add_arm(&mut self, junction: &JunctionId, road: RoadId) {
+        if let Some(entry) = self.map.junctions.get_mut(junction) {
+            if !entry.incoming_roads.contains(&road) {
+                entry.incoming_roads.push(road);
+            }
+        }
+    }
+
     /// Records the movement between two lane ends, whichever way round the document
     /// wrote it: the lane that is *left* by its end is the source.
     ///

@@ -163,9 +163,7 @@ pub fn required_stations<'a>(
             if to - from <= 0.0 {
                 continue;
             }
-            let steps = ((to - from) / config.max_segment_length).ceil() as usize;
-            stations
-                .extend((0..=steps).map(|step| from + (to - from) * step as f64 / steps as f64));
+            stations.extend(config.stations_between(from, to));
         }
     }
     stations

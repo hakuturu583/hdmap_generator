@@ -25,7 +25,7 @@ use opendrive::road::Road as OdRoad;
 use uom::si::length::meter;
 
 use roadgen_core::builder::LaneSpec;
-use roadgen_core::geometry::{Poly3Profile, SamplingConfig, Taper, WidthProfile};
+use roadgen_core::geometry::{Poly3Piece, Poly3Profile, SamplingConfig, Taper, WidthProfile};
 use roadgen_core::id::RoadId;
 use roadgen_core::map::TrafficHandedness;
 use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking};
@@ -38,21 +38,16 @@ use crate::error::ImportError;
 /// The narrowest a lane is allowed to be, metres.
 ///
 /// A centimetre: a lane the document takes to nothing is held here instead, which
-/// is below anything a consumer draws and above what validation calls zero.
+/// is below anything a consumer draws and above the zero `PositiveWidth` refuses.
 const MIN_WIDTH: f64 = 0.01;
 
-/// One lane of a section, as the layout takes it and as the document numbered it.
-pub struct LaneEntry {
-    pub opendrive_id: i64,
-    pub spec: LaneSpec,
-}
-
-/// One `<laneSection>`.
+/// One `<laneSection>`: its lanes as the layout takes them, and the number the
+/// document gave each — outwards from the reference line on each side, which is
+/// the order the layout stacks them in.
 pub struct Section {
     pub station: f64,
-    /// Outwards from the reference line on each side, which is the order the
-    /// layout stacks them in.
-    pub lanes: Vec<LaneEntry>,
+    pub specs: Vec<LaneSpec>,
+    pub opendrive_ids: Vec<i64>,
 }
 
 /// The road's sections, each with its lanes as specs.
@@ -60,16 +55,11 @@ pub fn sections(
     road_id: &RoadId,
     road: &OdRoad,
     length: f64,
+    lane_offset: &Poly3Profile,
     handedness: TrafficHandedness,
     config: SamplingConfig,
     approximations: &mut Approximations,
 ) -> Result<Vec<Section>, ImportError> {
-    let lane_offset = super::profile(
-        road.lanes
-            .lane_offset
-            .iter()
-            .map(|offset| (offset.s, offset.a, offset.b, offset.c, offset.d)),
-    )?;
     let sections: Vec<&LaneSection> = road.lanes.lane_section.iter().collect();
     let mut built = Vec::with_capacity(sections.len());
 
@@ -85,21 +75,25 @@ pub fn sections(
             road: road_id,
             section,
             range: (section.s, end),
-            lane_offset: &lane_offset,
+            lane_offset,
             handedness,
             config,
             approximations,
         };
-        let mut lanes = Vec::new();
+        let (mut specs, mut opendrive_ids) = (Vec::new(), Vec::new());
         // The lane the map's handedness puts forward traffic on comes first, then
         // the other side; each side outwards from the reference line.
         let forward_side = handedness.side_for(Direction::Forward);
         for side in [forward_side, forward_side.opposite()] {
-            lanes.extend(reader.side(side)?);
+            for (id, spec) in reader.side(side)? {
+                opendrive_ids.push(id);
+                specs.push(spec);
+            }
         }
         built.push(Section {
             station: section.s,
-            lanes,
+            specs,
+            opendrive_ids,
         });
     }
     Ok(built)
@@ -118,23 +112,10 @@ struct SectionReader<'a> {
 
 impl SectionReader<'_> {
     /// The lanes of one side, innermost first.
-    fn side(&mut self, side: LateralSide) -> Result<Vec<LaneEntry>, ImportError> {
-        let mut lanes: Vec<(i64, &OdLane)> = match side {
-            LateralSide::Left => self
-                .section
-                .left
-                .iter()
-                .flat_map(|left| left.lane.iter())
-                .map(|lane| (lane.id, &lane.base))
-                .collect(),
-            LateralSide::Right => self
-                .section
-                .right
-                .iter()
-                .flat_map(|right| right.lane.iter())
-                .map(|lane| (lane.id, &lane.base))
-                .collect(),
-        };
+    fn side(&mut self, side: LateralSide) -> Result<Vec<(i64, LaneSpec)>, ImportError> {
+        let mut lanes: Vec<(i64, &OdLane)> = super::numbered_lanes(self.section)
+            .filter(|(id, _)| (*id > 0) == (side == LateralSide::Left))
+            .collect();
         // Outwards: ascending on the left, descending on the right.
         lanes.sort_by_key(|(id, _)| id.abs());
         for (expected, (id, _)) in lanes.iter().enumerate() {
@@ -200,10 +181,7 @@ impl SectionReader<'_> {
                     ),
                 }
             }
-            entries.push(LaneEntry {
-                opendrive_id: id,
-                spec,
-            });
+            entries.push((id, spec));
             inner_marking = outer_marking;
             inner_widths.push(width);
         }
@@ -219,24 +197,26 @@ impl SectionReader<'_> {
         inner: &[WidthProfile],
     ) -> Result<WidthProfile, ImportError> {
         let (start, end) = self.range;
-        let mut widths: Vec<Cubic> = Vec::new();
-        let mut borders: Vec<Cubic> = Vec::new();
+        // Each piece rebased onto the road's own station, which is what a
+        // profile's knots are measured in.
+        let mut widths: Vec<Poly3Piece> = Vec::new();
+        let mut borders: Vec<Poly3Piece> = Vec::new();
         for choice in &lane.choice {
             match choice {
-                LaneChoice::Width(width) => widths.push(Cubic {
-                    station: start + width.s_offset.get::<meter>(),
-                    a: width.a,
-                    b: width.b,
-                    c: width.c,
-                    d: width.d,
-                }),
-                LaneChoice::Border(border) => borders.push(Cubic {
-                    station: start + border.s_offset.get::<meter>(),
-                    a: border.a,
-                    b: border.b,
-                    c: border.c,
-                    d: border.d,
-                }),
+                LaneChoice::Width(w) => widths.push(Poly3Piece::new(
+                    start + w.s_offset.get::<meter>(),
+                    w.a,
+                    w.b,
+                    w.c,
+                    w.d,
+                )),
+                LaneChoice::Border(b) => borders.push(Poly3Piece::new(
+                    start + b.s_offset.get::<meter>(),
+                    b.a,
+                    b.b,
+                    b.c,
+                    b.d,
+                )),
             }
         }
         widths.sort_by(|left, right| left.station.total_cmp(&right.station));
@@ -257,7 +237,7 @@ impl SectionReader<'_> {
                      that also state a `<width>` is ignored",
                 );
             }
-            self.width_knots(id, &widths, end)?
+            self.width_knots(&widths, end)?
         } else {
             // A border is where the edge is, measured from the reference line; the
             // width is what is left after the lanes inside it.
@@ -266,8 +246,9 @@ impl SectionReader<'_> {
                  read as the distance beyond the lane inside it, sampled along the section",
             );
             let sign = side.sign();
+            let lane_offset = self.lane_offset;
             let inner_edge = |s: f64| {
-                self.lane_offset.evaluate(s)
+                lane_offset.evaluate(s)
                     + sign
                         * inner
                             .iter()
@@ -280,14 +261,13 @@ impl SectionReader<'_> {
                     .get(index + 1)
                     .map(|next| next.station)
                     .unwrap_or(end);
-                for s in stations_along(border.station, piece_end, self.config) {
-                    let edge = border.evaluate(s);
-                    knots.push((s, sign * (edge - inner_edge(s))));
+                for s in self.config.stations_between(border.station, piece_end) {
+                    knots.push((s, sign * (border.evaluate(s) - inner_edge(s))));
                 }
             }
             (knots, Taper::Linear)
         };
-        self.profile(id, knots)
+        self.profile(knots)
     }
 
     /// The knots of a lane's `<width>` pieces, and the taper that joins them.
@@ -298,8 +278,7 @@ impl SectionReader<'_> {
     /// sampled too.
     fn width_knots(
         &mut self,
-        id: i64,
-        widths: &[Cubic],
+        widths: &[Poly3Piece],
         end: f64,
     ) -> Result<(Vec<(f64, f64)>, Taper), ImportError> {
         let mut kinds = Vec::with_capacity(widths.len());
@@ -308,7 +287,7 @@ impl SectionReader<'_> {
                 .get(index + 1)
                 .map(|next| next.station)
                 .unwrap_or(end);
-            kinds.push((piece, piece_end, piece.kind(piece_end - piece.station)));
+            kinds.push((piece, piece_end, kind_of(piece, piece_end - piece.station)));
         }
         let any_cubic = kinds.iter().any(|(_, _, kind)| *kind == Kind::Cubic);
         let any_smooth = kinds.iter().any(|(_, _, kind)| *kind == Kind::Smooth);
@@ -326,12 +305,11 @@ impl SectionReader<'_> {
                  ease with a straight run are sampled into straight runs",
             );
         }
-        let _ = id;
 
         let mut knots = Vec::new();
         for (piece, piece_end, kind) in kinds {
             if sample_everything && kind != Kind::Constant {
-                for s in stations_along(piece.station, piece_end, self.config) {
+                for s in self.config.stations_between(piece.station, piece_end) {
                     knots.push((s, piece.evaluate(s)));
                 }
             } else {
@@ -347,38 +325,27 @@ impl SectionReader<'_> {
         Ok((knots, taper))
     }
 
-    /// A profile from knots: repeats dropped, a floor put under the width, and a
-    /// constant width kept as the one knot it is.
+    /// A profile from knots, with a floor put under the width. `WidthProfile::new`
+    /// drops the knots that change nothing; what is worth saying here is a step —
+    /// two widths at one station — which the IR crosses in no distance.
     fn profile(
         &mut self,
-        id: i64,
         (knots, taper): (Vec<(f64, f64)>, Taper),
     ) -> Result<WidthProfile, ImportError> {
-        let mut cleaned: Vec<(f64, f64)> = Vec::with_capacity(knots.len());
-        for (station, width) in knots {
-            if let Some(&(last_station, last_width)) = cleaned.last() {
-                if (station - last_station).abs() < 1e-9 && (width - last_width).abs() < 1e-9 {
-                    continue;
-                }
-                if (station - last_station).abs() < 1e-9 {
-                    self.approximations.count(
-                        "a lane width is continuous in the IR, so at {n} places where a \
-                         `<width>` steps the lane changes width over no distance",
-                    );
-                }
-            }
-            cleaned.push((station, width));
-        }
-        // A profile holds its last width to the end of the road, so a knot that
-        // only repeats the one before it says nothing — and the last `<width>`
-        // piece of a section, held to the section's end, always writes one.
-        while cleaned.len() >= 2
-            && (cleaned[cleaned.len() - 1].1 - cleaned[cleaned.len() - 2].1).abs() < 1e-9
-        {
-            cleaned.pop();
+        let steps = knots
+            .windows(2)
+            .filter(|pair| {
+                (pair[1].0 - pair[0].0).abs() < 1e-9 && (pair[1].1 - pair[0].1).abs() > 1e-9
+            })
+            .count();
+        for _ in 0..steps {
+            self.approximations.count(
+                "a lane width is continuous in the IR, so at {n} places where a `<width>` \
+                 steps the lane changes width over no distance",
+            );
         }
         let mut floored = false;
-        let positive: Vec<(f64, PositiveWidth)> = cleaned
+        let positive: Vec<(f64, PositiveWidth)> = knots
             .into_iter()
             .map(|(station, width)| {
                 let held = if width < MIN_WIDTH {
@@ -398,10 +365,6 @@ impl SectionReader<'_> {
                 "a lane width is greater than zero everywhere in the IR, so {{n}} lanes whose \
                  `<width>` reaches zero are held at {MIN_WIDTH} m there"
             ));
-        }
-        let _ = id;
-        if positive.len() == 1 || positive.iter().all(|(_, w)| *w == positive[0].1) {
-            return Ok(WidthProfile::constant(positive[0].1));
         }
         Ok(WidthProfile::new(positive, taper)?)
     }
@@ -495,16 +458,6 @@ impl SectionReader<'_> {
     }
 }
 
-/// A cubic in `ds` from its own station, as every OpenDRIVE width is.
-#[derive(Debug, Clone, Copy)]
-struct Cubic {
-    station: f64,
-    a: f64,
-    b: f64,
-    c: f64,
-    d: f64,
-}
-
 /// What shape a width piece is, which decides how it is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -516,40 +469,25 @@ enum Kind {
     Cubic,
 }
 
-impl Cubic {
-    fn evaluate(&self, station: f64) -> f64 {
-        let ds = station - self.station;
-        self.a + self.b * ds + self.c * ds * ds + self.d * ds * ds * ds
+/// The shape of a width piece `length` metres long.
+fn kind_of(piece: &Poly3Piece, length: f64) -> Kind {
+    let tiny = 1e-12;
+    if piece.is_straight() {
+        return if piece.b.abs() < tiny {
+            Kind::Constant
+        } else {
+            Kind::Linear
+        };
     }
-
-    fn kind(&self, length: f64) -> Kind {
-        let tiny = 1e-12;
-        if self.c.abs() < tiny && self.d.abs() < tiny {
-            return if self.b.abs() < tiny {
-                Kind::Constant
-            } else {
-                Kind::Linear
-            };
+    if piece.b.abs() < tiny && length > 0.0 {
+        // c = 3Δ/L² and d = −2Δ/L³ for the same Δ.
+        let delta = piece.c * length * length / 3.0;
+        let expected_d = -2.0 * delta / (length * length * length);
+        if (piece.d - expected_d).abs() <= 1e-9 * (1.0 + expected_d.abs()) {
+            return Kind::Smooth;
         }
-        if self.b.abs() < tiny && length > 0.0 {
-            // c = 3Δ/L² and d = −2Δ/L³ for the same Δ.
-            let delta = self.c * length * length / 3.0;
-            let expected_d = -2.0 * delta / (length * length * length);
-            if (self.d - expected_d).abs() <= 1e-9 * (1.0 + expected_d.abs()) {
-                return Kind::Smooth;
-            }
-        }
-        Kind::Cubic
     }
-}
-
-/// Stations from `from` to `to`, both included, no further apart than the
-/// sampling length.
-fn stations_along(from: f64, to: f64, config: SamplingConfig) -> Vec<f64> {
-    let steps = ((to - from) / config.max_segment_length).ceil().max(1.0) as usize;
-    (0..=steps)
-        .map(|step| from + (to - from) * step as f64 / steps as f64)
-        .collect()
+    Kind::Cubic
 }
 
 /// A speed in the document's unit, in metres per second. OpenDRIVE's default unit

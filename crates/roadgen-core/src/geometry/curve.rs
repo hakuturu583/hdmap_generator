@@ -32,6 +32,13 @@ impl SamplingConfig {
     fn segments_for(&self, length: f64) -> usize {
         ((length / self.max_segment_length).ceil() as usize).max(1)
     }
+
+    /// Stations from `from` to `to`, both included, evenly spaced and no further
+    /// apart than the bound.
+    pub fn stations_between(&self, from: f64, to: f64) -> impl Iterator<Item = f64> {
+        let steps = self.segments_for(to - from);
+        (0..=steps).map(move |step| from + (to - from) * step as f64 / steps as f64)
+    }
 }
 
 impl Default for SamplingConfig {

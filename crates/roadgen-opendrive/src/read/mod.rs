@@ -41,6 +41,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use opendrive::core::OpenDrive;
+use opendrive::lane::lane_section::LaneSection;
+use opendrive::lane::Lane as OdLane;
 use opendrive::road::rule::Rule;
 use opendrive::road::Road as OdRoad;
 use uom::si::length::meter;
@@ -107,7 +109,21 @@ pub fn read_with(path: impl AsRef<Path>, options: &ReadOptions) -> Result<Import
 
 /// Reads a parsed document.
 pub fn from_document(document: &OpenDrive, options: &ReadOptions) -> Result<Imported, ImportError> {
-    Reader::new(document, options)?.run()
+    Reader::new(document, options).run()
+}
+
+/// The lanes of a section with the numbers the document gave them: the left ones,
+/// then the right ones, each in document order. The centre lane is not a lane.
+fn numbered_lanes(section: &LaneSection) -> impl Iterator<Item = (i64, &OdLane)> {
+    let left = section
+        .left
+        .iter()
+        .flat_map(|left| left.lane.iter().map(|lane| (lane.id, &lane.base)));
+    let right = section
+        .right
+        .iter()
+        .flat_map(|right| right.lane.iter().map(|lane| (lane.id, &lane.base)));
+    left.chain(right)
 }
 
 /// The road ids and junction ids a document names, so a link can be resolved
@@ -163,7 +179,7 @@ impl Approximations {
 }
 
 impl<'a> Reader<'a> {
-    fn new(document: &'a OpenDrive, options: &'a ReadOptions) -> Result<Self, ImportError> {
+    fn new(document: &'a OpenDrive, options: &'a ReadOptions) -> Self {
         let mut approximations = Approximations::default();
         let metadata = metadata(document, options, &mut approximations);
         let names = Names {
@@ -178,14 +194,14 @@ impl<'a> Reader<'a> {
                 .map(|junction| (junction.id.clone(), JunctionId::new(&junction.id)))
                 .collect(),
         };
-        Ok(Reader {
+        Reader {
             document,
             options,
             names,
             map: Map::new(metadata),
             lanes: HashMap::new(),
             approximations,
-        })
+        }
     }
 
     fn run(mut self) -> Result<Imported, ImportError> {
@@ -280,6 +296,7 @@ impl<'a> Reader<'a> {
             &id,
             road,
             length,
+            &lane_offset,
             self.handedness(),
             config,
             &mut self.approximations,
@@ -289,7 +306,7 @@ impl<'a> Reader<'a> {
             sections.iter().map(|section| section.station),
             sections
                 .iter()
-                .flat_map(|section| section.lanes.iter().map(|lane| &lane.spec.width)),
+                .flat_map(|section| section.specs.iter().map(|spec| &spec.width)),
             config,
         );
         let geometry = RoadGeometry::new(&reference_line, &superelevation, config, &required)?;
@@ -302,9 +319,8 @@ impl<'a> Reader<'a> {
                 .get(index + 1)
                 .map(|next| next.station)
                 .unwrap_or(length);
-            let specs: Vec<_> = section.lanes.iter().map(|lane| lane.spec.clone()).collect();
             let layout = SectionLayout::new(
-                &specs,
+                &section.specs,
                 (section.station, end),
                 lane_offset.clone(),
                 self.handedness(),
@@ -312,15 +328,15 @@ impl<'a> Reader<'a> {
             let built = layout::section_lanes(
                 &id,
                 &geometry,
-                &specs,
+                &section.specs,
                 index,
                 index_offset,
                 &layout,
                 speed_limit,
             )?;
-            for (lane, entry) in built.iter().zip(&section.lanes) {
+            for (lane, number) in built.iter().zip(&section.opendrive_ids) {
                 self.lanes
-                    .insert((id.clone(), index, entry.opendrive_id), lane.id.clone());
+                    .insert((id.clone(), index, *number), lane.id.clone());
             }
             cross_sections.push(CrossSection {
                 station: section.station,
@@ -364,21 +380,22 @@ impl<'a> Reader<'a> {
     }
 
     /// The IR lane at an OpenDRIVE (road, section, lane id), or an error naming
-    /// what pointed at it.
+    /// what pointed at it — `referrer` is only asked for when there is an error.
     fn lane_at(
         &self,
         road: &RoadId,
         section: usize,
         lane: i64,
-        referrer: &str,
+        referrer: impl FnOnce() -> String,
     ) -> Result<LaneId, ImportError> {
         self.lanes
             .get(&(road.clone(), section, lane))
             .cloned()
             .ok_or_else(|| {
                 ImportError::Inconsistent(format!(
-                    "{referrer} names lane {lane} of section {section} of {road}, which has no \
-                     such lane"
+                    "{} names lane {lane} of section {section} of {road}, which has no such \
+                     lane",
+                    referrer()
                 ))
             })
     }
@@ -424,28 +441,21 @@ fn road_type(
              keep their first",
         );
     }
-    let road_type = match first.r#type {
-        RoadTypeE::Rural => RoadType::Rural,
-        RoadTypeE::Motorway => RoadType::Motorway,
-        RoadTypeE::Town
-        | RoadTypeE::TownExpressway
+    let (road_type, exact) = match first.r#type {
+        RoadTypeE::Rural => (RoadType::Rural, true),
+        RoadTypeE::Motorway => (RoadType::Motorway, true),
+        RoadTypeE::Town => (RoadType::Town, true),
+        RoadTypeE::LowSpeed => (RoadType::LowSpeed, true),
+        RoadTypeE::Pedestrian => (RoadType::Pedestrian, true),
+        RoadTypeE::TownExpressway
         | RoadTypeE::TownCollector
         | RoadTypeE::TownArterial
         | RoadTypeE::TownPrivate
         | RoadTypeE::TownLocal
         | RoadTypeE::TownPlayStreet
-        | RoadTypeE::Unknown => RoadType::Town,
-        RoadTypeE::LowSpeed | RoadTypeE::Bicycle => RoadType::LowSpeed,
-        RoadTypeE::Pedestrian => RoadType::Pedestrian,
+        | RoadTypeE::Unknown => (RoadType::Town, false),
+        RoadTypeE::Bicycle => (RoadType::LowSpeed, false),
     };
-    let exact = matches!(
-        first.r#type,
-        RoadTypeE::Rural
-            | RoadTypeE::Motorway
-            | RoadTypeE::Town
-            | RoadTypeE::LowSpeed
-            | RoadTypeE::Pedestrian
-    );
     if !exact {
         approximations.count(format!(
             "the IR has five road types, so {{n}} roads of type {:?} are read as {}",
@@ -487,29 +497,21 @@ fn metadata(
     // The rule is per road in OpenDRIVE and per map in the IR. The first road's is
     // the map's; a road that disagrees is reported, because its lanes will be read
     // as running the other way.
-    let mut handedness = TrafficHandedness::RightHand;
-    let mut stated: Option<Rule> = None;
-    for road in &document.road {
-        let Some(rule) = &road.rule else {
-            continue;
-        };
-        match &stated {
-            None => {
-                stated = Some(rule.clone());
-                handedness = match rule {
-                    Rule::RightHandTraffic => TrafficHandedness::RightHand,
-                    Rule::LeftHandTraffic => TrafficHandedness::LeftHand,
-                };
-            }
-            Some(first) if first != rule => {
-                approximations.count(
-                    "the IR keeps to one side of the road: {n} roads state the opposite \
-                     `rule` from the first and are read with the first's",
-                );
-            }
+    let mut first: Option<&Rule> = None;
+    for rule in document.road.iter().filter_map(|road| road.rule.as_ref()) {
+        match first {
+            None => first = Some(rule),
+            Some(stated) if stated != rule => approximations.count(
+                "the IR keeps to one side of the road: {n} roads state the opposite `rule` \
+                 from the first and are read with the first's",
+            ),
             Some(_) => {}
         }
     }
+    let handedness = match first {
+        Some(Rule::LeftHandTraffic) => TrafficHandedness::LeftHand,
+        _ => TrafficHandedness::RightHand,
+    };
 
     MapMetadata {
         name: document.header.name.clone(),

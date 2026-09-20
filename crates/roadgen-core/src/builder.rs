@@ -442,10 +442,10 @@ impl MapBuilder {
 
     /// Where a lane sits in its road's cross-section, resolved against handedness.
     fn lane_side(&self, lane: &LaneRef) -> Result<LateralSide, BuildError> {
-        let spec = self.lane_spec(lane)?;
-        Ok(spec
-            .side
-            .unwrap_or_else(|| self.metadata.handedness.side_for(spec.direction)))
+        Ok(layout::side_of(
+            self.lane_spec(lane)?,
+            self.metadata.handedness,
+        ))
     }
 
     /// Rank of the lane outwards from the cross-section origin, counting from 1.
