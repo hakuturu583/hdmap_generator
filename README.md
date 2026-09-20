@@ -727,8 +727,11 @@ Furniture goes on the way's own nodes, which is where OSM puts it:
 caller's code>`. A node is inserted at the object's own position rather than snapped
 to the nearest vertex — a straight road has two of those, and everything on it would
 otherwise pile up on one end. Where several controls share a point, the stronger
-keeps the node's single `highway` tag: a signalised stop is signals, not a stop sign.
-A crossing also gets a `highway=footway` + `footway=crossing` way across the road.
+keeps the node's single `highway` tag: a signalised stop is signals, not a stop sign —
+and `osm_warnings()` says which pair was folded together. A crossing is a place rather
+than a control, so it always has a node of its own, however close the stop line
+before it stands, and it also gets a `highway=footway` + `footway=crossing` way across
+the road, through that node, so the footway and the road share a vertex.
 
 ### Junctions, which is where the two models disagree
 

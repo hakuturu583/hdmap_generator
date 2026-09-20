@@ -157,7 +157,61 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             heights.1 - heights.0
         ));
     }
+    problems.extend(merged_controls(map));
     problems.extend(building_losses(map));
+    problems
+}
+
+/// Controls that will share one node, and which of them keeps its `highway` tag.
+///
+/// Two controls within `NODE_SPACING` of each other on the same road land on one
+/// node, and a node has one `highway` tag: the stronger control keeps it and the
+/// other survives only as far as OSM's conventions carry it (a stop line under a
+/// signal is what `traffic_signals` means). A crossing is not a control and always
+/// gets a node of its own, so it is not in this list.
+fn merged_controls(map: &ValidatedMap) -> Vec<String> {
+    let controls: Vec<(&MapObject, Point3, &'static str)> = map
+        .objects
+        .iter()
+        .filter_map(|object| {
+            let value = match object.kind {
+                MapObjectKind::TrafficLight => "traffic_signals",
+                MapObjectKind::StopLine => "stop",
+                _ => return None,
+            };
+            Some((object, object_position(object)?, value))
+        })
+        .collect();
+    let mut problems = Vec::new();
+    for (index, (object, position, value)) in controls.iter().enumerate() {
+        for (other, other_position, other_value) in &controls[index + 1..] {
+            if value == other_value
+                || position.horizontal_distance_to(*other_position) >= NODE_SPACING
+                || object
+                    .lanes
+                    .first()
+                    .and_then(|lane| map.lane(lane))
+                    .map(|lane| &lane.road)
+                    != other
+                        .lanes
+                        .first()
+                        .and_then(|lane| map.lane(lane))
+                        .map(|lane| &lane.road)
+            {
+                continue;
+            }
+            let (kept, _) = if control_rank(value) >= control_rank(other_value) {
+                (value, other_value)
+            } else {
+                (other_value, value)
+            };
+            problems.push(format!(
+                "{} and {} stand within {NODE_SPACING} m of each other and share one node, \
+                 which OSM tags `highway={kept}`",
+                object.id, other.id
+            ));
+        }
+    }
     problems
 }
 
@@ -438,7 +492,18 @@ impl<'a> Exporter<'a> {
             let Some(position) = object_position(object) else {
                 continue;
             };
-            let Some(node) = self.node_on_way(&road, position)? else {
+            // A crossing is a place on the road, not a control of it, so it never
+            // shares a node with a stop line or a signal however close they stand —
+            // a stop line set back a few metres from the mouth with the crosswalk
+            // between it and the junction is the ordinary layout, and the two land
+            // well within `NODE_SPACING` of each other. Controls may share a node
+            // with each other; a crossing only with another crossing.
+            let is_crossing = object.kind == MapObjectKind::Crosswalk;
+            let Some(node) = self.node_on_way(&road, position, |tags| {
+                tags.get("highway")
+                    .is_none_or(|existing| (existing == "crossing") == is_crossing)
+            })?
+            else {
                 continue;
             };
 
@@ -465,14 +530,22 @@ impl<'a> Exporter<'a> {
 
             // A crossing is also a footway in its own right, so that it is a thing
             // pedestrians can be routed along rather than only a tag on the road.
-            if object.kind == MapObjectKind::Crosswalk {
-                self.add_crossing_way(object)?;
+            if is_crossing {
+                self.add_crossing_way(object, node)?;
             }
         }
         Ok(())
     }
 
-    fn add_crossing_way(&mut self, object: &MapObject) -> Result<(), ExportError> {
+    /// The footway across the road at a crossing, through `crossing_node` — the
+    /// road way's own node there — so that the two ways share a vertex and a
+    /// pedestrian router can step from one onto the other. Two ways that merely
+    /// cross in the plane are, to OSM, a bridge.
+    fn add_crossing_way(
+        &mut self,
+        object: &MapObject,
+        crossing_node: i64,
+    ) -> Result<(), ExportError> {
         let ObjectGeometry::Band { left, right } = &object.geometry else {
             return Ok(());
         };
@@ -483,13 +556,28 @@ impl<'a> Exporter<'a> {
         }
         // Down the middle of the painted strip, which is where someone crossing
         // actually walks.
-        let mut nodes = Vec::with_capacity(left.len());
+        let mut nodes = Vec::with_capacity(left.len() + 1);
         for (a, b) in left.points().iter().zip(right.points()) {
             nodes.push(self.node_at(a.lerp(*b, 0.5))?);
         }
         nodes.dedup();
         if nodes.len() < 2 {
             return Ok(());
+        }
+        // The road's node goes in where the footway passes it: after every vertex
+        // that lies before it along the footway.
+        if !nodes.contains(&crossing_node) {
+            let first = self.positions[&nodes[0]];
+            let last = self.positions[nodes.last().expect("two or more nodes")];
+            let along = |point: Point3| {
+                (point.x - first.x) * (last.x - first.x) + (point.y - first.y) * (last.y - first.y)
+            };
+            let here = along(self.positions[&crossing_node]);
+            let index = nodes
+                .iter()
+                .take_while(|node| along(self.positions[node]) < here)
+                .count();
+            nodes.insert(index, crossing_node);
         }
 
         let id = self.take_id();
@@ -510,7 +598,12 @@ impl<'a> Exporter<'a> {
     ///
     /// The search is horizontal, because a traffic light five metres above the road
     /// is still at the same place on it.
-    fn node_on_way(&mut self, road: &RoadId, position: Point3) -> Result<Option<i64>, ExportError> {
+    fn node_on_way(
+        &mut self,
+        road: &RoadId,
+        position: Point3,
+        may_reuse: impl Fn(&Tags) -> bool,
+    ) -> Result<Option<i64>, ExportError> {
         let Some(way_id) = self.ways.get(road).copied() else {
             return Ok(None);
         };
@@ -548,18 +641,23 @@ impl<'a> Exporter<'a> {
             return Ok(None);
         };
 
-        // A vertex near enough to the spot is used as it stands; only a point well
-        // between two of them needs a node of its own.
+        // A vertex near enough to the spot is used as it stands, if the caller lets
+        // it be; only a point well between two of them needs a node of its own.
         let (a, b) = (
             self.positions[&nodes[index]],
             self.positions[&nodes[index + 1]],
         );
         let point = a.lerp(b, fraction);
-        if point.distance_to(a) < NODE_SPACING {
-            return Ok(Some(nodes[index]));
-        }
-        if point.distance_to(b) < NODE_SPACING {
-            return Ok(Some(nodes[index + 1]));
+        for near in [nodes[index], nodes[index + 1]] {
+            if point.distance_to(self.positions[&near]) < NODE_SPACING
+                && self
+                    .document
+                    .nodes
+                    .get(&near)
+                    .is_some_and(|node| may_reuse(&node.tags))
+            {
+                return Ok(Some(near));
+            }
         }
 
         let node = self.node_at(point)?;
