@@ -262,13 +262,79 @@ fn furniture_lands_on_the_way_where_the_ir_put_it() {
     // than a stop sign: one `highway` tag, and the stronger control keeps it.
     assert!(osm.nodes_tagged("highway", "stop").is_empty());
 
-    // The crossing is a node on the road and a footway across it.
+    // The crossing is a node on the road and a footway across it — through that
+    // node, so the footway and the road share a vertex and a router can step from
+    // one onto the other.
     let crossings = osm.nodes_tagged("highway", "crossing");
     assert_eq!(crossings.len(), 1);
     assert!(north.nodes.contains(&crossings[0].id));
     let footways = osm.ways_tagged("footway", "crossing");
     assert_eq!(footways.len(), 1);
-    assert!(footways[0].nodes.len() >= 2);
+    assert!(footways[0].nodes.len() >= 3);
+    assert!(footways[0].nodes.contains(&crossings[0].id));
+
+    // And the check says which controls will share a node, and which tag wins.
+    let problems = roadgen_osm::check(&map);
+    let merged = problems
+        .iter()
+        .find(|problem| problem.contains("share one node"))
+        .expect("the stop line under the light is reported");
+    assert!(merged.contains("highway=traffic_signals"), "{merged}");
+}
+
+#[test]
+fn a_crossing_beside_a_stop_line_keeps_its_own_node() {
+    // The ordinary layout at a signalised mouth: the stop line set back a few
+    // metres, the crosswalk between it and the junction. The two land 0.4 m apart
+    // — within the spacing that folds two controls onto one node — and a crossing
+    // is not a control, so it must not be folded away.
+    let mut builder = MapBuilder::new(scenarios::metadata("crossing"));
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(100.0, 0.0, 0.0),
+                scenarios::two_way(),
+            )
+            .unwrap()
+            .with_name("main"),
+        )
+        .unwrap();
+    let approach = LaneRef::new(road.clone(), 0);
+    builder
+        .add_stop_line_at(&approach, LaneEnd::End, 6.0)
+        .unwrap();
+    builder.add_crosswalk(&road, 0.936, 4.0).unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let osm = reload_osm(&map);
+
+    let stops = osm.nodes_tagged("highway", "stop");
+    let crossings = osm.nodes_tagged("highway", "crossing");
+    assert_eq!(stops.len(), 1);
+    assert_eq!(crossings.len(), 1);
+    assert_ne!(stops[0].id, crossings[0].id);
+    let main = osm.way_named("main");
+    assert!(main.nodes.contains(&stops[0].id));
+    assert!(main.nodes.contains(&crossings[0].id));
+    assert!((osm.at(stops[0].id).x - 94.0).abs() < 1e-3);
+    assert!((osm.at(crossings[0].id).x - 93.6).abs() < 1e-3);
+
+    // The footway goes through the road's crossing node.
+    let footways = osm.ways_tagged("footway", "crossing");
+    assert_eq!(footways.len(), 1);
+    assert!(footways[0].nodes.contains(&crossings[0].id));
+    // In order: kerb, road, kerb — not tacked on at an end.
+    let index = footways[0]
+        .nodes
+        .iter()
+        .position(|node| *node == crossings[0].id)
+        .unwrap();
+    assert!(index > 0 && index + 1 < footways[0].nodes.len());
+
+    // Nothing was merged, so nothing is reported as merged.
+    assert!(!roadgen_osm::check(&map)
+        .iter()
+        .any(|problem| problem.contains("share one node")));
 }
 
 #[test]
