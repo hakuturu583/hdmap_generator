@@ -5,9 +5,11 @@ same network out as **OpenDRIVE**, as an **Autoware-ready Lanelet2** map, as pla
 **OpenStreetMap**, as a **SUMO** network, as a **CARLA UE5 asset package**, as a
 **ClipGT** clip for NVIDIA Cosmos, and as a **GPUDrive** scene.
 
-This is a generator, not a converter. Nothing here parses an existing HD map: you
-describe roads, lanes, junctions and the movements between them, and the library
-builds the geometry and writes the files.
+This is a generator, not a converter. You describe roads, lanes, junctions and the
+movements between them, and the library builds the geometry and writes the files.
+The one file it reads is its own kind: an **OpenDRIVE** document can be
+[read back](#reading-opendrive-back) into the same model, whether roadgen wrote it or
+someone else did, and written out again in every other format.
 
 **[Try it in a browser](https://hakuturu583.github.io/hdmap_generator/)** — the demo
 page runs this package, compiled for WebAssembly. Write a script, press Run, and flip
@@ -75,6 +77,8 @@ m.export_gpudrive("scene.json")
                      └──▶ GPUDrive       scene .json         `serde_json`
 
               the written files ──▶ roadgen-viewer ──▶ SVG
+
+                map.xodr ──▶ roadgen-opendrive::read ──▶ Canonical Road IR
 ```
 
 Every exporter reads a `ValidatedMap` and writes nothing back into it: what a format
@@ -87,11 +91,14 @@ same way the builder reads a `RoadSpec` and writes lanes. It runs after generati
 and before validation, because a lot is measured against geometry that does not exist
 until the first and buildings are part of what the second checks.
 
-The arrow at the bottom goes the other way, and is the only one that does.
-`roadgen-viewer` reads the **written files** — never the IR — so a picture it draws
-is a picture of what a consumer would receive. It is what the
-[demo page](#the-demo-page) shows, and it is the one thing here that looks at an
-export rather than producing one.
+The two arrows at the bottom go the other way. `roadgen-viewer` reads the **written
+files** — never the IR — so a picture it draws is a picture of what a consumer would
+receive. It is what the [demo page](#the-demo-page) shows. And
+`roadgen-opendrive::read` is the one route from a file *into* the IR: OpenDRIVE is
+the format the IR was shaped against, so a document comes back as roads, lanes,
+movements, furniture and rules rather than as a picture — see
+[Reading OpenDRIVE back](#reading-opendrive-back). No other format is read, and
+[`docs/import-feasibility.md`](docs/import-feasibility.md) says why.
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
 
@@ -246,6 +253,8 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 | `render_opendrive(path)` / `render_sumo(directory)` / `render_carla(path)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
+| `read_opendrive(path, sampling=, origin=, projection=)` | read an OpenDRIVE file as a `Map` — one that exports like any other and cannot be added to |
+| `read_warnings()` | what the file a map was read from said that the map could not keep |
 | `building_presets()` / `building_rules(name=None)` | the built-in rule sets, and one of them as text to edit |
 
 The `render_*` functions are module-level rather than methods on `Map`, because they
@@ -1677,6 +1686,71 @@ Each exporter adds the constraints its own format imposes, through
 from Python). Those constraints stay on the exporter's side of the boundary and are
 never pushed back into the IR.
 
+## Reading OpenDRIVE back
+
+```python
+m = roadgen.read_opendrive("map.xodr")
+for note in m.read_warnings():
+    print(note)
+m.export_lanelet2("map.osm")
+m.export_sumo("sumo/")
+```
+
+```rust
+let imported = roadgen_opendrive::read("map.xodr")?;
+for note in &imported.approximations {
+    eprintln!("{note}");
+}
+let map = imported.map.validate()?;
+roadgen_lanelet2::write(&map, "map.osm")?;
+```
+
+The exporter's table — road to `<road>`, lane to `<lane>`, connection to
+`<laneLink>` — read the other way. Nothing is regenerated: the reference line is
+rebuilt piece for piece from `<planView>` (a line, an arc and a spiral as
+themselves, a `<paramPoly3>` as the cubic it is), the widths from `<width>`, the
+movements from the lane links and the junctions, the lights, signs, stop lines,
+crosswalks and buildings from the signals and objects, and the controllers and
+priorities as rules. The lane boundaries are then laid out by the **same code the
+builder uses** for a road it generated, so a file roadgen wrote comes back with the
+boundaries it was written from, and a file from somewhere else gets the boundaries
+roadgen would have given it. The map that comes back is an `UnvalidatedMap`, and
+`validate()` is the same gate every generated map goes through.
+
+The IR is narrower than OpenDRIVE in a few places, and where it is, the reader
+approximates and says so — `Imported::approximations` in Rust, `read_warnings()` in
+Python, one line per thing the map now says less exactly than the file did:
+
+- a `<width>` that is a straight run or the IR's own smooth ease is read exactly;
+  any other cubic is sampled into straight runs;
+- a width that reaches zero is held at a centimetre, because a `WidthProfile`
+  cannot reach zero;
+- an `<elevation>` that curves inside one plan-view piece is cut into straight
+  grades at the sampling length, since every piece of the IR climbs at one grade;
+  a `<paramPoly3>` cannot be cut and takes one grade end to end;
+- a lane type the IR does not have — `stop`, `median`, `bus`, the ramps — lands on
+  the nearest it does, and a road type likewise;
+- a building's roof is flat, because an outline has one height per corner;
+- a signal or object that names no lanes is read as governing every lane of its
+  section that runs the way it faces.
+
+What is an error rather than a note is a document that is not a road network: a
+reference line with a gap in it wider than 10 cm (a narrower one is closed and
+reported), a link to a road that is not there, a lane link to a lane the neighbour
+does not have. A `<geoReference>` the reader does not recognise places the map at
+latitude 0, longitude 0 and says so; `origin=` overrides it.
+
+Roads and junctions are named after the file's ids, so the file's road 12 is
+`road/12`; a signal, object or building whose `name` is one of the IR's own
+identifiers gets it back, which is what makes a map that goes out and comes in keep
+its object names. A map read from a file cannot be added to — `add_road` and the
+rest refuse — because it has no builder behind it: roadgen generates maps and reads
+them, it does not edit them.
+
+`tests/integration/tests/reimport.rs` writes every scenario, reads it back and
+writes it again, and asks the independent evaluator whether every lane edge of the
+second document is where the first put it. It is.
+
 ## Agreement between OpenDRIVE and Lanelet2
 
 The test suite exports each scenario, reads the OpenDRIVE back with the `opendrive`
@@ -1708,13 +1782,14 @@ roadgen/
 │   ├── roadgen-core/        canonical IR, generation, validation
 │   │   ├── topology/        connectivity
 │   │   ├── geometry/        3D curves, alignments, frames, profiles, sampling
+│   │   ├── layout/          a cross-section laid out against a reference line
 │   │   ├── semantics/       lane types, rules, markings, objects
 │   │   ├── buildings/       footprints, heights, storeys
 │   │   ├── id/              typed identifiers
 │   │   └── validation/      UnvalidatedMap → ValidatedMap
 │   ├── roadgen-buildings/   a town beside the roads, from a CGA shape grammar
 │   ├── roadgen-carla/       meshes, FBX and the package CARLA UE5 imports
-│   ├── roadgen-opendrive/   lowering onto the `opendrive` crate
+│   ├── roadgen-opendrive/   lowering onto the `opendrive` crate, and reading it back
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
 │   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON

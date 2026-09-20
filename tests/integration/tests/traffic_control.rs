@@ -238,7 +238,9 @@ fn a_stop_line_becomes_a_road_mark_object_across_the_lane() {
         .iter()
         .find(|object| object.r#type == Some(ObjectType::RoadMark))
         .expect("the stop line is a road-mark object");
-    assert_eq!(stop_line.name.as_deref(), Some("stopLine"));
+    // Named after its own identifier, like every signal, so that it comes back
+    // under it; the subtype is what says it is a stop line.
+    assert!(stop_line.name.as_deref().unwrap().starts_with("object/"));
     assert_eq!(stop_line.subtype.as_deref(), Some("stopLine"));
     // It reaches right across the lane it stops, and only a little along the road.
     assert!((stop_line.width.unwrap().value - 3.5).abs() < 1e-6);

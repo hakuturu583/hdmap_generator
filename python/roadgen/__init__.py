@@ -51,6 +51,15 @@ Every export can be drawn back:
 
     svg = roadgen.render_opendrive("map.xodr")
 
+And an OpenDRIVE file can be read back as a map — one that exports like any
+other and cannot be added to, since it came from a file rather than from
+`add_road`:
+
+    m = roadgen.read_opendrive("map.xodr")
+    for note in m.read_warnings():        # what the file said that the map cannot
+        print(note)
+    m.export_lanelet2("map.osm")
+
 The `render_*` functions read the file rather than the map, so what they draw is
 what a consumer would receive. They return an SVG document as text — in a notebook,
 `IPython.display.SVG(svg)`; anywhere else, a string to write out or put in a page.
@@ -89,6 +98,7 @@ from ._roadgen import (
     __version__,
     building_presets,
     building_rules,
+    read_opendrive,
     render_carla,
     render_clipgt,
     render_gpudrive,
@@ -120,6 +130,7 @@ __all__ = [
     "render_carla",
     "render_clipgt",
     "render_gpudrive",
+    "read_opendrive",
     "render_opendrive",
     "render_sumo",
     "texture_manifest",

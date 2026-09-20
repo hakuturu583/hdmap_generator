@@ -19,6 +19,11 @@
 //!   Right of way      → <junction>/<priority>
 //! ```
 //!
+//! The same table is read the other way by [`read()`]: an OpenDRIVE document becomes
+//! an [`UnvalidatedMap`](roadgen_core::validation::UnvalidatedMap), with its lane
+//! boundaries laid out by the builder's own layout code and a note for everything
+//! the IR holds less exactly than the file did.
+//!
 //! # Buildings, which belong to no road
 //!
 //! Every OpenDRIVE object hangs off a `<road>` and is placed in that road's own
@@ -141,11 +146,13 @@ use roadgen_core::GeometryError;
 pub mod controllers;
 mod error;
 pub mod options;
+pub mod read;
 pub mod road_coordinates;
 
 pub use controllers::{signal_groups, SignalGroup};
-pub use error::ExportError;
+pub use error::{ExportError, ImportError};
 pub use options::{Options, SignalCatalogue, SignalPlacement};
+pub use read::{from_xml, from_xml_with, read, read_with, Imported, ReadOptions};
 pub use road_coordinates::RoadPosition;
 
 /// Width of a painted lane marking, metres. OpenDRIVE wants a number; this is the
@@ -995,43 +1002,53 @@ impl<'a> Exporter<'a> {
         let Some(entry) = self.map.junction(junction) else {
             return Ok(None);
         };
+        // One `<connection>` per approach road and contact point of each
+        // connector, carrying every lane link that enters the connector there. A
+        // generated connector is one lane entered at its start from one road, so
+        // that is one connection; a connector that was read from a document may be
+        // several lanes, entered from either end.
         let mut connections = Vec::new();
-        for (index, connector_id) in entry.connecting_roads.iter().enumerate() {
+        for connector_id in &entry.connecting_roads {
             let Some(connector) = self.map.road(connector_id) else {
                 continue;
             };
-            let Some(RoadLinkTarget::Road(incoming)) = &connector.link.predecessor else {
-                continue;
-            };
-            // The connector's single lane, and the approach lane that feeds it.
-            let Some(connector_lane) = connector.lanes.first() else {
-                continue;
-            };
-            let lane_link = self
-                .map
-                .connections_to(connector_lane)
-                .into_iter()
-                .map(|connection| {
-                    Ok(JunctionLaneLink {
+            let mut groups: Vec<((RoadId, LaneEnd), Vec<JunctionLaneLink>)> = Vec::new();
+            for connector_lane in &connector.lanes {
+                for connection in self.map.connections_to(connector_lane) {
+                    let Some(from) = self.map.lanes.get(&connection.from.lane) else {
+                        continue;
+                    };
+                    // A movement from another connector is that connector's business.
+                    if self.map.road(&from.road).is_some_and(Road::is_connector) {
+                        continue;
+                    }
+                    let key = (from.road.clone(), connection.to.end);
+                    let link = JunctionLaneLink {
                         from: self.lane_id(&connection.from.lane)?,
                         to: self.lane_id(connector_lane)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, ExportError>>()?;
-
-            connections.push(Connection {
-                predecessor: None,
-                successor: None,
-                lane_link,
-                connecting_road: Some(self.road_id(connector_id)?.to_owned()),
-                // Every generated connector runs forwards from the approach, so
-                // traffic always enters it at its start.
-                contact_point: Some(ContactPoint::Start),
-                id: index.to_string(),
-                incoming_road: Some(self.road_id(&incoming.road)?.to_owned()),
-                linked_road: None,
-                r#type: None,
-            });
+                    };
+                    match groups.iter_mut().find(|(held, _)| *held == key) {
+                        Some((_, links)) => links.push(link),
+                        None => groups.push((key, vec![link])),
+                    }
+                }
+            }
+            for ((incoming, contact), lane_link) in groups {
+                connections.push(Connection {
+                    predecessor: None,
+                    successor: None,
+                    lane_link,
+                    connecting_road: Some(self.road_id(connector_id)?.to_owned()),
+                    contact_point: Some(match contact {
+                        LaneEnd::Start => ContactPoint::Start,
+                        LaneEnd::End => ContactPoint::End,
+                    }),
+                    id: connections.len().to_string(),
+                    incoming_road: Some(self.road_id(&incoming)?.to_owned()),
+                    linked_road: None,
+                    r#type: None,
+                });
+            }
         }
 
         let Ok(connection) = Vec1::try_from_vec(connections) else {
@@ -1251,7 +1268,9 @@ impl<'a> Exporter<'a> {
                         height: None,
                         id: self.object_id(&object.id)?.to_owned(),
                         length: Some(Length::new::<meter>(STOP_LINE_DEPTH)),
-                        name: Some("stopLine".to_owned()),
+                        // Its own identifier, as every signal and crosswalk carries;
+                        // the subtype is what says it is a stop line.
+                        name: Some(object.id.to_string()),
                         orientation: Some(self.orientation(object)),
                         perp_to_road: None,
                         pitch: None,

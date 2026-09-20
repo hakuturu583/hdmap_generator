@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use roadgen_core::GeometryError;
+use roadgen_core::{GeometryError, QuantityError};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportError {
@@ -45,3 +45,48 @@ impl fmt::Display for ExportError {
 }
 
 impl std::error::Error for ExportError {}
+
+/// Errors raised while reading an OpenDRIVE document back into the IR.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportError {
+    /// The document is not OpenDRIVE the parser accepts.
+    Parse(String),
+    /// A piece of the document's geometry cannot be built as the IR's.
+    Geometry(GeometryError),
+    /// A number in the document is outside what the IR's units allow.
+    Quantity(QuantityError),
+    /// The document says something the IR cannot hold and the reader has no way
+    /// to approximate. Named by the element it was found in.
+    Unsupported(String),
+    /// The document contradicts itself: a link to a road that is not there, a lane
+    /// link to a lane the neighbour does not have.
+    Inconsistent(String),
+    Io(String),
+}
+
+impl From<GeometryError> for ImportError {
+    fn from(value: GeometryError) -> Self {
+        ImportError::Geometry(value)
+    }
+}
+
+impl From<QuantityError> for ImportError {
+    fn from(value: QuantityError) -> Self {
+        ImportError::Quantity(value)
+    }
+}
+
+impl fmt::Display for ImportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImportError::Parse(detail) => write!(f, "the document is not OpenDRIVE: {detail}"),
+            ImportError::Geometry(error) => write!(f, "{error}"),
+            ImportError::Quantity(error) => write!(f, "{error}"),
+            ImportError::Unsupported(what) => write!(f, "the IR cannot hold {what}"),
+            ImportError::Inconsistent(what) => write!(f, "the document contradicts itself: {what}"),
+            ImportError::Io(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ImportError {}

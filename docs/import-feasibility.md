@@ -1,7 +1,9 @@
 # Reading a map back into the IR
 
-*An investigation, September 2026. Nothing here is implemented; this is what would be
-involved, per format, and which ones are worth it.*
+*An investigation, September 2026, of what would be involved per format and which
+ones are worth it. The OpenDRIVE reader it recommends has since been built —
+`roadgen_opendrive::read`, `roadgen.read_opendrive` — along the lines of the last
+section; the rest is as it was.*
 
 The README says it in the second paragraph: roadgen is a generator, not a converter,
 and nothing parses an existing map. That is a design stance and not an accident, so
