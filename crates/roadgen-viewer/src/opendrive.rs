@@ -47,6 +47,7 @@ use opendrive::lane::Lane;
 use opendrive::object::corner::Corner;
 use opendrive::object::orientation::ObjectType;
 use opendrive::road::geometry::geometry_type::GeometryType;
+use opendrive::road::geometry::param_poly_3_p_range::ParamPoly3pRange;
 use opendrive::road::Road;
 use uom::si::angle::radian;
 use uom::si::curvature::radian_per_meter;
@@ -412,6 +413,14 @@ enum PieceKind {
         start: f64,
         end: f64,
     },
+    /// A parametric cubic in the frame of its start — what a junction connector is
+    /// written as. `range` is what its parameter runs to: 1 when normalised, the
+    /// piece's length otherwise.
+    Cubic {
+        u: [f64; 4],
+        v: [f64; 4],
+        range: f64,
+    },
     /// Anything else the standard allows and roadgen does not write. Drawn as the
     /// chord it spans, which is wrong in the middle and right at both ends — better
     /// than a gap, and [`Drawing::notes`] would be the place to say so if roadgen
@@ -437,6 +446,14 @@ impl ReferenceLine {
                     GeometryType::Spiral(spiral) => PieceKind::Spiral {
                         start: spiral.curvature_start.get::<radian_per_meter>(),
                         end: spiral.curvature_end.get::<radian_per_meter>(),
+                    },
+                    GeometryType::ParamPoly3(poly) => PieceKind::Cubic {
+                        u: [poly.a_u, poly.b_u, poly.c_u, poly.d_u],
+                        v: [poly.a_v, poly.b_v, poly.c_v, poly.d_v],
+                        range: match poly.p_range {
+                            ParamPoly3pRange::Normalized => 1.0,
+                            ParamPoly3pRange::ArcLength => geometry.length.get::<meter>(),
+                        },
                     },
                     _ => PieceKind::Chord,
                 },
@@ -535,6 +552,43 @@ impl Piece {
                     y += step * heading.sin();
                 }
                 (x, y, self.heading + start * ds + rate * ds * ds / 2.0)
+            }
+            // A cubic's parameter is not arc length, so the parameter at which the
+            // curve is `ds` along is solved for: the arc length is integrated and
+            // Newton's method run on it, from the guess that the two are
+            // proportional — which for a road's gentle cubic they nearly are.
+            PieceKind::Cubic { u, v, range } => {
+                let at = |c: &[f64; 4], p: f64| c[0] + c[1] * p + c[2] * p * p + c[3] * p * p * p;
+                let slope = |c: &[f64; 4], p: f64| c[1] + 2.0 * c[2] * p + 3.0 * c[3] * p * p;
+                let speed = |p: f64| slope(&u, p).hypot(slope(&v, p));
+                let arc_length = |to: f64| {
+                    // Composite midpoint rule, fine enough for a picture.
+                    let steps = 64;
+                    let step = to / steps as f64;
+                    (0..steps)
+                        .map(|index| step * speed(step * (index as f64 + 0.5)))
+                        .sum::<f64>()
+                };
+                let mut p = if self.length > 0.0 {
+                    range * ds / self.length
+                } else {
+                    0.0
+                };
+                for _ in 0..20 {
+                    let residual = arc_length(p) - ds;
+                    let rate = speed(p);
+                    if rate <= 0.0 || residual.abs() < 1e-6 {
+                        break;
+                    }
+                    p = (p - residual / rate).clamp(0.0, range);
+                }
+                let (du, dv) = (at(&u, p), at(&v, p));
+                let (sin, cos) = self.heading.sin_cos();
+                (
+                    self.x + du * cos - dv * sin,
+                    self.y + du * sin + dv * cos,
+                    self.heading + slope(&v, p).atan2(slope(&u, p)),
+                )
             }
         }
     }
@@ -760,6 +814,52 @@ mod tests {
         let (x, y, _) = piece.at(10.0);
         assert!((x - 10.0).abs() < 1e-9);
         assert!(y.abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_cubic_is_walked_by_arc_length_not_by_its_parameter() {
+        // u = 20p², v = 0: a straight line whose parameter is not proportional to
+        // distance along it. Asked for the point 5 m along, the piece has to solve
+        // for p = 0.5 rather than take p = 0.25 and land at 1.25 m.
+        let piece = Piece {
+            start: 0.0,
+            length: 20.0,
+            x: 0.0,
+            y: 0.0,
+            heading: 0.0,
+            kind: PieceKind::Cubic {
+                u: [0.0, 0.0, 20.0, 0.0],
+                v: [0.0; 4],
+                range: 1.0,
+            },
+        };
+        let (x, y, heading) = piece.at(5.0);
+        assert!((x - 5.0).abs() < 1e-4, "{x}");
+        assert!(y.abs() < 1e-9);
+        assert!(heading.abs() < 1e-9);
+
+        // A quarter turn, in the frame of a piece heading north: the cubic through
+        // (0,0) and (10,10) leaving along u and arriving along v, rotated into place.
+        // Its end is where the control polygon says, whatever the parameterisation.
+        let piece = Piece {
+            start: 0.0,
+            length: 15.489,
+            x: 3.0,
+            y: 4.0,
+            heading: PI / 2.0,
+            kind: PieceKind::Cubic {
+                // Control points (0,0) (5,0) (10,5) (10,10): b = 3P₁, c = 3P₂ − 6P₁,
+                // d = P₃ − 3P₂ + 3P₁.
+                u: [0.0, 15.0, 0.0, -5.0],
+                v: [0.0, 0.0, 15.0, -5.0],
+                range: 1.0,
+            },
+        };
+        let (x, y, heading) = piece.at(15.489);
+        // (u, v) = (10, 10) at p = 1, turned a quarter left: (-10, +10) from the start.
+        assert!((x - (3.0 - 10.0)).abs() < 1e-3, "{x}");
+        assert!((y - (4.0 + 10.0)).abs() < 1e-3, "{y}");
+        assert!((heading - PI).abs() < 1e-6, "{heading}");
     }
 
     #[test]

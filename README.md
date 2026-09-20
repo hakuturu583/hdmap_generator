@@ -379,6 +379,12 @@ m.connect(trunk, slip, junction=junction)
 
 That one model lowers cleanly both ways: the connectors become OpenDRIVE connecting
 roads inside a `<junction>`, and lanelets that a Lanelet2 routing graph walks through.
+The connecting road's reference line is the cubic itself, a `<paramPoly3>`, not a
+chain of chords through its vertices: a chain would put a heading step at every
+vertex and end some degrees off the tangent it shares with the arm, and OpenDRIVE lays
+lane edges perpendicular to the heading, so the connector's cross-section at the
+mouth would be turned against the arm's. The vertices Lanelet2 gets are on the cubic,
+at its own arc length, so the two files put every lane edge in the same place.
 
 `connect` joins the end of the first road to the start of the second, which is the
 shape of a road carrying on into the next one. A crossroads is the other shape: its

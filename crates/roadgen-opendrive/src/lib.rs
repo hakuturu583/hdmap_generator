@@ -93,6 +93,8 @@ use opendrive::road::element_type::ElementType;
 use opendrive::road::geometry::arc::Arc as OdArc;
 use opendrive::road::geometry::geometry_type::GeometryType;
 use opendrive::road::geometry::line::Line as OdLine;
+use opendrive::road::geometry::param_poly_3::ParamPoly3;
+use opendrive::road::geometry::param_poly_3_p_range::ParamPoly3pRange;
 use opendrive::road::geometry::plan_view::PlanView;
 use opendrive::road::geometry::spiral::Spiral as OdSpiral;
 use opendrive::road::geometry::Geometry;
@@ -546,11 +548,20 @@ impl<'a> Exporter<'a> {
 
     /// One `<geometry>` entry per piece of the reference line, starting at `offset`.
     ///
-    /// A line, an arc and a clothoid each survive as themselves — OpenDRIVE has an
-    /// element for all three, so nothing is approximated. A composite recurses, one
-    /// entry per piece. Anything else is written as the chain of straight segments
-    /// the IR would sample it into, so that the OpenDRIVE file and the Lanelet2 file
-    /// describe the same vertices.
+    /// A line, an arc, a clothoid and a cubic each survive as themselves — OpenDRIVE
+    /// has an element for all four, so nothing is approximated. A composite recurses,
+    /// one entry per piece. A polyline is written as the chain of straight segments
+    /// it is, so that the OpenDRIVE file and the Lanelet2 file describe the same
+    /// vertices.
+    ///
+    /// A cubic — every junction connector is one — is a `<paramPoly3>` rather than a
+    /// chain of chords through its vertices. The chords would carry a heading step at
+    /// every vertex and, at the two ends, a heading some degrees off the tangent the
+    /// connector shares with the lane it joins; OpenDRIVE lays the lane edges
+    /// perpendicular to the heading, so the connector's cross-section at the
+    /// junction mouth would be rotated against the arm's by a lane-edge's fraction of
+    /// a metre. The cubic's heading is continuous and its end tangents are the arm's,
+    /// so the edges meet.
     fn geometry_entries(
         &self,
         curve: &Curve3,
@@ -596,6 +607,38 @@ impl<'a> Exporter<'a> {
                     curvature_end: Curvature::new::<radian_per_meter>(clothoid.curvature_end()),
                 }),
             )],
+            Curve3::Bezier(bezier) => {
+                // The cubic in the frame of its start: u along the start tangent, v
+                // to its left. B(p) = Σ Bernstein(p)·Pᵢ with P₀ at the origin expands
+                // to u(p) = 3u₁p + (3u₂ − 6u₁)p² + (u₃ − 3u₂ + 3u₁)p³, and the same
+                // in v; p runs 0..1 over the curve's own arc length, which is what
+                // the vertices' stations are measured in.
+                let [p0, p1, p2, p3] = *bezier.control();
+                let heading = first.tangent.heading();
+                let (sin, cos) = heading.sin_cos();
+                let local = |point: Point3| {
+                    let (dx, dy) = (point.x - p0.x, point.y - p0.y);
+                    (dx * cos + dy * sin, -dx * sin + dy * cos)
+                };
+                let ((u1, v1), (u2, v2), (u3, v3)) = (local(p1), local(p2), local(p3));
+                vec![entry(
+                    offset,
+                    p0,
+                    heading,
+                    bezier.horizontal_length(),
+                    GeometryType::ParamPoly3(ParamPoly3 {
+                        a_u: 0.0,
+                        b_u: 3.0 * u1,
+                        c_u: 3.0 * u2 - 6.0 * u1,
+                        d_u: u3 - 3.0 * u2 + 3.0 * u1,
+                        a_v: 0.0,
+                        b_v: 3.0 * v1,
+                        c_v: 3.0 * v2 - 6.0 * v1,
+                        d_v: v3 - 3.0 * v2 + 3.0 * v1,
+                        p_range: ParamPoly3pRange::Normalized,
+                    }),
+                )]
+            }
             Curve3::Composite(segments) => {
                 let mut entries = Vec::with_capacity(segments.len());
                 let mut station = offset;
@@ -606,7 +649,7 @@ impl<'a> Exporter<'a> {
                 }
                 entries
             }
-            _ => samples
+            Curve3::Polyline(_) => samples
                 .windows(2)
                 .map(|pair| {
                     let (here, next) = (pair[0], pair[1]);

@@ -333,17 +333,18 @@ pub struct Bezier3 {
     control: [Point3; 4],
     /// How many straight segments this curve is realised as.
     ///
-    /// A cubic is parameterised by `t` rather than by arc length, so a station along
-    /// it can only be had by walking it — and a walk taken in smaller steps measures
-    /// a longer curve. The resolution is therefore part of the curve, fixed when it
-    /// is built, rather than something each caller brings: [`Curve3::sample_at`] says
+    /// A cubic is parameterised by `t` rather than by arc length, so its vertices
+    /// are placed at equal steps of `t` and the station of each is the arc length of
+    /// the curve up to it. The resolution is part of the curve, fixed when it is
+    /// built, rather than something each caller brings: [`Curve3::sample_at`] says
     /// the same thing from the other side, that a Bézier "is already an approximation
     /// of itself at the configured resolution".
     ///
-    /// Were the resolution the caller's, the same curve would report one length to a
-    /// road generated at two metres and another to one generated at one; a lane cut
-    /// to the first would stop short of the last vertex the second produced, and a
-    /// junction connector would end a sampling step away from the lane it joins.
+    /// Were the resolution the caller's, the same curve would have one set of
+    /// vertices for a road generated at two metres and another for one generated at
+    /// one; a lane cut to the first would stop short of the last vertex the second
+    /// produced, and a junction connector would end a sampling step away from the
+    /// lane it joins.
     segments: usize,
 }
 
@@ -361,10 +362,23 @@ impl Bezier3 {
             .sum();
         // The control polygon is longer than the curve, so stepping it out at the
         // configured length errs towards more vertices rather than fewer. Eight is
-        // the floor: below that a corner stops looking like one.
+        // the floor: below that a corner stops looking like one. And a curve that
+        // turns hard in a short distance — a tight turn through a junction — gets a
+        // vertex at least every five degrees of turn, so that the chords between the
+        // vertices (which is what every polyline format receives) stay within a few
+        // centimetres of the curve (which is what OpenDRIVE receives).
+        let turn = {
+            let leaving = (control[1] - control[0]).normalize();
+            let arriving = (control[3] - control[2]).normalize();
+            match (leaving, arriving) {
+                (Ok(a), Ok(b)) => a.dot(b).clamp(-1.0, 1.0).acos(),
+                _ => 0.0,
+            }
+        };
+        let per_five_degrees = (turn / (5.0_f64).to_radians()).ceil() as usize;
         Ok(Bezier3 {
             control,
-            segments: config.segments_for(polygon).max(8),
+            segments: config.segments_for(polygon).max(8).max(per_five_degrees),
         })
     }
 
@@ -382,17 +396,59 @@ impl Bezier3 {
         }
     }
 
-    /// The length of the curve as the IR realises it: its vertices, end to end, in
-    /// plan.
+    /// The horizontal arc length of the curve.
+    ///
+    /// The arc length of the curve itself, not of the chords between its vertices —
+    /// which is what OpenDRIVE's `<paramPoly3>` measures its stations in, so a vertex
+    /// written at this station is the point the consumer evaluates there. It is the
+    /// sum of [`Bezier3::segment_lengths`], so the last vertex's station is exactly
+    /// this number.
     pub fn horizontal_length(&self) -> f64 {
-        let mut length = 0.0;
-        let mut previous = self.at(0.0);
-        for step in 1..=self.segments {
-            let point = self.at(step as f64 / self.segments as f64);
-            length += previous.horizontal_distance_to(point);
-            previous = point;
+        self.segment_lengths().iter().sum()
+    }
+
+    /// The horizontal arc length of each of the [`Bezier3::segments`] pieces the
+    /// curve is cut into, from `t = 0` to `t = 1`.
+    fn segment_lengths(&self) -> Vec<f64> {
+        (0..self.segments)
+            .map(|step| {
+                let from = step as f64 / self.segments as f64;
+                let to = (step + 1) as f64 / self.segments as f64;
+                self.horizontal_arc_length(from, to)
+            })
+            .collect()
+    }
+
+    /// The horizontal arc length between parameters `from` and `to`.
+    ///
+    /// ∫ |dB/dt|_horizontal dt, by eight-point Gauss–Legendre quadrature: the
+    /// integrand of a cubic's speed is smooth, so eight points on an interval an
+    /// eighth of the curve long are exact to well below a micrometre.
+    fn horizontal_arc_length(&self, from: f64, to: f64) -> f64 {
+        // Nodes and weights for [-1, 1].
+        const NODES: [f64; 4] = [
+            0.183_434_642_495_649_8,
+            0.525_532_409_916_329,
+            0.796_666_477_413_626_7,
+            0.960_289_856_497_536_3,
+        ];
+        const WEIGHTS: [f64; 4] = [
+            0.362_683_783_378_362,
+            0.313_706_645_877_887_3,
+            0.222_381_034_453_374_5,
+            0.101_228_536_290_376_3,
+        ];
+        let half = (to - from) / 2.0;
+        let middle = (to + from) / 2.0;
+        let speed = |t: f64| {
+            let d = self.derivative(t);
+            (d.x * d.x + d.y * d.y).sqrt()
+        };
+        let mut total = 0.0;
+        for (node, weight) in NODES.iter().zip(WEIGHTS) {
+            total += weight * (speed(middle - half * node) + speed(middle + half * node));
         }
-        length
+        total * half
     }
 
     /// The cubic through `start` and `end` leaving along `start_tangent` and
@@ -585,19 +641,24 @@ impl Curve3 {
                 Ok(samples)
             }
             Curve3::Bezier(bezier) => {
-                // The curve's own resolution, not the caller's: see [`Bezier3`].
+                // The curve's own resolution, not the caller's: see [`Bezier3`]. The
+                // stations are arc lengths along the curve, so that the OpenDRIVE
+                // export, which writes the curve itself, puts each vertex where the
+                // IR has it.
                 let steps = bezier.segments();
                 let mut samples = Vec::with_capacity(steps + 1);
                 let mut station = 0.0;
-                let mut previous = bezier.at(0.0);
-                for i in 0..=steps {
-                    let t = i as f64 / steps as f64;
-                    let point = bezier.at(t);
-                    station += previous.horizontal_distance_to(point);
-                    previous = point;
+                samples.push(Sample {
+                    station,
+                    point: bezier.at(0.0),
+                    tangent: bezier.tangent(0.0)?,
+                });
+                for (i, length) in bezier.segment_lengths().into_iter().enumerate() {
+                    let t = (i + 1) as f64 / steps as f64;
+                    station += length;
                     samples.push(Sample {
                         station,
-                        point,
+                        point: bezier.at(t),
                         tangent: bezier.tangent(t)?,
                     });
                 }
@@ -1133,11 +1194,25 @@ mod tests {
                 (sampled - stated).abs() < 1e-12,
                 "asked at {step} m it samples to {sampled} but says it is {stated} long"
             );
-            // And the length is the vertices end to end, which is what the OpenDRIVE
-            // export writes them out as.
+            // The length is the curve's own arc length, which the chords between
+            // the vertices fall a little short of — and the finer the vertices,
+            // the less short.
             let walked = bezier.to_polyline(config).unwrap().horizontal_length();
-            assert!((walked - stated).abs() < 1e-9, "{walked} vs {stated}");
+            assert!(walked <= stated + 1e-9, "{walked} vs {stated}");
+            assert!((walked - stated).abs() < 0.02, "{walked} vs {stated}");
         }
+        // Against a brute-force walk of the curve, the quadrature is exact.
+        let Curve3::Bezier(inner) = &bezier else {
+            unreachable!()
+        };
+        let mut brute = 0.0;
+        let mut previous = inner.control()[0];
+        for step in 1..=200_000 {
+            let point = inner.at(step as f64 / 200_000.0);
+            brute += previous.horizontal_distance_to(point);
+            previous = point;
+        }
+        assert!((brute - stated).abs() < 1e-7, "{brute} vs {stated}");
     }
 
     #[test]
