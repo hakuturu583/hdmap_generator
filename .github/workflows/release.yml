@@ -289,10 +289,16 @@ jobs:
   # the wheel for the stable ABI, so one wheel serves 3.9 through 3.13. The feature
   # is passed here rather than set in pyproject.toml because the demo page's Pyodide
   # wheel is built from the same manifest and Pyodide does not load abi3 wheels.
+  #
+  # Alongside `verify` rather than after it: the wheels owe the tests nothing until
+  # `publish`, which waits for both, and building them in parallel takes the longer
+  # of the two off the release's clock. The compile itself is cached through sccache
+  # in the Actions cache, so a release whose dependencies did not change rebuilds
+  # only roadgen's own crates.
   wheels:
     name: wheel (${{ matrix.target }})
-    needs: [resolve, verify]
-    if: ${{ !cancelled() && needs.verify.result == 'success' }}
+    needs: [resolve]
+    if: ${{ !cancelled() && needs.resolve.outputs.proceed == 'true' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -306,6 +312,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --locked --features pyo3/abi3-py39
           manylinux: auto
+          sccache: "true"
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.target }}
@@ -316,8 +323,8 @@ jobs:
   # it needs a Rust toolchain, which maturin bootstraps.
   sdist:
     name: sdist
-    needs: [resolve, verify]
-    if: ${{ !cancelled() && needs.verify.result == 'success' }}
+    needs: [resolve]
+    if: ${{ !cancelled() && needs.resolve.outputs.proceed == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -332,10 +339,12 @@ jobs:
           name: sdist
           path: dist
 
+  # Nothing is uploaded until the tests have passed on the same commit the wheels
+  # were built from.
   publish:
     name: publish to PyPI
-    needs: [resolve, wheels, sdist]
-    if: ${{ !cancelled() && needs.resolve.outputs.publish == 'true' && needs.wheels.result == 'success' && needs.sdist.result == 'success' }}
+    needs: [resolve, verify, wheels, sdist]
+    if: ${{ !cancelled() && needs.resolve.outputs.publish == 'true' && needs.verify.result == 'success' && needs.wheels.result == 'success' && needs.sdist.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
