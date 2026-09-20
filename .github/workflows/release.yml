@@ -233,10 +233,14 @@ jobs:
   # The same checks CI runs, on the commit that is about to be published: SUMO is
   # installed so the SUMO export is checked by SUMO itself, and pandas and pyarrow so
   # the ClipGT export is read the way a Cosmos reader reads it.
+  # Every job from here on says `!cancelled()`: a job's `if` otherwise carries an
+  # implicit `success()`, which is false whenever any job it transitively depends on
+  # was skipped -- and `release` is skipped on the tag and dispatch paths. Without
+  # it those two paths resolve what to build and then build nothing.
   verify:
     name: test the tagged commit
     needs: [resolve]
-    if: needs.resolve.outputs.proceed == 'true'
+    if: ${{ !cancelled() && needs.resolve.outputs.proceed == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -288,6 +292,7 @@ jobs:
   wheels:
     name: wheel (${{ matrix.target }})
     needs: [resolve, verify]
+    if: ${{ !cancelled() && needs.verify.result == 'success' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -312,6 +317,7 @@ jobs:
   sdist:
     name: sdist
     needs: [resolve, verify]
+    if: ${{ !cancelled() && needs.verify.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -329,7 +335,7 @@ jobs:
   publish:
     name: publish to PyPI
     needs: [resolve, wheels, sdist]
-    if: needs.resolve.outputs.publish == 'true'
+    if: ${{ !cancelled() && needs.resolve.outputs.publish == 'true' && needs.wheels.result == 'success' && needs.sdist.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
