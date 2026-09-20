@@ -455,7 +455,9 @@ def test_a_lane_can_taper_without_becoming_two_lanes():
             ),
         ],
     )
-    assert m.format_warnings() == []
+    # Lanelet2 has no lanelet for a shoulder, and says so; nothing else is lost.
+    assert [w for w in m.format_warnings() if "1 shoulder" not in w] == []
+    assert len(m.format_warnings()) == 1
 
     # Still two lanes, and one lane section: a taper is a width, not a new section.
     assert m.lane_ids() == ["lane/layby/0", "lane/layby/1"]

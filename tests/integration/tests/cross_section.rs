@@ -271,7 +271,23 @@ fn a_connector_tapers_between_lanes_of_different_widths() {
 fn the_new_scenarios_export_cleanly_and_deterministically() {
     for map in [scenarios::lane_drop(), scenarios::widening_road()] {
         assert!(roadgen_opendrive::check(&map).is_empty());
-        assert!(roadgen_lanelet2::check(&map).is_empty());
+        // The widening road's shoulder is the one lane Lanelet2 has no word for,
+        // and the export says so rather than dropping it quietly.
+        let problems = roadgen_lanelet2::check(&map);
+        let shoulders = map
+            .lanes
+            .iter()
+            .filter(|lane| lane.lane_type == LaneType::Shoulder)
+            .count();
+        if shoulders == 0 {
+            assert!(problems.is_empty(), "{problems:?}");
+        } else {
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(
+                problems[0].contains(&format!("{shoulders} shoulder")),
+                "{problems:?}"
+            );
+        }
         reparse_opendrive(&map);
         reload_lanelet2(&map);
     }

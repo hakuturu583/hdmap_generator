@@ -23,7 +23,7 @@
 //! routing graph then finds the same topology the IR holds. Lateral adjacency works
 //! the same way, through the shared boundary linestring between neighbouring lanes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -121,6 +121,27 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             }
         }
         Ok(LocalCoordinates::AsIs) => {}
+    }
+
+    // A shoulder, a border or a parking strip becomes no lanelet at all — see
+    // `tags::lanelet_subtype` — which is a whole lane gone rather than a detail of
+    // one, so it is said here the way the other exporters say what they drop.
+    let mut dropped: BTreeMap<&str, usize> = BTreeMap::new();
+    for lane in map.lanes.iter() {
+        if tags::lanelet_subtype(lane.lane_type).is_none() {
+            *dropped.entry(lane.lane_type.as_str()).or_default() += 1;
+        }
+    }
+    if !dropped.is_empty() {
+        let counts: Vec<String> = dropped
+            .iter()
+            .map(|(lane_type, count)| format!("{count} {lane_type}"))
+            .collect();
+        problems.push(format!(
+            "a lanelet is a lane traffic or pedestrians move along, so the map's {} \
+             lanes are not written; the road surface they occupy is not in the map",
+            counts.join(", ")
+        ));
     }
 
     for connection in map.connections.iter() {
