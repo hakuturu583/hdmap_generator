@@ -102,6 +102,14 @@ pub enum BuildError {
         angle_degrees: f64,
         detail: String,
     },
+    /// A polyline road bends at one of its vertices more sharply than the corner
+    /// can be rounded.
+    VertexTooSharp {
+        road: RoadId,
+        vertex: usize,
+        angle_degrees: f64,
+        detail: String,
+    },
 }
 
 impl From<GeometryError> for BuildError {
@@ -155,6 +163,17 @@ impl fmt::Display for BuildError {
                 "roads {from} and {to} meet at {angle_degrees:.1}° and the corner cannot be \
                  rounded: {detail}. Join them with an arc or spiral alignment, or through \
                  a junction"
+            ),
+            BuildError::VertexTooSharp {
+                road,
+                vertex,
+                angle_degrees,
+                detail,
+            } => write!(
+                f,
+                "road {road} bends by {angle_degrees:.1}° at vertex {vertex} and the corner \
+                 cannot be rounded: {detail}. Give the bend an arc or spiral alignment, or \
+                 more room"
             ),
         }
     }

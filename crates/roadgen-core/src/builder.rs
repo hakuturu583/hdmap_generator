@@ -1053,6 +1053,7 @@ impl Generator {
     }
 
     fn run(mut self) -> Result<UnvalidatedMap, BuildError> {
+        self.round_vertices()?;
         self.round_corners()?;
         self.build_reference_geometry()?;
         self.mitre_joints()?;
@@ -1270,6 +1271,240 @@ impl Generator {
             }
         }
         Ok(())
+    }
+
+    /// Rounds the interior vertices of every polyline reference line.
+    ///
+    /// A road given as a polyline bends at each vertex, and a bend is the same kink
+    /// a joint between two roads is (see [`Generator::round_corners`]): Lanelet2 can
+    /// be cut on the slant, OpenDRIVE cannot, and a file every consumer takes at face
+    /// value would have a wedge of nothing on the outside of the turn and an overlap
+    /// on the inside. So each vertex gets what a joint gets — an arc of
+    /// [`CORNER_INNER_RADIUS`] past the inside of the cross-section, tangent to both
+    /// chords, the chords cut back to meet it — and the polyline becomes a chain of
+    /// lines and arcs that every format draws the same way. A vertex the road has no
+    /// room to round shrinks its arc to fit, down to a corner as tight as the road is
+    /// wide, and past that the build fails and says which vertex.
+    fn round_vertices(&mut self) -> Result<(), BuildError> {
+        let roads: Vec<RoadId> = self
+            .builder
+            .roads
+            .iter()
+            .map(|draft| draft.id.clone())
+            .collect();
+        for road in roads {
+            let Curve3::Polyline(polyline) = self.builder.draft(&road)?.spec.reference_line.clone()
+            else {
+                continue;
+            };
+            let points = polyline.points().to_vec();
+            if points.len() < 3 {
+                continue;
+            }
+            let Some((reference_line, moved)) = self.round_polyline(&road, &points)? else {
+                continue;
+            };
+            let draft = self.builder.draft_mut(&road)?;
+            draft.spec.reference_line = reference_line;
+            draft.spec.map_stations(&moved);
+            for (_, object) in &mut self.builder.objects {
+                if let ObjectSpec::AcrossRoad {
+                    road: at, station, ..
+                } = object
+                {
+                    if at == &road {
+                        *station = moved(*station);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The polyline `points` with an arc at each bend, and the map from the
+    /// polyline's stations to the new curve's — or `None` when nothing bends.
+    fn round_polyline(
+        &self,
+        road: &RoadId,
+        points: &[Point3],
+    ) -> Result<Option<(Curve3, impl Fn(f64) -> f64)>, BuildError> {
+        // Each chord's direction and length in plan, and each vertex's station.
+        let mut directions = Vec::with_capacity(points.len() - 1);
+        let mut lengths = Vec::with_capacity(points.len() - 1);
+        let mut stations = vec![0.0];
+        for pair in points.windows(2) {
+            directions.push(horizontal(pair[1] - pair[0])?);
+            let length = pair[0].horizontal_distance_to(pair[1]);
+            lengths.push(length);
+            stations.push(stations.last().unwrap() + length);
+        }
+
+        // What each interior vertex turns by, and the arc it asks for.
+        struct Bend {
+            angle: f64,
+            /// +1 for a left turn, −1 for a right.
+            turn: f64,
+            /// How far the cross-section reaches on the inside of the turn.
+            reach: f64,
+            radius: f64,
+        }
+        let mut bends: Vec<Option<Bend>> = Vec::with_capacity(points.len());
+        bends.push(None);
+        for vertex in 1..points.len() - 1 {
+            let (into, out) = (directions[vertex - 1], directions[vertex]);
+            let angle = into.dot(out).clamp(-1.0, 1.0).acos();
+            if angle < CORNER_TOLERANCE {
+                bends.push(None);
+                continue;
+            }
+            let too_sharp = |detail: String| BuildError::VertexTooSharp {
+                road: road.clone(),
+                vertex,
+                angle_degrees: angle.to_degrees(),
+                detail,
+            };
+            if angle > CORNER_MAX_ANGLE {
+                return Err(too_sharp("the road all but doubles back on itself".into()));
+            }
+            let turn = into.get().cross(out.get()).z.signum();
+            let inside = if turn > 0.0 {
+                LateralSide::Left
+            } else {
+                LateralSide::Right
+            };
+            let reach = self.reach_at(road, stations[vertex], inside)?;
+            bends.push(Some(Bend {
+                angle,
+                turn,
+                reach,
+                radius: reach + CORNER_INNER_RADIUS,
+            }));
+        }
+        bends.push(None);
+        if bends.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+
+        // Each chord is shared by the bends at its two ends, and each bend takes
+        // `radius · tan(angle / 2)` of it. Where the two together want more than the
+        // chord has, both shrink in proportion until they fit exactly — but never
+        // into a corner tighter than the road is wide.
+        let setback = |bend: &Bend| bend.radius * (bend.angle / 2.0).tan();
+        for (chord, &length) in lengths.iter().enumerate() {
+            let wanted: f64 = [chord, chord + 1]
+                .into_iter()
+                .filter_map(|vertex| bends[vertex].as_ref().map(setback))
+                .sum();
+            if wanted <= length {
+                continue;
+            }
+            let scale = length / wanted;
+            for vertex in [chord, chord + 1] {
+                let Some(bend) = bends[vertex].as_mut() else {
+                    continue;
+                };
+                let asked = bend.radius;
+                bend.radius *= scale;
+                if bend.radius < bend.reach + 1.0 {
+                    return Err(BuildError::VertexTooSharp {
+                        road: road.clone(),
+                        vertex,
+                        angle_degrees: bend.angle.to_degrees(),
+                        detail: format!(
+                            "rounding it needs {:.1} m of straight road on each side and \
+                             the chords either side leave {:.1} m",
+                            asked * (bend.angle / 2.0).tan(),
+                            bend.radius * (bend.angle / 2.0).tan()
+                        ),
+                    });
+                }
+            }
+        }
+
+        // The chain: each chord less what its bends take, then the bend's arc. The
+        // station map is built alongside, as knots the old stations are interpolated
+        // between: a chord keeps its length, a bend's two setbacks become its arc.
+        let mut pieces: Vec<Curve3> = Vec::new();
+        let mut knots: Vec<(f64, f64)> = vec![(0.0, 0.0)];
+        let mut cursor = points[0];
+        let mut new_station = 0.0;
+        for chord in 0..lengths.len() {
+            let ahead = bends[chord + 1].as_ref().map(setback).unwrap_or(0.0);
+            let cut =
+                points[chord].lerp(points[chord + 1], (lengths[chord] - ahead) / lengths[chord]);
+            let straight = cursor.horizontal_distance_to(cut);
+            if straight > Polyline3::MIN_SEGMENT {
+                pieces.push(Curve3::line(cursor, cut)?);
+            }
+            new_station += straight;
+            let Some(bend) = bends[chord + 1].as_ref() else {
+                knots.push((stations[chord + 1], new_station));
+                cursor = cut;
+                continue;
+            };
+            knots.push((stations[chord + 1] - ahead, new_station));
+            let arc_length = bend.radius * bend.angle;
+            let finish = points[chord + 1].lerp(points[chord + 2], ahead / lengths[chord + 1]);
+            let arc = Curve3::Arc(Arc3::new(
+                cut,
+                directions[chord].heading(),
+                bend.turn / bend.radius,
+                arc_length,
+                finish.z,
+            )?);
+            let miss = arc.end_point().horizontal_distance_to(finish);
+            if miss > Curve3::JOIN_TOLERANCE {
+                return Err(BuildError::VertexTooSharp {
+                    road: road.clone(),
+                    vertex: chord + 1,
+                    angle_degrees: bend.angle.to_degrees(),
+                    detail: format!("the arc misses the next chord by {miss:.3} m"),
+                });
+            }
+            pieces.push(arc);
+            new_station += arc_length;
+            knots.push((stations[chord + 1] + ahead, new_station));
+            cursor = finish;
+        }
+        let curve = Curve3::composite(pieces)?;
+        let moved = move |station: f64| -> f64 {
+            let index = knots
+                .iter()
+                .rposition(|(old, _)| *old <= station)
+                .unwrap_or(0)
+                .min(knots.len() - 2);
+            let ((from_old, from_new), (to_old, to_new)) = (knots[index], knots[index + 1]);
+            let fraction = if to_old > from_old {
+                ((station - from_old) / (to_old - from_old)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (from_new + fraction * (to_new - from_new)).clamp(0.0, new_station)
+        };
+        Ok(Some((curve, moved)))
+    }
+
+    /// How far road `road`'s cross-section at `station` reaches to `side` of its
+    /// reference line.
+    fn reach_at(&self, road: &RoadId, station: f64, side: LateralSide) -> Result<f64, BuildError> {
+        let sections = &self.builder.draft(road)?.spec.cross_sections;
+        let section = sections
+            .iter()
+            .rposition(|section| section.station <= station + 1e-9)
+            .unwrap_or(0);
+        let mut extent = 0.0;
+        for index in self.builder.lanes_of_section(road, section)? {
+            let lane = LaneRef::new(road.clone(), index);
+            if self.builder.lane_side(&lane)? == side {
+                extent += self
+                    .builder
+                    .lane_spec(&lane)?
+                    .width
+                    .evaluate(station)
+                    .metres();
+            }
+        }
+        Ok(extent)
     }
 
     /// How far road `road`'s cross-section at `end` reaches to `side` of the flow

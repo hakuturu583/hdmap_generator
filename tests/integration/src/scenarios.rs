@@ -330,6 +330,30 @@ pub fn graded_road() -> ValidatedMap {
     finish(builder)
 }
 
+/// A road given as a polyline that actually bends — 37° left, 37° right, 45°
+/// right — so its vertices are corners. Each is rounded into an arc the way a joint
+/// between two roads is, which is what lets every format agree on it.
+pub fn bent_polyline() -> ValidatedMap {
+    let mut builder = MapBuilder::new(metadata("bent"));
+    builder
+        .add_road(
+            RoadSpec::new(
+                Curve3::polyline([
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(60.0, 0.0, 1.0),
+                    Point3::new(100.0, 30.0, 2.0),
+                    Point3::new(160.0, 30.0, 3.0),
+                    Point3::new(200.0, -10.0, 4.0),
+                ])
+                .unwrap(),
+                two_way(),
+            )
+            .with_name("wiggle"),
+        )
+        .unwrap();
+    finish(builder)
+}
+
 /// A proper alignment: straight, transition, bend, transition, straight.
 ///
 /// The transitions are clothoids, which is how a road actually enters a bend — and

@@ -346,6 +346,13 @@ The result is the same in every format, because it is in the IR: `roadgen-viewer
 OpenDRIVE panel draws a line, an arc and a line, Lanelet2 gets the arc's vertices, and
 the CARLA surface goes round the corner too.
 
+A road given as a polyline — `add_road(points=[...])` — bends at each of its vertices,
+and a bend inside one road is the same kink as a joint between two. So each interior
+vertex is rounded the same way, with the same radius rule, the chords either side cut
+back to meet the arc; a vertex the road has no room to round shrinks its arc to fit,
+and past a corner as tight as the road is wide the build fails and names the vertex.
+What comes out is a chain of lines and arcs, and every format gets that chain.
+
 ## A cross-section that changes
 
 Two different things, with two different answers:
