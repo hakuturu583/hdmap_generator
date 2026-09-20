@@ -35,7 +35,7 @@ use ll2_core::map::{LaneletMap, Primitive};
 use ll2_core::point::Point;
 use ll2_core::regelem::{roles, RegElemKind, RegulatoryElement, RuleParameter, RuleParameterMap};
 use ll2_io::osm::WriteParams;
-use ll2_projection::{GpsPoint, LocalCartesian, Origin, Projector, Utm};
+use ll2_projection::{GpsPoint, LocalCartesian, Origin, ProjectionError, Projector, Utm};
 
 use roadgen_core::geometry::{Curve3, Point3, SamplingConfig};
 use roadgen_core::id::{LaneId, ObjectId, RoadId};
@@ -163,6 +163,10 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
 /// An MGRS map is written about its origin like any other, so its latitudes and
 /// longitudes come from the same local projection; what MGRS changes is the metric
 /// position reported alongside them, which [`local_coordinates`] works out per node.
+///
+/// Heights are the map's own throughout: a node's `ele` is its `z`, as it is in every
+/// other export, and a map loaded back through this projector gets that `z` again —
+/// which is what Autoware's MGRS, UTM and local projectors do with `ele`.
 pub fn projector_for(map: &ValidatedMap) -> Result<Box<dyn Projector>, ExportError> {
     let origin = Origin::new(GpsPoint::new(
         map.metadata.origin.latitude(),
@@ -170,12 +174,41 @@ pub fn projector_for(map: &ValidatedMap) -> Result<Box<dyn Projector>, ExportErr
         map.metadata.origin.altitude(),
     ));
     Ok(match map.metadata.projection {
-        Projection::LocalCartesian | Projection::Mgrs => Box::new(LocalCartesian::new(origin)),
-        Projection::Utm => Box::new(
+        Projection::LocalCartesian | Projection::Mgrs => {
+            Box::new(OwnHeights(LocalCartesian::new(origin)))
+        }
+        Projection::Utm => Box::new(OwnHeights(
             Utm::new(origin, true, false)
                 .map_err(|error| ExportError::Projection(error.message().to_owned()))?,
-        ),
+        )),
     })
+}
+
+/// A projector that keeps the map's own heights.
+///
+/// A local Cartesian projection's reverse hands back the *ellipsoidal* height of an
+/// east/north/up point — the origin's altitude, plus `z`, plus the amount the
+/// ellipsoid falls away beneath the tangent plane, which is d²/2R and already 3 m at
+/// 6 km out. Written as `ele`, that puts the Lanelet2 map that far above the
+/// OpenDRIVE, SUMO, ClipGT and CARLA exports of the same IR, all of which carry the
+/// map's `z`, and above the plain OSM export, whose `ele` is `z` too. The
+/// latitude and longitude are the projection's; the height stays the map's.
+struct OwnHeights<P: Projector>(P);
+
+impl<P: Projector> Projector for OwnHeights<P> {
+    fn forward(&self, point: GpsPoint) -> Result<[f64; 3], ProjectionError> {
+        let projected = self.0.forward(point)?;
+        Ok([projected[0], projected[1], point.ele])
+    }
+
+    fn reverse(&self, point: [f64; 3]) -> Result<GpsPoint, ProjectionError> {
+        let position = self.0.reverse(point)?;
+        Ok(GpsPoint::new(position.lat, position.lon, point[2]))
+    }
+
+    fn origin(&self) -> Origin {
+        self.0.origin()
+    }
 }
 
 /// The MGRS square a map's coordinates are reported in, if it uses that projection.
