@@ -501,6 +501,29 @@ def test_a_lane_that_ends_needs_a_new_cross_section():
     assert m.successors("lane/wide/2") == []
 
 
+def test_a_lane_dropped_from_the_middle_does_not_hand_its_traffic_to_the_shoulder():
+    m = roadgen.Map()
+    left = roadgen.Lane(width=3.5)
+    middle = roadgen.Lane(width=3.5)
+    outer = roadgen.Lane(width=3.5)
+    shoulder = roadgen.Lane(width=3.5, type_="shoulder")
+    m.add_road(
+        lanes=[left, middle, outer, shoulder],
+        cross_sections=[(200.0, [left, middle, shoulder])],
+        start=(0.0, 0.0, 0.0),
+        end=(300.0, 0.0, 0.0),
+        name="drop",
+    )
+    assert m.issues() == []
+    # The two lanes that carry on are connected; the one that ends, and the shoulder
+    # that has moved into its place, are not.
+    assert sorted(m.connections()) == [
+        ("lane/drop/0", "lane/drop/4"),
+        ("lane/drop/1", "lane/drop/5"),
+    ]
+    assert m.successors("lane/drop/2") == []
+
+
 def test_a_width_of_zero_is_refused_wherever_it_is_written():
     with pytest.raises(ValueError, match="greater than zero"):
         roadgen.Lane(width=3.5, width_profile=[(0.0, 3.5), (100.0, 0.0)])

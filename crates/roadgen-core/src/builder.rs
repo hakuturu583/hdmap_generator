@@ -1547,13 +1547,19 @@ impl Generator {
                 .filter_map(|id| self.map.lanes.get(id).cloned())
                 .collect();
             for earlier in &before {
-                // A lane carries on if the next section has one in the same slot
-                // going the same way; otherwise it ends here, which is the point of
-                // having a second section.
+                // A lane carries on if the next section has the same kind of lane,
+                // going the same way, whose inner edge picks up where this one's
+                // leaves off; otherwise it ends here, which is the point of having
+                // a second section. Matched by what the lane *is* and where it
+                // *lies*, not by its rank from the centre: drop a lane from the
+                // middle of a cross-section and everything outside it moves one rank
+                // in, and a rank-matched join would carry a driving lane on into
+                // whatever now holds its rank — the shoulder beside it, say.
                 let Some(later) = after.iter().find(|candidate| {
                     candidate.side == earlier.side
-                        && candidate.ordinal == earlier.ordinal
                         && candidate.direction == earlier.direction
+                        && candidate.lane_type == earlier.lane_type
+                        && continues_inner_edge(earlier, candidate)
                 }) else {
                     continue;
                 };
@@ -2232,6 +2238,25 @@ impl RoadSpec {
             self.superelevation = profile;
         }
     }
+}
+
+/// Whether `later`'s inner boundary — the one nearer the reference line — starts
+/// where `earlier`'s ends, which is what makes them one lane across a cross-section
+/// boundary. The outer boundary may step (a lane can change width at a boundary; the
+/// validator measures that as the gap between the centrelines); the inner one may
+/// not, because a lane that has moved sideways is not the same lane.
+fn continues_inner_edge(earlier: &Lane, later: &Lane) -> bool {
+    let (end, start) = match earlier.side {
+        LateralSide::Left => (
+            earlier.right_boundary.end_point(),
+            later.right_boundary.start_point(),
+        ),
+        LateralSide::Right => (
+            earlier.left_boundary.end_point(),
+            later.left_boundary.start_point(),
+        ),
+    };
+    end.distance_to(start) <= Curve3::JOIN_TOLERANCE
 }
 
 /// The point `distance` metres back along `polyline` from one of its ends: from

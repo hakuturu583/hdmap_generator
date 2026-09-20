@@ -156,6 +156,66 @@ fn lanes_that_carry_on_are_connected_and_the_dropped_one_is_not() {
 }
 
 #[test]
+fn a_lane_dropped_from_the_middle_takes_nothing_else_with_it() {
+    // Three driving lanes and a shoulder; past 200 m the middle one is gone. The
+    // lanes are matched across the boundary by what they are and where they lie,
+    // not by their rank from the centre — a rank-matched join would carry the
+    // outer driving lane on into the shoulder, which now holds its old rank, and
+    // the map would validate if the widths happened to agree.
+    let mut builder = MapBuilder::new(scenarios::metadata("middle-drop"));
+    let shoulder = || scenarios::lane(3.5, Direction::Forward).with_type(LaneType::Shoulder);
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(300.0, 0.0, 0.0),
+                vec![
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Forward),
+                    shoulder(),
+                ],
+            )
+            .unwrap()
+            .with_name("drop")
+            .with_cross_section(
+                200.0,
+                vec![
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Forward),
+                    shoulder(),
+                ],
+            ),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let road = RoadId::new("drop");
+    let before = map.lanes_of_section(&road, 0);
+    let after = map.lanes_of_section(&road, 1);
+
+    // The two inner driving lanes continue; the outer one, whose ground is the
+    // second section's shoulder, ends — it is not connected to the shoulder.
+    assert_eq!(map.successors(&before[0].id), vec![after[0].id.clone()]);
+    assert_eq!(map.successors(&before[1].id), vec![after[1].id.clone()]);
+    assert!(
+        map.successors(&before[2].id).is_empty(),
+        "the dropped driving lane must not continue into {}",
+        after[2].id
+    );
+    // The shoulder does not continue either: it has moved a lane inwards, and a
+    // lane that has moved sideways is not the same lane.
+    assert!(map.successors(&before[3].id).is_empty());
+    assert_eq!(map.connections.len(), 2);
+
+    // Nothing in the movements crosses a lane type.
+    for connection in map.connections.iter() {
+        let from = map.lane(&connection.from.lane).unwrap();
+        let to = map.lane(&connection.to.lane).unwrap();
+        assert_eq!(from.lane_type, to.lane_type);
+    }
+}
+
+#[test]
 fn the_lane_drop_reaches_opendrive_as_two_lane_sections() {
     let map = scenarios::lane_drop();
     let document = reparse_opendrive(&map);
