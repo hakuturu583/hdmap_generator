@@ -5,7 +5,12 @@
 //! each is put through the road's frame at its station: the inverse of
 //! [`crate::road_coordinates::locate`], which is what put it there.
 //!
-//! A `<signal>` is a traffic light when it is dynamic and a sign otherwise; a
+//! A `<signal>` is a traffic light when it is dynamic and a sign otherwise. It
+//! governs the lanes its own validity names on its road plus, for every
+//! `<signalReference>` to it, the lanes that reference names on its road: a
+//! junction's light is one post, placed once, that other roads refer to (CARLA's
+//! Town maps stand theirs on a sidewalk with `fromLane="0" toLane="0"`, valid on no
+//! lane of their own road, and govern the approaches only by reference). A
 //! `roadMark` object named as a stop line is one; a `crosswalk` object with an
 //! outline is a band; a `building` object with outlines is a building of as many
 //! parts. A `<controller>` is the lights that switch together, which is what a
@@ -19,6 +24,7 @@ use opendrive::object::lane_validity::LaneValidity;
 use opendrive::object::orientation::{ObjectType, Orientation};
 use opendrive::object::outline::Outline;
 use opendrive::object::Object;
+use opendrive::signal::signal_reference::SignalReference;
 use opendrive::signal::Signal;
 use uom::si::angle::radian;
 use uom::si::length::meter;
@@ -50,6 +56,24 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
     let mut signal_ids: HashMap<&str, ObjectId> = HashMap::new();
     let mut stop_lines: Vec<ObjectId> = Vec::new();
 
+    // Every road's references to a signal, by the signal's id, gathered before any
+    // signal is read: a reference may stand on a road that comes after the signal.
+    let mut references: HashMap<&str, Vec<(Road, &SignalReference)>> = HashMap::new();
+    for road in &document.road {
+        for reference in road.signals.iter().flat_map(|s| s.signal_reference.iter()) {
+            let entry = reader
+                .map
+                .roads
+                .get(&RoadId::new(&road.id))
+                .cloned()
+                .expect("roads are read first");
+            references
+                .entry(reference.id.as_str())
+                .or_default()
+                .push((entry, reference));
+        }
+    }
+
     for road in &document.road {
         // One copy per road, so that the road can be read while objects are added.
         let entry = reader
@@ -59,7 +83,10 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
             .cloned()
             .expect("roads are read first");
         for signal in road.signals.iter().flat_map(|s| s.signal.iter()) {
-            if let Some(id) = reader.read_signal(&entry, signal)? {
+            let referenced = references
+                .get(signal.id.as_str())
+                .map_or(&[][..], Vec::as_slice);
+            if let Some(id) = reader.read_signal(&entry, signal, referenced)? {
                 signal_ids.entry(&signal.id).or_insert(id);
             }
         }
@@ -289,10 +316,22 @@ impl Reader<'_> {
         orientation: Option<&Orientation>,
         (name, od_id): (Option<&str>, &str),
     ) -> Result<Option<ObjectId>, ImportError> {
-        let s = placement.0;
-        let frame = road.frame_at(s, self.sampling())?;
+        let lanes = self.governed(road, placement.0, validity, orientation);
+        self.place_across(road, kind, placement, lanes, (name, od_id))
+    }
+
+    /// Something across the road at one station over the given lanes; `None`, and
+    /// counted, when there are none.
+    fn place_across(
+        &mut self,
+        road: &Road,
+        kind: MapObjectKind,
+        placement: Placement,
+        lanes: Vec<LaneId>,
+        (name, od_id): (Option<&str>, &str),
+    ) -> Result<Option<ObjectId>, ImportError> {
+        let frame = road.frame_at(placement.0, self.sampling())?;
         let geometry = line_or_point(&frame, placement)?;
-        let lanes = self.governed(road, s, validity, orientation);
         if lanes.is_empty() {
             self.approximations.count(format!(
                 "{{n}} {}s govern no lane of the road they are on, and are not read",
@@ -303,10 +342,15 @@ impl Reader<'_> {
         Ok(Some(self.place(kind, geometry, lanes, name, od_id)))
     }
 
+    /// A signal where it stands, over the lanes it governs: those its validity
+    /// names on its own road and those each reference to it names on the
+    /// reference's road. Without a validity the own road contributes every lane
+    /// facing the signal, unless references say where it applies.
     fn read_signal(
         &mut self,
         road: &Road,
         signal: &Signal,
+        references: &[(Road, &SignalReference)],
     ) -> Result<Option<ObjectId>, ImportError> {
         let kind = if signal.dynamic || signal.r#type == TRAFFIC_LIGHT_TYPE {
             MapObjectKind::TrafficLight
@@ -319,17 +363,35 @@ impl Reader<'_> {
             };
             MapObjectKind::TrafficSign { code }
         };
-        self.read_across(
+        let s = signal.s.get::<meter>();
+        let mut lanes = if signal.validity.is_empty() && !references.is_empty() {
+            Vec::new()
+        } else {
+            self.governed(road, s, &signal.validity, Some(&signal.orientation))
+        };
+        for (referring, reference) in references {
+            let governed = self.governed(
+                referring,
+                reference.s.get::<meter>(),
+                &reference.validity,
+                Some(&reference.orientation),
+            );
+            for lane in governed {
+                if !lanes.contains(&lane) {
+                    lanes.push(lane);
+                }
+            }
+        }
+        self.place_across(
             road,
             kind,
             (
-                signal.s.get::<meter>(),
+                s,
                 signal.t.get::<meter>(),
                 signal.z_offset.get::<meter>(),
                 signal.width.map(|width| width.get::<meter>()),
             ),
-            &signal.validity,
-            Some(&signal.orientation),
+            lanes,
             (signal.name.as_deref(), &signal.id),
         )
     }
