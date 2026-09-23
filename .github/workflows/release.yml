@@ -3,12 +3,15 @@
 # There are three ways in, and the first is the everyday one:
 #
 #   push to main   the auto-release mechanism (the one simple_lanelet2 uses, borrowed
-#                  from tier4/splatsim). Every PR carries exactly one
-#                  `release:major|minor|patch|none` label -- release-label.yml
-#                  refuses to let one merge without. When the PRs merged since the
-#                  last release ask for one, the `release` job bumps the version by
-#                  the highest level any of them asked for, tags it `vX.Y.Z`, and
-#                  the tag is built and published -- all in this one run.
+#                  from tier4/splatsim). Every merge is a release. Every PR carries
+#                  exactly one `release:major|minor|patch` label -- release-label.yml
+#                  refuses to let one merge without -- and the `release` job bumps
+#                  the version by the highest level asked for by the PRs merged
+#                  since the last release, tags it `vX.Y.Z`, and the tag is built
+#                  and published -- all in this one run. A commit on main that no
+#                  labelled PR accounts for (a merge that bypassed the check, a
+#                  direct push) still counts for a patch: nothing lands on main
+#                  without a version to find it under.
 #
 #                  "Since the last release" rather than "this PR" on purpose: runs
 #                  are serialised by the concurrency group below, and a run that was
@@ -108,7 +111,9 @@ jobs:
             # "this commit came from no pull request" is an empty list.
             labels=$(gh api "repos/${{ github.repository }}/commits/${sha}/pulls" \
               --jq '[.[0].labels[]?.name] | join(",")')
-            asked=none
+            # A commit with no release label is still a change, and a change is at
+            # least a patch.
+            asked=patch
             count=0
             for lvl in major minor patch; do
               if echo ",$labels," | grep -q ",release:${lvl},"; then

@@ -1837,18 +1837,19 @@ a failure, which is what CI does.
 
 ## Releasing
 
-A release is a merged pull request with a label on it. Every PR carries exactly one
-of `release:major`, `release:minor`, `release:patch` or `release:none` — the
+Every merge is a release. Every PR carries exactly one of `release:major`,
+`release:minor` or `release:patch` — the
 [release-label check](.github/workflows/release-label.yml) fails without one, and it
-is a required check on `main`, so a PR cannot be merged until it says what it does
-to the version. When a PR lands on `main`, the
-[release workflow](.github/workflows/release.yml) looks at every PR merged since the
-last release: if any asked for one, it bumps the version by the highest level asked
-for, commits `chore(release): vX.Y.Z`, tags it, writes a GitHub release with
-generated notes, runs the tests again on the tagged commit, builds the wheels and the
-sdist, and publishes them to PyPI. Releases run one at a time, so two PRs that land
-together become one release rather than a race. `release:none` on every PR since the
-last release changes nothing on PyPI.
+is a required check on `main`, so a PR cannot be merged until it says how far it
+moves the version; there is no label for "not at all", because a change that is not
+worth a patch release is not worth merging. When a PR lands on `main`, the
+[release workflow](.github/workflows/release.yml) looks at every commit since the
+last release, bumps the version by the highest level any of their PRs asked for (a
+patch for a commit no labelled PR accounts for), commits `chore(release): vX.Y.Z`,
+tags it, writes a GitHub release with generated notes, runs the tests again on the
+tagged commit, builds the wheels and the sdist, and publishes them to PyPI. Releases
+run one at a time, so two PRs that land together become one release rather than a
+race.
 
 The version lives in three files that have to agree — `pyproject.toml`, the
 `[workspace.package]` in `Cargo.toml` (which is what `roadgen.__version__` reports)
