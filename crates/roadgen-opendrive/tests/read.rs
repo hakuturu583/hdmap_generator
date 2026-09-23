@@ -259,3 +259,82 @@ fn a_gap_in_the_reference_line_is_an_error() {
     let error = from_xml(&broken).expect_err("a metre-wide gap is not a road");
     assert!(error.to_string().contains("starts 1.000 m from"), "{error}");
 }
+
+/// CARLA's Town maps: the light is a post on a sidewalk-only road, valid on no lane
+/// of its own (`fromLane="0" toLane="0"`), and the approach names it through a
+/// `<signalReference>` over the lanes it controls.
+fn by_reference() -> String {
+    let sidewalk = r#"<road name="post" length="20.0" id="4" junction="-1">
+    <planView>
+      <geometry s="0.0" x="0.0" y="30.0" hdg="0.0" length="20.0"><line/></geometry>
+    </planView>
+    <lanes>
+      <laneSection s="0.0">
+        <center><lane id="0" type="none" level="false"/></center>
+        <right>
+          <lane id="-1" type="sidewalk" level="false">
+            <width sOffset="0.0" a="2.0" b="0.0" c="0.0" d="0.0"/>
+          </lane>
+        </right>
+      </laneSection>
+    </lanes>
+    <signals>
+      <signal s="10.0" t="-1.0" id="42" name="light" dynamic="yes" orientation="+" zOffset="5.0" type="1000001" subtype="-1">
+        <validity fromLane="0" toLane="0"/>
+      </signal>
+    </signals>
+  </road>
+  <controller "#;
+    FOREIGN
+        .replace(
+            r#"<signal s="95.0" t="-8.0" id="42" name="light" dynamic="yes" orientation="+" zOffset="5.0" type="1000001" subtype="-1"/>"#,
+            r#"<signalReference s="95.0" t="-8.0" id="42" orientation="+"><validity fromLane="-2" toLane="-1"/></signalReference>"#,
+        )
+        .replacen("<controller ", sidewalk, 1)
+}
+
+#[test]
+fn a_light_governs_the_lanes_that_refer_to_it() {
+    let document = by_reference();
+    assert!(document.contains("<signalReference") && document.contains(r#"id="4""#));
+    let imported = from_xml(&document).expect("the document should read");
+    let notes = imported.approximations.clone();
+    let map = imported.map.validate().expect("the map should validate");
+
+    let light = map
+        .objects
+        .iter()
+        .find(|object| object.kind == MapObjectKind::TrafficLight)
+        .unwrap_or_else(|| panic!("the light is read: {notes:#?}"));
+    let mut governed = light.lanes.clone();
+    governed.sort();
+    let mut approach = vec![
+        lane_of(&map, "1", LateralSide::Right, 1),
+        lane_of(&map, "1", LateralSide::Right, 2),
+    ];
+    approach.sort();
+    assert_eq!(governed, approach, "the approach lanes the reference names");
+    // Where the post stands: on the sidewalk road (t = -1 m, to its right), not at
+    // the reference.
+    let ObjectGeometry::Point(at) = &light.geometry else {
+        panic!("a light is a point");
+    };
+    assert!(
+        (at.x - 10.0).abs() < 1e-6 && (at.y - 29.0).abs() < 1e-6,
+        "{at:?}"
+    );
+    assert!(!says(&notes, "traffic lights govern no lane"), "{notes:#?}");
+
+    // The controller's rule is over the approach, with its stop line.
+    let TrafficRule::TrafficLight {
+        lights,
+        stop_line,
+        lanes,
+    } = &map.rules[0]
+    else {
+        panic!("a traffic light rule");
+    };
+    assert_eq!(lights, &vec![light.id.clone()]);
+    assert!(stop_line.is_some());
+    assert_eq!(lanes.len(), 2);
+}
