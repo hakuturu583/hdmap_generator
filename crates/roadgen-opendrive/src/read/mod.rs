@@ -307,6 +307,9 @@ impl<'a> Reader<'a> {
             sections
                 .iter()
                 .flat_map(|section| section.specs.iter().map(|spec| &spec.width)),
+            sections
+                .iter()
+                .flat_map(|section| section.specs.iter().map(|spec| &spec.height)),
             config,
         );
         let geometry = RoadGeometry::new(&reference_line, &superelevation, config, &required)?;

@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ll2_core::id::Id;
 
 use roadgen_core::geometry::{
-    Bezier3, Curve3, Frame3, Point3, Poly3Piece, Poly3Profile, Sample, SamplingConfig, Taper,
-    WidthProfile,
+    Bezier3, Curve3, Frame3, LaneHeight, Point3, Poly3Piece, Poly3Profile, Sample, SamplingConfig,
+    Taper, WidthProfile,
 };
 use roadgen_core::id::{LaneId, RoadId};
 use roadgen_core::map::{CrossSection, Lane, Map, Road};
@@ -487,6 +487,10 @@ fn road_along(
             direction: Direction::Forward,
             lane_type: lane_type(&lanelet.subtype).unwrap_or(LaneType::Driving),
             width,
+            // The boundaries are the file's, heights and all; the lift OpenDRIVE
+            // would need to reproduce them off the one tilted surface is not
+            // measured yet.
+            height: LaneHeight::flat(),
             speed_limit: lanelet
                 .speed_limit_kph
                 .map(SpeedLimit::from_kph)

@@ -148,6 +148,23 @@ impl<'a> RoadEvaluator<'a> {
         }
     }
 
+    /// How steeply the road climbs at station `s`: the elevation's derivative.
+    fn grade_at(&self, s: f64) -> f64 {
+        let Some(profile) = &self.road.elevation_profile else {
+            return 0.0;
+        };
+        let Some(entry) = profile
+            .elevation
+            .iter()
+            .rfind(|entry| entry.s <= s + 1e-9)
+            .or_else(|| profile.elevation.first())
+        else {
+            return 0.0;
+        };
+        let ds = s - entry.s;
+        entry.b + 2.0 * entry.c * ds + 3.0 * entry.d * ds * ds
+    }
+
     fn elevation_at(&self, s: f64) -> f64 {
         let Some(profile) = &self.road.elevation_profile else {
             return 0.0;
@@ -296,30 +313,106 @@ impl<'a> RoadEvaluator<'a> {
         None
     }
 
+    /// The `<height>` of lane `id` at station `s`: how far its inner and outer
+    /// edges stand off the road surface. Straight from one entry to the next,
+    /// counted from the section's start, and held after the last.
+    pub fn lane_heights(&self, id: i64, s: f64) -> (f64, f64) {
+        let (section, section_start) = self.section_at(s);
+        let lane = if id > 0 {
+            section
+                .left
+                .as_ref()
+                .and_then(|side| side.lane.iter().find(|lane| lane.id == id))
+                .map(|lane| &lane.base)
+        } else {
+            section
+                .right
+                .as_ref()
+                .and_then(|side| side.lane.iter().find(|lane| lane.id == id))
+                .map(|lane| &lane.base)
+        };
+        let Some(lane) = lane else {
+            return (0.0, 0.0);
+        };
+        let ds = s - section_start;
+        let heights = &lane.height;
+        let Some(index) = heights
+            .iter()
+            .rposition(|height| height.s_offset.value <= ds + 1e-9)
+        else {
+            return heights
+                .first()
+                .map(|height| (height.inner.value, height.outer.value))
+                .unwrap_or((0.0, 0.0));
+        };
+        let here = &heights[index];
+        match heights.get(index + 1) {
+            Some(next) if next.s_offset.value > here.s_offset.value => {
+                let t = (ds - here.s_offset.value) / (next.s_offset.value - here.s_offset.value);
+                (
+                    here.inner.value + (next.inner.value - here.inner.value) * t,
+                    here.outer.value + (next.outer.value - here.outer.value) * t,
+                )
+            }
+            _ => (here.inner.value, here.outer.value),
+        }
+    }
+
     /// The centre of lane `id` at station `s`.
     pub fn lane_center(&self, id: i64, s: f64) -> Option<Position> {
-        Some(self.position_at(s, self.lane_center_offset(id, s)?))
+        let (inner, outer) = self.lane_heights(id, s);
+        Some(self.position_raised(s, self.lane_center_offset(id, s)?, (inner + outer) / 2.0))
     }
 
     /// The two edges of lane `id` at station `s`, the one nearer the reference line
     /// first.
     pub fn lane_edges(&self, id: i64, s: f64) -> Option<(Position, Position)> {
         let (inner, outer) = self.lane_edge_offsets(id, s)?;
-        Some((self.position_at(s, inner), self.position_at(s, outer)))
+        let (inner_height, outer_height) = self.lane_heights(id, s);
+        Some((
+            self.position_raised(s, inner, inner_height),
+            self.position_raised(s, outer, outer_height),
+        ))
     }
 
     /// The point `t` metres to the left of the reference line at station `s`.
     pub fn position_at(&self, s: f64, t: f64) -> Position {
+        self.position_raised(s, t, 0.0)
+    }
+
+    /// The point `t` metres to the left of the reference line at station `s`, and
+    /// `h` metres off the road surface along its normal.
+    pub fn position_raised(&self, s: f64, t: f64, h: f64) -> Position {
         let (x, y, heading) = self.reference_at(s);
-        // Superelevation rolls the cross-section about the s-axis, so an offset `t`
-        // to the left rises by t·sin(roll) and reaches only t·cos(roll) across.
         let roll = self.superelevation_at(s);
-        let (across, rise) = (t * roll.cos(), t * roll.sin());
+        // The frame the specification builds: e_s along the reference line as it
+        // climbs, e_t the lateral rolled about it by the superelevation, and e_h =
+        // e_s × e_t the surface's normal. `t` is along e_t and `h` along e_h; on a
+        // level road e_t is horizontal and rolls up by t·sin(roll).
+        let grade = self.grade_at(s);
+        let (cos, sin) = (heading.cos(), heading.sin());
+        let norm = (1.0 + grade * grade).sqrt();
+        let e_s = [cos / norm, sin / norm, grade / norm];
+        let horizontal = e_s[0] * e_s[0] + e_s[1] * e_s[1];
+        let e_t = {
+            let v = [
+                roll.cos() * -e_s[1] + roll.sin() * -e_s[2] * e_s[0],
+                roll.cos() * e_s[0] + roll.sin() * -e_s[2] * e_s[1],
+                roll.sin() * horizontal,
+            ];
+            let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            [v[0] / n, v[1] / n, v[2] / n]
+        };
+        let e_h = [
+            e_s[1] * e_t[2] - e_s[2] * e_t[1],
+            e_s[2] * e_t[0] - e_s[0] * e_t[2],
+            e_s[0] * e_t[1] - e_s[1] * e_t[0],
+        ];
         Position {
             // `t` is positive to the left of the reference line.
-            x: x - across * heading.sin(),
-            y: y + across * heading.cos(),
-            z: self.elevation_at(s) + rise,
+            x: x + t * e_t[0] + h * e_h[0],
+            y: y + t * e_t[1] + h * e_h[1],
+            z: self.elevation_at(s) + t * e_t[2] + h * e_h[2],
         }
     }
 

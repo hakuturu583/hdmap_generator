@@ -21,11 +21,19 @@ class Lane:
         marking_color: str = "white",
         width_profile: Optional[Sequence[tuple[float, float]]] = None,
         taper: str = "linear",
-    ) -> None: ...
+        height: Optional[tuple[float, float]] = None,
+        height_profile: Optional[Sequence[tuple[float, float, float]]] = None,
+    ) -> None:
+        """`height` is `(inner, outer)` metres off the road surface — a pavement a
+        kerb above the carriageway, say — with inner the edge nearer the reference
+        line; `height_profile` is `(station, inner, outer)` knots for a lift that
+        changes along the road."""
     @property
     def width(self) -> float: ...
     @property
     def width_profile(self) -> list[tuple[float, float]]: ...
+    @property
+    def height_profile(self) -> list[tuple[float, float, float]]: ...
     @property
     def direction(self) -> str: ...
     @property
