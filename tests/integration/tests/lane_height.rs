@@ -345,3 +345,52 @@ fn a_lift_that_peaks_between_the_road_s_vertices_keeps_its_peak() {
     // And the document says the same.
     assert!(largest_edge_disagreement(&map) < 1e-3);
 }
+
+#[test]
+fn a_lift_that_slopes_across_a_banked_approach_meets_its_connector() {
+    // Rolled 3° and lifting its outer edge 0.1 m more than its inner one, an
+    // approach lane hands its connector a lift that varies across the lane. The
+    // connector has to lift its ends along the approach's tilted normal, or they
+    // miss the approach's edges sideways by the tilt.
+    let roll = 3.0_f64.to_radians();
+    let lanes = || {
+        vec![
+            scenarios::lane(3.5, Direction::Backward),
+            scenarios::lane(3.5, Direction::Forward)
+                .with_height(LaneHeight::constant(0.0, 0.1).unwrap()),
+        ]
+    };
+    let mut builder = MapBuilder::new(scenarios::metadata("banked turn"));
+    let junction = builder.add_junction(Some("x"));
+    let west = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-60.0, 0.0, 0.0),
+                Point3::new(-12.0, 0.0, 1.0),
+                lanes(),
+            )
+            .unwrap()
+            .with_superelevation(Poly3Profile::constant(roll)),
+        )
+        .unwrap();
+    let north = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 12.0, 1.0),
+                Point3::new(0.0, 60.0, 2.0),
+                lanes(),
+            )
+            .unwrap()
+            .with_superelevation(Poly3Profile::constant(-roll)),
+        )
+        .unwrap();
+    builder.connect_via(&junction, &west, &north).unwrap();
+    // Validation compares the boundaries where the connector meets each approach,
+    // to a millimetre; lifted along its own upright normal the connector misses
+    // them by almost three.
+    builder
+        .finish()
+        .unwrap()
+        .validate()
+        .unwrap_or_else(|e| panic!("{e}"));
+}
