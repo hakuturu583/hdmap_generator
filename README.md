@@ -1935,6 +1935,14 @@ each. Where one of those road ends already runs into a junction of the IR's, the
 connecting roads join that junction instead. The IR is untouched: this is a fact
 about OpenDRIVE, and it stays in its writer.
 
+A junction connector the IR has entered from two roads — two approaches merging
+right at the junction mouth — or leaving into two is written once for each pair of
+roads it joins: the connector as the IR links it, and a copy linked to the other
+road, which is the connecting road of that road's `<connection>`. A road has one
+predecessor, and a consumer that follows the connecting road's own `<link>` rather
+than the junction's lane links (CARLA does) never enters it from the road the link
+does not name. Nishi-Shinjuku has six such copies.
+
 On Nishi-Shinjuku that is 172 connecting roads in 57 places, 44 of them new
 junctions and 13 the junction beside them. Every one of the
 Lanelet2 routing graph's 970 successors is now a movement the document states, up

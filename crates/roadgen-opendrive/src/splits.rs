@@ -36,7 +36,7 @@ use roadgen_core::topology::{LaneConnection, LaneEnd, LaneEndpoint, RoadEnd, Roa
 pub(crate) const STUB_LENGTH: f64 = 1e-3;
 
 /// One end of one road.
-type RoadEndKey = (RoadId, RoadEnd);
+pub(crate) type RoadEndKey = (RoadId, RoadEnd);
 
 /// The junction a place's stubs belong to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub(crate) struct Splits<'a> {
 
 /// The road end a lane end is at, for a lane of an ordinary road at the start of
 /// its first section or the end of its last.
-fn road_end(map: &Map, endpoint: &LaneEndpoint) -> Option<RoadEndKey> {
+pub(crate) fn road_end(map: &Map, endpoint: &LaneEndpoint) -> Option<RoadEndKey> {
     let lane = map.lanes.get(&endpoint.lane)?;
     let road = map.road(&lane.road)?;
     if road.is_connector() {

@@ -581,3 +581,122 @@ fn turns_from_the_lanes_of_one_road_are_one_junction() {
     );
     assert!(roadgen_opendrive::check(&map).is_empty());
 }
+
+/// Where a lane leads through the junction its road runs into, found the way
+/// CARLA finds it: from the connecting roads whose own `<link>` names the road as
+/// their predecessor and whose lane names the lane — not from the junction's lane
+/// links — and then along that lane's own successor.
+fn carla_next(document: &OpenDrive, road: &str, lane: i64) -> BTreeSet<(String, i64)> {
+    let find = |id: &str| document.road.iter().find(|road| road.id == id).unwrap();
+    let lanes_of = |road: &opendrive::road::Road| -> Vec<(i64, opendrive::lane::Lane)> {
+        let section = &road.lanes.lane_section[0];
+        section
+            .left
+            .iter()
+            .flat_map(|left| left.lane.iter().map(|lane| (lane.id, lane.base.clone())))
+            .chain(
+                section
+                    .right
+                    .iter()
+                    .flat_map(|right| right.lane.iter().map(|lane| (lane.id, lane.base.clone()))),
+            )
+            .collect()
+    };
+    let Some(junction) = find(road)
+        .link
+        .as_ref()
+        .and_then(|link| link.successor.as_ref())
+        .filter(|end| end.element_type == Some(ElementType::Junction))
+    else {
+        return BTreeSet::new();
+    };
+    let junction = document
+        .junction
+        .iter()
+        .find(|candidate| candidate.id == junction.element_id)
+        .unwrap();
+    let mut found = BTreeSet::new();
+    for connection in junction.connection.iter() {
+        let connecting = find(connection.connecting_road.as_ref().unwrap());
+        let link = connecting.link.as_ref().unwrap();
+        if link.predecessor.as_ref().map(|end| end.element_id.as_str()) != Some(road) {
+            continue;
+        }
+        let exit = link.successor.as_ref().unwrap().element_id.clone();
+        for (_, base) in lanes_of(connecting) {
+            let Some(lane_link) = &base.link else {
+                continue;
+            };
+            if lane_link.predecessor.first().map(|p| p.id) == Some(lane) {
+                if let Some(next) = lane_link.successor.first() {
+                    found.insert((exit.clone(), next.id));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn a_connector_entered_from_two_roads_is_written_once_for_each() {
+    // Two approaches meet right at the mouth of one turn: both end on the two
+    // points the turn starts on. A connecting road has one predecessor, so the
+    // turn is written twice, once linked to each approach.
+    let mut osm = Osm::new();
+    let mouth_left = osm.node(0.0, 1.75, 0.0);
+    let mouth_right = osm.node(0.0, -1.75, 0.0);
+    let west_left = osm.line(None, &[(-40.0, 1.75), (-20.0, 1.75)]);
+    let west_right = osm.line(None, &[(-40.0, -1.75), (-20.0, -1.75)]);
+    let south_left = osm.line(None, &[(-40.0, -18.25), (-15.0, -8.0)]);
+    let south_right = osm.line(None, &[(-40.0, -21.75), (-13.0, -11.5)]);
+    for (left, right) in [(west_left, west_right), (south_left, south_right)] {
+        let left = left.into_iter().chain([mouth_left]).collect();
+        let right = right.into_iter().chain([mouth_right]).collect();
+        osm.lanelet(left, right);
+    }
+    let turn_left = osm.line(Some(mouth_left), &[(8.0, 2.5), (13.25, 8.0), (13.25, 15.0)]);
+    let turn_right = osm.line(
+        Some(mouth_right),
+        &[(10.0, -1.0), (16.75, 6.0), (16.75, 15.0)],
+    );
+    let exit_left = osm.line(turn_left.last().copied(), &[(13.25, 40.0)]);
+    let exit_right = osm.line(turn_right.last().copied(), &[(16.75, 40.0)]);
+    osm.turn(turn_left, turn_right, "left");
+    let exit = osm.lanelet(exit_left, exit_right);
+
+    let map = read(&osm, TrafficHandedness::RightHand);
+    assert_eq!(
+        map.roads.iter().filter(|road| road.is_connector()).count(),
+        1
+    );
+    let connector = map.roads.iter().find(|road| road.is_connector()).unwrap();
+    let entered_from: BTreeSet<_> = map
+        .lanes_of(&connector.id)
+        .iter()
+        .flat_map(|lane| map.connections_to(&lane.id))
+        .map(|connection| map.lanes.get(&connection.from.lane).unwrap().road.clone())
+        .collect();
+    assert_eq!(entered_from.len(), 2, "both approaches run into the turn");
+
+    let document = reparse_opendrive(&map);
+    let exit = document_id(&map, &roadgen_core::id::RoadId::new(exit.to_string()));
+    for approach in &entered_from {
+        let road = document_id(&map, approach);
+        let lane = map.lanes_of(approach)[0];
+        let number = roadgen_opendrive::lane_number(lane.side, lane.ordinal);
+        let reached = carla_next(&document, &road, number);
+        assert!(
+            reached.iter().any(|(road, _)| *road == exit),
+            "from road {road}, following the connecting roads' own links reaches {reached:?}"
+        );
+    }
+    assert_eq!(
+        document
+            .road
+            .iter()
+            .filter(|road| road.junction != "-1")
+            .count(),
+        2,
+        "the turn and its copy"
+    );
+}

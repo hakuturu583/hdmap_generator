@@ -52,7 +52,8 @@
 //! ids, its insistence that `s` be measured in the xy-plane, and its rule that a
 //! split needs a junction are all handled here; none of them reaches the IR. A lane
 //! that splits or merges outside a junction is given one, with a millimetre-long
-//! connecting road per movement: see the `splits` module.
+//! connecting road per movement: see the `splits` module. A connector entered
+//! from two roads, or leaving into two, is written once for each: see `copies`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -146,9 +147,11 @@ use roadgen_core::units::GeoOrigin;
 use roadgen_core::validation::ValidatedMap;
 use roadgen_core::GeometryError;
 
+use copies::{Copies, Copy};
 use splits::{Place, Splits, Stub, STUB_LENGTH};
 
 pub mod controllers;
+mod copies;
 mod error;
 pub mod options;
 pub mod read;
@@ -446,6 +449,8 @@ struct Exporter<'a> {
     buildings: HashMap<RoadId, Vec<&'a Building>>,
     /// Splits and merges outside a junction, which the document gives one.
     splits: Splits<'a>,
+    /// Connectors written again for the other roads they join.
+    copies: Copies,
 }
 
 impl<'a> Exporter<'a> {
@@ -461,6 +466,7 @@ impl<'a> Exporter<'a> {
         Exporter {
             numbering: Numbering::new(map),
             splits,
+            copies: Copies::new(map),
             groups: signal_groups(map),
             buildings,
             options,
@@ -483,6 +489,9 @@ impl<'a> Exporter<'a> {
         }
         for (index, stub) in self.splits.stubs.iter().enumerate() {
             drive.road.push(self.stub_road(index, stub)?);
+        }
+        for (index, copy) in self.copies.copies.iter().enumerate() {
+            drive.road.push(self.copy_road(index, copy)?);
         }
         for junction in self.map.junctions.iter() {
             if let Some(element) = self.junction(&junction.id)? {
@@ -1022,22 +1031,36 @@ impl<'a> Exporter<'a> {
         let Some(road) = self.map.road(&lane.road) else {
             return Ok(None);
         };
+        let linked = |end: RoadEnd| match road.link.at(end) {
+            Some(RoadLinkTarget::Road(target)) => Some(&target.road),
+            _ => None,
+        };
+        self.lane_link_to(lane, [linked(RoadEnd::Start), linked(RoadEnd::End)])
+    }
+
+    /// [`Exporter::lane_link`], for a connector whose ends link to `linked` — its
+    /// own links, or a copy's.
+    fn lane_link_to(
+        &self,
+        lane: &Lane,
+        linked: [Option<&RoadId>; 2],
+    ) -> Result<Option<LaneLink>, ExportError> {
+        let Some(road) = self.map.road(&lane.road) else {
+            return Ok(None);
+        };
         let is_connector = road.is_connector();
         // A lane link names a lane of the road linked at that end. A connector
-        // entered from two roads at once links to one of them; the junction's
-        // connections say it is entered from both.
+        // entered from two roads at once links to one of them, and a copy of it to
+        // the other.
         let reaches = |end: LaneEnd, other: &Lane| {
             if other.road == road.id || !is_connector {
                 return true;
             }
-            let end = match end {
-                LaneEnd::Start => RoadEnd::Start,
-                LaneEnd::End => RoadEnd::End,
+            let linked = match end {
+                LaneEnd::Start => linked[0],
+                LaneEnd::End => linked[1],
             };
-            match road.link.at(end) {
-                Some(RoadLinkTarget::Road(target)) => target.road == other.road,
-                _ => true,
-            }
+            linked.is_none_or(|target| *target == other.road)
         };
         let mut predecessor = Vec::new();
         let mut successor = Vec::new();
@@ -1120,20 +1143,57 @@ impl<'a> Exporter<'a> {
                 }
             }
             for ((incoming, contact), lane_link) in groups {
-                connections.push(Connection {
-                    predecessor: None,
-                    successor: None,
-                    lane_link,
-                    connecting_road: Some(self.road_id(connector_id)?.to_owned()),
-                    contact_point: Some(match contact {
-                        LaneEnd::Start => ContactPoint::Start,
-                        LaneEnd::End => ContactPoint::End,
-                    }),
-                    id: connections.len().to_string(),
-                    incoming_road: Some(self.road_id(&incoming)?.to_owned()),
-                    linked_road: None,
-                    r#type: None,
-                });
+                let end = match contact {
+                    LaneEnd::Start => RoadEnd::Start,
+                    LaneEnd::End => RoadEnd::End,
+                };
+                // Entered by the connector itself where its link names the road, and
+                // by each copy that links to it; by the connector too where nothing
+                // does, as before copies existed.
+                let copies: Vec<(usize, &Copy)> = self
+                    .copies
+                    .of(connector_id)
+                    .filter(|(_, copy)| copy.at(end).is_some_and(|(road, _)| *road == incoming))
+                    .collect();
+                let linked = matches!(connector.link.at(end),
+                    Some(RoadLinkTarget::Road(target)) if target.road == incoming);
+                let mut targets: Vec<(String, Vec<JunctionLaneLink>)> = Vec::new();
+                if linked || copies.is_empty() {
+                    targets.push((self.road_id(connector_id)?.to_owned(), lane_link.clone()));
+                }
+                for (index, copy) in copies {
+                    let carried: Vec<i64> = connector
+                        .lanes
+                        .iter()
+                        .filter_map(|lane| self.map.lanes.get(lane))
+                        .filter(|lane| copy.carries(self.map, lane))
+                        .map(|lane| self.lane_id(&lane.id))
+                        .collect::<Result<_, _>>()?;
+                    let links: Vec<JunctionLaneLink> = lane_link
+                        .iter()
+                        .filter(|link| carried.contains(&link.to))
+                        .cloned()
+                        .collect();
+                    if !links.is_empty() {
+                        targets.push((self.copy_id(index), links));
+                    }
+                }
+                for (connecting_road, lane_link) in targets {
+                    connections.push(Connection {
+                        predecessor: None,
+                        successor: None,
+                        lane_link,
+                        connecting_road: Some(connecting_road),
+                        contact_point: Some(match contact {
+                            LaneEnd::Start => ContactPoint::Start,
+                            LaneEnd::End => ContactPoint::End,
+                        }),
+                        id: connections.len().to_string(),
+                        incoming_road: Some(self.road_id(&incoming)?.to_owned()),
+                        linked_road: None,
+                        r#type: None,
+                    });
+                }
             }
         }
 
@@ -1541,12 +1601,23 @@ impl<'a> Exporter<'a> {
             else {
                 continue;
             };
+            // A connector's copies are the same movement, and yield or take way as
+            // it does.
+            let written = |road: &RoadId| -> Result<Vec<String>, ExportError> {
+                let mut ids = vec![self.road_id(road)?.to_owned()];
+                ids.extend(self.copies.of(road).map(|(index, _)| self.copy_id(index)));
+                Ok(ids)
+            };
             for high in connectors_for(right_of_way) {
                 for low in connectors_for(yielding) {
-                    priorities.push(Priority {
-                        high: Some(self.road_id(high)?.to_owned()),
-                        low: Some(self.road_id(low)?.to_owned()),
-                    });
+                    for high in written(high)? {
+                        for low in written(low)? {
+                            priorities.push(Priority {
+                                high: Some(high.clone()),
+                                low: Some(low),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -2002,6 +2073,79 @@ impl<'a> Exporter<'a> {
                 Ok((self.map.roads.len() + self.map.junctions.len() + index).to_string())
             }
         }
+    }
+
+    /// A connector written again, linked to other roads than the connector is: the
+    /// same geometry and lanes, with its lanes linked to the copy's roads. Its
+    /// signals and objects stay on the connector, which is where they are.
+    fn copy_road(&self, index: usize, copy: &Copy) -> Result<OdRoad, ExportError> {
+        let road = self
+            .map
+            .road(&copy.road)
+            .ok_or_else(|| ExportError::Unknown(copy.road.to_string()))?;
+        let mut written = self.road(road)?;
+        written.id = self.copy_id(index);
+        written.objects = None;
+        written.signals = None;
+        let target = |end: RoadEnd| -> Result<Option<PredecessorSuccessor>, ExportError> {
+            copy.at(end)
+                .map(|(other, other_end)| {
+                    Ok(PredecessorSuccessor {
+                        contact_point: Some(match other_end {
+                            RoadEnd::Start => ContactPoint::Start,
+                            RoadEnd::End => ContactPoint::End,
+                        }),
+                        element_dir: None,
+                        element_id: self.road_id(other)?.to_owned(),
+                        element_s: None,
+                        element_type: Some(ElementType::Road),
+                    })
+                })
+                .transpose()
+        };
+        let (predecessor, successor) = (target(RoadEnd::Start)?, target(RoadEnd::End)?);
+        written.link = (predecessor.is_some() || successor.is_some()).then(|| Link {
+            predecessor,
+            successor,
+            additional_data: AdditionalData::default(),
+        });
+        let linked = [
+            copy.at(RoadEnd::Start).map(|(road, _)| road),
+            copy.at(RoadEnd::End).map(|(road, _)| road),
+        ];
+        for (section_index, section) in written.lanes.lane_section.iter_mut().enumerate() {
+            let lanes = self.map.lanes_of_section(&road.id, section_index);
+            let find = |id: i64| {
+                lanes
+                    .iter()
+                    .find(|lane| lane_number(lane.side, lane.ordinal) == id)
+                    .copied()
+            };
+            for (id, base) in
+                section
+                    .left
+                    .iter_mut()
+                    .flat_map(|left| left.lane.iter_mut().map(|lane| (lane.id, &mut lane.base)))
+                    .chain(section.right.iter_mut().flat_map(|right| {
+                        right.lane.iter_mut().map(|lane| (lane.id, &mut lane.base))
+                    }))
+            {
+                if let Some(lane) = find(id) {
+                    base.link = self.lane_link_to(lane, linked)?;
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// The id of a connector's copy, numbered after every stub.
+    fn copy_id(&self, index: usize) -> String {
+        (self.map.roads.len()
+            + self.map.junctions.len()
+            + self.splits.new_junctions()
+            + self.splits.stubs.len()
+            + index)
+            .to_string()
     }
 
     /// The id of a stub, numbered after every road and junction.
