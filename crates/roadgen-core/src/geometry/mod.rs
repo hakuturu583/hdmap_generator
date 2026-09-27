@@ -8,6 +8,7 @@
 pub mod alignment;
 pub mod curve;
 pub mod grid;
+pub mod height;
 pub mod polyline;
 pub mod profile;
 pub mod vector;
@@ -16,6 +17,7 @@ pub mod width;
 pub use alignment::Alignment;
 pub use curve::{Arc3, Bezier3, Clothoid3, Curve3, Line3, Sample, SamplingConfig};
 pub use grid::Grid;
+pub use height::LaneHeight;
 pub use polyline::Polyline3;
 pub use profile::{Poly3Piece, Poly3Profile};
 pub use vector::{Frame3, Point3, UnitVector3, Vector3};

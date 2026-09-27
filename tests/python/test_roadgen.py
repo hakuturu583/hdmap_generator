@@ -1330,6 +1330,48 @@ def test_reading_a_file_that_is_not_opendrive_says_so(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Lane heights
+# --------------------------------------------------------------------------- #
+
+
+def raised_street():
+    return [
+        roadgen.Lane(width=3.5, direction="backward"),
+        roadgen.Lane(width=2.0, direction="backward", type_="sidewalk", height=(0.15, 0.15)),
+        roadgen.Lane(width=3.5, direction="forward"),
+        roadgen.Lane(
+            width=2.0,
+            direction="forward",
+            type_="sidewalk",
+            height_profile=[(0.0, 0.15, 0.15), (50.0, 0.2, 0.25)],
+        ),
+    ]
+
+
+def test_a_lane_carries_its_lift_off_the_road():
+    assert roadgen.Lane(width=2.0, height=(0.1, 0.2)).height_profile == [(0.0, 0.1, 0.2)]
+    assert roadgen.Lane(width=2.0).height_profile == []
+    with pytest.raises(ValueError, match="not both"):
+        roadgen.Lane(width=2.0, height=(0.1, 0.1), height_profile=[(0.0, 0.1, 0.1)])
+
+
+def test_a_raised_pavement_is_written_as_opendrive_height(tmp_path):
+    m = roadgen.Map()
+    m.add_road(start=(0.0, 0.0, 0.0), end=(100.0, 0.0, 0.0), lanes=raised_street())
+    m.export_opendrive(tmp_path / "map.xodr")
+    xml = (tmp_path / "map.xodr").read_text()
+    assert "<height " in xml
+    back = roadgen.read_opendrive(str(tmp_path / "map.xodr"))
+    # The pavements come back lifted: one a kerb up all along, the other rising to
+    # halfway between 0.2 and 0.25 from station 50; the carriageways on the road.
+    lifts = sorted(
+        tuple(sorted({round(point[2], 6) for point in back.lane_centerline(lane)}))
+        for lane in back.lane_ids()
+    )
+    assert lifts == [(0.0,), (0.0,), (0.15,), (0.15, 0.225)]
+
+
+# --------------------------------------------------------------------------- #
 # Buildings
 # --------------------------------------------------------------------------- #
 

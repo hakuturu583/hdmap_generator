@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{BuildError, GeometryError};
 use crate::geometry::{
-    Arc3, Bezier3, Curve3, Point3, Poly3Piece, Poly3Profile, Polyline3, SamplingConfig, Taper,
-    UnitVector3, Vector3, WidthProfile,
+    Arc3, Bezier3, Curve3, LaneHeight, Point3, Poly3Piece, Poly3Profile, Polyline3, SamplingConfig,
+    Taper, UnitVector3, Vector3, WidthProfile,
 };
 use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::layout::{self, RoadGeometry, SectionLayout};
@@ -33,6 +33,9 @@ pub struct LaneSpec {
     /// How wide the lane is along its length. A plain [`PositiveWidth`] converts, so
     /// a lane of constant width reads exactly as it did before profiles existed.
     pub width: WidthProfile,
+    /// How far the lane's inner and outer edges stand off the road surface — a
+    /// pavement raised a kerb's height, say. Flat unless given.
+    pub height: LaneHeight,
     pub direction: Direction,
     pub lane_type: LaneType,
     pub speed_limit: Option<SpeedLimit>,
@@ -47,6 +50,7 @@ impl LaneSpec {
     pub fn new(width: impl Into<WidthProfile>, direction: Direction) -> Self {
         LaneSpec {
             width: width.into(),
+            height: LaneHeight::flat(),
             direction,
             lane_type: LaneType::Driving,
             speed_limit: None,
@@ -77,6 +81,13 @@ impl LaneSpec {
     /// the lane's cross-section, so a taper is written where it is on the map.
     pub fn with_width_profile(mut self, width: WidthProfile) -> Self {
         self.width = width;
+        self
+    }
+
+    /// Lifts the lane's edges off the road surface: `inner` at the edge nearer the
+    /// reference line, `outer` at the edge further out, stations along the road.
+    pub fn with_height(mut self, height: LaneHeight) -> Self {
+        self.height = height;
         self
     }
 
@@ -941,6 +952,7 @@ impl Generator {
                     .iter()
                     .map(|section| section.station),
                 draft.spec.all_lanes().map(|lane| &lane.width),
+                draft.spec.all_lanes().map(|lane| &lane.height),
                 config,
             );
             self.geometry.insert(
@@ -1919,6 +1931,38 @@ impl Generator {
         // cross-section origin then sits half a lane the other way, so that the lane
         // is centred on the reference line, and follows the taper.
         let side = self.map.metadata.handedness.side_for(Direction::Forward);
+
+        // And it carries the heights of the lanes it joins across, edge for edge, so
+        // that a raised pavement turning a corner stays raised and meets both ends
+        // without a step. Which edge of the lane at each end is the connector's left
+        // depends on which way it leaves or enters that lane's reference line.
+        let travel = |lane: &Lane, end: RoadEnd, along: bool| {
+            let (left, right) = lane.reference_edge_heights(lane.station_at_end(end.as_lane_end()));
+            if along {
+                (left, right)
+            } else {
+                (right, left)
+            }
+        };
+        let (start_left, start_right) = travel(from_lane, from_end, from_end == RoadEnd::End);
+        let (end_left, end_right) = travel(to_lane, to_end, to_end == RoadEnd::Start);
+        // The connector's reference line runs through the ends of the lanes'
+        // centrelines, which are lifted already — by the middle of the lift across
+        // each lane — so its edges are lifted by what is left: each edge's lift less
+        // the middle's. A kerb the same height all across is then no lift at all.
+        let inner_outer = |left: f64, right: f64| {
+            let middle = (left + right) / 2.0;
+            match side {
+                LateralSide::Left => (right - middle, left - middle),
+                LateralSide::Right => (left - middle, right - middle),
+            }
+        };
+        let height = LaneHeight::tapered(
+            0.0,
+            reference_line.horizontal_length()?,
+            inner_outer(start_left, start_right),
+            inner_outer(end_left, end_right),
+        )?;
         let half_width = width.to_poly3(0.0).scaled(0.5);
         let lane_offset = match side {
             LateralSide::Right => half_width,
@@ -1932,6 +1976,7 @@ impl Generator {
                 station: 0.0,
                 lanes: vec![LaneSpec {
                     width,
+                    height,
                     direction: Direction::Forward,
                     lane_type: from_lane.lane_type,
                     speed_limit: from_lane.speed_limit,
