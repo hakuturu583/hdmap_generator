@@ -241,6 +241,18 @@ def read_opendrive(
     cannot be added to. `Map.read_warnings()` says what the file stated that the map
     could not keep."""
 
+def read_lanelet2(
+    path: str,
+    handedness: str = "RHT",
+    sampling: float = 2.0,
+    origin: Optional[Point] = None,
+) -> Map:
+    """The Lanelet2 map at `path`, read as a map that exports like any other and
+    cannot be added to. Lanelets that share a boundary become one road, and
+    `turn_direction` lanelets become junction connectors. `handedness` is "RHT" or
+    "LHT", which the file does not record. `Map.read_warnings()` says what the file
+    stated that the map could not keep."""
+
 def render_opendrive(path: str) -> str:
     """The OpenDRIVE file at `path`, drawn as an SVG document."""
 

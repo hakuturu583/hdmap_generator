@@ -1330,6 +1330,40 @@ def test_reading_a_file_that_is_not_opendrive_says_so(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Reading a Lanelet2 map back
+# --------------------------------------------------------------------------- #
+
+
+def test_a_lanelet2_map_reads_back_with_its_lanes_and_movements(joined, tmp_path):
+    joined.export_lanelet2(tmp_path / "map.osm")
+    back = roadgen.read_lanelet2(str(tmp_path / "map.osm"))
+    # Lanelet2 keeps lanes, not roads: each direction comes back as a road of its
+    # own, so the two two-way roads are four one-way ones with the same lanes and
+    # the same movements between them.
+    assert len(back.road_ids()) == 4
+    assert len(back.lane_ids()) == len(joined.lane_ids())
+    assert len(back.connections()) == len(joined.connections())
+    assert back.read_warnings() == []
+    # And it exports like any other map.
+    back.export_opendrive(tmp_path / "map.xodr")
+    assert (tmp_path / "map.xodr").stat().st_size > 0
+
+
+def test_reading_a_lanelet2_map_takes_the_side_traffic_keeps_to(joined, tmp_path):
+    joined.export_lanelet2(tmp_path / "map.osm")
+    for handedness in ["RHT", "LHT"]:
+        back = roadgen.read_lanelet2(str(tmp_path / "map.osm"), handedness=handedness)
+        assert len(back.lane_ids()) == len(joined.lane_ids())
+    with pytest.raises(ValueError, match="handedness"):
+        roadgen.read_lanelet2(str(tmp_path / "map.osm"), handedness="sideways")
+
+
+def test_reading_a_file_that_is_not_lanelet2_says_so(tmp_path):
+    with pytest.raises(ValueError):
+        roadgen.read_lanelet2(str(tmp_path / "nothing.osm"))
+
+
+# --------------------------------------------------------------------------- #
 # Buildings
 # --------------------------------------------------------------------------- #
 

@@ -1,0 +1,502 @@
+//! Lanes, and the roads they are gathered into.
+//!
+//! Two lanelets are side by side when one's right boundary *is* the other's left —
+//! the same linestring, running the same way — which is how Lanelet2 draws lanes
+//! that share a line of paint. A run of lanelets side by side is one road with one
+//! cross-section. Its reference line is the boundary on the side the lanes are laid
+//! out from: the right-hand boundary of the rightmost lane when traffic keeps left
+//! (forward lanes sit left of the reference line), the left-hand boundary of the
+//! leftmost when it keeps right. Every lane then runs forward, and its width is
+//! measured across the reference line at each of its vertices.
+//!
+//! A lanelet tagged `turn_direction` is a road of its own, whatever it shares a
+//! boundary with: it is a junction connector, and a connector carries one lane.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use ll2_core::id::Id;
+
+use roadgen_core::geometry::{Curve3, Frame3, Point3, Poly3Profile, Sample, Taper, WidthProfile};
+use roadgen_core::id::{LaneId, RoadId};
+use roadgen_core::map::{CrossSection, Lane, Map, Road};
+use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking, RoadType};
+use roadgen_core::topology::{Direction, LateralSide, RoadLink};
+use roadgen_core::units::{PositiveWidth, SpeedLimit};
+
+use super::source::{Lanelet, Source};
+use super::Approximations;
+use crate::error::ImportError;
+
+/// The narrowest a lane is read as, metres. A `WidthProfile` cannot reach zero, and
+/// a lanelet whose boundaries meet — or cross — somewhere is held at this.
+const MIN_WIDTH: f64 = 0.01;
+
+/// How far across the reference line a boundary is looked for, metres. A lane is a
+/// few metres wide; a crossing further out than this is some other stretch of a
+/// boundary that bends back.
+const MAX_REACH: f64 = 50.0;
+
+/// What the lanes became, for the steps that follow.
+pub(crate) struct Built {
+    pub lane_of: HashMap<Id, LaneId>,
+    pub road_of: HashMap<Id, RoadId>,
+    /// The lanelets of each road, from the reference line outwards.
+    pub lanelets_of: BTreeMap<RoadId, Vec<Id>>,
+    /// Lanelets that became junction connectors.
+    pub connectors: BTreeSet<Id>,
+}
+
+/// The IR lane type of a lanelet subtype, if it has one.
+fn lane_type(subtype: &str) -> Option<LaneType> {
+    Some(match subtype {
+        "road" | "highway" | "play_street" | "bus_lane" => LaneType::Driving,
+        "road_shoulder" => LaneType::Shoulder,
+        "walkway" => LaneType::Sidewalk,
+        "bicycle_lane" => LaneType::Biking,
+        _ => return None,
+    })
+}
+
+pub(crate) fn build(
+    source: &Source,
+    map: &mut Map,
+    approximations: &mut Approximations,
+) -> Result<Built, ImportError> {
+    let mut built = Built {
+        lane_of: HashMap::new(),
+        road_of: HashMap::new(),
+        lanelets_of: BTreeMap::new(),
+        connectors: BTreeSet::new(),
+    };
+
+    let mut through: Vec<&Lanelet> = Vec::new();
+    let mut turning: Vec<&Lanelet> = Vec::new();
+    for lanelet in source.lanelets.values() {
+        match lane_type(&lanelet.subtype) {
+            Some(_) if lanelet.turn => turning.push(lanelet),
+            Some(_) => through.push(lanelet),
+            // A crosswalk is furniture, and read as such.
+            None if lanelet.subtype == "crosswalk" => {}
+            None => approximations.count(format!(
+                "the IR has no lane for a `{}` lanelet, so {{n}} of them are left out",
+                lanelet.subtype
+            )),
+        }
+        if !lanelet.one_way
+            && lane_type(&lanelet.subtype).is_some_and(|kind| kind != LaneType::Sidewalk)
+        {
+            approximations.count(
+                "an IR lane runs one way, so {n} lanelets that may be driven both ways are \
+                 read as running the way they are drawn",
+            );
+        }
+    }
+
+    let side = map.metadata.handedness.side_for(Direction::Forward);
+    for group in side_by_side(&through, side) {
+        make_road(source, map, &group, false, &mut built, approximations);
+    }
+    for lanelet in turning {
+        make_road(source, map, &[lanelet], true, &mut built, approximations);
+    }
+    Ok(built)
+}
+
+/// Runs of lanelets side by side, each ordered outwards from the side the lanes are
+/// laid out from.
+fn side_by_side<'a>(lanelets: &[&'a Lanelet], side: LateralSide) -> Vec<Vec<&'a Lanelet>> {
+    // Keyed by the way *and* which way round it runs, so a line two lanelets share
+    // running opposite ways — the middle of a two-way street drawn as one line —
+    // does not make them neighbours: they are not the same cross-section.
+    fn key(way: Id, nodes: &[Id]) -> (Id, Id, Id) {
+        (way, nodes[0], nodes[nodes.len() - 1])
+    }
+    let by_left: HashMap<(Id, Id, Id), &'a Lanelet> = lanelets
+        .iter()
+        .map(|lanelet| (key(lanelet.left_way, &lanelet.left), *lanelet))
+        .collect();
+    let by_right: HashMap<(Id, Id, Id), &'a Lanelet> = lanelets
+        .iter()
+        .map(|lanelet| (key(lanelet.right_way, &lanelet.right), *lanelet))
+        .collect();
+    // The neighbour further out from the reference line, and the one nearer it.
+    let outer = |lanelet: &Lanelet| -> Option<&'a Lanelet> {
+        match side {
+            LateralSide::Left => by_right.get(&key(lanelet.left_way, &lanelet.left)),
+            LateralSide::Right => by_left.get(&key(lanelet.right_way, &lanelet.right)),
+        }
+        .copied()
+    };
+    let inner = |lanelet: &Lanelet| -> Option<&'a Lanelet> {
+        match side {
+            LateralSide::Left => by_left.get(&key(lanelet.right_way, &lanelet.right)),
+            LateralSide::Right => by_right.get(&key(lanelet.left_way, &lanelet.left)),
+        }
+        .copied()
+    };
+
+    let mut placed: BTreeSet<Id> = BTreeSet::new();
+    let mut groups = Vec::new();
+    for lanelet in lanelets {
+        if inner(lanelet).is_some() || placed.contains(&lanelet.id) {
+            continue;
+        }
+        let mut group = vec![*lanelet];
+        placed.insert(lanelet.id);
+        let mut current = *lanelet;
+        while let Some(next) = outer(current) {
+            if !placed.insert(next.id) {
+                break;
+            }
+            group.push(next);
+            current = next;
+        }
+        groups.push(group);
+    }
+    // Whatever is left sits in a ring of neighbours with no innermost lane, which a
+    // map cannot draw; each is a road of its own rather than lost.
+    for lanelet in lanelets {
+        if placed.insert(lanelet.id) {
+            groups.push(vec![*lanelet]);
+        }
+    }
+    groups
+}
+
+/// Builds one road from lanelets ordered outwards from its reference line, or
+/// leaves them out and says why.
+fn make_road(
+    source: &Source,
+    map: &mut Map,
+    group: &[&Lanelet],
+    connector: bool,
+    built: &mut Built,
+    approximations: &mut Approximations,
+) {
+    let id = RoadId::new(group[0].id.to_string());
+    match road(source, map, &id, group) {
+        Ok((road, lanes)) => {
+            for (lanelet, lane) in group.iter().zip(&lanes) {
+                built.lane_of.insert(lanelet.id, lane.id.clone());
+                built.road_of.insert(lanelet.id, id.clone());
+                if connector {
+                    built.connectors.insert(lanelet.id);
+                }
+            }
+            built
+                .lanelets_of
+                .insert(id.clone(), group.iter().map(|lanelet| lanelet.id).collect());
+            // The ids are the lanelets', which the file keeps unique.
+            map.roads.insert(id, road).ok();
+            for lane in lanes {
+                map.lanes.insert(lane.id.clone(), lane).ok();
+            }
+        }
+        // One lanelet that cannot be measured across should not take its
+        // neighbours with it: they are tried as roads of their own.
+        Err(_) if group.len() > 1 => {
+            for lanelet in group {
+                make_road(source, map, &[lanelet], connector, built, approximations);
+            }
+        }
+        Err(error) => {
+            let ids: Vec<String> = group.iter().map(|lanelet| lanelet.id.to_string()).collect();
+            approximations.note(format!(
+                "lanelets {} could not be read as a road and are left out: {error}",
+                ids.join(", ")
+            ));
+        }
+    }
+}
+
+fn road(
+    source: &Source,
+    map: &Map,
+    id: &RoadId,
+    group: &[&Lanelet],
+) -> Result<(Road, Vec<Lane>), ImportError> {
+    let config = map.metadata.sampling;
+    let side = map.metadata.handedness.side_for(Direction::Forward);
+
+    // The cross-section's edges, outwards from the reference line: edge 0 is the
+    // reference line itself, edge k the outer boundary of the k-th lane.
+    let mut edges: Vec<Vec<Point3>> = vec![source.polyline(inner_and_outer(group[0], side).0)];
+    for lanelet in group {
+        edges.push(source.polyline(inner_and_outer(lanelet, side).1));
+    }
+
+    let reference_line = Curve3::polyline(edges[0].iter().copied())?;
+    let length = reference_line.horizontal_length()?;
+    let mut road = Road {
+        id: id.clone(),
+        name: Some(format!(
+            "lanelet {}",
+            group
+                .iter()
+                .map(|lanelet| lanelet.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        reference_line,
+        lane_offset: Poly3Profile::default(),
+        lanes: Vec::new(),
+        sections: Vec::new(),
+        junction: None,
+        link: RoadLink::default(),
+        road_type: road_type(group[0].location.as_deref()),
+        speed_limit: None,
+        superelevation: Poly3Profile::default(),
+    };
+
+    // Where each edge crosses the reference line's normal, at every vertex of the
+    // reference line. At the two ends it is where the edge itself starts and stops,
+    // measured across the road the way validation measures it, so the widths agree
+    // with the boundaries there exactly.
+    let stations = measuring_stations(&road.reference_line.samples(config)?, &edges, length);
+    let start_frame = road.frame_at(0.0, config)?;
+    let end_frame = road.frame_at(length, config)?;
+    let frames = stations
+        .iter()
+        .map(|station| {
+            road.frame_at(*station, config)
+                .map(|frame| (*station, frame))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut offsets: Vec<Vec<(f64, f64)>> = vec![Vec::new(); edges.len()];
+    for (k, edge) in edges.iter().enumerate() {
+        offsets[k].push((0.0, across(&start_frame, edge[0])));
+        for (station, frame) in &frames {
+            if let Some(offset) = crossing(frame, edge) {
+                offsets[k].push((*station, offset));
+            }
+        }
+        offsets[k].push((length, across(&end_frame, *edge.last().unwrap())));
+    }
+
+    let mut lanes = Vec::new();
+    for (index, lanelet) in group.iter().enumerate() {
+        let ordinal = index + 1;
+        let (inner, outer) = (&offsets[index], &offsets[index + 1]);
+        // Both edges have a value at both ends; in between, only at stations where
+        // both were found.
+        let mut knots = Vec::new();
+        for (station, outer_offset) in outer {
+            let Some((_, inner_offset)) = inner
+                .iter()
+                .find(|(other, _)| (other - station).abs() < 1e-9)
+            else {
+                continue;
+            };
+            let width = side.sign() * (outer_offset - inner_offset);
+            let at_end = *station == 0.0 || *station == length;
+            if at_end && width <= 0.0 {
+                // Validation measures a lane's ends across the reference line, and
+                // these boundaries end on the wrong sides of each other there: a
+                // lanelet that turns a corner with its end drawn along the way it
+                // runs, which no cross-section can describe.
+                return Err(ImportError::Unsupported(format!(
+                    "lanelet {}, whose end is drawn along the way it runs: measured across \
+                     the road there, its left boundary is {:.3} m to the right of its right",
+                    lanelet.id, -width
+                )));
+            }
+            knots.push((*station, PositiveWidth::new(width.max(MIN_WIDTH))?));
+        }
+        let width = WidthProfile::new(knots, Taper::Linear)?;
+
+        let left = source.polyline(&lanelet.left);
+        let right = source.polyline(&lanelet.right);
+        let (left_edge, right_edge) = match side {
+            LateralSide::Left => (ordinal as i32, ordinal as i32 - 1),
+            LateralSide::Right => (-(ordinal as i32 - 1), -(ordinal as i32)),
+        };
+        let centerline = Curve3::polyline(midline(&left, &right))?;
+        lanes.push(Lane {
+            id: LaneId::of_road(id, index),
+            road: id.clone(),
+            index,
+            side,
+            ordinal,
+            direction: Direction::Forward,
+            lane_type: lane_type(&lanelet.subtype).unwrap_or(LaneType::Driving),
+            width,
+            speed_limit: lanelet
+                .speed_limit_kph
+                .map(SpeedLimit::from_kph)
+                .transpose()?,
+            section: 0,
+            station_range: (0.0, length),
+            left_edge,
+            right_edge,
+            left_offset: across(&start_frame, left[0]),
+            right_offset: across(&start_frame, right[0]),
+            left_marking: marking(source, lanelet.left_way),
+            right_marking: marking(source, lanelet.right_way),
+            left_boundary: Curve3::polyline(left)?,
+            right_boundary: Curve3::polyline(right)?,
+            centerline,
+        });
+    }
+
+    let limits: BTreeSet<u64> = lanes
+        .iter()
+        .filter_map(|lane| lane.speed_limit.map(|limit| limit.kph().to_bits()))
+        .collect();
+    if limits.len() == 1 && lanes.iter().all(|lane| lane.speed_limit.is_some()) {
+        road.speed_limit = lanes[0].speed_limit;
+    }
+    road.lanes = lanes.iter().map(|lane| lane.id.clone()).collect();
+    road.sections = vec![CrossSection {
+        station: 0.0,
+        lanes: road.lanes.clone(),
+    }];
+    Ok((road, lanes))
+}
+
+/// Stations to measure the widths at, strictly between the ends: every vertex of
+/// the reference line, and the station abeam every vertex of every other edge — a
+/// width is a straight run between two of these, so a boundary's corner needs a
+/// station of its own or the run cuts across it.
+fn measuring_stations(samples: &[Sample], edges: &[Vec<Point3>], length: f64) -> Vec<f64> {
+    let mut stations: Vec<f64> = samples.iter().map(|sample| sample.station).collect();
+    for edge in &edges[1..] {
+        for point in edge {
+            if let Some(station) = station_of(samples, *point) {
+                stations.push(station);
+            }
+        }
+    }
+    stations.retain(|station| *station > 1e-6 && *station < length - 1e-6);
+    stations.sort_by(f64::total_cmp);
+    stations.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+    stations
+}
+
+/// The station on the reference line nearest a point, in plan.
+fn station_of(samples: &[Sample], point: Point3) -> Option<f64> {
+    let mut best: Option<(f64, f64)> = None;
+    for pair in samples.windows(2) {
+        let (a, b) = (pair[0].point, pair[1].point);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let length_squared = dx * dx + dy * dy;
+        if length_squared <= 0.0 {
+            continue;
+        }
+        let u = (((point.x - a.x) * dx + (point.y - a.y) * dy) / length_squared).clamp(0.0, 1.0);
+        let distance = (a.x + dx * u - point.x).hypot(a.y + dy * u - point.y);
+        if best.is_none_or(|(_, previous)| distance < previous) {
+            best = Some((
+                pair[0].station + (pair[1].station - pair[0].station) * u,
+                distance,
+            ));
+        }
+    }
+    best.map(|(station, _)| station)
+}
+
+/// A lanelet's boundary nearer the reference line, and the one further out.
+fn inner_and_outer(lanelet: &Lanelet, side: LateralSide) -> (&[Id], &[Id]) {
+    match side {
+        LateralSide::Left => (&lanelet.right, &lanelet.left),
+        LateralSide::Right => (&lanelet.left, &lanelet.right),
+    }
+}
+
+fn road_type(location: Option<&str>) -> RoadType {
+    match location {
+        Some("nonurban") => RoadType::Rural,
+        // Autoware's `private` is a car park or a private drive.
+        Some("private") => RoadType::LowSpeed,
+        _ => RoadType::Town,
+    }
+}
+
+/// How far to the left of the frame's origin a point is, across the road.
+fn across(frame: &Frame3, point: Point3) -> f64 {
+    (point - frame.origin).dot(frame.left.get())
+}
+
+/// Where the frame's lateral axis, in plan, crosses a polyline: the offset to the
+/// left of the origin, nearest first. `None` when it does not cross within reach.
+fn crossing(frame: &Frame3, polyline: &[Point3]) -> Option<f64> {
+    let (ox, oy) = (frame.origin.x, frame.origin.y);
+    let left = frame.left.get();
+    let (lx, ly) = (left.x, left.y);
+    let mut best: Option<f64> = None;
+    for pair in polyline.windows(2) {
+        let (ax, ay) = (pair[0].x, pair[0].y);
+        let (dx, dy) = (pair[1].x - ax, pair[1].y - ay);
+        let denominator = lx * dy - ly * dx;
+        if denominator.abs() < 1e-12 {
+            continue;
+        }
+        let (wx, wy) = (ax - ox, ay - oy);
+        let t = (wx * dy - wy * dx) / denominator;
+        let u = (wx * ly - wy * lx) / denominator;
+        if (-1e-9..=1.0 + 1e-9).contains(&u)
+            && t.abs() <= MAX_REACH
+            && best.is_none_or(|previous: f64| t.abs() < previous.abs())
+        {
+            best = Some(t);
+        }
+    }
+    best
+}
+
+/// The line halfway between two boundaries: both walked at the same fraction of
+/// their length, so the ends are the midpoints of the ends — which is what makes two
+/// lanelets that share their end points share their centreline's end too.
+fn midline(left: &[Point3], right: &[Point3]) -> Vec<Point3> {
+    let count = left.len().max(right.len()).max(2);
+    (0..count)
+        .map(|i| {
+            let fraction = i as f64 / (count - 1) as f64;
+            at_fraction(left, fraction).lerp(at_fraction(right, fraction), 0.5)
+        })
+        .collect()
+}
+
+fn at_fraction(polyline: &[Point3], fraction: f64) -> Point3 {
+    let lengths: Vec<f64> = polyline
+        .windows(2)
+        .map(|pair| pair[0].distance_to(pair[1]))
+        .collect();
+    let total: f64 = lengths.iter().sum();
+    if total <= 0.0 || fraction <= 0.0 {
+        return polyline[0];
+    }
+    if fraction >= 1.0 {
+        return *polyline.last().unwrap();
+    }
+    let mut remaining = fraction * total;
+    for (index, length) in lengths.iter().enumerate() {
+        if remaining <= *length && *length > 0.0 {
+            return polyline[index].lerp(polyline[index + 1], remaining / length);
+        }
+        remaining -= length;
+    }
+    *polyline.last().unwrap()
+}
+
+/// The paint on a boundary, from its way's tags.
+fn marking(source: &Source, way: Id) -> BoundaryMarking {
+    let color = match source.way_tag(way, "color") {
+        Some("yellow") | Some("orange") => MarkingColor::Yellow,
+        _ => MarkingColor::White,
+    };
+    let marking = match (source.way_tag(way, "type"), source.way_tag(way, "subtype")) {
+        (Some("virtual"), _) => RoadMarking::None,
+        (Some("line_thin" | "line_thick"), subtype) => match subtype {
+            Some("dashed") => RoadMarking::Broken,
+            Some("solid_solid") => RoadMarking::SolidSolid,
+            Some("dashed_solid") => RoadMarking::BrokenSolid,
+            Some("solid_dashed") => RoadMarking::SolidBroken,
+            _ => RoadMarking::Solid,
+        },
+        (Some("curbstone" | "road_border" | "guard_rail" | "wall" | "fence"), _) => {
+            RoadMarking::Curbstone
+        }
+        _ => RoadMarking::None,
+    };
+    BoundaryMarking::new(marking, color)
+}

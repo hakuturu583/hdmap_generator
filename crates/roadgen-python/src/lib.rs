@@ -1689,6 +1689,45 @@ fn read_opendrive(
     })
 }
 
+/// Reads a Lanelet2 map as a map.
+///
+/// Lanelet2 holds every lane and no road, so the roads and junctions are
+/// reconstructed: lanelets that share a boundary are one road, and lanelets tagged
+/// `turn_direction` are junction connectors, gathered into one junction where they
+/// meet. The lanes keep the file's boundaries exactly. `handedness` is which side
+/// traffic keeps to, which the file does not say; `origin` is `(latitude,
+/// longitude, altitude)` for the map's `(0, 0)`, by default the middle of its nodes.
+///
+/// `Map.read_warnings()` says what the file stated that the map could not keep.
+#[pyfunction]
+#[pyo3(name = "read_lanelet2")]
+#[pyo3(signature = (path, handedness = "RHT", sampling = 2.0, origin = None))]
+fn read_lanelet2(
+    path: PathBuf,
+    handedness: &str,
+    sampling: f64,
+    origin: Option<(f64, f64, f64)>,
+) -> PyResult<PyMap> {
+    let options = roadgen_lanelet2::ReadOptions {
+        handedness: TrafficHandedness::parse(handedness)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown handedness {handedness:?}")))?,
+        origin: origin
+            .map(|(latitude, longitude, altitude)| GeoOrigin::new(latitude, longitude, altitude))
+            .transpose()
+            .map_err(value_error)?,
+        sampling: SamplingConfig::new(sampling).map_err(value_error)?,
+    };
+    let imported = roadgen_lanelet2::read_with(&path, &options).map_err(value_error)?;
+    Ok(PyMap {
+        source: Source::Read {
+            map: Box::new(imported.map),
+            notes: imported.approximations,
+        },
+        built: None,
+        buildings: None,
+    })
+}
+
 #[pyfunction]
 #[pyo3(name = "render_opendrive")]
 fn render_opendrive(path: PathBuf) -> PyResult<String> {
@@ -1785,6 +1824,7 @@ fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyLaneRef>()?;
     module.add_class::<PyAlignment>()?;
     module.add_function(wrap_pyfunction!(read_opendrive, module)?)?;
+    module.add_function(wrap_pyfunction!(read_lanelet2, module)?)?;
     module.add_function(wrap_pyfunction!(render_opendrive, module)?)?;
     module.add_function(wrap_pyfunction!(render_sumo, module)?)?;
     module.add_function(wrap_pyfunction!(render_clipgt, module)?)?;

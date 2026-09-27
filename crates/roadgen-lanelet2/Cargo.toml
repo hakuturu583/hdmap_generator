@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Lowers the roadgen canonical IR onto an Autoware-ready Lanelet2 map"
+description = "Lowers the roadgen canonical IR onto an Autoware-ready Lanelet2 map, and reads a Lanelet2 map back into it"
 
 [dependencies]
 roadgen-core.workspace = true

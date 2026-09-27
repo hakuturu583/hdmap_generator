@@ -22,6 +22,12 @@
 //! lanes that the IR says are connected end up sharing point objects, and a Lanelet2
 //! routing graph then finds the same topology the IR holds. Lateral adjacency works
 //! the same way, through the shared boundary linestring between neighbouring lanes.
+//!
+//! ## Reading one back
+//!
+//! [`read`] goes the other way: a Lanelet2 map from anywhere — an Autoware map drawn
+//! by hand as much as one written here — becomes an unvalidated IR map, its lanes
+//! kept exactly and its roads and junctions reconstructed from them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -46,10 +52,12 @@ use roadgen_core::validation::ValidatedMap;
 
 mod error;
 mod grid;
+mod read;
 mod tags;
 
-pub use error::ExportError;
+pub use error::{ExportError, ImportError};
 pub use grid::MgrsGrid;
+pub use read::{from_osm_str, read, read_with, Imported, ReadOptions};
 
 /// Positions this close together are the same vertex.
 ///

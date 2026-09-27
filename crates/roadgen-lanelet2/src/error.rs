@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use roadgen_core::GeometryError;
+use roadgen_core::{GeometryError, QuantityError};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportError {
@@ -48,3 +48,50 @@ impl fmt::Display for ExportError {
 }
 
 impl std::error::Error for ExportError {}
+
+/// Errors raised while reading a Lanelet2 map into the IR.
+///
+/// Only what stops the file being read as a map at all is an error. A lanelet the
+/// IR cannot hold is left out and reported through [`crate::Imported`]'s
+/// approximations instead, the way an exporter's `check` reports what it drops.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportError {
+    /// The file is not OSM XML the parser accepts.
+    Parse(String),
+    Geometry(GeometryError),
+    Quantity(QuantityError),
+    /// The file says something the IR cannot hold and the reader has no way to
+    /// approximate.
+    Unsupported(String),
+    /// The file contradicts itself: a lanelet whose boundary names a way that is
+    /// not there, a way that names a node that is not there.
+    Inconsistent(String),
+    Io(String),
+}
+
+impl From<GeometryError> for ImportError {
+    fn from(value: GeometryError) -> Self {
+        ImportError::Geometry(value)
+    }
+}
+
+impl From<QuantityError> for ImportError {
+    fn from(value: QuantityError) -> Self {
+        ImportError::Quantity(value)
+    }
+}
+
+impl fmt::Display for ImportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImportError::Parse(detail) => write!(f, "the file is not OSM XML: {detail}"),
+            ImportError::Geometry(error) => write!(f, "{error}"),
+            ImportError::Quantity(error) => write!(f, "{error}"),
+            ImportError::Unsupported(what) => write!(f, "the IR cannot hold {what}"),
+            ImportError::Inconsistent(what) => write!(f, "the map contradicts itself: {what}"),
+            ImportError::Io(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ImportError {}

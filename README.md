@@ -7,9 +7,11 @@ same network out as **OpenDRIVE**, as an **Autoware-ready Lanelet2** map, as pla
 
 This is a generator, not a converter. You describe roads, lanes, junctions and the
 movements between them, and the library builds the geometry and writes the files.
-The one file it reads is its own kind: an **OpenDRIVE** document can be
-[read back](#reading-opendrive-back) into the same model, whether roadgen wrote it or
-someone else did, and written out again in every other format.
+Two formats can be read back into the same model and written out again in every
+other: an **OpenDRIVE** document ([reading OpenDRIVE back](#reading-opendrive-back)),
+whether roadgen wrote it or someone else did, and a **Lanelet2** map
+([reading Lanelet2 back](#reading-lanelet2-back)), whose roads and junctions are
+reconstructed from its lanes.
 
 **[Try it in a browser](https://hakuturu583.github.io/hdmap_generator/)** — the demo
 page runs this package, compiled for WebAssembly. Write a script, press Run, and flip
@@ -79,6 +81,7 @@ m.export_gpudrive("scene.json")
               the written files ──▶ roadgen-viewer ──▶ SVG
 
                 map.xodr ──▶ roadgen-opendrive::read ──▶ Canonical Road IR
+                 map.osm ──▶ roadgen-lanelet2::read  ──▶ Canonical Road IR
 ```
 
 Every exporter reads a `ValidatedMap` and writes nothing back into it: what a format
@@ -91,13 +94,16 @@ same way the builder reads a `RoadSpec` and writes lanes. It runs after generati
 and before validation, because a lot is measured against geometry that does not exist
 until the first and buildings are part of what the second checks.
 
-The two arrows at the bottom go the other way. `roadgen-viewer` reads the **written
+The arrows at the bottom go the other way. `roadgen-viewer` reads the **written
 files** — never the IR — so a picture it draws is a picture of what a consumer would
 receive. It is what the [demo page](#the-demo-page) shows. And
 `roadgen-opendrive::read` is the one route from a file *into* the IR: OpenDRIVE is
 the format the IR was shaped against, so a document comes back as roads, lanes,
 movements, furniture and rules rather than as a picture — see
-[Reading OpenDRIVE back](#reading-opendrive-back). No other format is read, and
+[Reading OpenDRIVE back](#reading-opendrive-back). `roadgen-lanelet2::read` is the
+other, and a different kind of job: a Lanelet2 map holds every lane exactly and no
+road at all, so the roads and junctions are *reconstructed* — see
+[Reading Lanelet2 back](#reading-lanelet2-back). No other format is read, and
 [`docs/import-feasibility.md`](docs/import-feasibility.md) says why.
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
@@ -1758,6 +1764,75 @@ them, it does not edit them.
 `tests/integration/tests/reimport.rs` writes every scenario, reads it back and
 writes it again, and asks the independent evaluator whether every lane edge of the
 second document is where the first put it. It is.
+
+## Reading Lanelet2 back
+
+```python
+m = roadgen.read_lanelet2("lanelet2_map.osm", handedness="LHT")
+for note in m.read_warnings():
+    print(note)
+m.export_opendrive("map.xodr")
+```
+
+```rust
+let options = roadgen_lanelet2::ReadOptions {
+    handedness: TrafficHandedness::LeftHand,
+    ..Default::default()
+};
+let imported = roadgen_lanelet2::read_with("lanelet2_map.osm", &options)?;
+for note in &imported.approximations {
+    eprintln!("{note}");
+}
+let map = imported.map.validate()?;
+roadgen_opendrive::write(&map, "map.xodr")?;
+```
+
+A Lanelet2 map holds every lane — both boundaries, in 3D, and the points two lanes
+share — and no road and no junction. So nothing about the lanes is regenerated: each
+lanelet a vehicle, a bicycle or a pedestrian moves along becomes one lane with the
+lanelet's own boundaries. What is reconstructed is everything above them:
+
+- **Roads.** Lanelets that share a boundary linestring, running the same way, are
+  side by side, and a run of them is one road with one cross-section. Its reference
+  line is the boundary on the side the lanes are laid out from — the right-hand one
+  of the rightmost lane when traffic keeps left, the left-hand one of the leftmost
+  when it keeps right — and each lane's width is measured across it, abeam every
+  vertex of every boundary. Opposite directions are separate roads: nothing in the
+  file pairs them.
+- **Junctions.** Autoware marks the lanelets that cross an intersection with
+  `turn_direction`, and each becomes a junction connector. Connectors are one
+  junction when one follows another, they leave or reach the same lane, they share
+  a boundary, their centrelines cross at the same level, or their ends come within
+  a lane's width of each other — a flyover crossing a connector below it is not in
+  its junction, which is why the heights are compared.
+- **Movements.** Every pair of lanelets where one starts at the points the other
+  ends at is a lane connection, inside the junction of the connector if either is
+  one. Roads link to the junction they run into, and to each other where two meet
+  one to one; where lanes split or merge outside a junction the lane connections
+  say where traffic goes and the roads are not linked.
+- **Rules and furniture.** `traffic_light` and `right_of_way` elements become the
+  IR's rules over the lanes that refer to them, with their lights and stop lines as
+  objects; a `traffic_sign`'s signs and a `road_marking`'s stop lines become
+  objects; a crosswalk lanelet becomes a crosswalk.
+
+The file does not say which side traffic keeps to, so the caller does (`handedness`,
+right by default). The origin is the middle of the file's nodes unless the caller
+gives one, and a map whose nodes carry an `mgrs_code` is read as an MGRS map, so it
+writes out with the same kind of `local_x`/`local_y`. The boundary directions are
+decided the way Lanelet2 decides them on load — by which side of the other each
+boundary lies — so a two-way walkway drawn either way round reads the same.
+
+What comes back approximately, or not at all, is reported in `read_warnings()` /
+`Imported::approximations`, one line per kind: a lanelet the IR has no lane for, a
+lanelet whose end is drawn along the way it runs so that no cross-section can
+measure it (a walkway turning a corner, for one), a road end that splits or merges
+outside a junction, a regulatory element the IR has no rule for.
+
+`tests/integration/tests/lanelet2_reimport.rs` writes every scenario as Lanelet2,
+reads it back, and asks that the map validates, that every lane comes back with its
+boundaries where they were, that every movement comes back, and that the rules
+govern the same lanes; with `turn_direction` added to the connectors, a crossroads
+comes back as one junction.
 
 ## Agreement between OpenDRIVE and Lanelet2
 
