@@ -1832,9 +1832,12 @@ lanelet's own boundaries. What is reconstructed is everything above them:
   end is rarely drawn square to the lane. The widths and the lane offset are
   measured along that normal, abeam every vertex of every boundary, and the tilt
   that best fits the boundaries' heights across the road is its superelevation, so
-  outer lanes sit at their own height rather than the reference line's. Lanes side
-  by side whose ends are staggered along the road, or whose surface is not one
-  tilt, are split into roads that can each be described this way.
+  outer lanes sit at their own height rather than the reference line's. What one
+  tilt cannot say — a crowned carriageway, a kerb — each lane's
+  [height](#a-lane-off-the-road-surface) says: how far its edges stand off the
+  tilted surface, kept to within 5 mm with as few knots as that takes. Lanes side
+  by side whose ends are staggered along the road are split into roads that can
+  each be described this way.
 - **Junctions.** Autoware marks the lanelets that cross an intersection with
   `turn_direction`, and each becomes a junction connector. Connectors are one
   junction when one follows another, they leave or reach the same lane, they share
@@ -1876,7 +1879,8 @@ cargo run --release -p roadgen-integration-tests --example lanelet2_opendrive_dr
 ```
 
 says how far each lane edge moves on its way through OpenDRIVE. On Autoware's
-Nishi-Shinjuku map, nine in ten boundary vertices move less than 9 mm; what moves
+Nishi-Shinjuku map, evaluated by libOpenDRIVE, ninety-nine in a hundred boundary
+vertices stay within 5 mm; what moves
 further than 10 cm is a handful of lanelets whose far end is drawn along the road,
 twenty metres past their neighbour's, which no OpenDRIVE cross-section can
 describe — the warnings name them.

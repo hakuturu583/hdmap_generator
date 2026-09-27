@@ -394,3 +394,90 @@ fn a_lift_that_slopes_across_a_banked_approach_meets_its_connector() {
         .validate()
         .unwrap_or_else(|e| panic!("{e}"));
 }
+
+#[test]
+fn a_cross_section_that_is_not_one_plane_keeps_its_heights_from_lanelet2_to_opendrive() {
+    // Two lanes side by side, the outer one falling away 0.1 m more than a single
+    // tilt would put it: Lanelet2 draws the boundaries where they are and shares
+    // the line between the lanes. Read back, the two are one road with one tilt,
+    // and each lane's height has to make up the rest — or OpenDRIVE flattens the
+    // crown onto a plane and moves an edge by centimetres.
+    let mut builder = MapBuilder::new(scenarios::metadata("crown"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 10.0),
+                Point3::new(80.0, 0.0, 11.0),
+                vec![
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Forward)
+                        .with_height(LaneHeight::constant(0.0, -0.1).unwrap()),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let read = roadgen_lanelet2::from_osm_str(
+        &roadgen_lanelet2::to_osm_xml(&map).unwrap(),
+        &roadgen_lanelet2::ReadOptions {
+            handedness: map.metadata.handedness,
+            origin: Some(map.metadata.origin),
+            sampling: map.metadata.sampling,
+        },
+    )
+    .unwrap()
+    .map
+    .validate()
+    .unwrap();
+    assert_eq!(read.roads.len(), 1, "the lanes share their middle line");
+    assert!(
+        read.lanes.iter().any(|lane| !lane.height.is_flat()),
+        "one tilt cannot hold the crown, so some lane is lifted"
+    );
+    let worst = largest_edge_distance(&read);
+    assert!(worst < 0.01, "OpenDRIVE puts an edge {worst} m off");
+}
+
+/// Every lane edge the independent evaluator finds in the document, against the
+/// IR's boundaries as curves rather than vertex for vertex: a map read from a file
+/// keeps the file's vertices, which need not stand at the reference line's stations.
+fn largest_edge_distance(map: &ValidatedMap) -> f64 {
+    let document = reparse_opendrive(map);
+    let config = map.metadata.sampling;
+    let distance = |polyline: &[Point3], point: Position| {
+        let point = Point3::new(point.x, point.y, point.z);
+        polyline
+            .windows(2)
+            .map(|pair| {
+                let along = pair[1] - pair[0];
+                let u = ((point - pair[0]).dot(along) / along.dot(along)).clamp(0.0, 1.0);
+                pair[0].lerp(pair[1], u).distance_to(point)
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let mut worst: f64 = 0.0;
+    for (index, road) in map.roads.iter().enumerate() {
+        let evaluator = RoadEvaluator::find(&document, &index.to_string()).unwrap();
+        for lane in map.lanes_of(&road.id) {
+            let (inner, outer) = match lane.side {
+                LateralSide::Left => (&lane.right_boundary, &lane.left_boundary),
+                LateralSide::Right => (&lane.left_boundary, &lane.right_boundary),
+            };
+            let inner = inner.to_polyline(config).unwrap();
+            let outer = outer.to_polyline(config).unwrap();
+            let (start, end) = lane.station_range;
+            let steps = ((end - start) / 0.5).ceil() as usize;
+            for step in 0..=steps {
+                let station = (start + (end - start) * step as f64 / steps as f64).min(end - 1e-9);
+                let (found_inner, found_outer) = evaluator
+                    .lane_edges(opendrive_lane_id(lane), station)
+                    .unwrap();
+                worst = worst
+                    .max(distance(inner.points(), found_inner))
+                    .max(distance(outer.points(), found_outer));
+            }
+        }
+    }
+    worst
+}

@@ -203,11 +203,10 @@ fn make_road(
         Ok(BuiltRoad { road, lanes, miss }) => {
             if miss > MAX_MISS {
                 approximations.count(
-                    "OpenDRIVE ends a road's lanes square to its reference line and tilts \
-                     them as one, so {n} lanelets whose end is drawn along the way they run, \
-                     or whose surface is not one tilt, come out more than 10 cm from where \
-                     the file draws them there; their boundaries in the IR, and in Lanelet2, \
-                     are the file's",
+                    "OpenDRIVE ends a road's lanes square to its reference line, so {n} \
+                     lanelets whose end is drawn along the way they run come out more than \
+                     10 cm from where the file draws them there; their boundaries in the IR, \
+                     and in Lanelet2, are the file's",
                 );
             }
             for (lanelet, lane) in group.iter().zip(&lanes) {
@@ -379,7 +378,6 @@ fn road_along(
         }
     };
     let mut rolls: Vec<(f64, f64)> = Vec::new();
-    let mut unevenness: f64 = 0.0;
     for sample in &samples {
         let frame = sample.frame()?;
         let (lx, ly) = (frame.left.get().x, frame.left.get().y);
@@ -392,17 +390,7 @@ fn road_along(
             }
         }
         if spread > MIN_SPACING * MIN_SPACING {
-            let slope = moment / spread;
-            rolls.push((sample.station, slope.atan()));
-            // How far the edges stand off the plane that slope describes: a
-            // carriageway crowned between its lanes is not one tilt.
-            for edge in edges {
-                if let Some(point) = edge_at(&frame, sample.station, edge) {
-                    let across = (point.x - frame.origin.x) * lx + (point.y - frame.origin.y) * ly;
-                    let off = (point.z - frame.origin.z - slope * across).abs();
-                    unevenness = unevenness.max(off);
-                }
-            }
+            rolls.push((sample.station, (moment / spread).atan()));
         }
     }
     road.superelevation = linear_profile(&rolls)?;
@@ -416,6 +404,10 @@ fn road_along(
     let start_frame = road.frame_at(0.0, config)?;
     let end_frame = road.frame_at(length, config)?;
     let mut offsets: Vec<Vec<(f64, f64)>> = vec![Vec::new(); edges.len()];
+    // And how far each edge stands off that tilted surface: what one tilt across
+    // the road cannot say, each lane's height says, so a crowned or kerbed
+    // carriageway keeps its edges at their own heights in OpenDRIVE too.
+    let mut lifts: Vec<Vec<(f64, f64)>> = vec![Vec::new(); edges.len()];
     for sample in &samples {
         let station = sample.station;
         let frame = if station <= 0.0 {
@@ -428,13 +420,17 @@ fn road_along(
                 .banked(road.superelevation.evaluate(station))
         };
         for (k, edge) in edges.iter().enumerate() {
-            let offset = if at_end(station) {
-                edge_at(&frame, station, edge).map(|point| across(&frame, point))
+            let point = if at_end(station) {
+                edge_at(&frame, station, edge)
             } else {
-                crossing(&frame, edge).map(|(offset, _)| offset)
+                crossing(&frame, edge).map(|(_, point)| point)
             };
-            if let Some(offset) = offset {
-                offsets[k].push((station, offset));
+            // Across the surface and off it: the edge is `t` along the tilted
+            // lateral and `h` along the surface's normal from the reference line.
+            if let Some(point) = point {
+                let from = point - frame.origin;
+                offsets[k].push((station, from.dot(frame.left.get())));
+                lifts[k].push((station, from.dot(frame.up.get())));
             }
         }
     }
@@ -487,10 +483,7 @@ fn road_along(
             direction: Direction::Forward,
             lane_type: lane_type(&lanelet.subtype).unwrap_or(LaneType::Driving),
             width,
-            // The boundaries are the file's, heights and all; the lift OpenDRIVE
-            // would need to reproduce them off the one tilted surface is not
-            // measured yet.
-            height: LaneHeight::flat(),
+            height: lane_height(&lifts[index], &lifts[index + 1])?,
             speed_limit: lanelet
                 .speed_limit_kph
                 .map(SpeedLimit::from_kph)
@@ -535,7 +528,7 @@ fn road_along(
     Ok(BuiltRoad {
         road,
         lanes,
-        miss: miss.max(unevenness).max(strays),
+        miss: miss.max(strays),
     })
 }
 
@@ -566,11 +559,16 @@ fn strays(
             .banked(road.superelevation.evaluate(station));
         let mut offset = road.lane_offset.evaluate(station);
         for (k, edge) in edges.iter().enumerate() {
-            if k > 0 {
+            // Edge k is the outer edge of lane k and the inner edge of lane k + 1,
+            // whose lifts there were measured at the same place.
+            let lift = if k == 0 {
+                lanes[0].height.evaluate(station).0
+            } else {
                 let lane = &lanes[k - 1];
                 offset += lane.side.sign() * lane.width.evaluate(station).metres();
-            }
-            let point = frame.origin + frame.left.get() * offset;
+                lane.height.evaluate(station).1
+            };
+            let point = frame.origin + frame.left.get() * offset + frame.up.get() * lift;
             worst = worst.max(distance_to(edge, point));
         }
     }
@@ -608,7 +606,10 @@ fn measuring_stations(samples: &[Sample], edges: &[Vec<Point3>], length: f64) ->
             }
         }
     }
-    stations.retain(|station| *station > 1e-6 && *station < length - 1e-6);
+    // Not hard against an end: there the normal meets each edge on its last stub
+    // of segment, or past it, and what it measures is that stub, not the road —
+    // the ends themselves are measured from the edges' own end points.
+    stations.retain(|station| *station > MIN_SPACING && *station < length - MIN_SPACING);
     stations.sort_by(f64::total_cmp);
     stations.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
     stations
@@ -792,6 +793,62 @@ fn crossing(frame: &Frame3, polyline: &[Point3]) -> Option<(f64, Point3)> {
     }
     best
 }
+
+/// How far a lanelet's edges have to be lifted off the road's tilted surface to
+/// stand where the file draws them, from the lifts measured along its inner and
+/// outer edge.
+///
+/// Measured at every station the widths are, which is far more knots than the lift
+/// needs: a knot a straight run through its neighbours already passes within
+/// [`LIFT_TOLERANCE`] of is left out, so a lane that sits on the surface is flat
+/// and a kerb is a handful of knots.
+fn lane_height(inner: &[(f64, f64)], outer: &[(f64, f64)]) -> Result<LaneHeight, ImportError> {
+    let knots: Vec<(f64, f64, f64)> = outer
+        .iter()
+        .filter_map(|(station, out)| {
+            inner
+                .iter()
+                .find(|(other, _)| (other - station).abs() < 1e-9)
+                .map(|(_, inn)| (*station, *inn, *out))
+        })
+        .collect();
+    if knots
+        .iter()
+        .all(|(_, inner, outer)| inner.abs() <= LIFT_TOLERANCE && outer.abs() <= LIFT_TOLERANCE)
+    {
+        return Ok(LaneHeight::flat());
+    }
+    // Greedily: from each kept knot, reach as far as a straight run to a later knot
+    // stays within tolerance of every knot it passes.
+    let mut kept = vec![knots[0]];
+    let mut anchor = 0;
+    while anchor < knots.len() - 1 {
+        let mut reach = anchor + 1;
+        while reach + 1 < knots.len() {
+            let (a, b) = (knots[anchor], knots[reach + 1]);
+            let fits = knots[anchor + 1..=reach].iter().all(|knot| {
+                let t = if b.0 > a.0 {
+                    (knot.0 - a.0) / (b.0 - a.0)
+                } else {
+                    0.0
+                };
+                (a.1 + (b.1 - a.1) * t - knot.1).abs() <= LIFT_TOLERANCE
+                    && (a.2 + (b.2 - a.2) * t - knot.2).abs() <= LIFT_TOLERANCE
+            });
+            if !fits {
+                break;
+            }
+            reach += 1;
+        }
+        kept.push(knots[reach]);
+        anchor = reach;
+    }
+    Ok(LaneHeight::new(kept)?)
+}
+
+/// How far a lane's lift may stray from the heights measured along it before
+/// another knot is kept, metres.
+const LIFT_TOLERANCE: f64 = 0.005;
 
 /// A profile running straight from each `(station, value)` to the next.
 fn linear_profile(knots: &[(f64, f64)]) -> Result<Poly3Profile, ImportError> {
