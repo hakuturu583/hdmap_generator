@@ -114,6 +114,11 @@ pub struct RoadGeometry {
     pub laterals: Vec<Vector3>,
     /// Superelevation at each station, radians.
     pub rolls: Vec<f64>,
+    /// The normal a lane is lifted along at each station, where it is not the
+    /// road's own banked up: a junction connector adopts the normal of the lane it
+    /// joins at each end, as it adopts that lane's lateral, so a lift that slopes
+    /// across the lane meets the lane's edges rather than missing them by the tilt.
+    pub ups: Vec<Option<Vector3>>,
 }
 
 impl RoadGeometry {
@@ -136,10 +141,12 @@ impl RoadGeometry {
             .iter()
             .map(|sample| superelevation.evaluate(sample.station))
             .collect();
+        let ups = vec![None; samples.len()];
         Ok(RoadGeometry {
             samples,
             laterals,
             rolls,
+            ups,
         })
     }
 
@@ -198,6 +205,9 @@ impl RoadGeometry {
 
     /// The road surface's normal at one station: up, tilted with the road's roll.
     pub fn banked_up(&self, index: usize) -> Result<Vector3, GeometryError> {
+        if let Some(up) = self.ups[index] {
+            return Ok(up);
+        }
         let sample = &self.samples[index];
         Ok(sample.frame()?.banked(self.rolls[index]).up.get())
     }
@@ -207,6 +217,11 @@ impl RoadGeometry {
     /// whatever each of them is banked to.
     pub fn lateral_at(&self, end: RoadEnd) -> Vector3 {
         self.laterals[self.index_at(end)]
+    }
+
+    /// The normal a lane is lifted along at one end.
+    pub fn banked_up_at(&self, end: RoadEnd) -> Result<Vector3, GeometryError> {
+        self.banked_up(self.index_at(end))
     }
 
     /// The lateral direction at one end with the road's roll applied — the direction

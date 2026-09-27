@@ -1911,6 +1911,11 @@ impl Generator {
         let last = geometry.laterals.len() - 1;
         geometry.laterals[0] = start_lateral;
         geometry.laterals[last] = end_lateral;
+        // And the normal each lane there is lifted along, for the same reason: a
+        // lift that slopes across the lane lands on the approach's edges only along
+        // the approach's tilt.
+        geometry.ups[0] = Some(self.geometry[&from_lane.road].banked_up_at(from_end)?);
+        geometry.ups[last] = Some(self.geometry[&to_lane.road].banked_up_at(to_end)?);
         self.geometry.insert(road_id.clone(), geometry);
 
         // The connector carries the source lane's width into the target's. Where the
