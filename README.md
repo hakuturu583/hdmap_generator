@@ -1943,6 +1943,15 @@ predecessor, and a consumer that follows the connecting road's own `<link>` rath
 than the junction's lane links (CARLA does) never enters it from the road the link
 does not name. Nishi-Shinjuku has six such copies.
 
+An ordinary road whose two ends both run into one junction — a short link
+between two sets of turns inside a large intersection — is cut in two at a geometry
+boundary near its middle, joined road to road. That is valid OpenDRIVE either way,
+but CARLA looks for a road end's continuations among the junction's connecting
+roads whose predecessor *or successor* is the road, without asking at which end,
+so a turn into such a road's start is taken for one out of its end and the
+movement is dropped. The second half carries the road's own profiles, widths,
+lifts and furniture from the cut, and nothing moves. Nishi-Shinjuku has thirteen.
+
 On Nishi-Shinjuku that is 172 connecting roads in 57 places, 44 of them new
 junctions and 13 the junction beside them. Every one of the
 Lanelet2 routing graph's 970 successors is now a movement the document states, up

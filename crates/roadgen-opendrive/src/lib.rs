@@ -153,6 +153,7 @@ use splits::{Place, Splits, Stub, STUB_LENGTH};
 pub mod controllers;
 mod copies;
 mod error;
+mod loops;
 pub mod options;
 pub mod read;
 pub mod road_coordinates;
@@ -518,6 +519,9 @@ impl<'a> Exporter<'a> {
                 }
             }
         }
+        // CARLA misreads a road both of whose ends run into one junction; cut in
+        // two, each half has one end there.
+        loops::cut_looping_roads(&mut drive);
         for group in &self.groups {
             let mut control = Vec::with_capacity(group.lights.len());
             for light in &group.lights {
