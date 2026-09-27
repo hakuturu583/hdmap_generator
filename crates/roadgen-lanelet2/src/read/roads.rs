@@ -16,7 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ll2_core::id::Id;
 
-use roadgen_core::geometry::{Curve3, Frame3, Point3, Poly3Profile, Sample, Taper, WidthProfile};
+use roadgen_core::geometry::{
+    Bezier3, Curve3, Frame3, Point3, Poly3Piece, Poly3Profile, Sample, SamplingConfig, Taper,
+    WidthProfile,
+};
 use roadgen_core::id::{LaneId, RoadId};
 use roadgen_core::map::{CrossSection, Lane, Map, Road};
 use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking, RoadType};
@@ -175,7 +178,38 @@ fn make_road(
 ) {
     let id = RoadId::new(group[0].id.to_string());
     match road(source, map, &id, group) {
-        Ok((road, lanes)) => {
+        // Lanes side by side whose ends are staggered along the road — one stops
+        // twenty metres before its neighbour — cannot share one pair of ends, and
+        // lanes on either side of a crown cannot share one tilt. Each run of them
+        // that can becomes a road of its own.
+        Ok(built_road) if built_road.miss > MAX_MISS && group.len() > 1 => {
+            let fits = |run: &[&Lanelet]| {
+                road(source, map, &id, run).is_ok_and(|built| built.miss <= MAX_MISS)
+            };
+            let mut runs = Vec::new();
+            let mut start = 0;
+            while start < group.len() {
+                let mut end = start + 1;
+                while end < group.len() && fits(&group[start..=end]) {
+                    end += 1;
+                }
+                runs.push(start..end);
+                start = end;
+            }
+            for run in runs {
+                make_road(source, map, &group[run], connector, built, approximations);
+            }
+        }
+        Ok(BuiltRoad { road, lanes, miss }) => {
+            if miss > MAX_MISS {
+                approximations.count(
+                    "OpenDRIVE ends a road's lanes square to its reference line and tilts \
+                     them as one, so {n} lanelets whose end is drawn along the way they run, \
+                     or whose surface is not one tilt, come out more than 10 cm from where \
+                     the file draws them there; their boundaries in the IR, and in Lanelet2, \
+                     are the file's",
+                );
+            }
             for (lanelet, lane) in group.iter().zip(&lanes) {
                 built.lane_of.insert(lanelet.id, lane.id.clone());
                 built.road_of.insert(lanelet.id, id.clone());
@@ -209,12 +243,26 @@ fn make_road(
     }
 }
 
+/// A road, and how far OpenDRIVE would move the furthest of its lane edges: along
+/// the road, where a lane ends off the reference line's normal at that end — every
+/// lane ends on it in OpenDRIVE — or up and down, where an edge stands off the one
+/// tilt a cross-section can have.
+struct BuiltRoad {
+    road: Road,
+    lanes: Vec<Lane>,
+    miss: f64,
+}
+
+/// How far OpenDRIVE may move a lane edge before the lanes are split into separate
+/// roads, metres.
+const MAX_MISS: f64 = 0.1;
+
 fn road(
     source: &Source,
     map: &Map,
     id: &RoadId,
     group: &[&Lanelet],
-) -> Result<(Road, Vec<Lane>), ImportError> {
+) -> Result<BuiltRoad, ImportError> {
     let config = map.metadata.sampling;
     let side = map.metadata.handedness.side_for(Direction::Forward);
 
@@ -225,7 +273,7 @@ fn road(
         edges.push(source.polyline(inner_and_outer(lanelet, side).1));
     }
 
-    let reference_line = Curve3::polyline(edges[0].iter().copied())?;
+    let reference_line = smooth_reference(&edges, side, config)?;
     let length = reference_line.horizontal_length()?;
     let mut road = Road {
         id: id.clone(),
@@ -248,30 +296,87 @@ fn road(
         superelevation: Poly3Profile::default(),
     };
 
-    // Where each edge crosses the reference line's normal, at every vertex of the
-    // reference line. At the two ends it is where the edge itself starts and stops,
-    // measured across the road the way validation measures it, so the widths agree
-    // with the boundaries there exactly.
-    let stations = measuring_stations(&road.reference_line.samples(config)?, &edges, length);
-    let start_frame = road.frame_at(0.0, config)?;
-    let end_frame = road.frame_at(length, config)?;
-    let frames = stations
-        .iter()
-        .map(|station| {
-            road.frame_at(*station, config)
-                .map(|frame| (*station, frame))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut offsets: Vec<Vec<(f64, f64)>> = vec![Vec::new(); edges.len()];
-    for (k, edge) in edges.iter().enumerate() {
-        offsets[k].push((0.0, across(&start_frame, edge[0])));
-        for (station, frame) in &frames {
-            if let Some(offset) = crossing(frame, edge) {
-                offsets[k].push((*station, offset));
+    // The road's cross-fall. Lanelet2 boundaries carry their own heights, and a
+    // carriageway is rarely level across: its outer lanes sit lower, or higher, than
+    // the line it is laid out from. OpenDRIVE lays every lane out along the reference
+    // line's normal, so unless that normal is tilted the way the road is, every lane
+    // comes out at the reference line's height — and a connector joining an outer
+    // lane meets it with a step. So the tilt is measured at every station, as the
+    // slope that best fits the edges' heights across the road, and becomes the
+    // road's superelevation.
+    let required = measuring_stations(&road.reference_line.samples(config)?, &edges, length);
+    let samples = road.reference_line.samples_including(config, &required)?;
+    let at_end = |station: f64| station <= 0.0 || station >= length - 1e-9;
+    let edge_at = |frame: &Frame3, station: f64, edge: &[Point3]| -> Option<Point3> {
+        if station <= 0.0 {
+            Some(edge[0])
+        } else if station >= length - 1e-9 {
+            edge.last().copied()
+        } else {
+            crossing(frame, edge).map(|(_, point)| point)
+        }
+    };
+    let mut rolls: Vec<(f64, f64)> = Vec::new();
+    let mut unevenness: f64 = 0.0;
+    for sample in &samples {
+        let frame = sample.frame()?;
+        let (lx, ly) = (frame.left.get().x, frame.left.get().y);
+        let (mut moment, mut spread) = (0.0, 0.0);
+        for edge in &edges {
+            if let Some(point) = edge_at(&frame, sample.station, edge) {
+                let across = (point.x - frame.origin.x) * lx + (point.y - frame.origin.y) * ly;
+                moment += across * (point.z - frame.origin.z);
+                spread += across * across;
             }
         }
-        offsets[k].push((length, across(&end_frame, *edge.last().unwrap())));
+        if spread > MIN_SPACING * MIN_SPACING {
+            let slope = moment / spread;
+            rolls.push((sample.station, slope.atan()));
+            // How far the edges stand off the plane that slope describes: a
+            // carriageway crowned between its lanes is not one tilt.
+            for edge in &edges {
+                if let Some(point) = edge_at(&frame, sample.station, edge) {
+                    let across = (point.x - frame.origin.x) * lx + (point.y - frame.origin.y) * ly;
+                    let off = (point.z - frame.origin.z - slope * across).abs();
+                    unevenness = unevenness.max(off);
+                }
+            }
+        }
     }
+    road.superelevation = linear_profile(&rolls)?;
+
+    // Where each edge crosses the reference line's normal, now tilted, all along
+    // it. At the two ends it is where the edge itself starts and stops, measured
+    // across the road the way validation measures it, so the widths agree with the
+    // boundaries there exactly. Edge 0 is the reference line's own boundary, which
+    // the smooth line runs through at every vertex and bows away from a little in
+    // between; how far is the lane offset.
+    let start_frame = road.frame_at(0.0, config)?;
+    let end_frame = road.frame_at(length, config)?;
+    let mut offsets: Vec<Vec<(f64, f64)>> = vec![Vec::new(); edges.len()];
+    for sample in &samples {
+        let station = sample.station;
+        let frame = if station <= 0.0 {
+            start_frame
+        } else if station >= length - 1e-9 {
+            end_frame
+        } else {
+            sample
+                .frame()?
+                .banked(road.superelevation.evaluate(station))
+        };
+        for (k, edge) in edges.iter().enumerate() {
+            let offset = if at_end(station) {
+                edge_at(&frame, station, edge).map(|point| across(&frame, point))
+            } else {
+                crossing(&frame, edge).map(|(offset, _)| offset)
+            };
+            if let Some(offset) = offset {
+                offsets[k].push((station, offset));
+            }
+        }
+    }
+    road.lane_offset = linear_profile(&offsets[0])?;
 
     let mut lanes = Vec::new();
     for (index, lanelet) in group.iter().enumerate() {
@@ -350,16 +455,30 @@ fn road(
         station: 0.0,
         lanes: road.lanes.clone(),
     }];
-    Ok((road, lanes))
+    let miss = edges
+        .iter()
+        .flat_map(|edge| {
+            [
+                (start_frame, edge[0]),
+                (end_frame, *edge.last().expect("an edge has points")),
+            ]
+        })
+        .map(|(frame, point)| (point - frame.origin).dot(frame.tangent.get()).abs())
+        .fold(0.0, f64::max);
+    Ok(BuiltRoad {
+        road,
+        lanes,
+        miss: miss.max(unevenness),
+    })
 }
 
 /// Stations to measure the widths at, strictly between the ends: every vertex of
-/// the reference line, and the station abeam every vertex of every other edge — a
+/// the reference line, and the station abeam every vertex of every edge — a
 /// width is a straight run between two of these, so a boundary's corner needs a
 /// station of its own or the run cuts across it.
 fn measuring_stations(samples: &[Sample], edges: &[Vec<Point3>], length: f64) -> Vec<f64> {
     let mut stations: Vec<f64> = samples.iter().map(|sample| sample.station).collect();
-    for edge in &edges[1..] {
+    for edge in edges {
         for point in edge {
             if let Some(station) = station_of(samples, *point) {
                 stations.push(station);
@@ -394,6 +513,100 @@ fn station_of(samples: &[Sample], point: Point3) -> Option<f64> {
     best.map(|(station, _)| station)
 }
 
+/// How far a road's end may lean before the reference line stops turning to meet
+/// it square, radians. Beyond this the end is drawn along the way the road runs
+/// more than across it, and turning the line that far would fold the cross-section.
+const MAX_END_LEAN: f64 = std::f64::consts::FRAC_PI_4;
+
+/// Vertices of the reference boundary closer together than this are one vertex,
+/// metres; a cubic through two nearly coincident points only wobbles.
+const MIN_SPACING: f64 = 0.05;
+
+/// The reference line: a smooth curve through the vertices of edge 0.
+///
+/// OpenDRIVE lays every lane out along the reference line's normal. A polyline has
+/// a normal that jumps at every vertex, and it is written as one `<line>` per
+/// segment, so every lane but the one on the line would break at every vertex, by
+/// its offset times the angle turned. So the line is a chain of cubics through the
+/// same vertices, their tangents the directions from each vertex's neighbour to
+/// the next (Catmull–Rom): continuous, and within centimetres of the boundary.
+///
+/// At its two ends the tangent is square to the road's end — the line from where
+/// edge 0 ends to where the outermost edge ends. A lanelet's end is where it meets
+/// the next lanelet, and it is rarely drawn square to the lane; OpenDRIVE ends
+/// every lane on the normal at the end of the reference line, so a square normal is
+/// the only one on which every lane ends where the file says. Two roads that meet
+/// share that end, so they turn to the same direction there and stay continuous.
+fn smooth_reference(
+    edges: &[Vec<Point3>],
+    side: LateralSide,
+    config: SamplingConfig,
+) -> Result<Curve3, ImportError> {
+    let base = &edges[0];
+    let mut points: Vec<Point3> = vec![base[0]];
+    for point in &base[1..base.len() - 1] {
+        if point.horizontal_distance_to(*points.last().unwrap()) >= MIN_SPACING {
+            points.push(*point);
+        }
+    }
+    let last = *base.last().unwrap();
+    if points.len() > 1 && last.horizontal_distance_to(*points.last().unwrap()) < MIN_SPACING {
+        points.pop();
+    }
+    points.push(last);
+    if points.len() < 2 {
+        return Ok(Curve3::polyline(base.iter().copied())?);
+    }
+
+    let n = points.len();
+    let outermost = edges.last().unwrap();
+    // Horizontal direction and grade of the tangent at each vertex.
+    let mut tangents: Vec<(f64, f64, f64)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (from, to) = (points[i.saturating_sub(1)], points[(i + 1).min(n - 1)]);
+        let run = from.horizontal_distance_to(to);
+        let (dx, dy) = ((to.x - from.x) / run, (to.y - from.y) / run);
+        tangents.push((dx, dy, (to.z - from.z) / run));
+    }
+    for (index, far) in [(0, outermost[0]), (n - 1, *outermost.last().unwrap())] {
+        let (dx, dy, grade) = tangents[index];
+        let near = points[index];
+        let (cx, cy) = (far.x - near.x, far.y - near.y);
+        let across = cx.hypot(cy);
+        if across < MIN_SPACING {
+            continue;
+        }
+        // The end runs from edge 0 out to the outermost edge, which is to the
+        // left of the road when the lanes are on its left.
+        let (lx, ly) = (side.sign() * cx / across, side.sign() * cy / across);
+        let (tx, ty) = (ly, -lx);
+        if (tx * dx + ty * dy).clamp(-1.0, 1.0).acos() <= MAX_END_LEAN {
+            tangents[index] = (tx, ty, grade);
+        }
+    }
+
+    let mut pieces = Vec::with_capacity(n - 1);
+    for i in 0..n - 1 {
+        let (start, end) = (points[i], points[i + 1]);
+        let handle = start.horizontal_distance_to(end) / 3.0;
+        let along = |point: Point3, (dx, dy, grade): (f64, f64, f64), sign: f64| {
+            Point3::new(
+                point.x + sign * dx * handle,
+                point.y + sign * dy * handle,
+                point.z + sign * grade * handle,
+            )
+        };
+        let control = [
+            start,
+            along(start, tangents[i], 1.0),
+            along(end, tangents[i + 1], -1.0),
+            end,
+        ];
+        pieces.push(Curve3::Bezier(Bezier3::new(control, config)?));
+    }
+    Ok(Curve3::composite(pieces)?)
+}
+
 /// A lanelet's boundary nearer the reference line, and the one further out.
 fn inner_and_outer(lanelet: &Lanelet, side: LateralSide) -> (&[Id], &[Id]) {
     match side {
@@ -417,12 +630,13 @@ fn across(frame: &Frame3, point: Point3) -> f64 {
 }
 
 /// Where the frame's lateral axis, in plan, crosses a polyline: the offset to the
-/// left of the origin, nearest first. `None` when it does not cross within reach.
-fn crossing(frame: &Frame3, polyline: &[Point3]) -> Option<f64> {
+/// left of the origin along that axis, nearest first, and the point of the polyline
+/// it crosses at. `None` when it does not cross within reach.
+fn crossing(frame: &Frame3, polyline: &[Point3]) -> Option<(f64, Point3)> {
     let (ox, oy) = (frame.origin.x, frame.origin.y);
     let left = frame.left.get();
     let (lx, ly) = (left.x, left.y);
-    let mut best: Option<f64> = None;
+    let mut best: Option<(f64, Point3)> = None;
     for pair in polyline.windows(2) {
         let (ax, ay) = (pair[0].x, pair[0].y);
         let (dx, dy) = (pair[1].x - ax, pair[1].y - ay);
@@ -435,12 +649,20 @@ fn crossing(frame: &Frame3, polyline: &[Point3]) -> Option<f64> {
         let u = (wx * ly - wy * lx) / denominator;
         if (-1e-9..=1.0 + 1e-9).contains(&u)
             && t.abs() <= MAX_REACH
-            && best.is_none_or(|previous: f64| t.abs() < previous.abs())
+            && best.is_none_or(|(previous, _)| t.abs() < previous.abs())
         {
-            best = Some(t);
+            best = Some((t, pair[0].lerp(pair[1], u.clamp(0.0, 1.0))));
         }
     }
     best
+}
+
+/// A profile running straight from each `(station, value)` to the next.
+fn linear_profile(knots: &[(f64, f64)]) -> Result<Poly3Profile, ImportError> {
+    Ok(Poly3Profile::new(knots.windows(2).filter_map(|pair| {
+        let ((from, a), (to, b)) = (pair[0], pair[1]);
+        (to - from > 0.0).then(|| Poly3Piece::new(from, a, (b - a) / (to - from), 0.0, 0.0))
+    }))?)
 }
 
 /// The line halfway between two boundaries: both walked at the same fraction of

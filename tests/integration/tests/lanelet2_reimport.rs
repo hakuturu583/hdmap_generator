@@ -312,3 +312,78 @@ fn the_rules_come_back_over_the_same_lanes() {
         signature(&map, &|lane| lane.clone())
     );
 }
+
+/// How far a lane edge of a map read from Lanelet2 may move, in 3D, on its way
+/// through OpenDRIVE, metres. The reference line is a chain of cubics through the
+/// boundary's vertices, the widths are straight runs between stations abeam every
+/// vertex and the cross-fall is one tilt per station, so what is left is the cubics
+/// bowing between vertices and the straight runs cutting the bow.
+const OPENDRIVE_TOLERANCE: f64 = 0.02;
+
+fn distance_to(polyline: &[Point3], point: Point3) -> f64 {
+    polyline
+        .windows(2)
+        .map(|pair| {
+            let (a, b) = (pair[0], pair[1]);
+            let (dx, dy, dz) = (b.x - a.x, b.y - a.y, b.z - a.z);
+            let length_squared = dx * dx + dy * dy + dz * dz;
+            let u = if length_squared > 0.0 {
+                (((point.x - a.x) * dx + (point.y - a.y) * dy + (point.z - a.z) * dz)
+                    / length_squared)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            a.lerp(b, u).distance_to(point)
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+#[test]
+fn a_map_read_from_lanelet2_keeps_its_lanes_through_opendrive() {
+    for (name, map) in every_scenario() {
+        let read = from_osm_str(&to_osm_xml(&map).unwrap(), &options_for(&map))
+            .unwrap()
+            .map
+            .validate()
+            .unwrap();
+        let config = read.metadata.sampling;
+        let xml = roadgen_opendrive::to_xml(&read).unwrap();
+        let back = roadgen_opendrive::from_xml(&xml).unwrap().map;
+        let back = back.as_map();
+        for (index, road) in read.roads.iter().enumerate() {
+            let twins = back.lanes_of(&RoadId::new(index.to_string()));
+            for lane in read.lanes_of(&road.id) {
+                let twin = twins
+                    .iter()
+                    .find(|other| other.side == lane.side && other.ordinal == lane.ordinal)
+                    .unwrap_or_else(|| panic!("{name}: {} has no twin", lane.id));
+                for (mine, theirs) in [
+                    (&lane.left_boundary, &twin.left_boundary),
+                    (&lane.right_boundary, &twin.right_boundary),
+                ] {
+                    let theirs = theirs.to_polyline(config).unwrap();
+                    let mine = mine.to_polyline(config).unwrap();
+                    // Both ends where they were, not merely somewhere on the other
+                    // boundary: a lane that ends early or late is on the line.
+                    for (a, b) in [(mine.first(), theirs.first()), (mine.last(), theirs.last())] {
+                        let drift = a.distance_to(b);
+                        assert!(
+                            drift <= OPENDRIVE_TOLERANCE,
+                            "{name}: an end of {} moves {drift:.3} m through OpenDRIVE",
+                            lane.id
+                        );
+                    }
+                    for point in mine.points() {
+                        let drift = distance_to(theirs.points(), *point);
+                        assert!(
+                            drift <= OPENDRIVE_TOLERANCE,
+                            "{name}: {} moves {drift:.3} m through OpenDRIVE",
+                            lane.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

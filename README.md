@@ -1793,12 +1793,21 @@ lanelet a vehicle, a bicycle or a pedestrian moves along becomes one lane with t
 lanelet's own boundaries. What is reconstructed is everything above them:
 
 - **Roads.** Lanelets that share a boundary linestring, running the same way, are
-  side by side, and a run of them is one road with one cross-section. Its reference
-  line is the boundary on the side the lanes are laid out from — the right-hand one
-  of the rightmost lane when traffic keeps left, the left-hand one of the leftmost
-  when it keeps right — and each lane's width is measured across it, abeam every
-  vertex of every boundary. Opposite directions are separate roads: nothing in the
-  file pairs them.
+  side by side, and a run of them is one road with one cross-section. Opposite
+  directions are separate roads: nothing in the file pairs them.
+- **Reference lines, widths and cross-fall.** The lanes keep the file's boundaries,
+  but OpenDRIVE describes a lane by a reference line and widths, so those are
+  measured to describe the same boundaries. The reference line runs through every
+  vertex of the boundary on the side the lanes are laid out from — the right-hand
+  one of the rightmost lane when traffic keeps left — as a chain of cubics, so its
+  normal turns smoothly instead of jumping at each vertex, and it meets each end of
+  the road square: OpenDRIVE ends every lane on the normal there, and a lanelet's
+  end is rarely drawn square to the lane. The widths and the lane offset are
+  measured along that normal, abeam every vertex of every boundary, and the tilt
+  that best fits the boundaries' heights across the road is its superelevation, so
+  outer lanes sit at their own height rather than the reference line's. Lanes side
+  by side whose ends are staggered along the road, or whose surface is not one
+  tilt, are split into roads that can each be described this way.
 - **Junctions.** Autoware marks the lanelets that cross an intersection with
   `turn_direction`, and each becomes a junction connector. Connectors are one
   junction when one follows another, they leave or reach the same lane, they share
@@ -1832,7 +1841,18 @@ outside a junction, a regulatory element the IR has no rule for.
 reads it back, and asks that the map validates, that every lane comes back with its
 boundaries where they were, that every movement comes back, and that the rules
 govern the same lanes; with `turn_direction` added to the connectors, a crossroads
-comes back as one junction.
+comes back as one junction; and written on as OpenDRIVE, every lane edge stays
+within 2 cm of the file's. For a map of your own,
+
+```
+cargo run --release -p roadgen-integration-tests --example lanelet2_opendrive_drift -- map.osm --lht
+```
+
+says how far each lane edge moves on its way through OpenDRIVE. On Autoware's
+Nishi-Shinjuku map, nine in ten boundary vertices move less than 9 mm; what moves
+further than 10 cm is a handful of lanelets whose far end is drawn along the road,
+twenty metres past their neighbour's, which no OpenDRIVE cross-section can
+describe — the warnings name them.
 
 ## Agreement between OpenDRIVE and Lanelet2
 

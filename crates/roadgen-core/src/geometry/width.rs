@@ -107,6 +107,12 @@ impl WidthProfile {
             })
             .map(|(_, knot)| *knot)
             .collect();
+        // A run of knots each within rounding of the next, but drifting further than
+        // that from end to end, has every knot agreeing with both its neighbours and
+        // would lose them all. It is as flat as makes no difference: its first width.
+        if kept.is_empty() {
+            return Ok(WidthProfile::constant(knots[0].1));
+        }
         Ok(WidthProfile { knots: kept, taper })
     }
 
@@ -226,6 +232,14 @@ impl TryFrom<f64> for WidthProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knots_that_drift_by_less_than_rounding_leave_a_flat_profile() {
+        let knots = (0..5).map(|i| (i as f64, w(3.5 + i as f64 * 6e-13)));
+        let profile = WidthProfile::new(knots, Taper::Linear).unwrap();
+        assert!(!profile.knots().is_empty());
+        assert!((profile.evaluate(2.0).metres() - 3.5).abs() < 1e-9);
+    }
 
     fn w(metres: f64) -> PositiveWidth {
         PositiveWidth::new(metres).unwrap()
