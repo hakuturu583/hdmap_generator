@@ -50,7 +50,9 @@
 //!
 //! Format-specific decisions stay on this side of the boundary. OpenDRIVE's numeric
 //! ids, its insistence that `s` be measured in the xy-plane, and its rule that a
-//! split needs a junction are all handled here; none of them reaches the IR.
+//! split needs a junction are all handled here; none of them reaches the IR. A lane
+//! that splits or merges outside a junction is given one, with a millimetre-long
+//! connecting road per movement: see the `splits` module.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -131,7 +133,7 @@ use vec1::Vec1;
 
 use ll2_projection::utmups;
 use roadgen_core::buildings::{Building, BuildingPart};
-use roadgen_core::geometry::{Curve3, Point3, Sample};
+use roadgen_core::geometry::{Curve3, Point3, Sample, Vector3};
 use roadgen_core::id::ObjectId;
 use roadgen_core::id::{BuildingId, JunctionId, LaneId, RoadId};
 use roadgen_core::map::{Lane, Map, Projection, Road, TrafficHandedness};
@@ -144,11 +146,14 @@ use roadgen_core::units::GeoOrigin;
 use roadgen_core::validation::ValidatedMap;
 use roadgen_core::GeometryError;
 
+use splits::{Place, Splits, Stub, STUB_LENGTH};
+
 pub mod controllers;
 mod error;
 pub mod options;
 pub mod read;
 pub mod road_coordinates;
+mod splits;
 
 pub use controllers::{signal_groups, SignalGroup};
 pub use error::{ExportError, ImportError};
@@ -318,9 +323,10 @@ pub fn lane_id(map: &ValidatedMap, lane: &LaneId) -> Option<(String, i64)> {
 /// Constraints OpenDRIVE imposes that the IR does not.
 ///
 /// The IR is happy for a lane to fan out into several without a junction; OpenDRIVE
-/// only allows a lane more than one continuation inside one. Reporting that here,
-/// rather than in `roadgen-core`, keeps the format's rules on the format's side of
-/// the boundary.
+/// only allows a lane more than one continuation inside one. The exporter gives
+/// such a place a junction of its own (see `splits`), so what is reported here is
+/// only what that cannot cover. Reporting it here, rather than in `roadgen-core`,
+/// keeps the format's rules on the format's side of the boundary.
 pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = Vec::new();
 
@@ -340,6 +346,15 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         ));
     }
 
+    let splits = Splits::new(map.as_map());
+    if splits.unresolved > 0 {
+        problems.push(format!(
+            "{} places where lanes split or merge outside a junction have road ends that \
+             already run into more than one junction, so they can link to none; their \
+             lanes keep links OpenDRIVE does not allow",
+            splits.unresolved
+        ));
+    }
     for lane in map.lanes.iter() {
         let in_junction = map
             .road(&lane.road)
@@ -355,6 +370,7 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             let direct = connections
                 .iter()
                 .filter(|connection| connection.junction.is_none())
+                .filter(|connection| !splits.diverted.contains(&connection.id))
                 .count();
             if direct > 1 {
                 problems.push(format!(
@@ -428,6 +444,8 @@ struct Exporter<'a> {
     /// Resolving one is a search when it names no frontage, so every building is
     /// resolved once for the whole map rather than once for every road it is not on.
     buildings: HashMap<RoadId, Vec<&'a Building>>,
+    /// Splits and merges outside a junction, which the document gives one.
+    splits: Splits<'a>,
 }
 
 impl<'a> Exporter<'a> {
@@ -439,8 +457,10 @@ impl<'a> Exporter<'a> {
                 buildings.entry(road.id.clone()).or_default().push(building);
             }
         }
+        let splits = Splits::new(map);
         Exporter {
             numbering: Numbering::new(map),
+            splits,
             groups: signal_groups(map),
             buildings,
             options,
@@ -461,9 +481,32 @@ impl<'a> Exporter<'a> {
         for road in self.map.roads.iter() {
             drive.road.push(self.road(road)?);
         }
+        for (index, stub) in self.splits.stubs.iter().enumerate() {
+            drive.road.push(self.stub_road(index, stub)?);
+        }
         for junction in self.map.junctions.iter() {
             if let Some(element) = self.junction(&junction.id)? {
                 drive.junction.push(element);
+            }
+        }
+        for (place, kind) in self.splits.places.iter().enumerate() {
+            if let Place::New(_) = kind {
+                if let Ok(connection) = Vec1::try_from_vec(self.stub_connections(place)?) {
+                    drive.junction.push(OdJunction {
+                        connection,
+                        priority: Vec::new(),
+                        controller: Vec::new(),
+                        surface: None,
+                        id: self.place_id(place)?,
+                        main_road: None,
+                        name: None,
+                        orientation: None,
+                        s_end: None,
+                        s_start: None,
+                        r#type: Some(JunctionType::Default),
+                        additional_data: AdditionalData::default(),
+                    });
+                }
             }
         }
         for group in &self.groups {
@@ -599,13 +642,7 @@ impl<'a> Exporter<'a> {
                 }),
                 country: None,
                 s: Length::new::<meter>(0.0),
-                r#type: match road.road_type {
-                    RoadType::Town => RoadTypeE::Town,
-                    RoadType::Rural => RoadTypeE::Rural,
-                    RoadType::Motorway => RoadTypeE::Motorway,
-                    RoadType::LowSpeed => RoadTypeE::LowSpeed,
-                    RoadType::Pedestrian => RoadTypeE::Pedestrian,
-                },
+                r#type: od_road_type(road.road_type),
                 additional_data: AdditionalData::default(),
             }],
             plan_view: self.plan_view(road, &samples)?,
@@ -785,6 +822,16 @@ impl<'a> Exporter<'a> {
 
     fn road_link(&self, road: &Road) -> Result<Option<Link>, ExportError> {
         let resolve = |end: RoadEnd| -> Result<Option<PredecessorSuccessor>, ExportError> {
+            // A split or merge here: the road runs into the place's junction.
+            if let Some(place) = self.splits.ends.get(&(road.id.clone(), end)) {
+                return Ok(Some(PredecessorSuccessor {
+                    contact_point: None,
+                    element_dir: None,
+                    element_id: self.place_id(*place)?,
+                    element_s: None,
+                    element_type: Some(ElementType::Junction),
+                }));
+            }
             Ok(match road.link.at(end) {
                 None => None,
                 Some(RoadLinkTarget::Road(other)) => Some(PredecessorSuccessor {
@@ -897,25 +944,7 @@ impl<'a> Exporter<'a> {
                 lane,
                 additional_data: AdditionalData::default(),
             }),
-            center: Center {
-                lane: Vec1::new(CenterLane {
-                    id: 0,
-                    base: OdLane {
-                        link: None,
-                        choice: Vec::new(),
-                        road_mark: vec![road_mark(centre_marking.0, centre_marking.1)],
-                        material: Vec::new(),
-                        speed: Vec::new(),
-                        access: Vec::new(),
-                        height: Vec::new(),
-                        rule: Vec::new(),
-                        level: None,
-                        r#type: OdLaneType::None,
-                        additional_data: AdditionalData::default(),
-                    },
-                }),
-                additional_data: AdditionalData::default(),
-            },
+            center: centre(road_mark(centre_marking.0, centre_marking.1)),
             right: Vec1::try_from_vec(
                 right
                     .iter()
@@ -990,40 +1019,56 @@ impl<'a> Exporter<'a> {
     /// on the lane would claim a continuation that does not exist. The connecting
     /// road's own lanes do link to the lanes at either side of it.
     fn lane_link(&self, lane: &Lane) -> Result<Option<LaneLink>, ExportError> {
-        let is_connector = self
-            .map
-            .road(&lane.road)
-            .map(Road::is_connector)
-            .unwrap_or(false);
+        let Some(road) = self.map.road(&lane.road) else {
+            return Ok(None);
+        };
+        let is_connector = road.is_connector();
+        // A lane link names a lane of the road linked at that end. A connector
+        // entered from two roads at once links to one of them; the junction's
+        // connections say it is entered from both.
+        let reaches = |end: LaneEnd, other: &Lane| {
+            if other.road == road.id || !is_connector {
+                return true;
+            }
+            let end = match end {
+                LaneEnd::Start => RoadEnd::Start,
+                LaneEnd::End => RoadEnd::End,
+            };
+            match road.link.at(end) {
+                Some(RoadLinkTarget::Road(target)) => target.road == other.road,
+                _ => true,
+            }
+        };
         let mut predecessor = Vec::new();
         let mut successor = Vec::new();
 
-        for connection in self.map.connections_from(&lane.id) {
-            if connection.junction.is_some() && !is_connector {
+        let ends = self
+            .map
+            .connections_from(&lane.id)
+            .into_iter()
+            .map(|connection| (connection, connection.from.end, &connection.to.lane))
+            .chain(
+                self.map
+                    .connections_to(&lane.id)
+                    .into_iter()
+                    .map(|connection| (connection, connection.to.end, &connection.from.lane)),
+            );
+        for (connection, end, other) in ends {
+            if (connection.junction.is_some() && !is_connector)
+                || self.splits.diverted.contains(&connection.id)
+            {
                 continue;
             }
-            let Some(other) = self.map.lanes.get(&connection.to.lane) else {
+            let Some(other) = self.map.lanes.get(other) else {
                 continue;
             };
+            if !reaches(end, other) {
+                continue;
+            }
             let entry = LanePredecessorSuccessor {
                 id: self.lane_id(&other.id)?,
             };
-            match connection.from.end {
-                LaneEnd::End => successor.push(entry),
-                LaneEnd::Start => predecessor.push(entry),
-            }
-        }
-        for connection in self.map.connections_to(&lane.id) {
-            if connection.junction.is_some() && !is_connector {
-                continue;
-            }
-            let Some(other) = self.map.lanes.get(&connection.from.lane) else {
-                continue;
-            };
-            let entry = LanePredecessorSuccessor {
-                id: self.lane_id(&other.id)?,
-            };
-            match connection.to.end {
+            match end {
                 LaneEnd::End => successor.push(entry),
                 LaneEnd::Start => predecessor.push(entry),
             }
@@ -1089,6 +1134,16 @@ impl<'a> Exporter<'a> {
                     linked_road: None,
                     r#type: None,
                 });
+            }
+        }
+
+        // The splits and merges beside it that joined it.
+        for (place, kind) in self.splits.places.iter().enumerate() {
+            if *kind == Place::Existing(junction.clone()) {
+                for mut connection in self.stub_connections(place)? {
+                    connection.id = connections.len().to_string();
+                    connections.push(connection);
+                }
             }
         }
 
@@ -1648,6 +1703,313 @@ impl<'a> Exporter<'a> {
             .ok_or_else(|| ExportError::Unknown(object.to_string()))
     }
 
+    /// A split or merge's lane connection, as a connecting road of its own.
+    ///
+    /// The stub is centred on the cross-section traffic leaves `from` by and square
+    /// to it, so its lane's edges pass through that lane's: its reference line runs
+    /// down the lane's middle, the lane is offset to straddle it, and the road is
+    /// banked by the cross-section's own fall. See [`splits`].
+    fn stub_road(&self, index: usize, stub: &Stub) -> Result<OdRoad, ExportError> {
+        let lane = |id: &LaneId| {
+            self.map
+                .lanes
+                .get(id)
+                .ok_or_else(|| ExportError::Unknown(id.to_string()))
+        };
+        let from = lane(&stub.connection.from.lane)?;
+        let to = lane(&stub.connection.to.lane)?;
+        let (from_left, from_right) = self.lane_edges_at(from, stub.connection.from.end, true)?;
+        let (to_left, to_right) = self.lane_edges_at(to, stub.connection.to.end, false)?;
+        // Along the cross-section traffic leaves by, square to it, and as far as the
+        // one it enters by lies beyond it — which is nothing, where the two lanes
+        // share their points, and then the stub takes its length half before and
+        // half after.
+        let across = from_left - from_right;
+        let heading = (-across.x).atan2(across.y);
+        let (sin, cos) = heading.sin_cos();
+        let ahead = Vector3::new(cos, sin, 0.0);
+        let normal = Vector3::new(-sin, cos, 0.0);
+        let leaving = from_right.lerp(from_left, 0.5);
+        let along = (to_right.lerp(to_left, 0.5) - leaving).dot(ahead);
+        let length = along.max(STUB_LENGTH);
+        let start = leaving - ahead * ((length - along) / 2.0);
+        // Traffic runs along the stub, so its lane is on the side traffic keeps to,
+        // with its inner edge — the driver's left on the right — at the offset.
+        let side = match self.map.metadata.handedness {
+            TrafficHandedness::RightHand => LateralSide::Right,
+            TrafficHandedness::LeftHand => LateralSide::Left,
+        };
+        // Each end's cross-section as the stub describes it: the inner edge's offset,
+        // the width, the reference line's elevation and the roll that put the lane's
+        // two edges where the lanes on either side have theirs.
+        let section = |left: Point3, right: Point3, station: f64| {
+            let at = start + ahead * station;
+            let inner = match side {
+                LateralSide::Right => left,
+                LateralSide::Left => right,
+            };
+            let (run, rise) = ((left - right).dot(normal), left.z - right.z);
+            let roll = rise.atan2(run);
+            let offset = (inner - at).dot(normal) / roll.cos();
+            [offset, run.hypot(rise), inner.z - offset * roll.sin(), roll]
+        };
+        let first = section(from_left, from_right, 0.0);
+        let last = section(to_left, to_right, length);
+        // Each straight from one end to the other — but the elevation, which is
+        // level at the two ends' mean. Over a millimetre, the tenth of one the
+        // two ends may differ by is a grade of ten percent, and OpenDRIVE tilts a
+        // banked cross-section with its grade: the lane's edges would swing along
+        // the road by millimetres to meet a height that was a fraction of one out.
+        let [offset, width, _, roll] =
+            std::array::from_fn(|i| (first[i], (last[i] - first[i]) / length));
+        let elevation = ((first[2] + last[2]) / 2.0, 0.0);
+        let number = lane_number(side, 1);
+        let road_of =
+            |(road, end): &(RoadId, RoadEnd)| -> Result<PredecessorSuccessor, ExportError> {
+                Ok(PredecessorSuccessor {
+                    contact_point: Some(match end {
+                        RoadEnd::Start => ContactPoint::Start,
+                        RoadEnd::End => ContactPoint::End,
+                    }),
+                    element_dir: None,
+                    element_id: self.road_id(road)?.to_owned(),
+                    element_s: None,
+                    element_type: Some(ElementType::Road),
+                })
+            };
+        let road_type = self
+            .map
+            .road(&from.road)
+            .map(|road| road.road_type)
+            .unwrap_or(RoadType::Town);
+        let stub_lane = OdLane {
+            link: Some(LaneLink {
+                predecessor: vec![LanePredecessorSuccessor {
+                    id: self.lane_id(&from.id)?,
+                }],
+                successor: vec![LanePredecessorSuccessor {
+                    id: self.lane_id(&to.id)?,
+                }],
+                additional_data: AdditionalData::default(),
+            }),
+            choice: vec![LaneChoice::Width(Width {
+                a: width.0,
+                b: width.1,
+                c: 0.0,
+                d: 0.0,
+                s_offset: Length::new::<meter>(0.0),
+            })],
+            road_mark: vec![road_mark(RoadMarking::None, MarkingColor::White)],
+            material: Vec::new(),
+            speed: to
+                .speed_limit
+                .map(|limit| LaneSpeed {
+                    max: limit.mps(),
+                    s_offset: Length::new::<meter>(0.0),
+                    unit: Some(SpeedUnit::MetersPerSecond),
+                })
+                .into_iter()
+                .collect(),
+            access: Vec::new(),
+            height: Vec::new(),
+            rule: Vec::new(),
+            level: None,
+            r#type: lane_type(from.lane_type),
+            additional_data: AdditionalData::default(),
+        };
+        let (left_lanes, right_lanes) = match side {
+            LateralSide::Left => (
+                Some(Left {
+                    lane: Vec1::new(LeftLane {
+                        id: number,
+                        base: stub_lane,
+                    }),
+                    additional_data: AdditionalData::default(),
+                }),
+                None,
+            ),
+            LateralSide::Right => (
+                None,
+                Some(Right {
+                    lane: Vec1::new(RightLane {
+                        id: number,
+                        base: stub_lane,
+                    }),
+                    additional_data: AdditionalData::default(),
+                }),
+            ),
+        };
+        Ok(OdRoad {
+            id: self.stub_id(index),
+            junction: self.place_id(stub.place)?,
+            length: Length::new::<meter>(length),
+            name: None,
+            rule: Some(match self.map.metadata.handedness {
+                TrafficHandedness::RightHand => Rule::RightHandTraffic,
+                TrafficHandedness::LeftHand => Rule::LeftHandTraffic,
+            }),
+            link: Some(Link {
+                predecessor: Some(road_of(&stub.from)?),
+                successor: Some(road_of(&stub.to)?),
+                additional_data: AdditionalData::default(),
+            }),
+            r#type: vec![OdRoadType {
+                speed: None,
+                country: None,
+                s: Length::new::<meter>(0.0),
+                r#type: od_road_type(road_type),
+                additional_data: AdditionalData::default(),
+            }],
+            plan_view: PlanView {
+                geometry: Vec1::new(Geometry {
+                    hdg: Angle::new::<radian>(heading),
+                    length: Length::new::<meter>(length),
+                    s: Length::new::<meter>(0.0),
+                    x: Length::new::<meter>(start.x),
+                    y: Length::new::<meter>(start.y),
+                    r#type: GeometryType::Line(OdLine {}),
+                    additional_data: AdditionalData::default(),
+                }),
+                additional_data: AdditionalData::default(),
+            },
+            elevation_profile: Some(ElevationProfile {
+                elevation: vec![Elevation {
+                    a: elevation.0,
+                    b: elevation.1,
+                    c: 0.0,
+                    d: 0.0,
+                    s: 0.0,
+                }],
+                additional_data: AdditionalData::default(),
+            }),
+            lateral_profile: (roll != (0.0, 0.0)).then(|| LateralProfile {
+                super_elevation: vec![SuperElevation {
+                    a: roll.0,
+                    b: roll.1,
+                    c: 0.0,
+                    d: 0.0,
+                    s: 0.0,
+                }],
+                shape: Vec::new(),
+                additional_data: AdditionalData::default(),
+            }),
+            lanes: Lanes {
+                lane_offset: vec![LaneOffset {
+                    a: offset.0,
+                    b: offset.1,
+                    c: 0.0,
+                    d: 0.0,
+                    s: 0.0,
+                }],
+                lane_section: Vec1::new(LaneSection {
+                    s: 0.0,
+                    single_side: None,
+                    left: left_lanes,
+                    center: centre(road_mark(RoadMarking::None, MarkingColor::White)),
+                    right: right_lanes,
+                    additional_data: AdditionalData::default(),
+                }),
+                additional_data: AdditionalData::default(),
+            },
+            objects: None,
+            signals: None,
+            surface: None,
+            railroad: None,
+            additional_data: AdditionalData::default(),
+        })
+    }
+
+    /// Where OpenDRIVE puts a lane's two edges at one of its ends, from the road's
+    /// reference line, lane offset, widths, superelevation and the lane's lift —
+    /// which is where a stub has to meet them. Left and right are as the driver sees
+    /// them, `leaving` by that end or entering by it.
+    fn lane_edges_at(
+        &self,
+        lane: &Lane,
+        end: LaneEnd,
+        leaving: bool,
+    ) -> Result<(Point3, Point3), ExportError> {
+        let road = self
+            .map
+            .road(&lane.road)
+            .ok_or_else(|| ExportError::Unknown(lane.road.to_string()))?;
+        let station = lane.station_at_end(end);
+        let frame = road.frame_at(station, self.map.metadata.sampling)?;
+        let sign = match lane.side {
+            LateralSide::Left => 1.0,
+            LateralSide::Right => -1.0,
+        };
+        let inside: f64 = self
+            .map
+            .lanes_of_section(&road.id, lane.section)
+            .iter()
+            .filter(|other| other.side == lane.side && other.ordinal < lane.ordinal)
+            .map(|other| other.width_at(station))
+            .sum();
+        let inner = road.lane_offset.evaluate(station) + sign * inside;
+        let outer = inner + sign * lane.width_at(station);
+        let (inner_lift, outer_lift) = lane.height.evaluate(station);
+        let point = |offset: f64, lift: f64| {
+            frame.origin + frame.left.get() * offset + frame.up.get() * lift
+        };
+        let (inner, outer) = (point(inner, inner_lift), point(outer, outer_lift));
+        let (left, right) = match lane.side {
+            LateralSide::Left => (outer, inner),
+            LateralSide::Right => (inner, outer),
+        };
+        Ok(if (end == LaneEnd::End) == leaving {
+            (left, right)
+        } else {
+            (right, left)
+        })
+    }
+
+    /// The `<connection>`s of a place's stubs: one per stub, entered at its start
+    /// from the road traffic leaves.
+    fn stub_connections(&self, place: usize) -> Result<Vec<Connection>, ExportError> {
+        let side = match self.map.metadata.handedness {
+            TrafficHandedness::RightHand => LateralSide::Right,
+            TrafficHandedness::LeftHand => LateralSide::Left,
+        };
+        let mut connections = Vec::new();
+        for (index, stub) in self.splits.stubs.iter().enumerate() {
+            if stub.place != place {
+                continue;
+            }
+            connections.push(Connection {
+                predecessor: None,
+                successor: None,
+                lane_link: vec![JunctionLaneLink {
+                    from: self.lane_id(&stub.connection.from.lane)?,
+                    to: lane_number(side, 1),
+                }],
+                connecting_road: Some(self.stub_id(index)),
+                contact_point: Some(ContactPoint::Start),
+                id: connections.len().to_string(),
+                incoming_road: Some(self.road_id(&stub.from.0)?.to_owned()),
+                linked_road: None,
+                r#type: None,
+            });
+        }
+        Ok(connections)
+    }
+
+    /// The id of a place's junction: the IR's, or one numbered after all of them.
+    fn place_id(&self, place: usize) -> Result<String, ExportError> {
+        match &self.splits.places[place] {
+            Place::Existing(junction) => Ok(self.junction_id(junction)?.to_owned()),
+            Place::New(index) => {
+                Ok((self.map.roads.len() + self.map.junctions.len() + index).to_string())
+            }
+        }
+    }
+
+    /// The id of a stub, numbered after every road and junction.
+    fn stub_id(&self, index: usize) -> String {
+        (self.map.roads.len() + self.map.junctions.len() + self.splits.new_junctions() + index)
+            .to_string()
+    }
+
     fn road_id(&self, road: &RoadId) -> Result<&str, ExportError> {
         self.numbering
             .roads
@@ -1730,6 +2092,39 @@ fn elevation_profile(samples: &[Sample]) -> ElevationProfile {
     ElevationProfile {
         elevation,
         additional_data: AdditionalData::default(),
+    }
+}
+
+/// A lane section's centre lane, which carries only the mark on the reference line.
+fn centre(mark: RoadMark) -> Center {
+    Center {
+        lane: Vec1::new(CenterLane {
+            id: 0,
+            base: OdLane {
+                link: None,
+                choice: Vec::new(),
+                road_mark: vec![mark],
+                material: Vec::new(),
+                speed: Vec::new(),
+                access: Vec::new(),
+                height: Vec::new(),
+                rule: Vec::new(),
+                level: None,
+                r#type: OdLaneType::None,
+                additional_data: AdditionalData::default(),
+            },
+        }),
+        additional_data: AdditionalData::default(),
+    }
+}
+
+fn od_road_type(road_type: RoadType) -> RoadTypeE {
+    match road_type {
+        RoadType::Town => RoadTypeE::Town,
+        RoadType::Rural => RoadTypeE::Rural,
+        RoadType::Motorway => RoadTypeE::Motorway,
+        RoadType::LowSpeed => RoadTypeE::LowSpeed,
+        RoadType::Pedestrian => RoadTypeE::Pedestrian,
     }
 }
 

@@ -1839,8 +1839,11 @@ lanelet's own boundaries. What is reconstructed is everything above them:
   by side whose ends are staggered along the road are split into roads that can
   each be described this way.
 - **Junctions.** Autoware marks the lanelets that cross an intersection with
-  `turn_direction`, and each becomes a junction connector. Connectors are one
-  junction when one follows another, they leave or reach the same lane, they share
+  `turn_direction`, and each becomes a junction connector — except one that
+  branches into several turns, or that several turns run into, which is read as
+  the road it is up to the branch: a connecting road never runs into another.
+  Connectors are one junction when one follows another, they leave or reach the
+  same road (a road end runs into one junction), they share
   a boundary, their centrelines cross at the same level, or their ends come within
   a lane's width of each other — a flyover crossing a connector below it is not in
   its junction, which is why the heights are compared.
@@ -1848,7 +1851,10 @@ lanelet's own boundaries. What is reconstructed is everything above them:
   ends at is a lane connection, inside the junction of the connector if either is
   one. Roads link to the junction they run into, and to each other where two meet
   one to one; where lanes split or merge outside a junction the lane connections
-  say where traffic goes and the roads are not linked.
+  say where traffic goes and the roads are not linked. OpenDRIVE has no way to say
+  that, so its writer gives each such place a junction of its own, with a
+  millimetre-long connecting road for each lane connection there; see
+  [Splits and merges in OpenDRIVE](#splits-and-merges-in-opendrive).
 - **Rules and furniture.** `traffic_light` and `right_of_way` elements become the
   IR's rules over the lanes that refer to them, with their lights and stop lines as
   objects; a `traffic_sign`'s signs and a `road_marking`'s stop lines become
@@ -1907,6 +1913,33 @@ that used to be the one place the formats disagreed is now a place they agree.
 The mitre the IR applies where road ends meet is still there for the joints that
 remain — a junction's arms, and roads that meet along one tangent — and is what makes
 their boundary points the *same* points rather than merely nearby ones.
+
+### Splits and merges in OpenDRIVE
+
+The IR lets a lane run on into lanes of two roads, or two roads' lanes run into one,
+with no junction there — a turn pocket opening beside a through lane, a slip road
+leaving a carriageway — and a Lanelet2 map draws them that way all the time.
+OpenDRIVE does not: a road end links to one road or one junction, a lane link names
+a lane of the road linked at that end, and a lane has more than one continuation
+only inside a junction. Written as they were, such lanes linked into roads their own
+road does not reach, which a consumer drops (the movement is lost) or trips over
+(CARLA crashed on Autoware's Nishi-Shinjuku map).
+
+So the writer gives every such place a junction. Road ends that meet any way but one
+to one are gathered into one place, every road end there links to its junction, and
+every lane connection there becomes a connecting road of its own: one lane from the
+cross-section the lane traffic leaves ends with, as OpenDRIVE draws it, to the one
+the lane it enters starts with — width, lane offset and roll straight from one to
+the other — a millimetre long where the two are the same, half of it reaching past
+each. Where one of those road ends already runs into a junction of the IR's, the
+connecting roads join that junction instead. The IR is untouched: this is a fact
+about OpenDRIVE, and it stays in its writer.
+
+On Nishi-Shinjuku that is 172 connecting roads in 57 places, 44 of them new
+junctions and 13 the junction beside them. Every one of the
+Lanelet2 routing graph's 970 successors is now a movement the document states, up
+from 795, and none of its lane links names a lane its road does not reach, down from
+153.
 
 ## Layout
 

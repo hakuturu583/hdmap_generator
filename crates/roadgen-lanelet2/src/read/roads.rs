@@ -11,6 +11,11 @@
 //!
 //! A lanelet tagged `turn_direction` is a road of its own, whatever it shares a
 //! boundary with: it is a junction connector, and a connector carries one lane.
+//! All but one kind: a turn that branches into several turns partway through the
+//! intersection, or that several turns run into. A connecting road runs from one
+//! road to another, never into another connecting road, and a lane's movements
+//! through a junction fan out only from a road; so that lanelet is read as the
+//! road it is up to where the turns fan out, running into the junction.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -72,11 +77,20 @@ pub(crate) fn build(
         connectors: BTreeSet::new(),
     };
 
+    let turns = |ids: &[Id]| {
+        ids.iter()
+            .filter(|id| source.lanelets.get(id).is_some_and(|lanelet| lanelet.turn))
+            .count()
+    };
+    let branches = |lanelet: &Lanelet| {
+        turns(source.successors_of(lanelet.id)) > 1 || turns(source.predecessors_of(lanelet.id)) > 1
+    };
+
     let mut through: Vec<&Lanelet> = Vec::new();
     let mut turning: Vec<&Lanelet> = Vec::new();
     for lanelet in source.lanelets.values() {
         match lane_type(&lanelet.subtype) {
-            Some(_) if lanelet.turn => turning.push(lanelet),
+            Some(_) if lanelet.turn && !branches(lanelet) => turning.push(lanelet),
             Some(_) => through.push(lanelet),
             // A crosswalk is furniture, and read as such.
             None if lanelet.subtype == "crosswalk" => {}

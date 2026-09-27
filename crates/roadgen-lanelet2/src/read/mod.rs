@@ -15,8 +15,9 @@
 //! 3. **Junctions.** A lanelet tagged `turn_direction` is how Autoware marks the
 //!    lanes that cross an intersection, so each of those becomes a junction
 //!    connector of its own, and connectors that belong together — one follows the
-//!    other, they leave or reach the same lane, they share a boundary, or they cross
-//!    at the same level — are one junction. See [`junctions`].
+//!    other, they leave or reach the same road, they share a boundary, or they cross
+//!    at the same level — are one junction. A turn that branches into several
+//!    turns is the road it is up to the branch. See [`junctions`].
 //! 4. **Rules and furniture.** Traffic lights, right of way, signs, stop lines and
 //!    crosswalks come back as the IR's objects and rules. See [`furniture`].
 //!

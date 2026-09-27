@@ -5,7 +5,7 @@
 //! left is deciding which connectors are the *same* junction. Two are when
 //!
 //! * one follows the other (a turn drawn as more than one lanelet),
-//! * they leave the same lane or reach the same lane,
+//! * they leave the same road or reach the same road,
 //! * they share a boundary (two turn lanes side by side), or
 //! * their centrelines cross at the same level — a connector passing *over* another
 //!   on a flyover is not in its junction, which is why the heights are compared — or
@@ -126,20 +126,30 @@ fn cluster(source: &Source, built: &Built) -> BTreeMap<Id, JunctionId> {
             }
         }
     }
-    // They leave the same lane, or reach the same lane.
+    // They leave the same road, or reach the same road: a road end links to one
+    // junction, and every lane of it that turns turns into that one. One lane is
+    // the narrowest road.
+    let mut by_road: BTreeMap<(&RoadId, bool), Vec<usize>> = BTreeMap::new();
     for lanelet in source.lanelets.keys() {
-        for neighbours in [
-            source.successors_of(*lanelet),
-            source.predecessors_of(*lanelet),
+        let Some(road) = built.road_of.get(lanelet) else {
+            continue;
+        };
+        if built.connectors.contains(lanelet) {
+            continue;
+        }
+        for (neighbours, leaving) in [
+            (source.successors_of(*lanelet), true),
+            (source.predecessors_of(*lanelet), false),
         ] {
-            let members: Vec<usize> = neighbours
-                .iter()
-                .filter_map(|n| index.get(n))
-                .copied()
-                .collect();
-            for pair in members.windows(2) {
-                sets.union(pair[0], pair[1]);
-            }
+            by_road
+                .entry((road, leaving))
+                .or_default()
+                .extend(neighbours.iter().filter_map(|n| index.get(n)));
+        }
+    }
+    for members in by_road.values() {
+        for pair in members.windows(2) {
+            sets.union(pair[0], pair[1]);
         }
     }
     // They share a boundary.
