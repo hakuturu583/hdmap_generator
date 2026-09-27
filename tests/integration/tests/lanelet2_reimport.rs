@@ -374,6 +374,17 @@ fn a_map_read_from_lanelet2_keeps_its_lanes_through_opendrive() {
                             lane.id
                         );
                     }
+                    // The document's boundary against the file's too: a boundary
+                    // that loops out and back between the file's vertices passes
+                    // near every one of them.
+                    for point in theirs.points() {
+                        let drift = distance_to(mine.points(), *point);
+                        assert!(
+                            drift <= OPENDRIVE_TOLERANCE,
+                            "{name}: {} strays {drift:.3} m in OpenDRIVE",
+                            lane.id
+                        );
+                    }
                     for point in mine.points() {
                         let drift = distance_to(theirs.points(), *point);
                         assert!(

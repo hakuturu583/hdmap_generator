@@ -177,14 +177,14 @@ fn make_road(
     approximations: &mut Approximations,
 ) {
     let id = RoadId::new(group[0].id.to_string());
-    match road(source, map, &id, group) {
+    match road(source, map, &id, group, connector) {
         // Lanes side by side whose ends are staggered along the road — one stops
         // twenty metres before its neighbour — cannot share one pair of ends, and
         // lanes on either side of a crown cannot share one tilt. Each run of them
         // that can becomes a road of its own.
         Ok(built_road) if built_road.miss > MAX_MISS && group.len() > 1 => {
             let fits = |run: &[&Lanelet]| {
-                road(source, map, &id, run).is_ok_and(|built| built.miss <= MAX_MISS)
+                road(source, map, &id, run, connector).is_ok_and(|built| built.miss <= MAX_MISS)
             };
             let mut runs = Vec::new();
             let mut start = 0;
@@ -245,8 +245,9 @@ fn make_road(
 
 /// A road, and how far OpenDRIVE would move the furthest of its lane edges: along
 /// the road, where a lane ends off the reference line's normal at that end — every
-/// lane ends on it in OpenDRIVE — or up and down, where an edge stands off the one
-/// tilt a cross-section can have.
+/// lane ends on it in OpenDRIVE — up and down, where an edge stands off the one
+/// tilt a cross-section can have, or anywhere, where the lanes laid out along the
+/// normals stray from the boundaries between the stations they were measured at.
 struct BuiltRoad {
     road: Road,
     lanes: Vec<Lane>,
@@ -257,23 +258,84 @@ struct BuiltRoad {
 /// roads, metres.
 const MAX_MISS: f64 = 0.1;
 
+/// How far the reference line turns to meet each end square, as fractions of the
+/// full turn: tried in this order until the lanes it lays out stay on the file's
+/// boundaries.
+const LEANS: [f64; 4] = [1.0, 0.5, 0.25, 0.0];
+
+/// Below this the laid-out lanes are as good as they get, metres.
+const GOOD_ENOUGH: f64 = 0.02;
+
+/// Builds the road with the reference line that best describes its lanes.
+///
+/// Meeting a road's end square is what puts every lane's end where the file draws
+/// it, but a reference line that has to turn hard to do it — the short end of a
+/// tight turn through a junction — fans its normals so fast that the lanes laid
+/// out along them fold into a loop before the end. So less of the turn is tried,
+/// down to none, and the road that strays least from the file is kept.
+///
+/// A junction connector's reference line may also run down the middle of its lane
+/// or along its far boundary: a turn tighter than the lane is wide folds every
+/// normal from its outer boundary before they reach the inner one, and from the
+/// inside or the middle they do not. It is only a connector's that may: an
+/// ordinary road links to the next where their reference lines meet, and the
+/// boundary on the reference side is where they do.
 fn road(
     source: &Source,
     map: &Map,
     id: &RoadId,
     group: &[&Lanelet],
+    connector: bool,
 ) -> Result<BuiltRoad, ImportError> {
-    let config = map.metadata.sampling;
     let side = map.metadata.handedness.side_for(Direction::Forward);
-
-    // The cross-section's edges, outwards from the reference line: edge 0 is the
-    // reference line itself, edge k the outer boundary of the k-th lane.
+    // The cross-section's edges, outwards from the reference side: edge 0 the
+    // innermost boundary, edge k the outer boundary of the k-th lane.
     let mut edges: Vec<Vec<Point3>> = vec![source.polyline(inner_and_outer(group[0], side).0)];
     for lanelet in group {
         edges.push(source.polyline(inner_and_outer(lanelet, side).1));
     }
+    let mut bases = vec![edges[0].clone()];
+    if connector && group.len() == 1 {
+        bases.push(midline(&edges[0], &edges[1]));
+        bases.push(edges[1].clone());
+    }
 
-    let reference_line = smooth_reference(&edges, side, config)?;
+    let mut best: Option<BuiltRoad> = None;
+    let mut failure = None;
+    'search: for base in &bases {
+        for lean in LEANS {
+            match road_along(source, map, id, group, &edges, base, lean) {
+                Ok(built) => {
+                    let done = built.miss <= GOOD_ENOUGH;
+                    if best.as_ref().is_none_or(|kept| built.miss < kept.miss) {
+                        best = Some(built);
+                    }
+                    if done {
+                        break 'search;
+                    }
+                }
+                Err(error) => failure = failure.or(Some(error)),
+            }
+        }
+    }
+    best.ok_or_else(|| failure.expect("every reference line was tried"))
+}
+
+/// Builds the road along one reference line: a smooth line through `base`, turned
+/// `lean` of the way to meeting each end square.
+fn road_along(
+    source: &Source,
+    map: &Map,
+    id: &RoadId,
+    group: &[&Lanelet],
+    edges: &[Vec<Point3>],
+    base: &[Point3],
+    lean: f64,
+) -> Result<BuiltRoad, ImportError> {
+    let config = map.metadata.sampling;
+    let side = map.metadata.handedness.side_for(Direction::Forward);
+
+    let reference_line = smooth_reference(edges, base, side, config, lean)?;
     let length = reference_line.horizontal_length()?;
     let mut road = Road {
         id: id.clone(),
@@ -304,7 +366,7 @@ fn road(
     // lane meets it with a step. So the tilt is measured at every station, as the
     // slope that best fits the edges' heights across the road, and becomes the
     // road's superelevation.
-    let required = measuring_stations(&road.reference_line.samples(config)?, &edges, length);
+    let required = measuring_stations(&road.reference_line.samples(config)?, edges, length);
     let samples = road.reference_line.samples_including(config, &required)?;
     let at_end = |station: f64| station <= 0.0 || station >= length - 1e-9;
     let edge_at = |frame: &Frame3, station: f64, edge: &[Point3]| -> Option<Point3> {
@@ -322,7 +384,7 @@ fn road(
         let frame = sample.frame()?;
         let (lx, ly) = (frame.left.get().x, frame.left.get().y);
         let (mut moment, mut spread) = (0.0, 0.0);
-        for edge in &edges {
+        for edge in edges {
             if let Some(point) = edge_at(&frame, sample.station, edge) {
                 let across = (point.x - frame.origin.x) * lx + (point.y - frame.origin.y) * ly;
                 moment += across * (point.z - frame.origin.z);
@@ -334,7 +396,7 @@ fn road(
             rolls.push((sample.station, slope.atan()));
             // How far the edges stand off the plane that slope describes: a
             // carriageway crowned between its lanes is not one tilt.
-            for edge in &edges {
+            for edge in edges {
                 if let Some(point) = edge_at(&frame, sample.station, edge) {
                     let across = (point.x - frame.origin.x) * lx + (point.y - frame.origin.y) * ly;
                     let off = (point.z - frame.origin.z - slope * across).abs();
@@ -465,11 +527,68 @@ fn road(
         })
         .map(|(frame, point)| (point - frame.origin).dot(frame.tangent.get()).abs())
         .fold(0.0, f64::max);
+    let strays = strays(&road, &lanes, edges, config)?;
     Ok(BuiltRoad {
         road,
         lanes,
-        miss: miss.max(unevenness),
+        miss: miss.max(unevenness).max(strays),
     })
+}
+
+/// How far the lane edges the road describes — its reference line, tilted by its
+/// superelevation, with the lane offset and widths stacked along the normal, which
+/// is what OpenDRIVE receives — stray from the file's boundaries, metres, in 3D.
+///
+/// Checked at every sample and halfway between each two: on the samples the edges
+/// were measured, so a fold shows only between them, where the normals have turned
+/// further than the straight runs of width can follow.
+fn strays(
+    road: &Road,
+    lanes: &[Lane],
+    edges: &[Vec<Point3>],
+    config: SamplingConfig,
+) -> Result<f64, ImportError> {
+    let coarse = road.reference_line.samples(config)?;
+    let halfway: Vec<f64> = coarse
+        .windows(2)
+        .map(|pair| (pair[0].station + pair[1].station) / 2.0)
+        .collect();
+    let samples = road.reference_line.samples_including(config, &halfway)?;
+    let mut worst: f64 = 0.0;
+    for sample in &samples {
+        let station = sample.station;
+        let frame = sample
+            .frame()?
+            .banked(road.superelevation.evaluate(station));
+        let mut offset = road.lane_offset.evaluate(station);
+        for (k, edge) in edges.iter().enumerate() {
+            if k > 0 {
+                let lane = &lanes[k - 1];
+                offset += lane.side.sign() * lane.width.evaluate(station).metres();
+            }
+            let point = frame.origin + frame.left.get() * offset;
+            worst = worst.max(distance_to(edge, point));
+        }
+    }
+    Ok(worst)
+}
+
+/// The distance from a point to a polyline, in 3D.
+fn distance_to(polyline: &[Point3], point: Point3) -> f64 {
+    polyline
+        .windows(2)
+        .map(|pair| {
+            let (a, b) = (pair[0], pair[1]);
+            let along = b - a;
+            let length_squared = along.dot(along);
+            let u = if length_squared > 0.0 {
+                ((point - a).dot(along) / length_squared).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            a.lerp(b, u).distance_to(point)
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Stations to measure the widths at, strictly between the ends: every vertex of
@@ -539,10 +658,11 @@ const MIN_SPACING: f64 = 0.05;
 /// share that end, so they turn to the same direction there and stay continuous.
 fn smooth_reference(
     edges: &[Vec<Point3>],
+    base: &[Point3],
     side: LateralSide,
     config: SamplingConfig,
+    lean: f64,
 ) -> Result<Curve3, ImportError> {
-    let base = &edges[0];
     let mut points: Vec<Point3> = vec![base[0]];
     for point in &base[1..base.len() - 1] {
         if point.horizontal_distance_to(*points.last().unwrap()) >= MIN_SPACING {
@@ -559,7 +679,7 @@ fn smooth_reference(
     }
 
     let n = points.len();
-    let outermost = edges.last().unwrap();
+    let (innermost, outermost) = (&edges[0], edges.last().unwrap());
     // Horizontal direction and grade of the tangent at each vertex.
     let mut tangents: Vec<(f64, f64, f64)> = Vec::with_capacity(n);
     for i in 0..n {
@@ -568,9 +688,15 @@ fn smooth_reference(
         let (dx, dy) = ((to.x - from.x) / run, (to.y - from.y) / run);
         tangents.push((dx, dy, (to.z - from.z) / run));
     }
-    for (index, far) in [(0, outermost[0]), (n - 1, *outermost.last().unwrap())] {
+    for (index, near, far) in [
+        (0, innermost[0], outermost[0]),
+        (
+            n - 1,
+            *innermost.last().unwrap(),
+            *outermost.last().unwrap(),
+        ),
+    ] {
         let (dx, dy, grade) = tangents[index];
-        let near = points[index];
         let (cx, cy) = (far.x - near.x, far.y - near.y);
         let across = cx.hypot(cy);
         if across < MIN_SPACING {
@@ -580,8 +706,11 @@ fn smooth_reference(
         // left of the road when the lanes are on its left.
         let (lx, ly) = (side.sign() * cx / across, side.sign() * cy / across);
         let (tx, ty) = (ly, -lx);
-        if (tx * dx + ty * dy).clamp(-1.0, 1.0).acos() <= MAX_END_LEAN {
-            tangents[index] = (tx, ty, grade);
+        let turn = (dx * ty - dy * tx).atan2(dx * tx + dy * ty);
+        if turn.abs() <= MAX_END_LEAN {
+            // `lean` of the way from the boundary's own direction to square.
+            let (sin, cos) = (turn * lean).sin_cos();
+            tangents[index] = (dx * cos - dy * sin, dx * sin + dy * cos, grade);
         }
     }
 
@@ -589,17 +718,20 @@ fn smooth_reference(
     for i in 0..n - 1 {
         let (start, end) = (points[i], points[i + 1]);
         let handle = start.horizontal_distance_to(end) / 3.0;
-        let along = |point: Point3, (dx, dy, grade): (f64, f64, f64), sign: f64| {
+        // Smooth in plan, straight in height: the boundary climbs straight from one
+        // vertex to the next, and a cubic height would bow away from it between.
+        let along = |point: Point3, (dx, dy, _): (f64, f64, f64), sign: f64, height: f64| {
             Point3::new(
                 point.x + sign * dx * handle,
                 point.y + sign * dy * handle,
-                point.z + sign * grade * handle,
+                height,
             )
         };
+        let climb = end.z - start.z;
         let control = [
             start,
-            along(start, tangents[i], 1.0),
-            along(end, tangents[i + 1], -1.0),
+            along(start, tangents[i], 1.0, start.z + climb / 3.0),
+            along(end, tangents[i + 1], -1.0, start.z + 2.0 * climb / 3.0),
             end,
         ];
         pieces.push(Curve3::Bezier(Bezier3::new(control, config)?));

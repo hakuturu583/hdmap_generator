@@ -6,8 +6,9 @@
 //!
 //! Reads the Lanelet2 map into the IR, writes it as OpenDRIVE, reads that back, and
 //! measures, in 3D, how far every lane boundary in the document is from the one in
-//! the file: every vertex against the document's boundary, and every end against
-//! the document's end — which is what a consumer of the OpenDRIVE sees. `--csv`
+//! the file: every vertex of the file's against the document's boundary, every
+//! vertex of the document's against the file's, and every end against the
+//! document's end — which is what a consumer of the OpenDRIVE sees. `--csv`
 //! writes every vertex as `x,y,z,drift` for plotting.
 
 use std::collections::BTreeMap;
@@ -76,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|index| args.get(index + 1));
     let mut rows = String::from("x,y,z,drift\n");
     let mut vertices = Vec::new();
+    let mut strays = Vec::new();
     let mut ends = Vec::new();
     let mut by_road: BTreeMap<String, f64> = BTreeMap::new();
     // The exporter numbers roads in the map's order, and the reader names them so.
@@ -101,6 +103,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ends.push(d);
                     worst = worst.max(d);
                 }
+                // And the document's vertices against the file's boundary, which is
+                // what shows a boundary that loops out between two of the file's.
+                for point in theirs.points() {
+                    let d = distance_to(mine.points(), *point);
+                    strays.push(d);
+                    worst = worst.max(d);
+                }
                 for point in mine.points() {
                     let d = distance_to(theirs.points(), *point);
                     vertices.push(d);
@@ -118,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     summary("ends", &mut ends);
     summary("vertices", &mut vertices);
+    summary("document", &mut strays);
     let mut far: Vec<(&String, &f64)> = by_road.iter().filter(|(_, d)| **d > REPORTED).collect();
     far.sort_by(|a, b| b.1.total_cmp(a.1));
     println!(
