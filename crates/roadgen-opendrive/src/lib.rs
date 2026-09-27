@@ -68,6 +68,7 @@ use opendrive::junction::priority::Priority;
 use opendrive::junction::Junction as OdJunction;
 use opendrive::lane::center::Center;
 use opendrive::lane::center_lane::CenterLane;
+use opendrive::lane::height::Height;
 use opendrive::lane::lane_choice::LaneChoice;
 use opendrive::lane::lane_link::LaneLink;
 use opendrive::lane::lane_section::LaneSection;
@@ -183,6 +184,39 @@ pub fn lane_number(side: LateralSide, ordinal: usize) -> i64 {
         LateralSide::Left => ordinal as i64,
         LateralSide::Right => -(ordinal as i64),
     }
+}
+
+/// A lane's `<height>` entries: its inner and outer lift off the road surface, at
+/// the start of its section, at every knot within it and at its end, `sOffset`
+/// from the section's start. OpenDRIVE runs the lift straight from one entry to
+/// the next and holds it after the last, which is the IR's meaning too. A flat
+/// lane has none.
+fn lane_heights(lane: &Lane) -> Vec<Height> {
+    if lane.height.is_flat() {
+        return Vec::new();
+    }
+    let (start, end) = lane.station_range;
+    let mut stations = vec![start];
+    stations.extend(
+        lane.height
+            .knots()
+            .iter()
+            .map(|knot| knot.0)
+            .filter(|station| *station > start && *station < end),
+    );
+    stations.push(end);
+    stations.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    stations
+        .into_iter()
+        .map(|station| {
+            let (inner, outer) = lane.height.evaluate(station);
+            Height {
+                inner: Length::new::<meter>(inner),
+                outer: Length::new::<meter>(outer),
+                s_offset: Length::new::<meter>(station - start),
+            }
+        })
+        .collect()
 }
 
 /// Turns a validated map into an OpenDRIVE document.
@@ -941,7 +975,7 @@ impl<'a> Exporter<'a> {
                 .into_iter()
                 .collect(),
             access: Vec::new(),
-            height: Vec::new(),
+            height: lane_heights(lane),
             rule: Vec::new(),
             level: None,
             r#type: lane_type(lane.lane_type),

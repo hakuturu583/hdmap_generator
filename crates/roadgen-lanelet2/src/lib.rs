@@ -287,6 +287,30 @@ impl LocalCoordinates {
     }
 }
 
+/// The tags of a lane boundary carrying `marking`.
+fn boundary_attributes(marking: roadgen_core::semantics::BoundaryMarking) -> AttributeMap {
+    let (kind, subtype) = tags::boundary_tags(marking.marking);
+    let mut attributes = vec![("type", kind.to_owned())];
+    if let Some(subtype) = subtype {
+        attributes.push(("subtype", subtype.to_owned()));
+    }
+    if kind == "line_thin" || kind == "line_thick" {
+        attributes.push(("color", marking.color.as_str().to_owned()));
+    }
+    tags::attributes(attributes)
+}
+
+/// Whether two boundary curves are the same line: the same vertices, to within the
+/// welding tolerance.
+fn same_line(a: &Curve3, b: &Curve3, config: SamplingConfig) -> Result<bool, ExportError> {
+    let (a, b) = (a.to_polyline(config)?, b.to_polyline(config)?);
+    Ok(a.len() == b.len()
+        && a.points()
+            .iter()
+            .zip(b.points())
+            .all(|(p, q)| p.distance_to(*q) <= WELD_TOLERANCE))
+}
+
 /// Interns vertices so that coincident positions become one `Point`.
 struct PointWelder {
     interned: HashMap<[i64; 3], Point>,
@@ -347,6 +371,9 @@ struct Exporter<'a> {
     /// One linestring per cross-section edge, shared by the lanes either side of it —
     /// which is what makes two lanelets laterally adjacent.
     boundaries: HashMap<(RoadId, usize, i32), LineString>,
+    /// The boundaries a lane does not share with its neighbour, because the two
+    /// put the edge at different heights.
+    own_boundaries: HashMap<(LaneId, i32), LineString>,
     lanelets: HashMap<LaneId, Lanelet>,
     objects: HashMap<ObjectId, Vec<LineString>>,
 }
@@ -365,6 +392,7 @@ impl<'a> Exporter<'a> {
             // block above them, so that adding a vertex cannot renumber a lanelet.
             next_id: Self::FIRST_ID + 1_000_000,
             boundaries: HashMap::new(),
+            own_boundaries: HashMap::new(),
             lanelets: HashMap::new(),
             objects: HashMap::new(),
         })
@@ -406,28 +434,38 @@ impl<'a> Exporter<'a> {
                 // matches the way the road reads.
                 let mut edges: Vec<(i32, &Curve3, roadgen_core::semantics::BoundaryMarking)> =
                     Vec::new();
+                // An edge the two lanes either side of it put at different heights —
+                // a kerb, where a raised pavement meets the carriageway — is two
+                // lines, not one: each lane keeps its own.
+                let mut own: Vec<(
+                    LaneId,
+                    i32,
+                    &Curve3,
+                    roadgen_core::semantics::BoundaryMarking,
+                )> = Vec::new();
                 for lane in &lanes {
                     for (rank, curve, marking) in [
                         (lane.left_edge, &lane.left_boundary, lane.left_marking),
                         (lane.right_edge, &lane.right_boundary, lane.right_marking),
                     ] {
-                        if !edges.iter().any(|(existing, _, _)| *existing == rank) {
-                            edges.push((rank, curve, marking));
+                        match edges.iter().find(|(existing, _, _)| *existing == rank) {
+                            None => edges.push((rank, curve, marking)),
+                            Some((_, shared, _)) => {
+                                if !same_line(shared, curve, self.config())? {
+                                    own.push((lane.id.clone(), rank, curve, marking));
+                                }
+                            }
                         }
                     }
                 }
                 edges.sort_by_key(|edge| std::cmp::Reverse(edge.0));
 
+                for (lane, rank, curve, marking) in own {
+                    let line = self.linestring(curve, boundary_attributes(marking))?;
+                    self.own_boundaries.insert((lane, rank), line);
+                }
                 for (rank, curve, marking) in edges {
-                    let (kind, subtype) = tags::boundary_tags(marking.marking);
-                    let mut attributes = vec![("type", kind.to_owned())];
-                    if let Some(subtype) = subtype {
-                        attributes.push(("subtype", subtype.to_owned()));
-                    }
-                    if kind == "line_thin" || kind == "line_thick" {
-                        attributes.push(("color", marking.color.as_str().to_owned()));
-                    }
-                    let line = self.linestring(curve, tags::attributes(attributes))?;
+                    let line = self.linestring(curve, boundary_attributes(marking))?;
                     self.boundaries
                         .insert((road.id.clone(), section, rank), line);
                 }
@@ -454,6 +492,9 @@ impl<'a> Exporter<'a> {
     }
 
     fn boundary(&self, lane: &Lane, rank: i32) -> Result<LineString, ExportError> {
+        if let Some(line) = self.own_boundaries.get(&(lane.id.clone(), rank)) {
+            return Ok(line.clone());
+        }
         self.boundaries
             .get(&(lane.road.clone(), lane.section, rank))
             .cloned()
