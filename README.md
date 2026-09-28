@@ -345,6 +345,13 @@ and keeps its full width across the tilted surface. OpenDRIVE gets the same piec
 polynomial in `<lateralProfile><superelevation>`; Lanelet2 has no such concept and
 does not need one, because the roll is already in the heights of its vertices.
 
+A junction's connectors are banked too: each leaves the road it comes from at that
+road's roll and grade and arrives at the next road's, the roll turning straight from
+one to the other along the way. A connector written flat would meet a banked road
+with its edges a roll times half a lane off the road's, which is ten centimetres on
+a 3° road; `a_connector_between_banked_roads_is_banked_in_opendrive_too` holds the
+two formats to a millimetre.
+
 ### Corners
 
 Two straight roads that meet at an angle — the map at the top of this file — are a

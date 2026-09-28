@@ -1870,10 +1870,16 @@ impl Generator {
         // own terms: a road's start is left against its direction and entered
         // along it. The sign says whether the new road runs with the lane's
         // reference line there (`+1`) or against it.
+        // Along each lane's own direction there, climb and all: the connector is
+        // banked as the road it meets, and a roll turns the cross-section about the
+        // direction of travel, so only a connector that leaves at the road's grade
+        // tilts its cross-section onto the road's.
         let start = from_lane.endpoint(from_end.as_lane_end());
-        let start_tangent = horizontal(into_joint(&from_lane.centerline, from_end)?)?;
+        let start_tangent = into_joint(&from_lane.centerline, from_end)?.normalize()?;
         let end = to_lane.endpoint(to_end.as_lane_end());
-        let end_tangent = horizontal(into_joint(&to_lane.centerline, to_end)?)?.reversed();
+        let end_tangent = into_joint(&to_lane.centerline, to_end)?
+            .normalize()?
+            .reversed();
         let sign = |end: RoadEnd| match end {
             RoadEnd::End => 1.0,
             RoadEnd::Start => -1.0,
@@ -1900,14 +1906,37 @@ impl Generator {
             to_lane.id.local_name()
         ));
 
-        let mut geometry =
-            RoadGeometry::new(&reference_line, &Poly3Profile::default(), config, &[])?;
+        // Banked as the roads it joins are at each end, and turning from the one roll
+        // to the other along the way, so that OpenDRIVE — which banks a road by its
+        // superelevation and nothing else — lays its ends where the IR does. A roll
+        // is about the reference line's own direction: where the connector runs
+        // against the road it meets, the road's left side is its right, and the roll
+        // changes sign.
+        let roll_at = |road: &RoadId, end: RoadEnd| {
+            let geometry = &self.geometry[road];
+            geometry.rolls[geometry.index_at(end)]
+        };
+        let start_roll = start_sign * roll_at(&from_lane.road, from_end);
+        let end_roll = end_sign * roll_at(&to_lane.road, to_end);
+        let length = reference_line.horizontal_length()?;
+        let superelevation = if start_roll == 0.0 && end_roll == 0.0 {
+            Poly3Profile::default()
+        } else {
+            Poly3Profile::new(vec![Poly3Piece::new(
+                0.0,
+                start_roll,
+                (end_roll - start_roll) / length,
+                0.0,
+                0.0,
+            )])?
+        };
+        let mut geometry = RoadGeometry::new(&reference_line, &superelevation, config, &[])?;
         // Adopt the lateral direction of each road it meets, so the connector's
-        // boundary endpoints land exactly on theirs. The banked direction, not the
-        // plan one: the endpoints have to land on the approach's, which a banked road
-        // lifts off the horizontal.
-        let start_lateral = self.geometry[&from_lane.road].banked_lateral_at(from_end) * start_sign;
-        let end_lateral = self.geometry[&to_lane.road].banked_lateral_at(to_end) * end_sign;
+        // boundary endpoints land exactly on theirs. The plan one, mitred as the road
+        // is: the connector's own roll, which is the road's there, banks it about
+        // the same direction as the road's roll banks the road's.
+        let start_lateral = self.geometry[&from_lane.road].lateral_at(from_end) * start_sign;
+        let end_lateral = self.geometry[&to_lane.road].lateral_at(to_end) * end_sign;
         let last = geometry.laterals.len() - 1;
         geometry.laterals[0] = start_lateral;
         geometry.laterals[last] = end_lateral;
@@ -2002,7 +2031,7 @@ impl Generator {
                 .map(|road| road.road_type)
                 .unwrap_or(RoadType::Town),
             speed_limit: from_lane.speed_limit,
-            superelevation: Poly3Profile::default(),
+            superelevation,
         };
         let (road, lanes) = self.build_road(
             &road_id,

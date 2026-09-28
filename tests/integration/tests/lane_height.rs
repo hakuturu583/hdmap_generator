@@ -481,3 +481,46 @@ fn largest_edge_distance(map: &ValidatedMap) -> f64 {
     }
     worst
 }
+
+/// Four arms banked each its own way, every one joined to every other through a
+/// junction — so a connector leaves a road rolled one way, and leaves it along its
+/// reference line or against it, and enters one rolled another.
+fn banked_crossroads() -> ValidatedMap {
+    let mut builder = MapBuilder::new(scenarios::metadata("banked crossroads"));
+    let junction = builder.add_junction(Some("x"));
+    let mut arm = |from: (f64, f64, f64), to: (f64, f64, f64), roll: f64| {
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(from.0, from.1, from.2),
+                    Point3::new(to.0, to.1, to.2),
+                    scenarios::two_way(),
+                )
+                .unwrap()
+                .with_superelevation(Poly3Profile::constant(roll)),
+            )
+            .unwrap()
+    };
+    let w = arm((-60.0, 0.0, 0.0), (-14.0, 0.0, 1.0), 0.05);
+    let e = arm((14.0, 0.0, 1.0), (60.0, 0.0, 1.5), -0.04);
+    let n = arm((0.0, 14.0, 1.0), (0.0, 60.0, 0.0), 0.03);
+    let s = arm((0.0, -60.0, 2.0), (0.0, -14.0, 1.0), -0.06);
+    for (from, to) in [(&w, &e), (&w, &n), (&s, &n), (&s, &e)] {
+        builder.connect_via(&junction, from, to).unwrap();
+    }
+    builder
+        .finish()
+        .unwrap()
+        .validate()
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+#[test]
+fn a_connector_between_banked_roads_is_banked_in_opendrive_too() {
+    // The IR banks a connector's ends with the roads it joins, so their edges meet;
+    // OpenDRIVE only banks a road by its superelevation, so a connector written
+    // flat puts its edges off the roads' by the roll times half its width.
+    let map = banked_crossroads();
+    let worst = largest_edge_disagreement(&map);
+    assert!(worst < 1e-3, "the document puts an edge {worst} m off");
+}
