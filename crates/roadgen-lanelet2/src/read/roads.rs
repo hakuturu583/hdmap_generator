@@ -290,9 +290,9 @@ const GOOD_ENOUGH: f64 = 0.02;
 /// A junction connector's reference line may also run down the middle of its lane
 /// or along its far boundary: a turn tighter than the lane is wide folds every
 /// normal from its outer boundary before they reach the inner one, and from the
-/// inside or the middle they do not. It is only a connector's that may: an
-/// ordinary road links to the next where their reference lines meet, and the
-/// boundary on the reference side is where they do.
+/// inside or the middle they do not. An ordinary road links to the next where
+/// their reference lines meet, and the boundary on the reference side is where
+/// they do, so it tries the other two only when that boundary cannot carry it.
 fn road(
     source: &Source,
     map: &Map,
@@ -328,6 +328,25 @@ fn road(
                     }
                 }
                 Err(error) => failure = failure.or(Some(error)),
+            }
+        }
+    }
+    // A lone lane that its own boundary cannot carry — a lane rounding a corner
+    // whose ends are drawn steeply across it swings its far edge out past them —
+    // may be laid out from its middle or its far side instead. The reference line
+    // then no longer ends where the next road's does, so the two are joined by a
+    // stub in a junction of their own rather than linked, which is no loss.
+    if !connector && group.len() == 1 && best.as_ref().is_some_and(|built| built.miss > MAX_MISS) {
+        for base in [midline(&edges[0], &edges[1]), edges[1].clone()] {
+            for lean in LEANS {
+                match road_along(source, map, id, group, &edges, &base, lean) {
+                    Ok(built) => {
+                        if best.as_ref().is_none_or(|kept| built.miss < kept.miss) {
+                            best = Some(built);
+                        }
+                    }
+                    Err(error) => failure = failure.or(Some(error)),
+                }
             }
         }
     }
@@ -653,8 +672,13 @@ fn station_of(samples: &[Sample], point: Point3) -> Option<f64> {
 
 /// How far a road's end may lean before the reference line stops turning to meet
 /// it square, radians. Beyond this the end is drawn along the way the road runs
-/// more than across it, and turning the line that far would fold the cross-section.
-const MAX_END_LEAN: f64 = std::f64::consts::FRAC_PI_4;
+/// far more than across it. Short of it the turn is only tried: a turn that folds
+/// the cross-section strays from the file's boundaries, and the search keeps the
+/// reference line that strays least. On Nishi-Shinjuku a limit of 45° left a lane
+/// rounding a corner, its ends drawn at 64° and 75°, overhanging the road by six
+/// square metres at each end; at 80° it overhangs by none, and no lane's path
+/// jumps where it hands over to the next.
+const MAX_END_LEAN: f64 = 80.0 * std::f64::consts::PI / 180.0;
 
 /// Vertices of the reference boundary closer together than this are one vertex,
 /// metres; a cubic through two nearly coincident points only wobbles.

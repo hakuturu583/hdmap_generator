@@ -1836,7 +1836,11 @@ lanelet's own boundaries. What is reconstructed is everything above them:
   one of the rightmost lane when traffic keeps left — as a chain of cubics, so its
   normal turns smoothly instead of jumping at each vertex, and it meets each end of
   the road square: OpenDRIVE ends every lane on the normal there, and a lanelet's
-  end is rarely drawn square to the lane. The widths and the lane offset are
+  end is rarely drawn square to the lane. It turns up to 80° to do so; a
+  one-lane road whose ends are drawn so steeply that the line through the laid-out
+  side cannot turn far enough without folding is laid out along the lane's middle
+  or its other side instead, whichever keeps the lane closest to the file, and is
+  joined to its neighbours through a junction. The widths and the lane offset are
   measured along that normal, abeam every vertex of every boundary, and the tilt
   that best fits the boundaries' heights across the road is its superelevation, so
   outer lanes sit at their own height rather than the reference line's. What one
