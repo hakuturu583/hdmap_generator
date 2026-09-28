@@ -351,6 +351,16 @@ fn check_cross_sections(map: &Map, config: ValidationConfig, issues: &mut Vec<Va
                 lane.right_boundary.end_point(),
             ),
         ] {
+            // A lane that stops on a cap has no width across the road at its end:
+            // its boundaries end at the cap's two corners, which the cap says.
+            let road = map.road(&lane.road);
+            let capped = road.is_some_and(|road| match name {
+                "start" => lane.section == 0 && road.cap(RoadEnd::Start).is_some(),
+                _ => lane.section + 1 == road.sections.len() && road.cap(RoadEnd::End).is_some(),
+            });
+            if capped {
+                continue;
+            }
             // Measured *across the cross-section*, not as a straight-line distance.
             // Where two roads meet at an angle the boundary is mitred, so the two
             // points are further apart in space than the lane is wide — and that is

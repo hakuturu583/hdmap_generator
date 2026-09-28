@@ -134,7 +134,7 @@ use vec1::Vec1;
 
 use ll2_projection::utmups;
 use roadgen_core::buildings::{Building, BuildingPart};
-use roadgen_core::geometry::{Curve3, Point3, Sample, Vector3};
+use roadgen_core::geometry::{Curve3, Point3, Poly3Piece, Sample, Vector3};
 use roadgen_core::id::ObjectId;
 use roadgen_core::id::{BuildingId, JunctionId, LaneId, RoadId};
 use roadgen_core::map::{Lane, Map, Projection, Road, TrafficHandedness};
@@ -168,6 +168,11 @@ pub use road_coordinates::RoadPosition;
 /// Width of a painted lane marking, metres. OpenDRIVE wants a number; this is the
 /// usual one, and callers who care can post-process.
 const MARKING_WIDTH: f64 = 0.13;
+
+/// How far apart the straight runs are that write a lane's width where a cap cuts
+/// it off, metres. A cap is a straight line, and a lane's edges near its end are
+/// nearly so; a quarter of a metre follows both to millimetres.
+const CLIP_STEP: f64 = 0.25;
 
 /// How far a stop line reaches along the road, metres — the width of the paint.
 const STOP_LINE_DEPTH: f64 = 0.4;
@@ -990,10 +995,8 @@ impl<'a> Exporter<'a> {
             // `<width>` is measured from the start of the lane section, so the IR's
             // profile — which counts from the start of the road — is rebased onto it.
             // Both of the IR's tapers are exactly a cubic, so nothing is approximated.
-            choice: lane
-                .width
-                .to_poly3(lane.station_range.0)
-                .pieces()
+            choice: self
+                .lane_widths(lane)?
                 .iter()
                 .map(|piece| {
                     LaneChoice::Width(Width {
@@ -1023,6 +1026,113 @@ impl<'a> Exporter<'a> {
             r#type: lane_type(lane.lane_type),
             additional_data: AdditionalData::default(),
         })
+    }
+
+    /// A lane's `<width>` records, counted from the start of its section.
+    ///
+    /// On a road whose lanes stop on a cap rather than square, a lane is cut off by
+    /// the cap over the stretch between its corners: there its width is what lies
+    /// between its inner edge and the cap, written as a straight run every
+    /// [`CLIP_STEP`], and elsewhere the IR's own profile. A lane wholly past the cap
+    /// is zero wide. OpenDRIVE stacks every lane on the ones inside it, so each lane
+    /// is cut where the cap crosses it and not where its own edges would put it.
+    fn lane_widths(&self, lane: &Lane) -> Result<Vec<Poly3Piece>, ExportError> {
+        let unclipped = lane.width.to_poly3(lane.station_range.0);
+        let Some(road) = self.map.road(&lane.road) else {
+            return Ok(unclipped.pieces().to_vec());
+        };
+        if road.caps.iter().all(Option::is_none) {
+            return Ok(unclipped.pieces().to_vec());
+        }
+        let sampling = self.map.metadata.sampling;
+        let sign = match lane.side {
+            LateralSide::Left => 1.0,
+            LateralSide::Right => -1.0,
+        };
+        let inside: Vec<&Lane> = self
+            .map
+            .lanes_of_section(&road.id, lane.section)
+            .into_iter()
+            .filter(|other| other.side == lane.side && other.ordinal < lane.ordinal)
+            .collect();
+        let clipped = |station: f64| -> Result<Option<f64>, ExportError> {
+            let Some(cap) = road.cap_offset(station, sampling)? else {
+                return Ok(None);
+            };
+            let inner = sign * road.lane_offset.evaluate(station)
+                + inside
+                    .iter()
+                    .map(|other| other.width_at(station))
+                    .sum::<f64>();
+            let full = lane.width_at(station);
+            let cap = sign * cap;
+            let width = ((inner + full).min(cap) - inner.min(cap)).max(0.0);
+            Ok((width < full - 1e-9).then_some(width))
+        };
+        let (start, end) = lane.station_range;
+        let steps = ((end - start) / CLIP_STEP).ceil().max(1.0) as usize;
+        let grid: Vec<f64> = (0..=steps)
+            .map(|i| start + (end - start) * i as f64 / steps as f64)
+            .collect();
+        let values = grid
+            .iter()
+            .map(|station| clipped(*station))
+            .collect::<Result<Vec<_>, _>>()?;
+        if values.iter().all(Option::is_none) {
+            return Ok(unclipped.pieces().to_vec());
+        }
+        // The IR's own profile from `station` on, as one piece about it.
+        let own_from = |station: f64| -> Poly3Piece {
+            let at = station - start;
+            let piece = unclipped
+                .pieces()
+                .iter()
+                .rev()
+                .find(|piece| piece.station <= at + 1e-12)
+                .or(unclipped.pieces().first())
+                .copied()
+                .expect("a width profile has a piece");
+            let k = at - piece.station;
+            Poly3Piece::new(
+                at,
+                piece.a + piece.b * k + piece.c * k * k + piece.d * k * k * k,
+                piece.b + 2.0 * piece.c * k + 3.0 * piece.d * k * k,
+                piece.c + 3.0 * piece.d * k,
+                piece.d,
+            )
+        };
+        let mut out: Vec<Poly3Piece> = Vec::new();
+        let mut cut = true;
+        for i in 0..steps {
+            let (from, to) = (grid[i], grid[i + 1]);
+            if values[i].is_some() || values[i + 1].is_some() {
+                let a = values[i].unwrap_or_else(|| lane.width_at(from));
+                let b = values[i + 1].unwrap_or_else(|| lane.width_at(to));
+                out.push(Poly3Piece::new(
+                    from - start,
+                    a,
+                    (b - a) / (to - from),
+                    0.0,
+                    0.0,
+                ));
+                cut = true;
+                continue;
+            }
+            if cut {
+                out.push(own_from(from));
+                cut = false;
+            }
+            out.extend(
+                unclipped
+                    .pieces()
+                    .iter()
+                    .filter(|piece| {
+                        piece.station > from - start + 1e-9 && piece.station < to - start - 1e-9
+                    })
+                    .copied(),
+            );
+        }
+        Ok(out)
     }
 
     /// Lane-level predecessor/successor links.

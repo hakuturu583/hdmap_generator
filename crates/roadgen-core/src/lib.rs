@@ -78,7 +78,9 @@ pub use geometry::{
     Polyline3, SamplingConfig, Taper, Vector3, WidthProfile,
 };
 pub use id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
-pub use map::{CrossSection, Lane, Map, MapMetadata, Projection, Road, Route, TrafficHandedness};
+pub use map::{
+    CrossSection, EndCap, Lane, Map, MapMetadata, Projection, Road, Route, TrafficHandedness,
+};
 pub use semantics::{
     BoundaryMarking, LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
     RoadType, TrafficRule,

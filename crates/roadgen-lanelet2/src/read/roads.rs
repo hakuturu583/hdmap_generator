@@ -26,9 +26,9 @@ use roadgen_core::geometry::{
     Taper, WidthProfile,
 };
 use roadgen_core::id::{LaneId, RoadId};
-use roadgen_core::map::{CrossSection, Lane, Map, Road};
+use roadgen_core::map::{CrossSection, EndCap, Lane, Map, Road};
 use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking, RoadType};
-use roadgen_core::topology::{Direction, LateralSide, RoadLink};
+use roadgen_core::topology::{Direction, LateralSide, RoadEnd, RoadLink};
 use roadgen_core::units::{PositiveWidth, SpeedLimit};
 
 use super::source::{Lanelet, Source};
@@ -315,23 +315,138 @@ fn road(
 
     let mut best: Option<BuiltRoad> = None;
     let mut failure = None;
+    let mut consider =
+        |result: Result<BuiltRoad, ImportError>, best: &mut Option<BuiltRoad>| match result {
+            Ok(built) => {
+                if best.as_ref().is_none_or(|kept| built.miss < kept.miss) {
+                    *best = Some(built);
+                }
+            }
+            Err(error) => failure = failure.take().or(Some(error)),
+        };
     'search: for base in &bases {
         for lean in LEANS {
-            match road_along(source, map, id, group, &edges, base, lean) {
-                Ok(built) => {
-                    let done = built.miss <= GOOD_ENOUGH;
-                    if best.as_ref().is_none_or(|kept| built.miss < kept.miss) {
-                        best = Some(built);
-                    }
-                    if done {
-                        break 'search;
-                    }
-                }
-                Err(error) => failure = failure.or(Some(error)),
+            consider(
+                road_along(
+                    source,
+                    map,
+                    id,
+                    group,
+                    &edges,
+                    base,
+                    EndChoice {
+                        leans: [lean, lean],
+                        capped: [false, false],
+                    },
+                ),
+                &mut best,
+            );
+            if best.as_ref().is_some_and(|built| built.miss <= GOOD_ENOUGH) {
+                break 'search;
             }
         }
     }
+    // An end the reference line cannot turn square to without folding the lanes
+    // is cut off by a cap instead, where the cap can say it: the reference line
+    // then runs on as the boundary does, and the lanes stop on the file's own line.
+    if best.as_ref().is_none_or(|built| built.miss > GOOD_ENOUGH) {
+        let cappable =
+            [RoadEnd::Start, RoadEnd::End].map(|end| can_cap(source, group, &edges, end));
+        let mut variants: Vec<([f64; 2], [bool; 2])> = Vec::new();
+        if cappable[0] && cappable[1] {
+            variants.push(([0.0, 0.0], [true, true]));
+        }
+        for lean in LEANS {
+            if cappable[0] {
+                variants.push(([0.0, lean], [true, false]));
+            }
+            if cappable[1] {
+                variants.push(([lean, 0.0], [false, true]));
+            }
+        }
+        for (leans, capped) in variants {
+            consider(
+                road_along(
+                    source,
+                    map,
+                    id,
+                    group,
+                    &edges,
+                    &edges[0],
+                    EndChoice { leans, capped },
+                ),
+                &mut best,
+            );
+        }
+    }
     best.ok_or_else(|| failure.expect("every reference line was tried"))
+}
+
+/// How a road's two ends are met: how far the reference line turns square to
+/// each, and whether it is a cap instead.
+#[derive(Debug, Clone, Copy)]
+struct EndChoice {
+    leans: [f64; 2],
+    capped: [bool; 2],
+}
+
+/// Whether a road's end may be a cap: its outermost edge ends short of the
+/// reference line's end — the only way round OpenDRIVE can cut its lanes off,
+/// narrowing them to the cap — and the lanes there run on one to one or into a
+/// junction, not into a split or merge whose stubs start square across the lanes.
+fn can_cap(source: &Source, group: &[&Lanelet], edges: &[Vec<Point3>], end: RoadEnd) -> bool {
+    let (inner, outer) = (&edges[0], edges.last().expect("a road has an outer edge"));
+    // A cap cuts the lanes off one after another, and OpenDRIVE narrows each to
+    // nothing where it goes: across several lanes their narrowed stubs sweep along
+    // the cap over the lanes beside them. One lane only narrows.
+    if inner.len() < 2 || group.len() > 1 {
+        return false;
+    }
+    let (near, far, along) = match end {
+        RoadEnd::Start => (inner[0], outer[0], inner[1] - inner[0]),
+        RoadEnd::End => (
+            inner[inner.len() - 1],
+            outer[outer.len() - 1],
+            inner[inner.len() - 1] - inner[inner.len() - 2],
+        ),
+    };
+    let run = along.horizontal_norm();
+    if run <= 0.0 {
+        return false;
+    }
+    let ahead = ((far.x - near.x) * along.x + (far.y - near.y) * along.y) / run;
+    let short = match end {
+        RoadEnd::Start => ahead > MIN_SPACING,
+        RoadEnd::End => ahead < -MIN_SPACING,
+    };
+    if !short {
+        return false;
+    }
+    if group.iter().all(|lanelet| lanelet.turn) {
+        return true;
+    }
+    let beyond = |lanelet: Id| match end {
+        RoadEnd::Start => source.predecessors_of(lanelet),
+        RoadEnd::End => source.successors_of(lanelet),
+    };
+    let back = |lanelet: Id| match end {
+        RoadEnd::Start => source.successors_of(lanelet),
+        RoadEnd::End => source.predecessors_of(lanelet),
+    };
+    let met: Vec<Id> = group
+        .iter()
+        .flat_map(|lanelet| beyond(lanelet.id))
+        .copied()
+        .collect();
+    let turn = |id: &Id| source.lanelets.get(id).is_some_and(|lanelet| lanelet.turn);
+    if met.iter().all(turn) {
+        return true;
+    }
+    if met.iter().any(turn) {
+        return false;
+    }
+    group.iter().all(|lanelet| beyond(lanelet.id).len() <= 1)
+        && met.iter().all(|other| back(*other).len() <= 1)
 }
 
 /// Builds the road along one reference line: a smooth line through `base`, turned
@@ -343,13 +458,28 @@ fn road_along(
     group: &[&Lanelet],
     edges: &[Vec<Point3>],
     base: &[Point3],
-    lean: f64,
+    ends: EndChoice,
 ) -> Result<BuiltRoad, ImportError> {
+    let EndChoice { leans, capped } = ends;
     let config = map.metadata.sampling;
     let side = map.metadata.handedness.side_for(Direction::Forward);
 
-    let reference_line = smooth_reference(edges, base, side, config, lean)?;
+    // A capped end keeps the boundary's own direction: the cap, not the reference
+    // line's turn, says where the lanes stop.
+    let leans = [0, 1].map(|end| if capped[end] { 0.0 } else { leans[end] });
+    let reference_line = smooth_reference(edges, base, side, config, leans)?;
     let length = reference_line.horizontal_length()?;
+    let outermost = edges.last().expect("a road has an outer edge");
+    let caps = [
+        capped[0].then(|| EndCap {
+            near: reference_line.start_point(),
+            far: outermost[0],
+        }),
+        capped[1].then(|| EndCap {
+            near: reference_line.end_point(),
+            far: *outermost.last().expect("an edge has points"),
+        }),
+    ];
     let mut road = Road {
         id: id.clone(),
         name: Some(format!(
@@ -369,6 +499,7 @@ fn road_along(
         road_type: road_type(group[0].location.as_deref()),
         speed_limit: None,
         superelevation: Poly3Profile::default(),
+        caps,
     };
 
     // The road's cross-fall. Lanelet2 boundaries carry their own heights, and a
@@ -381,11 +512,15 @@ fn road_along(
     // road's superelevation.
     let required = measuring_stations(&road.reference_line.samples(config)?, edges, length);
     let samples = road.reference_line.samples_including(config, &required)?;
-    let at_end = |station: f64| station <= 0.0 || station >= length - 1e-9;
+    // At a square end every edge is measured where it stops; at a capped end it is
+    // measured across the normal like anywhere else, and an edge that stops short of
+    // it is not there to measure.
+    let at_end =
+        |station: f64| (station <= 0.0 && !capped[0]) || (station >= length - 1e-9 && !capped[1]);
     let edge_at = |frame: &Frame3, station: f64, edge: &[Point3]| -> Option<Point3> {
-        if station <= 0.0 {
+        if station <= 0.0 && !capped[0] {
             Some(edge[0])
-        } else if station >= length - 1e-9 {
+        } else if station >= length - 1e-9 && !capped[1] {
             edge.last().copied()
         } else {
             crossing(frame, edge).map(|(_, point)| point)
@@ -465,7 +600,7 @@ fn road_along(
                 continue;
             };
             let width = side.sign() * (outer_offset - inner_offset);
-            let at_end = *station == 0.0 || *station == length;
+            let at_end = (*station == 0.0 && !capped[0]) || (*station == length && !capped[1]);
             if at_end && width <= 0.0 {
                 // Validation measures a lane's ends across the reference line, and
                 // these boundaries end on the wrong sides of each other there: a
@@ -532,10 +667,11 @@ fn road_along(
         .iter()
         .flat_map(|edge| {
             [
-                (start_frame, edge[0]),
-                (end_frame, *edge.last().expect("an edge has points")),
+                (!capped[0]).then_some((start_frame, edge[0])),
+                (!capped[1]).then_some((end_frame, *edge.last().expect("an edge has points"))),
             ]
         })
+        .flatten()
         .map(|(frame, point)| (point - frame.origin).dot(frame.tangent.get()).abs())
         .fold(0.0, f64::max);
     let strays = strays(&road, &lanes, edges, config)?;
@@ -572,6 +708,9 @@ fn strays(
             .frame()?
             .banked(road.superelevation.evaluate(station));
         let mut offset = road.lane_offset.evaluate(station);
+        // Past a cap an edge is cut off: what is left of the lane stops on the cap.
+        let cap = road.cap_offset(station, config)?;
+        let side = lanes[0].side.sign();
         for (k, edge) in edges.iter().enumerate() {
             // Edge k is the outer edge of lane k and the inner edge of lane k + 1,
             // whose lifts there were measured at the same place.
@@ -582,6 +721,9 @@ fn strays(
                 offset += lane.side.sign() * lane.width.evaluate(station).metres();
                 lane.height.evaluate(station).1
             };
+            if cap.is_some_and(|cap| side * offset > side * cap + 1e-6) {
+                continue;
+            }
             let point = frame.origin + frame.left.get() * offset + frame.up.get() * lift;
             worst = worst.max(distance_to(edge, point));
         }
@@ -680,7 +822,7 @@ fn smooth_reference(
     base: &[Point3],
     side: LateralSide,
     config: SamplingConfig,
-    lean: f64,
+    leans: [f64; 2],
 ) -> Result<Curve3, ImportError> {
     let mut points: Vec<Point3> = vec![base[0]];
     for point in &base[1..base.len() - 1] {
@@ -707,12 +849,13 @@ fn smooth_reference(
         let (dx, dy) = ((to.x - from.x) / run, (to.y - from.y) / run);
         tangents.push((dx, dy, (to.z - from.z) / run));
     }
-    for (index, near, far) in [
-        (0, innermost[0], outermost[0]),
+    for (index, near, far, lean) in [
+        (0, innermost[0], outermost[0], leans[0]),
         (
             n - 1,
             *innermost.last().unwrap(),
             *outermost.last().unwrap(),
+            leans[1],
         ),
     ] {
         let (dx, dy, grade) = tangents[index];

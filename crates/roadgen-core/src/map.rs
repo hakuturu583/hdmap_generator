@@ -190,6 +190,25 @@ pub struct CrossSection {
     pub lanes: Vec<LaneId>,
 }
 
+/// Where a road's lanes stop at one of its ends, when that is not square to the
+/// reference line.
+///
+/// A cross-section is laid out square to the reference line, so a road whose lanes
+/// all end on the normal at its end needs nothing more. A surveyed map rarely ends a
+/// lane that way: where a lanelet meets the next one the line between them is
+/// drawn where the paint is, often at an angle, and a slip lane's end can run along
+/// the carriageway for twenty metres. The cap is that line, straight in plan, from
+/// the reference line's end out to the outermost edge's; between the stations its
+/// two corners stand at, every lane keeps only what lies on the road's side of it.
+/// The widths beyond run on unclipped, so the cap alone says where each lane stops.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EndCap {
+    /// Where the cap meets the reference line: the reference line's own end.
+    pub near: Point3,
+    /// Where it meets the outermost edge of the cross-section.
+    pub far: Point3,
+}
+
 /// A stretch of road carrying a cross-section along one reference line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Road {
@@ -216,6 +235,9 @@ pub struct Road {
     /// Roll of the road surface about its reference line, radians against horizontal
     /// station. Zero everywhere for a road that is flat across.
     pub superelevation: Poly3Profile,
+    /// Where the lanes stop at the start and at the end, when that is not square to
+    /// the reference line; `None` for a square end.
+    pub caps: [Option<EndCap>; 2],
 }
 
 impl Road {
@@ -233,6 +255,53 @@ impl Road {
 
     pub fn is_connector(&self) -> bool {
         self.junction.is_some()
+    }
+
+    /// The cap at one end, if the lanes do not stop square there.
+    pub fn cap(&self, end: RoadEnd) -> Option<&EndCap> {
+        match end {
+            RoadEnd::Start => self.caps[0].as_ref(),
+            RoadEnd::End => self.caps[1].as_ref(),
+        }
+    }
+
+    /// How far to the left of the reference line a cap crosses the normal at
+    /// `station`, metres: the offset past which a lane there is cut off. `None`
+    /// where no cap crosses the normal, which is everywhere but the stretch between
+    /// a cap's two corners — and everywhere on a road with square ends.
+    pub fn cap_offset(
+        &self,
+        station: f64,
+        sampling: SamplingConfig,
+    ) -> Result<Option<f64>, GeometryError> {
+        if self.caps.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let sample = self.reference_line.sample_at(station, sampling)?;
+        let origin = sample.point;
+        let (tx, ty) = (sample.tangent.x(), sample.tangent.y());
+        let run = tx.hypot(ty);
+        let (nx, ny) = (-ty / run, tx / run);
+        let mut found: Option<f64> = None;
+        for cap in self.caps.iter().flatten() {
+            // origin + t·n = near + u·(far − near), in plan.
+            let (dx, dy) = (cap.far.x - cap.near.x, cap.far.y - cap.near.y);
+            let determinant = nx * -dy - ny * -dx;
+            if determinant.abs() < 1e-12 {
+                continue;
+            }
+            let (rx, ry) = (cap.near.x - origin.x, cap.near.y - origin.y);
+            let t = (rx * -dy - ry * -dx) / determinant;
+            let u = (nx * ry - ny * rx) / determinant;
+            if !(-1e-9..=1.0 + 1e-9).contains(&u) {
+                continue;
+            }
+            found = Some(match found {
+                Some(other) if other.abs() < t.abs() => other,
+                _ => t,
+            });
+        }
+        Ok(found)
     }
 
     /// The station range section `index` covers: from its own station to the next
@@ -724,6 +793,7 @@ mod tests {
             road_type: RoadType::Town,
             speed_limit: None,
             superelevation: Poly3Profile::default(),
+            caps: [None, None],
         };
         assert_eq!(road.section_at(0.0), Some(0));
         assert_eq!(road.section_at(39.9), Some(0));

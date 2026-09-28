@@ -361,6 +361,8 @@ impl<'a> Reader<'a> {
             road_type,
             speed_limit,
             superelevation,
+            // OpenDRIVE ends every lane square to its reference line.
+            caps: [None, None],
         };
         self.map
             .roads

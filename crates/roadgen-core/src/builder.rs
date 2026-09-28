@@ -1590,6 +1590,7 @@ impl Generator {
                 road_type: spec.road_type,
                 speed_limit: spec.speed_limit,
                 superelevation: spec.superelevation.clone(),
+                caps: [None, None],
             },
             lanes,
         ))
