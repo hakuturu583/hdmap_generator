@@ -306,7 +306,7 @@ pub fn build(
     let mut posts: Vec<Point3> = Vec::new();
     // Lights first, so that a sign on the same corner is the one that moves.
     for object in map.objects.iter() {
-        if object.kind != MapObjectKind::TrafficLight {
+        if !object.kind.is_traffic_light() {
             continue;
         }
         if let Some(placed) = light(

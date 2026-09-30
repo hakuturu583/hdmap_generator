@@ -311,7 +311,7 @@ pub fn check(map: &ValidatedMap, config: Option<&SceneConfig>) -> Vec<String> {
             .to_owned(),
     );
 
-    let lights = roads::objects_of(map, |kind| matches!(kind, MapObjectKind::TrafficLight)).count();
+    let lights = roads::objects_of(map, |kind| kind.is_traffic_light()).count();
     if lights > 0 {
         problems.push(format!(
             "the scene format has no traffic-light element, so the {lights} lights and \

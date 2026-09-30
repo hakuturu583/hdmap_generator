@@ -56,7 +56,7 @@ pub fn participant(subtype: &str) -> &'static str {
 /// The `type` of the linestring a map object becomes.
 pub fn object_type(kind: &MapObjectKind) -> &'static str {
     match kind {
-        MapObjectKind::TrafficLight => "traffic_light",
+        MapObjectKind::TrafficLight { .. } => "traffic_light",
         MapObjectKind::TrafficSign { .. } => "traffic_sign",
         MapObjectKind::StopLine => "stop_line",
         MapObjectKind::Crosswalk => "pedestrian_marking",

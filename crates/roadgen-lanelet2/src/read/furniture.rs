@@ -6,6 +6,10 @@
 //! `traffic_sign`'s signs and a `road_marking`'s stop lines become objects over the
 //! lanes that refer to them; a crosswalk lanelet becomes a crosswalk. Each way
 //! becomes one object however many elements name it, governing all their lanes.
+//!
+//! A traffic light keeps what Autoware draws of it besides its bottom edge: the
+//! `height` of its housing, and the lamps of the `light_bulbs` way whose
+//! `traffic_light_id` names it — each lamp's position, `color` and `arrow`.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -15,7 +19,10 @@ use ll2_io::osm::MemberType;
 use roadgen_core::geometry::Curve3;
 use roadgen_core::id::{LaneId, ObjectId};
 use roadgen_core::map::Map;
-use roadgen_core::semantics::{MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
+use roadgen_core::semantics::{
+    LightArrow, LightBulb, LightColor, LightHead, MapObject, MapObjectKind, ObjectGeometry,
+    TrafficRule,
+};
 
 use super::roads::Built;
 use super::source::{members, Source};
@@ -91,13 +98,16 @@ pub(crate) fn build(
             .unwrap_or("");
         match subtype {
             "traffic_light" => {
-                let lights: Vec<ObjectId> = ways("refers")
-                    .into_iter()
+                let refers = ways("refers");
+                let bulbs = ways("light_bulbs");
+                let lights: Vec<ObjectId> = refers
+                    .iter()
                     .filter_map(|way| {
+                        let head = light_head(source, *way, &refers, &bulbs, approximations);
                         objects.line(
                             source,
-                            way,
-                            MapObjectKind::TrafficLight,
+                            *way,
+                            MapObjectKind::TrafficLight { head },
                             &lanes,
                             approximations,
                         )
@@ -110,11 +120,6 @@ pub(crate) fn build(
                     &lanes,
                     approximations,
                 );
-                if !ways("light_bulbs").is_empty() {
-                    approximations.count(
-                        "the IR has no light bulbs, so the bulbs of {n} traffic lights are not read",
-                    );
-                }
                 map.rules.push(TrafficRule::TrafficLight {
                     lights,
                     stop_line,
@@ -250,4 +255,91 @@ impl Objects {
         }
         Some(id)
     }
+}
+
+/// A traffic light's housing height and lamps: the `height` of its own way, and
+/// the lamps of every `light_bulbs` way whose `traffic_light_id` is that way — or,
+/// where the bulbs name none of the element's lights, those of its one light or
+/// those listed in the same place as it.
+fn light_head(
+    source: &Source,
+    way: Id,
+    refers: &[Id],
+    bulbs: &[Id],
+    approximations: &mut Approximations,
+) -> LightHead {
+    let height = source
+        .way_tag(way, "height")
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|height| height.is_finite() && *height > 0.0);
+    let mut head = LightHead {
+        height,
+        bulbs: Vec::new(),
+    };
+    let named = |bulbs_way: Id| {
+        source
+            .way_tag(bulbs_way, "traffic_light_id")
+            .and_then(|value| value.trim().parse::<Id>().ok())
+            .filter(|light| refers.contains(light))
+    };
+    // Bulbs that name none of the element's lights — a mistyped id — are paired
+    // with the lights in the order both are listed, when there are as many of each.
+    let by_order = bulbs.len() == refers.len();
+    for (index, bulbs_way) in bulbs.iter().enumerate() {
+        let ours = match named(*bulbs_way) {
+            Some(light) => light == way,
+            None if refers.len() == 1 => true,
+            None if by_order => {
+                let ours = refers[index] == way;
+                if ours {
+                    approximations.count(
+                        "{n} times a `light_bulbs` way named no light of its element, and was \
+                         paired with the light listed in the same place",
+                    );
+                }
+                ours
+            }
+            None => false,
+        };
+        if !ours {
+            continue;
+        }
+        let Some(nodes) = source.document.ways.get(bulbs_way).map(|way| &way.nodes) else {
+            continue;
+        };
+        for node in nodes {
+            let (Some(position), Some(tags)) = (
+                source.points.get(node),
+                source.document.nodes.get(node).map(|node| &node.tags),
+            ) else {
+                continue;
+            };
+            let Some(color) = tags.get("color").and_then(|value| LightColor::parse(value)) else {
+                approximations.count(
+                    "the IR knows red, yellow and green lamps, so {n} traffic light lamps of \
+                     another colour, or none, are not read",
+                );
+                continue;
+            };
+            let arrow = match tags.get("arrow") {
+                None => None,
+                Some(value) => match LightArrow::parse(value) {
+                    Some(arrow) => Some(arrow),
+                    None => {
+                        approximations.count(
+                            "{n} traffic light lamps point an arrow the IR does not know, and \
+                             are read as round lamps",
+                        );
+                        None
+                    }
+                },
+            };
+            head.bulbs.push(LightBulb {
+                position: *position,
+                color,
+                arrow,
+            });
+        }
+    }
+    head
 }

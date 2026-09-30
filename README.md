@@ -514,7 +514,7 @@ govern — and both formats get them:
 
 | IR | OpenDRIVE | Lanelet2 |
 | --- | --- | --- |
-| Traffic light | `<signal dynamic="true">` with `<validity>` | `traffic_light` way + `traffic_light` regulatory element |
+| Traffic light | `<signal dynamic="true">` with `<validity>`, its housing's `height`, a `<userData>` per lamp | `traffic_light` way with its `height`, `light_bulbs` way + `traffic_light` regulatory element |
 | Traffic sign | `<signal>` carrying the caller's catalogue code | `traffic_sign` way, code as its subtype |
 | Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` |
 | Crosswalk | `<object type="crosswalk">` with its outline as `<cornerLocal>` corners | a lanelet of subtype `crosswalk` |
@@ -530,6 +530,17 @@ exporter projects the IR's position through the road local frame — a nearest-p
 search for the station, then `Frame3::to_local`. Height is measured away from the road
 surface rather than straight up, which is what "five metres above the road" means on a
 slope and what `zOffset` carries.
+
+A traffic light's line is the bottom edge of its housing, which is where `zOffset`
+puts a signal. What Autoware draws of a light besides — the `height` of its housing
+and the lamps of its `light_bulbs` way, each with its position, `color` and `arrow`
+— is kept in the IR as the light's `LightHead`, and both formats carry it: Lanelet2
+as Autoware wrote it, and OpenDRIVE as the signal's `height` and one `<userData
+code="lightBulb" value="color=green;arrow=right;x=…;y=…;z=…">` per lamp, in the
+document's inertial frame, which the reader reads back and any other consumer
+passes over. A `light_bulbs` way whose `traffic_light_id` names none of its
+element's lights goes with the light listed in the same place, and the reader says
+so.
 
 A crosswalk's outline is written as `<cornerLocal>` corners in the object's own frame
 — the object lying across the road, its `hdg` a quarter turn from the road's, the

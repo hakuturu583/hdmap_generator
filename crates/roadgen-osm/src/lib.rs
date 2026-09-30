@@ -175,7 +175,7 @@ fn merged_controls(map: &ValidatedMap) -> Vec<String> {
         .iter()
         .filter_map(|object| {
             let value = match object.kind {
-                MapObjectKind::TrafficLight => "traffic_signals",
+                MapObjectKind::TrafficLight { .. } => "traffic_signals",
                 MapObjectKind::StopLine => "stop",
                 _ => return None,
             };
@@ -508,7 +508,7 @@ impl<'a> Exporter<'a> {
             };
 
             let (key, value) = match &object.kind {
-                MapObjectKind::TrafficLight => ("highway", "traffic_signals".to_owned()),
+                MapObjectKind::TrafficLight { .. } => ("highway", "traffic_signals".to_owned()),
                 MapObjectKind::StopLine => ("highway", "stop".to_owned()),
                 MapObjectKind::TrafficSign { code } => ("traffic_sign", code.clone()),
                 MapObjectKind::Crosswalk => ("highway", "crossing".to_owned()),

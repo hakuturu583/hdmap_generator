@@ -187,10 +187,104 @@ pub enum ObjectGeometry {
     Band { left: Curve3, right: Curve3 },
 }
 
+/// The colour a traffic light's lamp shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LightColor {
+    Red,
+    Yellow,
+    Green,
+}
+
+impl LightColor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LightColor::Red => "red",
+            LightColor::Yellow => "yellow",
+            LightColor::Green => "green",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "red" => LightColor::Red,
+            "yellow" | "amber" => LightColor::Yellow,
+            "green" => LightColor::Green,
+            _ => return None,
+        })
+    }
+}
+
+/// The way an arrow lamp points, as seen by the driver facing it: `Up` is straight
+/// on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LightArrow {
+    Up,
+    Down,
+    Left,
+    Right,
+    UpLeft,
+    UpRight,
+    DownLeft,
+    DownRight,
+}
+
+impl LightArrow {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LightArrow::Up => "up",
+            LightArrow::Down => "down",
+            LightArrow::Left => "left",
+            LightArrow::Right => "right",
+            LightArrow::UpLeft => "up_left",
+            LightArrow::UpRight => "up_right",
+            LightArrow::DownLeft => "down_left",
+            LightArrow::DownRight => "down_right",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "up" => LightArrow::Up,
+            "down" => LightArrow::Down,
+            "left" => LightArrow::Left,
+            "right" => LightArrow::Right,
+            "up_left" => LightArrow::UpLeft,
+            "up_right" => LightArrow::UpRight,
+            "down_left" => LightArrow::DownLeft,
+            "down_right" => LightArrow::DownRight,
+            _ => return None,
+        })
+    }
+}
+
+/// One lamp of a traffic light: where it is, and what it shows when lit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LightBulb {
+    pub position: Point3,
+    pub color: LightColor,
+    /// `None` for a round lamp.
+    pub arrow: Option<LightArrow>,
+}
+
+/// What a traffic light looks like beyond where it stands: how tall its housing is
+/// and which lamps it carries. A light placed by the builder knows neither, and a
+/// consumer that needs them — a perception stack that looks for the lit lamp —
+/// falls back on its own defaults.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LightHead {
+    /// How far the housing reaches up from the object's geometry, which is its
+    /// bottom edge, metres.
+    pub height: Option<f64>,
+    /// The lamps, in the order they are listed.
+    pub bulbs: Vec<LightBulb>,
+}
+
 /// Kinds of physical furniture the IR knows about.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MapObjectKind {
-    TrafficLight,
+    TrafficLight {
+        head: LightHead,
+    },
     /// `code` is the sign's identifier in whatever catalogue the caller uses; the IR
     /// does not define one.
     TrafficSign {
@@ -201,9 +295,20 @@ pub enum MapObjectKind {
 }
 
 impl MapObjectKind {
+    /// A traffic light with nothing known of its housing or lamps.
+    pub fn traffic_light() -> Self {
+        MapObjectKind::TrafficLight {
+            head: LightHead::default(),
+        }
+    }
+
+    pub fn is_traffic_light(&self) -> bool {
+        matches!(self, MapObjectKind::TrafficLight { .. })
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
-            MapObjectKind::TrafficLight => "traffic_light",
+            MapObjectKind::TrafficLight { .. } => "traffic_light",
             MapObjectKind::TrafficSign { .. } => "traffic_sign",
             MapObjectKind::StopLine => "stop_line",
             MapObjectKind::Crosswalk => "crosswalk",
