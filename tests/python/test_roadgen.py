@@ -1400,6 +1400,43 @@ def test_reading_a_lanelet2_map_takes_the_side_traffic_keeps_to(joined, tmp_path
         roadgen.read_lanelet2(str(tmp_path / "map.osm"), handedness="sideways")
 
 
+def seam_along_the_lane(path):
+    """Two lanelets of one straight lane 3.5 m wide whose seam runs from 20 m along
+    the left boundary to 40 m along the right."""
+    metres = 111_320.0
+    nodes = {
+        1: (0, 3.5), 2: (20, 3.5), 3: (60, 3.5),
+        4: (0, 0), 5: (40, 0), 6: (60, 0),
+    }
+    ways = {11: [1, 2], 12: [2, 3], 13: [4, 5], 14: [5, 6]}
+    xml = ['<?xml version="1.0"?>', '<osm version="0.6">']
+    for id, (x, y) in nodes.items():
+        lat = 35 + y / metres
+        lon = 139 + x / (metres * math.cos(math.radians(35)))
+        xml.append(f'<node id="{id}" lat="{lat:.12f}" lon="{lon:.12f}"><tag k="ele" v="0"/></node>')
+    for id, refs in ways.items():
+        nds = "".join(f'<nd ref="{ref}"/>' for ref in refs)
+        xml.append(f'<way id="{id}">{nds}<tag k="type" v="line_thin"/></way>')
+    for id, left, right in [(21, 11, 13), (22, 12, 14)]:
+        xml.append(
+            f'<relation id="{id}"><member type="way" ref="{left}" role="left"/>'
+            f'<member type="way" ref="{right}" role="right"/>'
+            '<tag k="type" v="lanelet"/><tag k="subtype" v="road"/></relation>'
+        )
+    xml.append("</osm>")
+    path.write_text("\n".join(xml))
+    return str(path)
+
+
+def test_how_long_a_seam_is_before_two_lanelets_are_one_lane_is_an_option(tmp_path):
+    path = seam_along_the_lane(tmp_path / "seam.osm")
+    assert len(roadgen.read_lanelet2(path, handedness="LHT").road_ids()) == 1
+    assert len(roadgen.read_lanelet2(path, handedness="LHT", max_seam_along=25.0).road_ids()) == 2
+    assert len(roadgen.read_lanelet2(path, handedness="LHT", max_seam_along=None).road_ids()) == 2
+    with pytest.raises(ValueError, match="max_seam_along"):
+        roadgen.read_lanelet2(path, max_seam_along=-1.0)
+
+
 def test_reading_a_file_that_is_not_lanelet2_says_so(tmp_path):
     with pytest.raises(ValueError):
         roadgen.read_lanelet2(str(tmp_path / "nothing.osm"))

@@ -65,7 +65,29 @@ pub struct ReadOptions {
     pub origin: Option<GeoOrigin>,
     /// How finely curves are sampled when the map is written out again.
     pub sampling: SamplingConfig,
+    /// How far along the lane the seam between two lanelets may run, metres, before
+    /// the two are read as one lane; `None` never reads them so.
+    ///
+    /// OpenDRIVE ends a lane square to its road, so a seam drawn slantwise is met
+    /// by turning the road's reference line until its normal lies along the seam.
+    /// A seam a few metres long can be met that way. One drawn nearly along the
+    /// lane — twenty metres of diagonal between two lanes three wide, as a map may
+    /// draw where a lane changes shape — cannot: the lanes laid out square to the
+    /// reference line come out metres from the file's on one side of the seam or
+    /// the other. Read as one lane, named `lanelet a+b`, the two keep their shape
+    /// and lose only where the seam lay. Only a lanelet that runs into exactly one
+    /// other, which runs out of exactly it, is joined, and only when both are
+    /// ordinary lanes of one kind, going one way at one speed.
+    ///
+    /// By default [`DEFAULT_MAX_SEAM_ALONG`]. At zero every such pair with a seam
+    /// not square to the lane is joined, and whole runs of lanelets become one lane.
+    pub max_seam_along: Option<f64>,
 }
+
+/// [`ReadOptions::max_seam_along`] by default, metres. On Autoware's
+/// Nishi-Shinjuku map two seams run 19 and 22 m along the lane and the next
+/// longest 3.5 m.
+pub const DEFAULT_MAX_SEAM_ALONG: f64 = 10.0;
 
 impl Default for ReadOptions {
     fn default() -> Self {
@@ -73,6 +95,7 @@ impl Default for ReadOptions {
             handedness: TrafficHandedness::RightHand,
             origin: None,
             sampling: SamplingConfig::default(),
+            max_seam_along: Some(DEFAULT_MAX_SEAM_ALONG),
         }
     }
 }
@@ -104,7 +127,12 @@ pub fn from_osm_str(xml: &str, options: &ReadOptions) -> Result<Imported, Import
         metadata.origin.longitude(),
         metadata.origin.altitude(),
     )));
-    let source = Source::new(&document, &projector, &mut approximations)?;
+    let source = Source::new(
+        &document,
+        &projector,
+        options.max_seam_along,
+        &mut approximations,
+    )?;
 
     let mut map = Map::new(metadata);
     let built = roads::build(&source, &mut map, &mut approximations)?;

@@ -64,6 +64,7 @@ impl<'a> Source<'a> {
     pub fn new(
         document: &'a Document,
         projector: &LocalCartesian,
+        max_seam_along: Option<f64>,
         approximations: &mut Approximations,
     ) -> Result<Self, ImportError> {
         let mut points = HashMap::with_capacity(document.nodes.len());
@@ -91,7 +92,10 @@ impl<'a> Source<'a> {
             }
         }
 
-        let merged_into = merge_oblique_seams(&mut lanelets, &points, approximations);
+        let merged_into = match max_seam_along {
+            Some(limit) => merge_oblique_seams(&mut lanelets, &points, limit, approximations),
+            None => HashMap::new(),
+        };
 
         let mut starting: HashMap<(Id, Id), Vec<Id>> = HashMap::new();
         for lanelet in lanelets.values() {
@@ -234,21 +238,9 @@ fn lanelet(
     })
 }
 
-/// How far along the lane the seam between two lanelets may run before they are
-/// read as one, metres.
-///
-/// OpenDRIVE ends a lane square to its road, so a seam drawn slantwise has to be
-/// met by turning the road's reference line until its normal lies along the seam.
-/// A seam a few metres long can be met that way. One drawn nearly along the lane —
-/// twenty metres of diagonal between two lanes three wide, as a map may draw where
-/// a lane changes shape — cannot: the lanes laid out square to the reference line
-/// come out metres from the file's on one side of the seam or the other. On
-/// Autoware's Nishi-Shinjuku map two seams run 19 and 22 m along the lane and the
-/// next longest 3.5 m.
-const MAX_SEAM_ALONG: f64 = 10.0;
-
-/// Reads each lanelet that runs into exactly one other across a seam longer than
-/// [`MAX_SEAM_ALONG`] along the lane, and that one out of exactly it, as one lanelet
+/// Reads each lanelet that runs into exactly one other across a seam running more
+/// than `max_seam_along` metres along the lane — see
+/// [`ReadOptions::max_seam_along`](super::ReadOptions::max_seam_along) — and that one out of exactly it, as one lanelet
 /// with the other: their boundaries joined end to end, keeping the first one's id
 /// and its boundaries' ways. Where the seam lies is lost, and nothing else: the two
 /// must be ordinary lanes of one kind, going one way at one speed, and whatever
@@ -258,6 +250,7 @@ const MAX_SEAM_ALONG: f64 = 10.0;
 fn merge_oblique_seams(
     lanelets: &mut BTreeMap<Id, Lanelet>,
     points: &HashMap<Id, Point3>,
+    max_seam_along: f64,
     approximations: &mut Approximations,
 ) -> HashMap<Id, Id> {
     let mut merged_into: HashMap<Id, Id> = HashMap::new();
@@ -289,7 +282,7 @@ fn merge_oblique_seams(
                 && first.location == second.location
                 && first.one_way == second.one_way
                 && first.speed_limit_kph == second.speed_limit_kph;
-            (alike && seam_along(first, points) > MAX_SEAM_ALONG).then_some((first.id, *next))
+            (alike && seam_along(first, points) > max_seam_along).then_some((first.id, *next))
         });
         let Some((first, second)) = pair else {
             break;

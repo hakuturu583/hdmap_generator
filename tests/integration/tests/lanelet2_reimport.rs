@@ -38,6 +38,7 @@ fn options_for(map: &ValidatedMap) -> ReadOptions {
         handedness: map.metadata.handedness,
         origin: Some(map.metadata.origin),
         sampling: map.metadata.sampling,
+        ..ReadOptions::default()
     }
 }
 

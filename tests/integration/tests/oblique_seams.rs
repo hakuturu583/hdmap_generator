@@ -5,6 +5,7 @@
 //! other comes out metres from the file. So the reader takes the two as one lane.
 
 use roadgen_core::map::TrafficHandedness;
+use roadgen_core::validation::ValidatedMap;
 use roadgen_integration_tests::opendrive_eval::RoadEvaluator;
 use roadgen_integration_tests::osm::Osm;
 use roadgen_integration_tests::reparse_opendrive;
@@ -44,10 +45,9 @@ fn outside(polygon: &[(f64, f64)], p: (f64, f64)) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-#[test]
-fn a_seam_drawn_along_the_lane_is_read_as_one_lane() {
-    // A lane 3.5 m wide, gently curving, in two lanelets whose seam runs from 20 m
-    // along the left boundary to 40 m along the right.
+/// A lane 3.5 m wide, gently curving, in two lanelets whose seam runs from 20 m
+/// along the left boundary to 40 m along the right: the file, and the two ids.
+fn seam_along_the_lane() -> (String, i64, i64) {
     let curve = |x: f64| 0.002 * x * x;
     let at = |x: f64, y: f64| (x, curve(x) + y);
     let mut osm = Osm::new();
@@ -60,17 +60,37 @@ fn a_seam_drawn_along_the_lane_is_read_as_one_lane() {
     let right_b = osm.line(Some(right_a[2]), &[at(50.0, 0.0), at(60.0, 0.0)]);
     let first = osm.lanelet(left_a, right_a);
     let second = osm.lanelet(left_b, right_b);
-    let map = roadgen_lanelet2::from_osm_str(
-        &osm.xml(),
+    (osm.xml(), first, second)
+}
+
+fn read(xml: &str, max_seam_along: Option<f64>) -> ValidatedMap {
+    roadgen_lanelet2::from_osm_str(
+        xml,
         &ReadOptions {
             handedness: TrafficHandedness::LeftHand,
+            max_seam_along,
             ..ReadOptions::default()
         },
     )
     .unwrap()
     .map
     .validate()
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn how_long_a_seam_is_before_the_lanelets_are_joined_is_an_option() {
+    let (xml, _, _) = seam_along_the_lane();
+    // The seam runs some 20 m along the lane.
+    assert_eq!(read(&xml, Some(15.0)).roads.len(), 1);
+    assert_eq!(read(&xml, Some(25.0)).roads.len(), 2);
+    assert_eq!(read(&xml, None).roads.len(), 2);
+}
+
+#[test]
+fn a_seam_drawn_along_the_lane_is_read_as_one_lane() {
+    let (xml, first, second) = seam_along_the_lane();
+    let map = read(&xml, Some(roadgen_lanelet2::DEFAULT_MAX_SEAM_ALONG));
 
     assert_eq!(map.roads.len(), 1);
     let road = map.roads.iter().next().unwrap();

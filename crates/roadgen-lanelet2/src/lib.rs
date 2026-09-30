@@ -57,7 +57,7 @@ mod tags;
 
 pub use error::{ExportError, ImportError};
 pub use grid::MgrsGrid;
-pub use read::{from_osm_str, read, read_with, Imported, ReadOptions};
+pub use read::{from_osm_str, read, read_with, Imported, ReadOptions, DEFAULT_MAX_SEAM_ALONG};
 
 /// Positions this close together are the same vertex.
 ///

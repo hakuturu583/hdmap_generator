@@ -1851,7 +1851,8 @@ lanelet's own boundaries. What is reconstructed is everything above them:
   each be described this way. Two lanelets one after the other whose seam is drawn
   nearly along the lane — running more than 10 m along it, which no amount of
   turning the reference line meets — are read as one lane, named `lanelet a+b`;
-  where the seam lay is lost.
+  where the seam lay is lost. How far is `max_seam_along` (`ReadOptions::
+  max_seam_along` in Rust), and `None` never joins them.
 - **Junctions.** Autoware marks the lanelets that cross an intersection with
   `turn_direction`, and each becomes a junction connector — except one that
   branches into several turns, or that several turns run into, which is read as

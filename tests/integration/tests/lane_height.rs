@@ -269,6 +269,7 @@ fn lanelet2_draws_a_kerb_as_two_lines_and_every_other_edge_as_one() {
             handedness: map.metadata.handedness,
             origin: Some(map.metadata.origin),
             sampling: map.metadata.sampling,
+            ..roadgen_lanelet2::ReadOptions::default()
         },
     )
     .unwrap()
@@ -424,6 +425,7 @@ fn a_cross_section_that_is_not_one_plane_keeps_its_heights_from_lanelet2_to_open
             handedness: map.metadata.handedness,
             origin: Some(map.metadata.origin),
             sampling: map.metadata.sampling,
+            ..roadgen_lanelet2::ReadOptions::default()
         },
     )
     .unwrap()

@@ -254,12 +254,16 @@ def read_lanelet2(
     handedness: str = "RHT",
     sampling: float = 2.0,
     origin: Optional[Point] = None,
+    max_seam_along: Optional[float] = 10.0,
 ) -> Map:
     """The Lanelet2 map at `path`, read as a map that exports like any other and
     cannot be added to. Lanelets that share a boundary become one road, and
     `turn_direction` lanelets become junction connectors. `handedness` is "RHT" or
-    "LHT", which the file does not record. `Map.read_warnings()` says what the file
-    stated that the map could not keep."""
+    "LHT", which the file does not record. Two lanelets one after the other whose
+    seam runs more than `max_seam_along` metres along the lane become one lane,
+    named "lanelet a+b", as OpenDRIVE cannot end a lane along such a seam; `None`
+    never joins them. `Map.read_warnings()` says what the file stated that the map
+    could not keep."""
 
 def render_opendrive(path: str) -> str:
     """The OpenDRIVE file at `path`, drawn as an SVG document."""

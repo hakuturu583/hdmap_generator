@@ -1725,17 +1725,34 @@ fn read_opendrive(
 /// meet. The lanes keep the file's boundaries exactly. `handedness` is which side
 /// traffic keeps to, which the file does not say; `origin` is `(latitude,
 /// longitude, altitude)` for the map's `(0, 0)`, by default the middle of its nodes.
+/// Two lanelets one after the other whose seam runs more than `max_seam_along`
+/// metres along the lane are read as one lane, as OpenDRIVE cannot end a lane
+/// along such a seam; `None` never joins them.
 ///
 /// `Map.read_warnings()` says what the file stated that the map could not keep.
 #[pyfunction]
 #[pyo3(name = "read_lanelet2")]
-#[pyo3(signature = (path, handedness = "RHT", sampling = 2.0, origin = None))]
+#[pyo3(signature = (
+    path,
+    handedness = "RHT",
+    sampling = 2.0,
+    origin = None,
+    max_seam_along = Some(roadgen_lanelet2::DEFAULT_MAX_SEAM_ALONG),
+))]
 fn read_lanelet2(
     path: PathBuf,
     handedness: &str,
     sampling: f64,
     origin: Option<(f64, f64, f64)>,
+    max_seam_along: Option<f64>,
 ) -> PyResult<PyMap> {
+    if let Some(limit) = max_seam_along {
+        if !(limit.is_finite() && limit >= 0.0) {
+            return Err(PyValueError::new_err(format!(
+                "max_seam_along must be a length of zero or more, not {limit}"
+            )));
+        }
+    }
     let options = roadgen_lanelet2::ReadOptions {
         handedness: TrafficHandedness::parse(handedness)
             .ok_or_else(|| PyValueError::new_err(format!("unknown handedness {handedness:?}")))?,
@@ -1744,6 +1761,7 @@ fn read_lanelet2(
             .transpose()
             .map_err(value_error)?,
         sampling: SamplingConfig::new(sampling).map_err(value_error)?,
+        max_seam_along,
     };
     let imported = roadgen_lanelet2::read_with(&path, &options).map_err(value_error)?;
     Ok(PyMap {
