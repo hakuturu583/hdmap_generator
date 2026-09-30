@@ -318,6 +318,42 @@ mod tests {
     }
 
     #[test]
+    fn a_neighbour_reached_from_two_elements_is_two_answers() {
+        let map = two_roads();
+        let road = map.roads.iter().next().unwrap();
+        let lanes: Vec<_> = map
+            .lanes_of(&road.id)
+            .iter()
+            .map(|lane| lane.id.clone())
+            .collect();
+        assert!(lanes.len() >= 2);
+        // A boundary both lanes share, asked of a format that writes only roads.
+        let mut lines = Trace::new("lines");
+        for lane in &lanes {
+            lines.link(lane.clone(), "line:1", Relation::Merged);
+        }
+        let mut roads = Trace::new("roads");
+        roads.link(road.id.clone(), "road:1", Relation::Exact);
+
+        let mut index = TraceIndex::new();
+        index.add_ir(IrDocument::of(&map)).unwrap();
+        index
+            .add_trace(&lines, &IrCatalog::of(&map).fingerprint())
+            .unwrap();
+        index
+            .add_trace(&roads, &IrCatalog::of(&map).fingerprint())
+            .unwrap();
+        let via: Vec<_> = index
+            .translate("lines", "line:1", "roads")
+            .unwrap()
+            .into_iter()
+            .map(|answer| answer.via.unwrap())
+            .collect();
+        let expected: Vec<_> = lanes.iter().map(|lane| lane.to_string()).collect();
+        assert_eq!(via, expected);
+    }
+
+    #[test]
     fn bare_elements_take_the_formats_usual_kind() {
         let map = two_roads();
         let mut sumo = Trace::new("sumo");
