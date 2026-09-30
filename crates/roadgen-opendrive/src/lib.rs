@@ -1657,7 +1657,7 @@ impl<'a> Exporter<'a> {
         };
 
         let mut priorities = Vec::new();
-        for rule in &self.map.rules {
+        for (index, rule) in self.map.rules.iter().enumerate() {
             let TrafficRule::RightOfWay {
                 right_of_way,
                 yielding,
@@ -1666,6 +1666,7 @@ impl<'a> Exporter<'a> {
             else {
                 continue;
             };
+            let before = priorities.len();
             for high in connectors_for(right_of_way) {
                 for low in connectors_for(yielding) {
                     priorities.push(Priority {
@@ -1673,6 +1674,17 @@ impl<'a> Exporter<'a> {
                         low: Some(self.road_id(low)?.to_owned()),
                     });
                 }
+            }
+            // A `<priority>` has no id of its own, so the rule is traced to the
+            // junction that carries its entries, alongside whatever other rules the
+            // junction carries.
+            if priorities.len() > before {
+                self.trace.borrow_mut().link_as(
+                    IrRef::Rule(index),
+                    format!("junction:{}", self.junction_id(junction)?),
+                    Relation::Merged,
+                    "priority",
+                );
             }
         }
         Ok(priorities)

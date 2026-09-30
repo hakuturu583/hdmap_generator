@@ -338,3 +338,49 @@ fn an_internal_lane_netconvert_drew_translates_to_the_connector_it_carries() {
     }
     assert_eq!(reached.len(), connectors.len());
 }
+
+#[test]
+fn a_right_of_way_rule_translates_to_what_each_format_carries_it_by() {
+    let map = scenarios::controlled_crossroads();
+    let directory = tempfile::tempdir().unwrap();
+    export_everything(&map, directory.path());
+    let index = load_everything(directory.path());
+
+    let rules: Vec<usize> = map
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| matches!(rule, TrafficRule::RightOfWay { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    assert!(!rules.is_empty());
+    for rule in rules {
+        let ir = format!("rule/{rule}");
+        // Lanelet2 writes it as a regulatory element of its own.
+        let element = index.from_ir(&ir, "lanelet2").unwrap();
+        assert_eq!(element.len(), 1, "{ir}");
+        let element = element[0].local.clone();
+
+        // OpenDRIVE as `<priority>` entries of a junction.
+        let answers = index.translate("lanelet2", &element, "opendrive").unwrap();
+        assert!(
+            answers
+                .iter()
+                .any(|answer| answer.local.starts_with("junction:")
+                    && answer.role.as_deref() == Some("priority")
+                    && answer.via.is_none()),
+            "{ir}: {answers:?}"
+        );
+        // SUMO as the priority of the edges its lanes are on.
+        let answers = index.translate("lanelet2", &element, "sumo").unwrap();
+        assert!(!answers.is_empty(), "{ir}");
+        assert!(
+            answers
+                .iter()
+                .all(|answer| answer.local.starts_with("edge:")
+                    && answer.role.as_deref() == Some("priority")
+                    && answer.via.is_none()),
+            "{ir}: {answers:?}"
+        );
+    }
+}

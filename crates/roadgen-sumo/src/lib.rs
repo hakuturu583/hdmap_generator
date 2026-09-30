@@ -85,7 +85,7 @@ use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
 use roadgen_core::map::{Lane, Road};
 use roadgen_core::semantics::{MapObjectKind, TrafficRule};
 use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
-use roadgen_core::trace::{Relation, Trace};
+use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::{ConnectionId, JunctionId, LaneId, RoadId, ValidatedMap};
 
 pub use classes::Permission;
@@ -979,6 +979,34 @@ impl<'a> Exporter<'a> {
                     Relation::Merged,
                     "traffic_light",
                 );
+            }
+        }
+
+        // A right-of-way rule is carried by the priority of the edges whose lanes it
+        // names — raised for those that hold right of way, lowered for those that
+        // yield — which is all of it the format can state.
+        for (index, rule) in self.map.rules.iter().enumerate() {
+            let TrafficRule::RightOfWay {
+                right_of_way,
+                yielding,
+                ..
+            } = rule
+            else {
+                continue;
+            };
+            for edge in &self.edges {
+                let named = edge
+                    .lanes
+                    .iter()
+                    .any(|lane| right_of_way.contains(&lane.lane) || yielding.contains(&lane.lane));
+                if named {
+                    trace.link_as(
+                        IrRef::Rule(index),
+                        format!("edge:{}", edge.id),
+                        Relation::Merged,
+                        "priority",
+                    );
+                }
             }
         }
 
