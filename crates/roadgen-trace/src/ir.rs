@@ -51,6 +51,24 @@ pub struct IrDocument {
 }
 
 impl IrDocument {
+    /// Whether the body still hashes to the fingerprint the document states.
+    ///
+    /// The fingerprint is what traces are matched against, so a body edited under an
+    /// unchanged fingerprint would be joined to traces of a map it no longer
+    /// describes.
+    pub fn check(&self, name: &str) -> Result<(), crate::TraceError> {
+        let actual = self.body.fingerprint();
+        if actual == self.fingerprint {
+            Ok(())
+        } else {
+            Err(crate::TraceError::Altered {
+                path: name.to_owned(),
+                stated: self.fingerprint.clone(),
+                actual,
+            })
+        }
+    }
+
     pub fn of(map: &Map) -> Self {
         let body = IrCatalog::of(map);
         IrDocument {

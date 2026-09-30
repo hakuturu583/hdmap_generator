@@ -19,6 +19,14 @@ pub enum TraceError {
         trace: String,
         file: String,
     },
+    /// An IR dump whose body no longer hashes to the fingerprint it states: edited or
+    /// damaged since it was written, so the traces it would be joined to describe a
+    /// different map from the one it now holds.
+    Altered {
+        path: String,
+        stated: String,
+        actual: String,
+    },
     /// Two files that were to be joined came from different maps.
     Mismatch {
         path: String,
@@ -51,6 +59,15 @@ impl fmt::Display for TraceError {
                 f,
                 "{file} has changed since {trace} was written; export it again to get a \
                  trace that matches"
+            ),
+            TraceError::Altered {
+                path,
+                stated,
+                actual,
+            } => write!(
+                f,
+                "{path} states the fingerprint {stated} but its contents hash to {actual}; \
+                 it has been changed since it was written"
             ),
             TraceError::Mismatch {
                 path,

@@ -150,7 +150,7 @@ pub fn write_ir(map: &Map, path: impl AsRef<Path>) -> Result<(), TraceError> {
     write_json(path.as_ref(), &IrDocument::of(map))
 }
 
-/// Reads an IR dump.
+/// Reads an IR dump, refusing one whose body does not hash to its fingerprint.
 pub fn read_ir(path: impl AsRef<Path>) -> Result<IrDocument, TraceError> {
     let path = path.as_ref();
     let text = fs::read_to_string(path).map_err(|error| TraceError::io(path, error))?;
@@ -163,6 +163,7 @@ pub fn read_ir(path: impl AsRef<Path>) -> Result<IrDocument, TraceError> {
             expected: crate::ir::IR_SCHEMA,
         });
     }
+    document.check(&path.display().to_string())?;
     Ok(document)
 }
 

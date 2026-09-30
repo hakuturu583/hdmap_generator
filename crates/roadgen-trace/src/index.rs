@@ -162,6 +162,7 @@ impl TraceIndex {
 
     /// Adds an IR dump already in memory.
     pub fn add_ir(&mut self, document: IrDocument) -> Result<(), TraceError> {
+        document.check("the IR dump")?;
         self.agree("the IR dump", &document.fingerprint)?;
         self.ir = Some(document.body);
         Ok(())

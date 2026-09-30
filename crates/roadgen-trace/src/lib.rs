@@ -122,6 +122,59 @@ mod tests {
         assert_eq!(answers[0].via, None);
     }
 
+    /// A map whose numbers do not print short: a surveyed origin, a road whose
+    /// length and stations are nothing round.
+    fn awkward() -> ValidatedMap {
+        let mut builder = MapBuilder::new(MapMetadata {
+            name: Some("awkward".into()),
+            origin: GeoOrigin::new(35.681236, 139.767125, 3.3).unwrap(),
+            ..MapMetadata::default()
+        });
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.1, 0.2, 0.3),
+                    Point3::new(123.456789, 7.1, 0.7),
+                    vec![LaneSpec::new(
+                        PositiveWidth::new(3.3).unwrap(),
+                        Direction::Forward,
+                    )],
+                )
+                .unwrap()
+                .with_name("a"),
+            )
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    #[test]
+    fn a_dump_reads_back_to_the_fingerprint_it_was_written_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map.ir.json");
+        write_ir(&awkward(), &path).unwrap();
+        let document = read_ir(&path).unwrap();
+        assert_eq!(document, IrDocument::of(&awkward()));
+    }
+
+    #[test]
+    fn a_dump_edited_under_its_fingerprint_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map.ir.json");
+        write_ir(&two_roads(), &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replacen("\"road/a\"", "\"road/z\"", 1)).unwrap();
+
+        let error = read_ir(&path).unwrap_err();
+        assert!(matches!(error, TraceError::Altered { .. }), "{error}");
+        let error = TraceIndex::new().load(&path).unwrap_err();
+        assert!(matches!(error, TraceError::Altered { .. }), "{error}");
+
+        let mut document = IrDocument::of(&two_roads());
+        document.body.lanes.pop();
+        let error = TraceIndex::new().add_ir(document).unwrap_err();
+        assert!(matches!(error, TraceError::Altered { .. }), "{error}");
+    }
+
     #[test]
     fn a_rewritten_file_or_another_map_is_refused() {
         let map = two_roads();

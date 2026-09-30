@@ -11,7 +11,11 @@ description = "IR dumps and per-export trace files for roadgen, and lookups acro
 [dependencies]
 roadgen-core.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `float_roundtrip` so that a dump read back hashes to the fingerprint it was written
+# with: the writer emits the shortest text that round-trips every f64, and the default
+# parser is fast rather than exact, so without it a station could come back one ulp
+# off and an honest dump would be refused as altered.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 quick-xml.workspace = true
 
