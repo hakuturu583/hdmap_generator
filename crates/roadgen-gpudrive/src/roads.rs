@@ -196,11 +196,7 @@ impl<'a> Edge<'a> {
     /// it: `Merged` when two lanes share the edge, `Exact` when only one touches it.
     fn sources(&self, role: &'static str) -> Vec<Source> {
         let lanes: Vec<&Lane> = [self.left, self.right].into_iter().flatten().collect();
-        let relation = if lanes.len() > 1 {
-            Relation::Merged
-        } else {
-            Relation::Exact
-        };
+        let relation = Relation::shared_by(lanes.len());
         lanes
             .into_iter()
             .map(|lane| Source {

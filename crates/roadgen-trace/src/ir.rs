@@ -17,6 +17,8 @@
 //! line moved onto a light's node, which changes what OpenStreetMap merges — have
 //! different fingerprints, and their traces are not joined.
 
+use std::fmt::{self, Write as _};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -351,23 +353,29 @@ impl IrCatalog {
 /// Element by element rather than of the `Map` as a whole, because an arena's lookup
 /// table is a hash map, whose `Debug` order is not the same from one run to the next.
 fn geometry_digest(map: &Map) -> String {
-    let mut digest = Sha256::new();
-    let mut feed = |text: String| {
-        digest.update(text.as_bytes());
-        digest.update(b"\n");
+    /// Hashes what is formatted into it, rather than collecting it first: a road's
+    /// rendering runs to every vertex of its curves.
+    struct Hasher(Sha256);
+    impl fmt::Write for Hasher {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.0.update(text.as_bytes());
+            Ok(())
+        }
+    }
+    let mut digest = Hasher(Sha256::new());
+    let mut feed = |x: &dyn fmt::Debug| {
+        writeln!(digest, "{x:?}").expect("hashing does not fail");
     };
-    feed(format!("{:?}", map.metadata));
-    map.roads.iter().for_each(|x| feed(format!("{x:?}")));
-    map.lanes.iter().for_each(|x| feed(format!("{x:?}")));
-    map.junctions.iter().for_each(|x| feed(format!("{x:?}")));
-    map.connections.iter().for_each(|x| feed(format!("{x:?}")));
-    map.objects.iter().for_each(|x| feed(format!("{x:?}")));
-    map.rules.iter().for_each(|x| feed(format!("{x:?}")));
-    map.buildings.iter().for_each(|x| feed(format!("{x:?}")));
-    map.building_parts
-        .iter()
-        .for_each(|x| feed(format!("{x:?}")));
-    sha256_tag(&digest.finalize())
+    feed(&map.metadata);
+    map.roads.iter().for_each(|x| feed(x));
+    map.lanes.iter().for_each(|x| feed(x));
+    map.junctions.iter().for_each(|x| feed(x));
+    map.connections.iter().for_each(|x| feed(x));
+    map.objects.iter().for_each(|x| feed(x));
+    map.rules.iter().for_each(|x| feed(x));
+    map.buildings.iter().for_each(|x| feed(x));
+    map.building_parts.iter().for_each(|x| feed(x));
+    sha256_tag(&digest.0.finalize())
 }
 
 fn link_entry(target: &RoadLinkTarget) -> LinkEntry {

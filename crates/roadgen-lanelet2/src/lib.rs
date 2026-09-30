@@ -516,11 +516,8 @@ impl<'a> Exporter<'a> {
                 ("left_boundary", lanelet.left_bound()),
                 ("right_boundary", lanelet.right_bound()),
             ] {
-                let relation = if bound_users.get(&bound.id()).copied().unwrap_or(0) > 1 {
-                    Relation::Merged
-                } else {
-                    Relation::Exact
-                };
+                let relation =
+                    Relation::shared_by(bound_users.get(&bound.id()).copied().unwrap_or(0));
                 trace.link_as(
                     ir.clone(),
                     format!("linestring:{}", bound.id()),

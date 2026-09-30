@@ -86,7 +86,7 @@ use roadgen_core::map::{Lane, Road};
 use roadgen_core::semantics::{MapObjectKind, TrafficRule};
 use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
 use roadgen_core::trace::{IrRef, Relation, Trace};
-use roadgen_core::{ConnectionId, JunctionId, LaneId, RoadId, ValidatedMap};
+use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, ValidatedMap};
 
 pub use classes::Permission;
 pub use error::ExportError;
@@ -420,7 +420,8 @@ struct Exporter<'a> {
     movements: BTreeMap<(usize, usize, usize, usize), Movement>,
     slots: HashMap<LaneId, Slot>,
     /// Junctions a traffic light controls an approach to.
-    signalised: HashSet<JunctionId>,
+    /// The signalised junctions, each with the lights that govern it.
+    signalised: BTreeMap<JunctionId, BTreeSet<ObjectId>>,
     /// Lanes that keep right of way where another yields to them, and the lanes that
     /// yield. Held as lanes, not roads: a rule about one carriageway's approach must
     /// not move the opposing carriageway's priority with it.
@@ -439,7 +440,7 @@ impl<'a> Exporter<'a> {
             edges: Vec::new(),
             movements: BTreeMap::new(),
             slots: HashMap::new(),
-            signalised: HashSet::new(),
+            signalised: BTreeMap::new(),
             right_of_way: HashSet::new(),
             yielding: HashSet::new(),
             ruled: HashSet::new(),
@@ -457,7 +458,10 @@ impl<'a> Exporter<'a> {
             }
             for lane in &object.lanes {
                 if let Some(junction) = self.junction_ahead_of(lane) {
-                    self.signalised.insert(junction);
+                    self.signalised
+                        .entry(junction)
+                        .or_default()
+                        .insert(object.id.clone());
                 }
             }
         }
@@ -544,7 +548,7 @@ impl<'a> Exporter<'a> {
     fn road_end_node(&mut self, road: &Road, end: RoadEnd) -> String {
         match road.link.at(end).cloned() {
             Some(RoadLinkTarget::Junction(junction)) => {
-                let kind = if self.signalised.contains(&junction) {
+                let kind = if self.signalised.contains_key(&junction) {
                     NodeKind::TrafficLight
                 } else {
                     NodeKind::Unstated
@@ -960,19 +964,15 @@ impl<'a> Exporter<'a> {
                 junction_nodes.insert(junction, id);
             }
         }
-        for object in self.map.objects.iter() {
-            if !object.kind.is_traffic_light() {
+        // A light is part of the signal of the node it made one, as `read_rules`
+        // decided when it chose which nodes are signalised.
+        for (junction, lights) in &self.signalised {
+            let Some(node) = junction_nodes.get(junction) else {
                 continue;
-            }
-            let governed: BTreeSet<&str> = object
-                .lanes
-                .iter()
-                .filter_map(|lane| self.junction_ahead_of(lane))
-                .filter_map(|junction| junction_nodes.get(&junction).copied())
-                .collect();
-            for node in governed {
+            };
+            for light in lights {
                 trace.link_as(
-                    object.id.clone(),
+                    light.clone(),
                     format!("node:{node}"),
                     Relation::Merged,
                     "traffic_light",

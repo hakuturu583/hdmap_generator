@@ -155,7 +155,7 @@ impl TraceIndex {
         if path.to_string_lossy().ends_with(".net.xml") {
             return self.load_sumo_net(path).map(|_| ());
         }
-        let text = std::fs::read_to_string(path).map_err(|error| TraceError::io(path, error))?;
+        let text = crate::file::read_text(path)?;
         let schema = serde_json::from_str::<Head>(&text)
             .map(|head| head.schema)
             .unwrap_or_default();
@@ -395,7 +395,7 @@ impl TraceIndex {
     /// export's `.nod.xml` where the network put its junction.
     pub fn load_sumo_net(&mut self, path: impl AsRef<Path>) -> Result<SumoNetReport, TraceError> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|error| TraceError::io(path, error))?;
+        let text = crate::file::read_text(path)?;
         let net = parse_net(&text)
             .map_err(|detail| TraceError::Parse(path.display().to_string(), detail))?;
         let sumo = self
@@ -691,16 +691,11 @@ fn parse_net(text: &str) -> Result<Net, String> {
         match element.name().as_ref() {
             b"location" => {
                 if let Some(offset) = attributes.get(b"netOffset".as_slice()) {
-                    let (x, y) = offset
-                        .split_once(',')
-                        .ok_or_else(|| format!("an unreadable netOffset {offset}"))?;
+                    let unreadable = || format!("an unreadable netOffset {offset}");
+                    let (x, y) = offset.split_once(',').ok_or_else(unreadable)?;
                     net.offset = (
-                        x.trim()
-                            .parse()
-                            .map_err(|_| format!("an unreadable netOffset {offset}"))?,
-                        y.trim()
-                            .parse()
-                            .map_err(|_| format!("an unreadable netOffset {offset}"))?,
+                        x.trim().parse().map_err(|_| unreadable())?,
+                        y.trim().parse().map_err(|_| unreadable())?,
                     );
                 }
             }

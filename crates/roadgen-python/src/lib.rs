@@ -1026,8 +1026,10 @@ impl PyMap {
     /// neighbour when a format has nothing for an element itself.
     fn export_ir(&mut self, path: PathBuf) -> PyResult<()> {
         self.ensure_built()?;
-        roadgen_trace::write_ir(self.built.as_ref().expect("just built"), path)
-            .map_err(runtime_error)
+        let fingerprint = roadgen_trace::write_ir(self.built.as_ref().expect("just built"), path)
+            .map_err(runtime_error)?;
+        self.fingerprint = Some(fingerprint);
+        Ok(())
     }
 
     /// Writes the map as OpenDRIVE.
@@ -1329,12 +1331,7 @@ impl PyMap {
             roadgen_carla::write_traced(map, &directory, &config).map_err(runtime_error)?;
         if trace {
             // Named after the map, which names the `.xodr` and the `.fbx` too.
-            let name = written
-                .xodr
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let path = roadgen_trace::directory_sidecar(&directory, &name, &traced.format);
+            let path = roadgen_trace::directory_sidecar(&directory, &config.map, &traced.format);
             self.write_sidecar(&traced, path)?;
         }
 

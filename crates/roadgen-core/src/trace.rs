@@ -132,6 +132,16 @@ pub enum Relation {
 }
 
 impl Relation {
+    /// How one of `sources` IR elements relates to a written element they all
+    /// became: exactly it when it is the only one, else one of those merged into it.
+    pub fn shared_by(sources: usize) -> Self {
+        if sources > 1 {
+            Relation::Merged
+        } else {
+            Relation::Exact
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Relation::Exact => "exact",
@@ -185,12 +195,7 @@ impl Trace {
 
     /// Records that `ir` was written as `local`, which is `<kind>:<local>`.
     pub fn link(&mut self, ir: impl Into<IrRef>, local: impl Into<String>, relation: Relation) {
-        self.links.push(TraceLink {
-            ir: ir.into(),
-            local: local.into(),
-            relation,
-            role: None,
-        });
+        self.push(ir.into(), local.into(), relation, None);
     }
 
     /// Records a link with the role the written element plays for `ir`.
@@ -201,11 +206,15 @@ impl Trace {
         relation: Relation,
         role: impl Into<String>,
     ) {
+        self.push(ir.into(), local.into(), relation, Some(role.into()));
+    }
+
+    fn push(&mut self, ir: IrRef, local: String, relation: Relation, role: Option<String>) {
         self.links.push(TraceLink {
-            ir: ir.into(),
-            local: local.into(),
+            ir,
+            local,
             relation,
-            role: Some(role.into()),
+            role,
         });
     }
 

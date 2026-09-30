@@ -204,9 +204,12 @@ pub fn write_trace_with(
     TraceFile::new(trace, ir_fingerprint.to_owned(), path)?.write(path)
 }
 
-/// Writes the IR dump of `map` to `path`.
-pub fn write_ir(map: &Map, path: impl AsRef<Path>) -> Result<(), TraceError> {
-    write_json(path.as_ref(), &IrDocument::of(map))
+/// Writes the IR dump of `map` to `path`, and returns its fingerprint: what every
+/// trace of the same map records, for a caller that writes those too.
+pub fn write_ir(map: &Map, path: impl AsRef<Path>) -> Result<String, TraceError> {
+    let document = IrDocument::of(map);
+    write_json(path.as_ref(), &document)?;
+    Ok(document.fingerprint)
 }
 
 /// Reads an IR dump, refusing one whose body does not hash to its fingerprint.
@@ -253,7 +256,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), TraceError> {
     fs::write(path, text).map_err(|error| TraceError::io(path, error))
 }
 
-fn read_text(path: &Path) -> Result<String, TraceError> {
+pub(crate) fn read_text(path: &Path) -> Result<String, TraceError> {
     fs::read_to_string(path).map_err(|error| TraceError::io(path, error))
 }
 

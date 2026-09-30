@@ -442,11 +442,7 @@ fn link_edge(trace: &mut Trace, section: &[&Lane], edge: i32, local: &str) {
             }
         })
         .collect();
-    let relation = if bordering.len() > 1 {
-        Relation::Merged
-    } else {
-        Relation::Exact
-    };
+    let relation = Relation::shared_by(bordering.len());
     for (lane, role) in bordering {
         trace.link_as(IrRef::Lane(lane.id.clone()), local, relation, role);
     }

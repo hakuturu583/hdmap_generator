@@ -308,7 +308,9 @@ pub fn write(
 /// level, which is the name CARLA's editor shows it by. The meshes are not traced:
 /// a surface is cut from many lanes at once and belongs to none of them.
 ///
-/// The trace names every file the package wrote.
+/// The trace names every file the package wrote but the meshes, which no link
+/// points into and which are by far the largest: hashing them again on every write
+/// and every load would buy nothing.
 pub fn write_traced(
     map: &ValidatedMap,
     directory: impl AsRef<Path>,
@@ -456,14 +458,10 @@ pub fn write_traced(
 
     trace.files = [
         Some(&descriptor_path),
-        Some(&fbx_path),
         Some(&xodr_path),
         props_path.as_ref(),
-        lights_fbx.as_ref(),
-        signs_fbx.as_ref(),
         furniture_path.as_ref(),
         map_logic_path.as_ref(),
-        Some(&obj_path),
         Some(&script_path),
         Some(&texture_manifest_path),
         Some(&credits_path),

@@ -531,6 +531,11 @@ impl<'a> Exporter<'a> {
         self.trace.borrow_mut().link(ir, local, relation);
     }
 
+    /// Notes that `ir` was written as `local`, which plays `role` for it.
+    fn record_as(&self, ir: impl Into<IrRef>, local: String, relation: Relation, role: &str) {
+        self.trace.borrow_mut().link_as(ir, local, relation, role);
+    }
+
     fn run(self) -> Result<(OpenDrive, Trace), ExportError> {
         let mut drive = OpenDrive {
             header: self.header()?,
@@ -563,7 +568,7 @@ impl<'a> Exporter<'a> {
             // A light has a controller of its own in no format, so it is one of
             // the several the `<controller>` switches together.
             for light in &group.lights {
-                self.trace.borrow_mut().link_as(
+                self.record_as(
                     light.clone(),
                     format!("controller:{}", group.id),
                     Relation::Merged,
@@ -574,7 +579,7 @@ impl<'a> Exporter<'a> {
             // caller saying these lights are one phase, which is what a
             // `<controller>` says. Lights no rule names have none.
             if let Some(rule) = group.rule {
-                self.trace.borrow_mut().link_as(
+                self.record_as(
                     IrRef::Rule(rule),
                     format!("controller:{}", group.id),
                     Relation::Exact,
@@ -682,13 +687,10 @@ impl<'a> Exporter<'a> {
     fn road(&self, road: &Road) -> Result<OdRoad, ExportError> {
         let samples = self.samples(road)?;
         let length = road.horizontal_length()?;
-        self.record(
-            road.id.clone(),
-            format!("road:{}", self.road_id(&road.id)?),
-            Relation::Exact,
-        );
+        let id = self.road_id(&road.id)?;
+        self.record(road.id.clone(), format!("road:{id}"), Relation::Exact);
         Ok(OdRoad {
-            id: self.road_id(&road.id)?.to_owned(),
+            id: id.to_owned(),
             junction: match &road.junction {
                 Some(junction) => self.junction_id(junction)?.to_owned(),
                 // OpenDRIVE spells "not part of a junction" as -1.
@@ -1116,12 +1118,7 @@ impl<'a> Exporter<'a> {
         let mut successor = Vec::new();
         let local = self.lane_ref(lane)?;
         let record = |connection: &ConnectionId, role: &str| {
-            self.trace.borrow_mut().link_as(
-                connection.clone(),
-                local.clone(),
-                Relation::Collapsed,
-                role,
-            );
+            self.record_as(connection.clone(), local.clone(), Relation::Collapsed, role);
         };
 
         for connection in self.map.connections_from(&lane.id) {
@@ -1134,17 +1131,12 @@ impl<'a> Exporter<'a> {
             let entry = LanePredecessorSuccessor {
                 id: self.lane_id(&other.id)?,
             };
-            match connection.from.end {
-                LaneEnd::End => successor.push(entry),
-                LaneEnd::Start => predecessor.push(entry),
-            }
-            record(
-                &connection.id,
-                match connection.from.end {
-                    LaneEnd::End => "successor",
-                    LaneEnd::Start => "predecessor",
-                },
-            );
+            let (links, role) = match connection.from.end {
+                LaneEnd::End => (&mut successor, "successor"),
+                LaneEnd::Start => (&mut predecessor, "predecessor"),
+            };
+            links.push(entry);
+            record(&connection.id, role);
         }
         for connection in self.map.connections_to(&lane.id) {
             if connection.junction.is_some() && !is_connector {
@@ -1156,17 +1148,12 @@ impl<'a> Exporter<'a> {
             let entry = LanePredecessorSuccessor {
                 id: self.lane_id(&other.id)?,
             };
-            match connection.to.end {
-                LaneEnd::End => successor.push(entry),
-                LaneEnd::Start => predecessor.push(entry),
-            }
-            record(
-                &connection.id,
-                match connection.to.end {
-                    LaneEnd::End => "successor",
-                    LaneEnd::Start => "predecessor",
-                },
-            );
+            let (links, role) = match connection.to.end {
+                LaneEnd::End => (&mut successor, "successor"),
+                LaneEnd::Start => (&mut predecessor, "predecessor"),
+            };
+            links.push(entry);
+            record(&connection.id, role);
         }
 
         if predecessor.is_empty() && successor.is_empty() {
@@ -1682,7 +1669,7 @@ impl<'a> Exporter<'a> {
             // junction that carries its entries, alongside whatever other rules the
             // junction carries.
             if priorities.len() > before {
-                self.trace.borrow_mut().link_as(
+                self.record_as(
                     IrRef::Rule(index),
                     format!("junction:{}", self.junction_id(junction)?),
                     Relation::Merged,

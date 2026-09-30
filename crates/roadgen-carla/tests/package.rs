@@ -844,18 +844,15 @@ fn the_trace_names_what_the_package_holds() {
     let (package, trace) =
         roadgen_carla::write_traced(&map, directory.path(), &config).expect("a package");
     assert_eq!(trace.format, "carla");
-    for file in [
-        &package.descriptor,
-        &package.xodr,
-        &package.fbx,
-        &package.script,
-    ] {
+    for file in [&package.descriptor, &package.xodr, &package.script] {
         assert!(
             trace.files.contains(file),
             "{} is not listed",
             file.display()
         );
     }
+    // The meshes are not: no link points into them.
+    assert!(!trace.files.contains(&package.fbx));
     assert!(trace.files.contains(package.furniture.as_ref().unwrap()));
     for file in &trace.files {
         assert!(file.is_file(), "{} was not written", file.display());
