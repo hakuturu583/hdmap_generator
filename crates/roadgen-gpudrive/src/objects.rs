@@ -208,7 +208,8 @@ pub(crate) fn track_with_route(
 /// function saying only what order the lanes come in.
 ///
 /// Also where along it each lane starts, as the index of its first vertex — which,
-/// for a lane that picks up where the last left off, is the vertex the two share.
+/// for a lane that picks up where the last left off, is the vertex the two share, and
+/// for one that does not, is its own first vertex after the jump.
 fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<(Vec<Point3>, Vec<usize>), ExportError> {
     let config = map.metadata.sampling;
     let mut path: Vec<Point3> = Vec::new();
@@ -217,8 +218,18 @@ fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<(Vec<Point3>, Vec<usize>
         let lane = map
             .lane(id)
             .ok_or_else(|| ExportError::NoRoute(format!("{id} is not a lane of this map")))?;
-        starts.push(path.len().saturating_sub(1));
-        for point in lane.travel_polyline(config)?.points() {
+        let polyline = lane.travel_polyline(config)?;
+        // The lane starts at the vertex it shares with the last one when the two
+        // meet, and at its own first vertex when they do not: the jump between them
+        // is no part of either lane.
+        let welded = match (path.last(), polyline.points().first()) {
+            (Some(previous), Some(first)) => {
+                previous.horizontal_distance_to(*first) < WELD_TOLERANCE
+            }
+            _ => false,
+        };
+        starts.push(if welded { path.len() - 1 } else { path.len() });
+        for point in polyline.points() {
             match path.last() {
                 Some(previous) if previous.horizontal_distance_to(*point) < WELD_TOLERANCE => {
                     continue
@@ -241,5 +252,57 @@ pub fn default_size(kind: ObjectKind) -> (f64, f64, f64) {
         ObjectKind::Vehicle => (4.6, 2.0, 1.6),
         ObjectKind::Pedestrian => (0.6, 0.6, 1.8),
         ObjectKind::Cyclist => (1.8, 0.7, 1.7),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roadgen_core::prelude::*;
+
+    #[test]
+    fn a_lane_that_does_not_meet_the_last_starts_after_the_jump() {
+        let mut builder = MapBuilder::default();
+        let lanes = || {
+            vec![LaneSpec::new(
+                PositiveWidth::new(3.5).unwrap(),
+                Direction::Forward,
+            )]
+        };
+        let a = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    lanes(),
+                )
+                .unwrap()
+                .with_name("a"),
+            )
+            .unwrap();
+        let b = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 50.0, 0.0),
+                    Point3::new(100.0, 50.0, 0.0),
+                    lanes(),
+                )
+                .unwrap()
+                .with_name("b"),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let route = vec![LaneId::of_road(&a, 0), LaneId::of_road(&b, 0)];
+
+        let (path, starts) = path(&map, &route).unwrap();
+        let first_of_b = map
+            .lane(&route[1])
+            .unwrap()
+            .travel_polyline(map.metadata.sampling)
+            .unwrap()
+            .points()[0];
+        assert_eq!(starts[0], 0);
+        assert!(path[starts[1]].horizontal_distance_to(first_of_b) < WELD_TOLERANCE);
+        assert!(path[starts[1] - 1].horizontal_distance_to(first_of_b) > 1.0);
     }
 }
