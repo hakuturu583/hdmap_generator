@@ -244,7 +244,7 @@ fn furniture_lands_on_the_way_where_the_ir_put_it() {
     let light = map
         .objects
         .iter()
-        .find(|object| object.kind == MapObjectKind::TrafficLight)
+        .find(|object| object.kind.is_traffic_light())
         .unwrap();
     let ObjectGeometry::Line(bar) = &light.geometry else {
         panic!("a light is a bar across the lane")

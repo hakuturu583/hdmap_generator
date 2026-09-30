@@ -253,7 +253,7 @@ fn traffic_control_arrives_where_the_ir_put_it() {
     let ir_light = map
         .objects
         .iter()
-        .find(|object| object.kind == MapObjectKind::TrafficLight)
+        .find(|object| object.kind.is_traffic_light())
         .unwrap();
     let ObjectGeometry::Line(bar) = &ir_light.geometry else {
         panic!("a light is a bar across the lane")

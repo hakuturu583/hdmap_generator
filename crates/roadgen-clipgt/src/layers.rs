@@ -212,11 +212,7 @@ fn wait_lines(map: &ValidatedMap) -> Result<Layer, ExportError> {
 }
 
 fn traffic_lights(map: &ValidatedMap) -> Result<Layer, ExportError> {
-    let devices = devices(
-        map,
-        |kind| matches!(kind, MapObjectKind::TrafficLight),
-        LIGHT_DIMENSIONS,
-    )?;
+    let devices = devices(map, |kind| kind.is_traffic_light(), LIGHT_DIMENSIONS)?;
     let record = Record::new()
         .add("center", Arc::new(columns::points(&devices.centers)))
         .add("dimensions", Arc::new(columns::points(&devices.dimensions)))

@@ -33,10 +33,11 @@ use roadgen_core::buildings::{Building, BuildingPart, Footprint, Frontage, Solid
 use roadgen_core::geometry::{Curve3, Frame3, Point3};
 use roadgen_core::id::{BuildingId, BuildingPartId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::Road;
-use roadgen_core::semantics::{MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
+use roadgen_core::semantics::{LightHead, MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
 use roadgen_core::topology::{Direction, LateralSide};
 
 use super::Reader;
+use crate::bulbs::{self, BULB_CODE};
 use crate::error::ImportError;
 use crate::{lane_number, STOP_LINE_SUBTYPE, TRAFFIC_LIGHT_TYPE};
 
@@ -117,7 +118,7 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
             let Some(light) = signal_ids
                 .get(control.signal_id.as_str())
                 .and_then(|id| reader.map.objects.get(id))
-                .filter(|object| object.kind == MapObjectKind::TrafficLight)
+                .filter(|object| object.kind.is_traffic_light())
             else {
                 continue;
             };
@@ -353,7 +354,22 @@ impl Reader<'_> {
         references: &[(Road, &SignalReference)],
     ) -> Result<Option<ObjectId>, ImportError> {
         let kind = if signal.dynamic || signal.r#type == TRAFFIC_LIGHT_TYPE {
-            MapObjectKind::TrafficLight
+            let (bulbs, unreadable) = bulbs::from_user_data(&signal.additional_data.user_data);
+            if unreadable > 0 {
+                self.approximations.count(format!(
+                    "{{n}} `<userData code=\"{BULB_CODE}\">` of traffic lights do not say a \
+                     lamp's colour and position the way the writer does, and are not read"
+                ));
+            }
+            MapObjectKind::TrafficLight {
+                head: LightHead {
+                    height: signal
+                        .height
+                        .map(|height| height.get::<meter>())
+                        .filter(|height| height.is_finite() && *height > 0.0),
+                    bulbs,
+                },
+            }
         } else {
             // The caller's own code is the `type`, with the subtype after a slash
             // when the document states one — a catalogue sign is `type/subtype`.

@@ -41,7 +41,7 @@ fn a_traffic_light_becomes_a_signal_where_the_ir_put_it() {
     let ir_object = map
         .objects
         .iter()
-        .find(|object| object.kind == MapObjectKind::TrafficLight)
+        .find(|object| object.kind.is_traffic_light())
         .unwrap();
     let ObjectGeometry::Line(bar) = &ir_object.geometry else {
         panic!("a light is a bar across the lane")
@@ -134,7 +134,7 @@ fn a_placed_signal_stands_where_the_caller_said_and_applies_where_the_ir_did() {
     let light = map
         .objects
         .iter()
-        .find(|object| object.kind == MapObjectKind::TrafficLight)
+        .find(|object| object.kind.is_traffic_light())
         .unwrap();
     let mut options = roadgen_opendrive::Options::default();
     // Six metres east of the north approach's reference line at its end — to its

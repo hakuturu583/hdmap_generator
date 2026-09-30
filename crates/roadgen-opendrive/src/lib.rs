@@ -144,12 +144,14 @@ use roadgen_core::units::GeoOrigin;
 use roadgen_core::validation::ValidatedMap;
 use roadgen_core::GeometryError;
 
+mod bulbs;
 pub mod controllers;
 mod error;
 pub mod options;
 pub mod read;
 pub mod road_coordinates;
 
+pub use bulbs::BULB_CODE;
 pub use controllers::{signal_groups, SignalGroup};
 pub use error::{ExportError, ImportError};
 pub use options::{Options, SignalCatalogue, SignalPlacement};
@@ -291,7 +293,7 @@ pub fn signal_id(map: &ValidatedMap, object: &ObjectId) -> Option<String> {
     let entry = map.objects.get(object)?;
     matches!(
         entry.kind,
-        MapObjectKind::TrafficLight | MapObjectKind::TrafficSign { .. }
+        MapObjectKind::TrafficLight { .. } | MapObjectKind::TrafficSign { .. }
     )
     .then(|| Numbering::new(map).objects.get(object).cloned())
     .flatten()
@@ -1190,7 +1192,7 @@ impl<'a> Exporter<'a> {
         let mut signals = Vec::new();
         for object in self.objects_of(road) {
             let (mut kind, mut subtype, dynamic) = match &object.kind {
-                MapObjectKind::TrafficLight => (
+                MapObjectKind::TrafficLight { .. } => (
                     TRAFFIC_LIGHT_TYPE.to_owned(),
                     TRAFFIC_LIGHT_SUBTYPE.to_owned(),
                     true,
@@ -1260,7 +1262,12 @@ impl<'a> Exporter<'a> {
                 country,
                 country_revision: None,
                 dynamic,
-                height: None,
+                // A light's housing, up from the bottom edge `zOffset` stands at.
+                height: object
+                    .kind
+                    .light_head()
+                    .and_then(|head| head.height)
+                    .map(Length::new::<meter>),
                 // Typed as a length by the schema crate; the attribute is radians.
                 h_offset: h_offset.map(Length::new::<meter>),
                 id: self.object_id(&object.id)?.to_owned(),
@@ -1277,7 +1284,13 @@ impl<'a> Exporter<'a> {
                 value,
                 width: (placement.is_none() && width > 0.0).then(|| Length::new::<meter>(width)),
                 z_offset: Length::new::<meter>(stands.height),
-                additional_data: AdditionalData::default(),
+                additional_data: AdditionalData {
+                    user_data: object
+                        .kind
+                        .light_head()
+                        .map_or_else(Vec::new, |head| bulbs::to_user_data(&head.bulbs)),
+                    ..AdditionalData::default()
+                },
             });
         }
         if signals.is_empty() {

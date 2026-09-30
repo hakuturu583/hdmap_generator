@@ -225,7 +225,7 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
     let signals = map
         .objects
         .iter()
-        .filter(|object| object.kind == MapObjectKind::TrafficLight)
+        .filter(|object| object.kind.is_traffic_light())
         .count();
     if signals > 0 {
         problems.push(format!(
@@ -391,7 +391,7 @@ impl<'a> Exporter<'a> {
     /// junctions are signalised, and which arms hold right of way over which.
     fn read_rules(&mut self) {
         for object in self.map.objects.iter() {
-            if object.kind != MapObjectKind::TrafficLight {
+            if !object.kind.is_traffic_light() {
                 continue;
             }
             for lane in &object.lanes {

@@ -308,6 +308,10 @@ fn same_line(a: &Curve3, b: &Curve3, config: SamplingConfig) -> Result<bool, Exp
             .all(|(p, q)| p.distance_to(*q) <= WELD_TOLERANCE))
 }
 
+/// The type of a traffic light's lamp way, and its role in the light's regulatory
+/// element: Autoware's, not Lanelet2's own.
+const LIGHT_BULBS: &str = "light_bulbs";
+
 /// Interns vertices so that coincident positions become one `Point`.
 struct PointWelder {
     interned: HashMap<[i64; 3], Point>,
@@ -338,6 +342,18 @@ impl PointWelder {
         if let Some(existing) = self.interned.get(&Self::key(point)) {
             return Ok(existing.clone());
         }
+        let interned = self.tagged(point, Vec::new())?;
+        self.interned.insert(Self::key(point), interned.clone());
+        Ok(interned)
+    }
+
+    /// A `Point` of its own for this position, carrying `tags` besides its
+    /// coordinates: a lamp of a traffic light, which no other way shares.
+    fn tagged(
+        &mut self,
+        point: Point3,
+        tags: Vec<(&'static str, String)>,
+    ) -> Result<Point, ExportError> {
         let id = self.next_id;
         self.next_id += 1;
         // Autoware's OSM parsers read the metric position from `local_x`/`local_y`
@@ -345,18 +361,18 @@ impl PointWelder {
         // Which metres those are is the projection's business: the map's own, or the
         // position within an MGRS square.
         let (local_x, local_y) = self.coordinates.of(point)?;
-        let interned = Point::new(
+        let mut attributes = vec![
+            ("local_x", format!("{local_x:.6}")),
+            ("local_y", format!("{local_y:.6}")),
+        ];
+        attributes.extend(tags);
+        Ok(Point::new(
             id,
             point.x,
             point.y,
             point.z,
-            tags::attributes([
-                ("local_x", format!("{local_x:.6}")),
-                ("local_y", format!("{local_y:.6}")),
-            ]),
-        );
-        self.interned.insert(Self::key(point), interned.clone());
-        Ok(interned)
+            tags::attributes(attributes),
+        ))
     }
 }
 
@@ -373,6 +389,8 @@ struct Exporter<'a> {
     own_boundaries: HashMap<(LaneId, i32), LineString>,
     lanelets: HashMap<LaneId, Lanelet>,
     objects: HashMap<ObjectId, Vec<LineString>>,
+    /// The `light_bulbs` way of each traffic light that has lamps.
+    bulbs: HashMap<ObjectId, LineString>,
 }
 
 impl<'a> Exporter<'a> {
@@ -392,6 +410,7 @@ impl<'a> Exporter<'a> {
             own_boundaries: HashMap::new(),
             lanelets: HashMap::new(),
             objects: HashMap::new(),
+            bulbs: HashMap::new(),
         })
     }
 
@@ -564,8 +583,11 @@ impl<'a> Exporter<'a> {
                 // a regulatory element referring to one without a subtype is
                 // rejected at load time.
                 MapObjectKind::TrafficSign { code } => attributes.push(("subtype", code.clone())),
-                MapObjectKind::TrafficLight => {
-                    attributes.push(("subtype", "red_yellow_green".into()))
+                MapObjectKind::TrafficLight { head } => {
+                    attributes.push(("subtype", "red_yellow_green".into()));
+                    if let Some(height) = head.height {
+                        attributes.push(("height", format!("{height:.6}")));
+                    }
                 }
                 _ => {}
             }
@@ -606,6 +628,36 @@ impl<'a> Exporter<'a> {
                     vec![left_line, right_line]
                 }
             };
+            if let (MapObjectKind::TrafficLight { head }, Some(light)) =
+                (&object.kind, lines.first())
+            {
+                if !head.bulbs.is_empty() {
+                    // Autoware's light_bulbs way: one point per lamp, tagged with what
+                    // it shows, naming the light it belongs to.
+                    let points = head
+                        .bulbs
+                        .iter()
+                        .map(|bulb| {
+                            let mut tags = vec![("color", bulb.color.as_str().to_owned())];
+                            if let Some(arrow) = bulb.arrow {
+                                tags.push(("arrow", arrow.as_str().to_owned()));
+                            }
+                            self.welder.tagged(bulb.position, tags)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let id = self.take_id();
+                    let bulbs = LineString::new(
+                        id,
+                        points,
+                        tags::attributes([
+                            ("type", LIGHT_BULBS.to_owned()),
+                            ("traffic_light_id", light.id().to_string()),
+                        ]),
+                    );
+                    self.lanelet_map.add(Primitive::LineString(bulbs.clone()));
+                    self.bulbs.insert(object.id.clone(), bulbs);
+                }
+            }
             self.objects.insert(object.id.clone(), lines);
         }
         Ok(())
@@ -640,6 +692,14 @@ impl<'a> Exporter<'a> {
                         continue;
                     }
                     parameters.insert(roles::REFERS.to_owned(), refers);
+                    let bulbs: Vec<RuleParameter> = lights
+                        .iter()
+                        .filter_map(|light| self.bulbs.get(light).cloned())
+                        .map(RuleParameter::LineString)
+                        .collect();
+                    if !bulbs.is_empty() {
+                        parameters.insert(LIGHT_BULBS.to_owned(), bulbs);
+                    }
                     if let Some(stop_line) = stop_line {
                         parameters.insert(
                             roles::REF_LINE.to_owned(),

@@ -20,7 +20,7 @@
 
 use roadgen_core::id::{JunctionId, ObjectId, RoadId};
 use roadgen_core::map::Map;
-use roadgen_core::semantics::{MapObject, MapObjectKind, TrafficRule};
+use roadgen_core::semantics::{MapObject, TrafficRule};
 use roadgen_core::topology::{LaneEnd, RoadEnd, RoadLinkTarget};
 
 /// One `<controller>`: the lights that switch together, and the junction they do
@@ -45,7 +45,7 @@ pub fn signal_groups(map: &Map) -> Vec<SignalGroup> {
     let is_light = |id: &ObjectId| {
         map.objects
             .get(id)
-            .is_some_and(|object| object.kind == MapObjectKind::TrafficLight)
+            .is_some_and(|object| object.kind.is_traffic_light())
     };
     let mut groups: Vec<(Option<JunctionId>, Vec<ObjectId>)> = Vec::new();
     let mut assigned: Vec<ObjectId> = Vec::new();
@@ -76,7 +76,7 @@ pub fn signal_groups(map: &Map) -> Vec<SignalGroup> {
     type Approach = (Option<JunctionId>, Option<RoadId>);
     let mut approaches: Vec<(Approach, usize)> = Vec::new();
     for object in map.objects.iter() {
-        if object.kind != MapObjectKind::TrafficLight || assigned.contains(&object.id) {
+        if !object.kind.is_traffic_light() || assigned.contains(&object.id) {
             continue;
         }
         let junction = junction_ahead(map, object);
