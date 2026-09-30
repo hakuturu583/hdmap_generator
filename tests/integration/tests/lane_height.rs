@@ -3,7 +3,8 @@
 //! round its corners, OpenDRIVE writes it as `<height>` and reads it back, and
 //! Lanelet2 gives a kerb two lines instead of one.
 
-use roadgen_core::map::{Lane, Road};
+use ll2_core::map::as_lanelet;
+use roadgen_core::map::Lane;
 use roadgen_core::prelude::*;
 use roadgen_core::topology::LateralSide;
 use roadgen_integration_tests::opendrive_eval::{Position, RoadEvaluator};
@@ -262,39 +263,40 @@ fn a_lift_read_back_from_opendrive_is_the_lift_that_was_written() {
 #[test]
 fn lanelet2_draws_a_kerb_as_two_lines_and_every_other_edge_as_one() {
     let map = straight_street(0.0);
-    let xml = roadgen_lanelet2::to_osm_xml(&map).unwrap();
-    let back = roadgen_lanelet2::from_osm_str(
-        &xml,
-        &roadgen_lanelet2::ReadOptions {
-            handedness: map.metadata.handedness,
-            origin: Some(map.metadata.origin),
-            sampling: map.metadata.sampling,
-        },
-    )
-    .unwrap()
-    .map
-    .validate()
-    .unwrap();
-    // The two carriageway lanes share their middle line and read back as one road
-    // each way; a pavement shares no line with the carriageway beside it, since the
-    // kerb puts its edge higher, and reads back as a road of its own.
-    let (pavements, carriageways): (Vec<&Road>, Vec<&Road>) = back.roads.iter().partition(|road| {
-        back.lanes_of(&road.id)
-            .iter()
-            .all(|lane| lane.lane_type == LaneType::Sidewalk)
-    });
+    let loaded = roadgen_integration_tests::reload_lanelet2(&map);
+    let lanelets: Vec<_> = loaded
+        .lanelets
+        .all()
+        .into_iter()
+        .filter_map(|primitive| as_lanelet(&primitive).cloned())
+        .collect();
+    assert_eq!(lanelets.len(), 4);
+    // The two carriageway lanes share their middle line; a pavement shares no line
+    // with the carriageway beside it, since the kerb puts its edge higher. Four
+    // lanelets, eight bounds: seven lines, where sharing the kerb edges would be five.
+    let mut lines: Vec<_> = lanelets
+        .iter()
+        .flat_map(|lanelet| [lanelet.left_bound().id(), lanelet.right_bound().id()])
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    assert_eq!(lines.len(), 7);
+    // And the pavements are a kerb up, both edges, all along the graded road.
+    let pavements: Vec<_> = lanelets
+        .iter()
+        .filter(|lanelet| lanelet.attributes().read()["subtype"].value() == "walkway")
+        .collect();
     assert_eq!(pavements.len(), 2);
-    assert_eq!(carriageways.len(), 2);
-    // And the pavements come back a kerb up.
-    let config = back.metadata.sampling;
-    for road in pavements {
-        for lane in back.lanes_of(&road.id) {
-            for point in lane.left_boundary.to_polyline(config).unwrap().points() {
+    for lanelet in pavements {
+        for bound in [lanelet.left_bound(), lanelet.right_bound()] {
+            for point in bound.points() {
+                let surface = 10.0 + point.x() / 80.0 * 2.0;
                 assert!(
-                    (point.z - (10.0 + point.x / 80.0 * 2.0) - KERB).abs() < 1e-4,
-                    "{} came back at {}",
-                    lane.id,
-                    point.z
+                    (point.z() - surface - KERB).abs() < 1e-4,
+                    "lanelet {} has a point at {} where the kerb is at {}",
+                    lanelet.id(),
+                    point.z(),
+                    surface + KERB
                 );
             }
         }
