@@ -353,11 +353,8 @@ pub fn write_traced(
     let xodr_path = folder.join(format!("{}.xodr", config.map));
     let opendrive = roadgen_opendrive::write_with_traced(map, &xodr_path, &options)
         .map_err(|error| ExportError::OpenDrive(error.to_string()))?;
-    let mut trace = Trace {
-        format: "carla".to_owned(),
-        files: Vec::new(),
-        links: opendrive.links,
-    };
+    let mut trace = Trace::new("carla");
+    trace.links = opendrive.links;
 
     let mut props_path = None;
     let mut props = Vec::new();

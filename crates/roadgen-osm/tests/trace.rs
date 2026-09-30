@@ -140,7 +140,7 @@ fn every_road_but_a_connector_is_exactly_one_way() {
     let map = town();
     let (document, trace) = export(&map);
     for road in map.roads.iter() {
-        let links: Vec<_> = links_of(&trace, IrRef::Road(road.id.clone()));
+        let links: Vec<_> = trace.links_of(&IrRef::Road(road.id.clone())).collect();
         if road.is_connector() {
             assert!(links.is_empty(), "{} is a connector: {links:?}", road.id);
             continue;
@@ -164,7 +164,9 @@ fn junctions_furniture_restrictions_and_buildings_are_traced() {
     let id_of = |local: &str| -> i64 { local.split_once(':').unwrap().1.parse().unwrap() };
 
     for junction in map.junctions.iter() {
-        let links: Vec<_> = links_of(&trace, IrRef::Junction(junction.id.clone()));
+        let links: Vec<_> = trace
+            .links_of(&IrRef::Junction(junction.id.clone()))
+            .collect();
         let node: Vec<_> = links
             .iter()
             .filter(|l| l.local.starts_with("node:"))
@@ -189,13 +191,13 @@ fn junctions_furniture_restrictions_and_buildings_are_traced() {
 
     // The stop line and the light share one node, and both are traced to it though
     // only the light's tag survives there.
-    let furniture = |prefix: &str| -> Vec<TraceLink> {
+    let furniture = |prefix: &str| -> Vec<&TraceLink> {
         let object = map
             .objects
             .iter()
             .find(|object| object.id.local_name().starts_with(prefix))
             .unwrap();
-        links_of(&trace, IrRef::Object(object.id.clone()))
+        trace.links_of(&IrRef::Object(object.id.clone())).collect()
     };
     let stop = furniture("stopline");
     let light = furniture("trafficlight");
@@ -233,13 +235,15 @@ fn junctions_furniture_restrictions_and_buildings_are_traced() {
     );
 
     for building in map.buildings.iter() {
-        let outline: Vec<_> = links_of(&trace, IrRef::Building(building.id.clone()));
+        let outline: Vec<_> = trace
+            .links_of(&IrRef::Building(building.id.clone()))
+            .collect();
         assert_eq!(outline.len(), 1);
         assert_eq!(outline[0].relation, Relation::Exact);
         assert_eq!(outline[0].role.as_deref(), Some("outline"));
         let mut part_ways = HashSet::new();
         for part in &building.parts {
-            let links: Vec<_> = links_of(&trace, IrRef::BuildingPart(part.clone()));
+            let links: Vec<_> = trace.links_of(&IrRef::BuildingPart(part.clone())).collect();
             assert_eq!(links.len(), 1, "{part}");
             assert_eq!(links[0].relation, Relation::Exact);
             part_ways.insert(links[0].local.clone());
@@ -256,12 +260,6 @@ fn junctions_furniture_restrictions_and_buildings_are_traced() {
             }
         }
     }
-}
-
-/// Every link to `ir`, owned: the trace borrows the reference it is asked about for
-/// as long as the answer lives.
-fn links_of(trace: &Trace, ir: IrRef) -> Vec<TraceLink> {
-    trace.links_of(&ir).cloned().collect()
 }
 
 fn node_ref(id: i64) -> String {

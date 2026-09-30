@@ -8,8 +8,10 @@
 //! would give wrong answers without any sign of being wrong.
 
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -17,7 +19,7 @@ use roadgen_core::map::Map;
 use roadgen_core::trace::{Relation, Trace};
 
 use crate::error::TraceError;
-use crate::ir::{hex, Generator, IrCatalog, IrDocument};
+use crate::ir::{sha256_tag, Generator, IrCatalog, IrDocument, IR_SCHEMA};
 
 /// The schema a trace file is written with.
 pub const TRACE_SCHEMA: &str = "roadgen-trace/1";
@@ -25,7 +27,6 @@ pub const TRACE_SCHEMA: &str = "roadgen-trace/1";
 /// Which way a trace runs: from the IR to a file an exporter wrote, or from a file a
 /// reader read to the IR it made.
 pub const EXPORT: &str = "export";
-pub const IMPORT: &str = "import";
 
 /// A trace file as it is written to disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,30 +103,48 @@ impl TraceFile {
     }
 
     /// The digest of the file with its own [`digest`](Self::digest) left empty.
+    ///
+    /// Taken over a borrowed copy of the file rather than a clone of it, since the
+    /// links are most of a trace. The copy has to serialise to exactly the bytes the
+    /// file itself would with an empty digest, or every trace already written would
+    /// read as altered: same fields, same names, same order.
     fn contents_digest(&self) -> String {
-        let unsigned = TraceFile {
-            digest: String::new(),
-            ..self.clone()
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            schema: &'a str,
+            generator: &'a Generator,
+            format: &'a str,
+            direction: &'a str,
+            ir_fingerprint: &'a str,
+            files: &'a [FileDigest],
+            links: &'a [LinkRecord],
+            digest: &'a str,
+        }
+        let unsigned = Unsigned {
+            schema: &self.schema,
+            generator: &self.generator,
+            format: &self.format,
+            direction: &self.direction,
+            ir_fingerprint: &self.ir_fingerprint,
+            files: &self.files,
+            links: &self.links,
+            digest: "",
         };
         let bytes = serde_json::to_vec(&unsigned).expect("a trace is plain data");
-        format!("sha256:{}", hex(&Sha256::digest(bytes)))
+        sha256_tag(&Sha256::digest(bytes))
     }
 
     pub fn read(path: &Path) -> Result<Self, TraceError> {
-        let text = fs::read_to_string(path).map_err(|error| TraceError::io(path, error))?;
-        let file: TraceFile = serde_json::from_str(&text)
-            .map_err(|error| TraceError::Parse(path.display().to_string(), error.to_string()))?;
-        if file.schema != TRACE_SCHEMA {
-            return Err(TraceError::Schema {
-                path: path.display().to_string(),
-                found: file.schema,
-                expected: TRACE_SCHEMA,
-            });
-        }
+        TraceFile::parse(&read_text(path)?, &path.display().to_string())
+    }
+
+    /// A trace file from its text, `name` saying where it came from in any complaint.
+    pub fn parse(text: &str, name: &str) -> Result<Self, TraceError> {
+        let file = parse_json(text, name, TRACE_SCHEMA, |file: &TraceFile| &file.schema)?;
         let actual = file.contents_digest();
         if actual != file.digest {
             return Err(TraceError::Altered {
-                path: path.display().to_string(),
+                path: name.to_owned(),
                 stated: file.digest,
                 actual,
             });
@@ -133,7 +152,7 @@ impl TraceFile {
         for link in &file.links {
             if Relation::parse(&link.rel).is_none() {
                 return Err(TraceError::Parse(
-                    path.display().to_string(),
+                    name.to_owned(),
                     format!("unknown relation `{}`", link.rel),
                 ));
             }
@@ -167,8 +186,22 @@ impl TraceFile {
 /// Writes `trace` to `path`, recording the fingerprint of `map` and a digest of every
 /// file the trace lists.
 pub fn write_trace(trace: &Trace, map: &Map, path: impl AsRef<Path>) -> Result<(), TraceError> {
+    write_trace_with(trace, &IrCatalog::of(map).fingerprint(), path)
+}
+
+/// Writes `trace` to `path` as [`write_trace`] does, for the map `ir_fingerprint`
+/// identifies.
+///
+/// For a caller that writes several traces of one map: the fingerprint means
+/// cataloguing the whole map and hashing its geometry, which is worth doing once
+/// rather than once per export.
+pub fn write_trace_with(
+    trace: &Trace,
+    ir_fingerprint: &str,
+    path: impl AsRef<Path>,
+) -> Result<(), TraceError> {
     let path = path.as_ref();
-    TraceFile::new(trace, IrCatalog::of(map).fingerprint(), path)?.write(path)
+    TraceFile::new(trace, ir_fingerprint.to_owned(), path)?.write(path)
 }
 
 /// Writes the IR dump of `map` to `path`.
@@ -179,17 +212,16 @@ pub fn write_ir(map: &Map, path: impl AsRef<Path>) -> Result<(), TraceError> {
 /// Reads an IR dump, refusing one whose body does not hash to its fingerprint.
 pub fn read_ir(path: impl AsRef<Path>) -> Result<IrDocument, TraceError> {
     let path = path.as_ref();
-    let text = fs::read_to_string(path).map_err(|error| TraceError::io(path, error))?;
-    let document: IrDocument = serde_json::from_str(&text)
-        .map_err(|error| TraceError::Parse(path.display().to_string(), error.to_string()))?;
-    if document.schema != crate::ir::IR_SCHEMA {
-        return Err(TraceError::Schema {
-            path: path.display().to_string(),
-            found: document.schema,
-            expected: crate::ir::IR_SCHEMA,
-        });
-    }
-    document.check(&path.display().to_string())?;
+    read_ir_str(&read_text(path)?, &path.display().to_string())
+}
+
+/// An IR dump from its text, as [`read_ir`] reads one, `name` saying where it came
+/// from in any complaint.
+pub fn read_ir_str(text: &str, name: &str) -> Result<IrDocument, TraceError> {
+    let document = parse_json(text, name, IR_SCHEMA, |document: &IrDocument| {
+        &document.schema
+    })?;
+    document.check(name)?;
     Ok(document)
 }
 
@@ -221,12 +253,43 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), TraceError> {
     fs::write(path, text).map_err(|error| TraceError::io(path, error))
 }
 
-fn digest_file(path: &Path) -> Result<String, TraceError> {
-    let bytes = fs::read(path).map_err(|error| TraceError::io(path, error))?;
-    Ok(format!("sha256:{}", hex(&Sha256::digest(bytes))))
+fn read_text(path: &Path) -> Result<String, TraceError> {
+    fs::read_to_string(path).map_err(|error| TraceError::io(path, error))
 }
 
-fn parent_of(path: &Path) -> PathBuf {
+/// `text` as a `T` written with `expected` as its schema, which `schema` reads off
+/// it. Shared by both kinds of file, so they complain alike.
+fn parse_json<T: DeserializeOwned>(
+    text: &str,
+    name: &str,
+    expected: &'static str,
+    schema: fn(&T) -> &str,
+) -> Result<T, TraceError> {
+    let value: T = serde_json::from_str(text)
+        .map_err(|error| TraceError::Parse(name.to_owned(), error.to_string()))?;
+    let found = schema(&value);
+    if found != expected {
+        return Err(TraceError::Schema {
+            path: name.to_owned(),
+            found: found.to_owned(),
+            expected,
+        });
+    }
+    Ok(value)
+}
+
+/// Streamed, since the files a trace describes — a point cloud, a CARLA mesh — can be
+/// far larger than is worth holding in memory to hash.
+fn digest_file(path: &Path) -> Result<String, TraceError> {
+    let mut hasher = Sha256::new();
+    fs::File::open(path)
+        .and_then(|mut file| io::copy(&mut file, &mut hasher))
+        .map_err(|error| TraceError::io(path, error))?;
+    Ok(sha256_tag(&hasher.finalize()))
+}
+
+/// The directory `path` is in, `.` for a bare file name.
+pub(crate) fn parent_of(path: &Path) -> PathBuf {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),

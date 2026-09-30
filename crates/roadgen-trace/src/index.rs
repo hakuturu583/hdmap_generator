@@ -1,16 +1,17 @@
 //! Lookups across traces: from a written element to the IR, from the IR to a written
 //! element, and from one format to another through the IR.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use serde::Deserialize;
 
 use roadgen_core::trace::{IrRef, Relation, Trace};
 
 use crate::error::TraceError;
-use crate::file::{read_ir, TraceFile};
+use crate::file::{parent_of, read_ir, read_ir_str, TraceFile};
 use crate::ir::{IrCatalog, IrDocument};
 
 /// One link, as a lookup returns it.
@@ -25,7 +26,7 @@ pub struct Link {
 }
 
 /// One answer to [`TraceIndex::translate`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Translation {
     /// The element of the target format.
     pub local: String,
@@ -56,6 +57,10 @@ pub struct SumoNetReport {
 #[derive(Debug, Default)]
 pub struct TraceIndex {
     ir: Option<IrCatalog>,
+    /// Every element of the dump's neighbours, worked out once when the dump is
+    /// loaded: a translation steps to them for every element it cannot answer, and
+    /// finding them in the dump each time is a scan of the whole of it.
+    neighbours: HashMap<String, Vec<String>>,
     fingerprint: Option<String>,
     formats: BTreeMap<String, FormatLinks>,
     check_files: bool,
@@ -138,50 +143,60 @@ impl TraceIndex {
 
     /// Loads an IR dump or a trace file, telling which by its schema, or a SUMO
     /// `.net.xml` by its name.
+    ///
+    /// The file is read once, and the text that told which it is is the text parsed.
     pub fn load(&mut self, path: impl AsRef<Path>) -> Result<(), TraceError> {
+        /// All of a file that is needed to tell which it is.
+        #[derive(Deserialize)]
+        struct Head {
+            schema: String,
+        }
         let path = path.as_ref();
         if path.to_string_lossy().ends_with(".net.xml") {
             return self.load_sumo_net(path).map(|_| ());
         }
         let text = std::fs::read_to_string(path).map_err(|error| TraceError::io(path, error))?;
-        let schema = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| value.get("schema")?.as_str().map(str::to_owned))
+        let schema = serde_json::from_str::<Head>(&text)
+            .map(|head| head.schema)
             .unwrap_or_default();
+        let name = path.display().to_string();
         if schema.starts_with("roadgen-ir/") {
-            self.load_ir(path)
+            self.add_ir_as(&name, read_ir_str(&text, &name)?)
         } else {
-            self.load_trace(path)
+            self.add_trace_read(path, TraceFile::parse(&text, &name)?)
         }
     }
 
     pub fn load_ir(&mut self, path: impl AsRef<Path>) -> Result<(), TraceError> {
         let path = path.as_ref();
-        let document = read_ir(path)?;
-        self.agree(&path.display().to_string(), &document.fingerprint)?;
-        self.ir = Some(document.body);
-        Ok(())
+        self.add_ir_as(&path.display().to_string(), read_ir(path)?)
     }
 
     /// Adds an IR dump already in memory.
     pub fn add_ir(&mut self, document: IrDocument) -> Result<(), TraceError> {
         document.check("the IR dump")?;
-        self.agree("the IR dump", &document.fingerprint)?;
+        self.add_ir_as("the IR dump", document)
+    }
+
+    /// Adds a checked dump, called `name` in any complaint.
+    fn add_ir_as(&mut self, name: &str, document: IrDocument) -> Result<(), TraceError> {
+        self.agree(name, &document.fingerprint)?;
+        self.neighbours = neighbour_table(&document.body);
         self.ir = Some(document.body);
         Ok(())
     }
 
     pub fn load_trace(&mut self, path: impl AsRef<Path>) -> Result<(), TraceError> {
         let path = path.as_ref();
-        let file = TraceFile::read(path)?;
+        self.add_trace_read(path, TraceFile::read(path)?)
+    }
+
+    /// Adds `file`, as read from `path`.
+    fn add_trace_read(&mut self, path: &Path, file: TraceFile) -> Result<(), TraceError> {
         if self.check_files {
             file.verify_files(path)?;
         }
-        let base = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
-        self.add_trace_file(&path.display().to_string(), file, &base)
+        self.add_trace_file(&path.display().to_string(), file, &parent_of(path))
     }
 
     /// Adds a trace already in memory, of the map `ir_fingerprint` identifies.
@@ -330,23 +345,8 @@ impl TraceIndex {
                 }
             }
         }
-        // An answer is the same answer only when everything it says is the same: one
-        // element can stand for one IR element in two roles — a lane an agent drives
-        // and the lane its goal is on — or be reached from two IR elements through
-        // the same neighbour — a boundary's two lanes, both on one road — and each is
-        // an answer of its own.
-        let mut seen = BTreeSet::new();
-        let answers = found
+        let mut answers: Vec<Translation> = found
             .into_iter()
-            .filter(|(link, via)| {
-                seen.insert((
-                    link.local.as_str(),
-                    link.ir.as_str(),
-                    link.relation,
-                    link.role.as_deref(),
-                    *via,
-                ))
-            })
             .map(|(link, via)| Translation {
                 local: link.local.clone(),
                 ir: link.ir.clone(),
@@ -355,79 +355,18 @@ impl TraceIndex {
                 via: via.map(str::to_owned),
             })
             .collect();
+        // An answer is dropped only when identical to an earlier one: one element in
+        // two roles — the lane an agent drives and the lane its goal is on — or
+        // reached from two IR elements through one neighbour is two answers.
+        let mut seen = HashSet::new();
+        answers.retain(|answer| seen.insert(answer.clone()));
         Ok(answers)
     }
 
     /// The IR elements one step from `ir`, by the dump: what a lane belongs to and
     /// what joins it, what a connection joins, what a rule governs.
     pub fn neighbours(&self, ir: &str) -> Vec<String> {
-        let Some(catalog) = &self.ir else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        match IrRef::parse(ir) {
-            Some(IrRef::Lane(_)) => {
-                if let Some(lane) = catalog.lanes.iter().find(|lane| lane.id == ir) {
-                    out.push(lane.road.clone());
-                }
-                for connection in &catalog.connections {
-                    if connection.from.lane == ir || connection.to.lane == ir {
-                        out.push(connection.id.clone());
-                    }
-                }
-            }
-            Some(IrRef::Road(_)) => {
-                out.extend(
-                    catalog
-                        .lanes
-                        .iter()
-                        .filter(|lane| lane.road == ir)
-                        .map(|lane| lane.id.clone()),
-                );
-                if let Some(road) = catalog.roads.iter().find(|road| road.id == ir) {
-                    out.extend(road.junction.clone());
-                }
-            }
-            Some(IrRef::Connection(_)) => {
-                if let Some(connection) = catalog.connections.iter().find(|c| c.id == ir) {
-                    out.push(connection.from.lane.clone());
-                    out.push(connection.to.lane.clone());
-                    out.extend(connection.junction.clone());
-                }
-            }
-            Some(IrRef::Junction(_)) => {
-                if let Some(junction) = catalog.junctions.iter().find(|j| j.id == ir) {
-                    out.extend(junction.connecting.iter().cloned());
-                }
-            }
-            Some(IrRef::Object(_)) => {
-                if let Some(object) = catalog.objects.iter().find(|o| o.id == ir) {
-                    out.extend(object.lanes.iter().cloned());
-                }
-            }
-            Some(IrRef::Rule(_)) => {
-                if let Some(rule) = catalog.rules.iter().find(|r| r.id == ir) {
-                    out.extend(rule.objects.iter().cloned());
-                    out.extend(rule.lanes.iter().cloned());
-                }
-            }
-            Some(IrRef::Building(_)) => {
-                if let Some(building) = catalog.buildings.iter().find(|b| b.id == ir) {
-                    out.extend(building.parts.iter().cloned());
-                }
-            }
-            Some(IrRef::BuildingPart(_)) => {
-                if let Some(building) = catalog
-                    .buildings
-                    .iter()
-                    .find(|b| b.parts.iter().any(|part| part == ir))
-                {
-                    out.push(building.id.clone());
-                }
-            }
-            None => {}
-        }
-        out
+        self.neighbours.get(ir).cloned().unwrap_or_default()
     }
 
     fn format(&self, format: &str) -> Result<&FormatLinks, TraceError> {
@@ -475,11 +414,7 @@ impl TraceIndex {
         let mut carried: BTreeMap<String, Vec<Link>> = BTreeMap::new();
         for connection in connections.iter().filter(|c| !c.from.starts_with(':')) {
             let Some(via) = &connection.via else { continue };
-            let local = format!(
-                "connection:{}_{}>{}_{}",
-                connection.from, connection.from_lane, connection.to, connection.to_lane
-            );
-            let links: Vec<Link> = sumo.with_local(&local).cloned().collect();
+            let links: Vec<Link> = sumo.with_local(&connection.key()).cloned().collect();
             if links.is_empty() {
                 report.untraced += 1;
             } else {
@@ -518,6 +453,104 @@ impl TraceIndex {
     }
 }
 
+/// The IR elements one step from each element of `catalog`, for
+/// [`TraceIndex::neighbours`]: a lane's road and the connections that join it, a
+/// road's lanes and its junction, a connection's two lanes and its junction, a
+/// junction's connecting roads, an object's lanes, a rule's objects and then its
+/// lanes, a building's parts, a part's building.
+///
+/// An element is taken by the kind its id names, as [`IrRef::parse`] reads it, and
+/// where two entries share an id the first is the one described — as a search of
+/// the dump for that id would find.
+fn neighbour_table(catalog: &IrCatalog) -> HashMap<String, Vec<String>> {
+    let is = |id: &str, kind: fn(&IrRef) -> bool| IrRef::parse(id).as_ref().is_some_and(kind);
+    let lane = |id: &str| is(id, |r| matches!(r, IrRef::Lane(_)));
+    let road = |id: &str| is(id, |r| matches!(r, IrRef::Road(_)));
+
+    let mut table: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in &catalog.lanes {
+        if lane(&entry.id) {
+            table
+                .entry(entry.id.clone())
+                .or_insert_with(|| vec![entry.road.clone()]);
+        }
+        if road(&entry.road) {
+            table
+                .entry(entry.road.clone())
+                .or_default()
+                .push(entry.id.clone());
+        }
+    }
+    for connection in &catalog.connections {
+        let (from, to) = (&connection.from.lane, &connection.to.lane);
+        if lane(from) {
+            table
+                .entry(from.clone())
+                .or_default()
+                .push(connection.id.clone());
+        }
+        if to != from && lane(to) {
+            table
+                .entry(to.clone())
+                .or_default()
+                .push(connection.id.clone());
+        }
+        if is(&connection.id, |r| matches!(r, IrRef::Connection(_))) {
+            table.entry(connection.id.clone()).or_insert_with(|| {
+                let mut out = vec![from.clone(), to.clone()];
+                out.extend(connection.junction.clone());
+                out
+            });
+        }
+    }
+    // After the lanes, whose entries a road's junction follows.
+    let mut roads = HashSet::new();
+    for entry in &catalog.roads {
+        if road(&entry.id) && roads.insert(entry.id.as_str()) {
+            table
+                .entry(entry.id.clone())
+                .or_default()
+                .extend(entry.junction.clone());
+        }
+    }
+    for junction in &catalog.junctions {
+        if is(&junction.id, |r| matches!(r, IrRef::Junction(_))) {
+            table
+                .entry(junction.id.clone())
+                .or_insert_with(|| junction.connecting.clone());
+        }
+    }
+    for object in &catalog.objects {
+        if is(&object.id, |r| matches!(r, IrRef::Object(_))) {
+            table
+                .entry(object.id.clone())
+                .or_insert_with(|| object.lanes.clone());
+        }
+    }
+    for rule in &catalog.rules {
+        if is(&rule.id, |r| matches!(r, IrRef::Rule(_))) {
+            table
+                .entry(rule.id.clone())
+                .or_insert_with(|| [rule.objects.clone(), rule.lanes.clone()].concat());
+        }
+    }
+    for building in &catalog.buildings {
+        if is(&building.id, |r| matches!(r, IrRef::Building(_))) {
+            table
+                .entry(building.id.clone())
+                .or_insert_with(|| building.parts.clone());
+        }
+        for part in &building.parts {
+            if is(part, |r| matches!(r, IrRef::BuildingPart(_))) {
+                table
+                    .entry(part.clone())
+                    .or_insert_with(|| vec![building.id.clone()]);
+            }
+        }
+    }
+    table
+}
+
 /// Whether `net` is the network netconvert built from the export `sumo` traces.
 fn built_from(sumo: &FormatLinks, net: &Net) -> Result<(), String> {
     let written = |kind: &str| -> BTreeSet<&str> {
@@ -540,11 +573,11 @@ fn built_from(sumo: &FormatLinks, net: &Net) -> Result<(), String> {
         .connections
         .iter()
         .filter(|c| !c.from.starts_with(':'))
-        .map(|c| format!("{}_{}>{}_{}", c.from, c.from_lane, c.to, c.to_lane))
+        .map(NetConnection::key)
         .collect();
     if let Some(missing) = written("connection:")
         .into_iter()
-        .find(|connection| !connections.contains(*connection))
+        .find(|connection| !connections.contains(&format!("connection:{connection}")))
     {
         return Err(format!(
             "it has no connection {missing}, which the export wrote"
@@ -597,6 +630,18 @@ struct NetConnection {
     from_lane: String,
     to_lane: String,
     via: Option<String>,
+}
+
+impl NetConnection {
+    /// The connection as a trace names it, `connection:<from>_<fromLane>><to>_<toLane>`:
+    /// the form the SUMO exporter writes, so a built connection is found in the trace
+    /// by its key.
+    fn key(&self) -> String {
+        format!(
+            "connection:{}_{}>{}_{}",
+            self.from, self.from_lane, self.to, self.to_lane
+        )
+    }
 }
 
 /// A plan-view position, metres.

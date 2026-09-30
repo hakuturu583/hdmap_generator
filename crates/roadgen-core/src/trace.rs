@@ -210,12 +210,14 @@ impl Trace {
     }
 
     /// Every link to one IR element.
-    pub fn links_of<'a>(&'a self, ir: &'a IrRef) -> impl Iterator<Item = &'a TraceLink> + 'a {
-        self.links.iter().filter(move |link| &link.ir == ir)
+    pub fn links_of(&self, ir: &IrRef) -> impl Iterator<Item = &TraceLink> + '_ {
+        let ir = ir.clone();
+        self.links.iter().filter(move |link| link.ir == ir)
     }
 
     /// Every link to one written element.
-    pub fn links_to<'a>(&'a self, local: &'a str) -> impl Iterator<Item = &'a TraceLink> + 'a {
+    pub fn links_to(&self, local: &str) -> impl Iterator<Item = &TraceLink> + '_ {
+        let local = local.to_owned();
         self.links.iter().filter(move |link| link.local == local)
     }
 }

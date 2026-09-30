@@ -977,13 +977,8 @@ impl<'a> Exporter<'a> {
         left.sort_by_key(|lane| std::cmp::Reverse(lane.ordinal));
         right.sort_by_key(|lane| lane.ordinal);
 
-        let road_id = self.road_id(&road.id)?;
         for lane in left.iter().chain(&right) {
-            self.record(
-                lane.id.clone(),
-                format!("lane:{road_id}/{index}/{}", self.lane_id(&lane.id)?),
-                Relation::Exact,
-            );
+            self.record(lane.id.clone(), self.lane_ref(lane)?, Relation::Exact);
         }
 
         let centre_marking = right
@@ -1117,12 +1112,7 @@ impl<'a> Exporter<'a> {
             .unwrap_or(false);
         let mut predecessor = Vec::new();
         let mut successor = Vec::new();
-        let local = format!(
-            "lane:{}/{}/{}",
-            self.road_id(&lane.road)?,
-            lane.section,
-            self.lane_id(&lane.id)?
-        );
+        let local = self.lane_ref(lane)?;
         let record = |connection: &ConnectionId, role: &str| {
             self.trace.borrow_mut().link_as(
                 connection.clone(),
@@ -1865,6 +1855,16 @@ impl<'a> Exporter<'a> {
             .get(junction)
             .map(String::as_str)
             .ok_or_else(|| ExportError::Unknown(junction.to_string()))
+    }
+
+    /// The trace's name for a written lane: its road, lane section and lane id.
+    fn lane_ref(&self, lane: &Lane) -> Result<String, ExportError> {
+        Ok(format!(
+            "lane:{}/{}/{}",
+            self.road_id(&lane.road)?,
+            lane.section,
+            self.lane_id(&lane.id)?
+        ))
     }
 
     fn lane_id(&self, lane: &LaneId) -> Result<i64, ExportError> {

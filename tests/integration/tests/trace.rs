@@ -13,12 +13,12 @@ use roadgen_core::map::Lane;
 use roadgen_core::prelude::*;
 use roadgen_core::trace::Relation;
 use roadgen_integration_tests::scenarios;
-use roadgen_integration_tests::sumo_build::sumo_available;
+use roadgen_integration_tests::sumo_build::{netconvert, sumo_available, SumoNetwork};
 use roadgen_trace::{directory_sidecar, sidecar_path, write_ir, write_trace, TraceIndex};
 
 /// Every export the traces cover, written into `directory` with its trace beside it,
-/// and the IR dump.
-fn export_everything(map: &ValidatedMap, directory: &Path) {
+/// and the IR dump. Returns the prefix the SUMO export, in `sumo/`, named its files by.
+fn export_everything(map: &ValidatedMap, directory: &Path) -> String {
     write_ir(map, directory.join("map.ir.json")).unwrap();
 
     let xodr = directory.join("map.xodr");
@@ -52,6 +52,7 @@ fn export_everything(map: &ValidatedMap, directory: &Path) {
         roadgen_gpudrive::write_traced(map, &scene, &roadgen_gpudrive::SceneConfig::default())
             .unwrap();
     write_trace(&trace, map, sidecar_path(&scene)).unwrap();
+    prefix
 }
 
 fn load_everything(directory: &Path) -> TraceIndex {
@@ -251,28 +252,6 @@ fn a_rewritten_export_is_not_joined_with_a_stale_trace() {
     );
 }
 
-/// Runs netconvert on the SUMO export in `sumo`, through the configuration the export
-/// wrote, and hands back the network it built.
-fn build_network(sumo: &Path) -> std::path::PathBuf {
-    let config = std::fs::read_dir(sumo)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "netccfg")
-        })
-        .unwrap();
-    let status = std::process::Command::new("netconvert")
-        .arg("-c")
-        .arg(&config)
-        .current_dir(sumo)
-        .output()
-        .expect("netconvert should run");
-    assert!(status.status.success());
-    config.with_extension("net.xml")
-}
-
 #[test]
 fn a_network_built_from_another_map_with_the_same_names_is_refused() {
     if !sumo_available() {
@@ -289,8 +268,8 @@ fn a_network_built_from_another_map_with_the_same_names_is_refused() {
         .validate()
         .unwrap();
     let theirs = tempfile::tempdir().unwrap();
-    roadgen_sumo::write(&other, theirs.path()).unwrap();
-    let net = build_network(theirs.path());
+    let prefix = roadgen_sumo::write(&other, theirs.path()).unwrap();
+    let net = netconvert(theirs.path(), &prefix);
 
     let mut index = load_everything(ours.path());
     let error = index.load_sumo_net(&net).unwrap_err();
@@ -309,8 +288,8 @@ fn an_internal_lane_netconvert_drew_translates_to_the_connector_it_carries() {
     }
     let map = scenarios::crossroads();
     let directory = tempfile::tempdir().unwrap();
-    export_everything(&map, directory.path());
-    let net = build_network(&directory.path().join("sumo"));
+    let prefix = export_everything(&map, directory.path());
+    let net = netconvert(&directory.path().join("sumo"), &prefix);
 
     let mut index = load_everything(directory.path());
     let report = index.load_sumo_net(&net).unwrap();
@@ -326,11 +305,13 @@ fn an_internal_lane_netconvert_drew_translates_to_the_connector_it_carries() {
         .filter(|lane| map.road(&lane.road).unwrap().is_connector())
         .collect();
     let mut reached = std::collections::BTreeSet::new();
-    let text = std::fs::read_to_string(&net).unwrap();
-    for internal in text
-        .split("<lane id=\"")
-        .skip(1)
-        .filter_map(|rest| rest.split('"').next())
+    let network = SumoNetwork::read(&net);
+    for internal in network
+        .edges
+        .iter()
+        .filter(|edge| edge.function.as_deref() == Some("internal"))
+        .flat_map(|edge| &edge.lanes)
+        .map(|lane| lane.id.as_str())
         .filter(|id| id.starts_with(":j_"))
     {
         // One OpenDRIVE lane, reached through the connector lane itself and through

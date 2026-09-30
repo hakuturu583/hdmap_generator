@@ -413,10 +413,10 @@ struct Exporter<'a> {
     sampling: SamplingConfig,
     nodes: BTreeMap<String, Node>,
     edges: Vec<Edge>,
-    /// Ordered, and a set, because a junction with several connectors between one
-    /// pair of lanes would otherwise write the same movement twice.
-    connections: BTreeSet<(usize, usize, usize, usize)>,
-    /// What of the IR each written connection stands for.
+    /// Each written connection, by (from edge, from lane, to edge, to lane), and what
+    /// of the IR it stands for. Ordered, and a map, because a junction with several
+    /// connectors between one pair of lanes would otherwise write the same movement
+    /// twice.
     movements: BTreeMap<(usize, usize, usize, usize), Movement>,
     slots: HashMap<LaneId, Slot>,
     /// Junctions a traffic light controls an approach to.
@@ -437,7 +437,6 @@ impl<'a> Exporter<'a> {
             sampling: map.metadata.sampling,
             nodes: BTreeMap::new(),
             edges: Vec::new(),
-            connections: BTreeSet::new(),
             movements: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: HashSet::new(),
@@ -919,7 +918,6 @@ impl<'a> Exporter<'a> {
             return;
         }
         let key = (from.edge, from.index, to.edge, to.index);
-        self.connections.insert(key);
         let merged = self.movements.entry(key).or_default();
         merged.connections.extend(movement.connections);
         merged.connectors.extend(movement.connectors);
@@ -994,19 +992,19 @@ impl<'a> Exporter<'a> {
             else {
                 continue;
             };
-            for edge in &self.edges {
-                let named = edge
-                    .lanes
-                    .iter()
-                    .any(|lane| right_of_way.contains(&lane.lane) || yielding.contains(&lane.lane));
-                if named {
-                    trace.link_as(
-                        IrRef::Rule(index),
-                        format!("edge:{}", edge.id),
-                        Relation::Merged,
-                        "priority",
-                    );
-                }
+            let named: BTreeSet<usize> = right_of_way
+                .iter()
+                .chain(yielding.iter())
+                .filter_map(|lane| self.slots.get(lane))
+                .map(|slot| slot.edge)
+                .collect();
+            for edge in named {
+                trace.link_as(
+                    IrRef::Rule(index),
+                    format!("edge:{}", self.edges[edge].id),
+                    Relation::Merged,
+                    "priority",
+                );
             }
         }
 
@@ -1025,15 +1023,11 @@ impl<'a> Exporter<'a> {
             }
         }
 
-        for key in &self.connections {
-            let (from_edge, from_lane, to_edge, to_lane) = *key;
+        for (&(from_edge, from_lane, to_edge, to_lane), movement) in &self.movements {
             let local = format!(
                 "connection:{}_{from_lane}>{}_{to_lane}",
                 self.edges[from_edge].id, self.edges[to_edge].id
             );
-            let Some(movement) = self.movements.get(key) else {
-                continue;
-            };
             // One IR connection straight from lane to lane is this connection; any
             // more, or any connector between them, and it is one of several.
             let relation = if movement.connectors.is_empty() && movement.connections.len() == 1 {
@@ -1115,7 +1109,7 @@ impl<'a> Exporter<'a> {
     fn render_connections(&self) -> String {
         let mut document =
             xml::Document::new("connections", "http://sumo.dlr.de/xsd/connections_file.xsd");
-        for (from_edge, from_lane, to_edge, to_lane) in &self.connections {
+        for (from_edge, from_lane, to_edge, to_lane) in self.movements.keys() {
             document.leaf(
                 "connection",
                 &[
@@ -1394,10 +1388,6 @@ mod tests {
         found
     }
 
-    fn links_of(trace: &Trace, ir: IrRef) -> Vec<&TraceLink> {
-        trace.links.iter().filter(|link| link.ir == ir).collect()
-    }
-
     #[test]
     fn everything_the_trace_names_is_in_the_files() {
         for map in [crossroads(), in_line()] {
@@ -1432,8 +1422,9 @@ mod tests {
             let network = to_plain_xml(&map).unwrap();
             assert!(!network.lanes.is_empty());
             for (lane, id) in &network.lanes {
-                let exact: Vec<&str> = links_of(&network.trace, IrRef::Lane(lane.clone()))
-                    .into_iter()
+                let exact: Vec<&str> = network
+                    .trace
+                    .links_of(&IrRef::Lane(lane.clone()))
                     .filter(|link| link.relation == Relation::Exact)
                     .map(|link| link.local.as_str())
                     .collect();
@@ -1449,7 +1440,7 @@ mod tests {
         let trace = &network.trace;
 
         let junction = &map.junctions.iter().next().unwrap().id;
-        let exact = links_of(trace, IrRef::Junction(junction.clone()));
+        let exact: Vec<_> = trace.links_of(&IrRef::Junction(junction.clone())).collect();
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].local, "node:j_x");
         assert_eq!(exact[0].relation, Relation::Exact);
@@ -1459,7 +1450,7 @@ mod tests {
             .iter()
             .find(|object| object.kind == MapObjectKind::TrafficLight)
             .unwrap();
-        let signal = links_of(trace, IrRef::Object(light.id.clone()));
+        let signal: Vec<_> = trace.links_of(&IrRef::Object(light.id.clone())).collect();
         assert_eq!(signal.len(), 1);
         assert_eq!(signal[0].local, "node:j_x");
         assert_eq!(signal[0].relation, Relation::Merged);
@@ -1471,8 +1462,8 @@ mod tests {
             .iter()
             .find(|road| road.name.as_deref() == Some("north"))
             .unwrap();
-        let edges: Vec<&str> = links_of(trace, IrRef::Road(north.id.clone()))
-            .into_iter()
+        let edges: Vec<&str> = trace
+            .links_of(&IrRef::Road(north.id.clone()))
             .map(|link| link.local.as_str())
             .collect();
         assert_eq!(edges, ["edge:north.fwd", "edge:north.bwd"]);
@@ -1481,14 +1472,16 @@ mod tests {
         // every IR connection in the junction is merged into one.
         for road in map.roads.iter().filter(|road| road.is_connector()) {
             for lane in map.lanes.iter().filter(|lane| lane.road == road.id) {
-                let links = links_of(trace, IrRef::Lane(lane.id.clone()));
+                let links: Vec<_> = trace.links_of(&IrRef::Lane(lane.id.clone())).collect();
                 assert_eq!(links.len(), 1, "{}", lane.id);
                 assert_eq!(links[0].relation, Relation::Collapsed);
                 assert!(links[0].local.starts_with("connection:"));
             }
         }
         for connection in map.connections.iter() {
-            let links = links_of(trace, IrRef::Connection(connection.id.clone()));
+            let links: Vec<_> = trace
+                .links_of(&IrRef::Connection(connection.id.clone()))
+                .collect();
             assert_eq!(links.len(), 1, "{}", connection.id);
             assert_eq!(links[0].relation, Relation::Merged);
         }

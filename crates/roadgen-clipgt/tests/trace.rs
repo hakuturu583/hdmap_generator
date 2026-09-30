@@ -3,7 +3,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::path::PathBuf;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roadgen_clipgt::ClipConfig;
@@ -113,13 +112,6 @@ fn check_against(trace: &Trace, rows: &BTreeMap<String, usize>) {
     }
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let directory =
-        std::env::temp_dir().join(format!("roadgen-clipgt-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
-    directory
-}
-
 #[test]
 fn the_trace_names_the_rows_of_the_layers_it_was_built_with() {
     let map = crossroads();
@@ -138,9 +130,9 @@ fn the_trace_names_the_rows_of_the_layers_it_was_built_with() {
 #[test]
 fn the_trace_names_the_rows_of_the_files_it_wrote() {
     let map = crossroads();
-    let directory = temp_dir("written");
+    let directory = tempfile::tempdir().unwrap();
     let (clip, trace) =
-        roadgen_clipgt::write_traced(&map, &directory, &ClipConfig::new("x")).unwrap();
+        roadgen_clipgt::write_traced(&map, directory.path(), &ClipConfig::new("x")).unwrap();
     assert_eq!(clip, "x");
     assert_eq!(trace.files.len(), 10, "one Parquet file per layer");
 
@@ -159,7 +151,6 @@ fn the_trace_names_the_rows_of_the_files_it_wrote() {
         rows.insert(layer.to_owned(), count);
     }
     check_against(&trace, &rows);
-    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]

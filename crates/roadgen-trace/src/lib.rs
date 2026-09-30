@@ -29,7 +29,10 @@ pub mod index;
 pub mod ir;
 
 pub use error::TraceError;
-pub use file::{directory_sidecar, read_ir, sidecar_path, write_ir, write_trace, TraceFile};
+pub use file::{
+    directory_sidecar, read_ir, read_ir_str, sidecar_path, write_ir, write_trace, write_trace_with,
+    TraceFile,
+};
 pub use index::{Link, SumoNetReport, TraceIndex, Translation};
 pub use ir::{IrCatalog, IrDocument};
 

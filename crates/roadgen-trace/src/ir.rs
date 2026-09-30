@@ -342,7 +342,7 @@ impl IrCatalog {
     /// so the same map always hashes the same.
     pub fn fingerprint(&self) -> String {
         let bytes = serde_json::to_vec(self).expect("a catalogue is plain data");
-        format!("sha256:{}", hex(&Sha256::digest(bytes)))
+        sha256_tag(&Sha256::digest(bytes))
     }
 }
 
@@ -367,7 +367,7 @@ fn geometry_digest(map: &Map) -> String {
     map.building_parts
         .iter()
         .for_each(|x| feed(format!("{x:?}")));
-    format!("sha256:{}", hex(&digest.finalize()))
+    sha256_tag(&digest.finalize())
 }
 
 fn link_entry(target: &RoadLinkTarget) -> LinkEntry {
@@ -405,6 +405,9 @@ fn rule_objects(rule: &TrafficRule) -> Vec<String> {
     }
 }
 
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+/// A finished SHA-256 digest as every file here writes one: `sha256:<hex>`, so a
+/// digest says what it was taken with.
+pub(crate) fn sha256_tag(digest: &[u8]) -> String {
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("sha256:{hex}")
 }

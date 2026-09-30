@@ -64,13 +64,8 @@ fn load(xml: &str, map: &ValidatedMap) -> std::sync::Arc<LaneletMap> {
     ll2_io::load_str(xml, projector.as_ref()).expect("a Lanelet2 loader should accept this")
 }
 
-/// Every link to `ir`, owning the reference so a caller can build it inline.
-fn links_of(trace: &Trace, ir: IrRef) -> Vec<&TraceLink> {
-    trace.links.iter().filter(|link| link.ir == ir).collect()
-}
-
 fn lane_links<'a>(trace: &'a Trace, lane: &LaneId) -> Vec<&'a TraceLink> {
-    links_of(trace, IrRef::Lane(lane.clone()))
+    trace.links_of(&IrRef::Lane(lane.clone())).collect()
 }
 
 #[test]
@@ -163,7 +158,9 @@ fn objects_and_rules_are_traced_to_what_they_became() {
         .iter()
         .find(|object| object.kind == MapObjectKind::Crosswalk)
         .unwrap();
-    let links = links_of(&trace, IrRef::Object(crosswalk.id.clone()));
+    let links: Vec<_> = trace
+        .links_of(&IrRef::Object(crosswalk.id.clone()))
+        .collect();
     let lines = links
         .iter()
         .filter(|link| link.local.starts_with("linestring:"))
@@ -186,11 +183,11 @@ fn objects_and_rules_are_traced_to_what_they_became() {
         .iter()
         .find(|object| object.kind == MapObjectKind::TrafficLight)
         .unwrap();
-    let links = links_of(&trace, IrRef::Object(light.id.clone()));
+    let links: Vec<_> = trace.links_of(&IrRef::Object(light.id.clone())).collect();
     assert_eq!(links.len(), 1);
     assert_eq!(links[0].relation, Relation::Exact);
 
-    let rule = |index| links_of(&trace, IrRef::Rule(index));
+    let rule = |index| trace.links_of(&IrRef::Rule(index)).collect::<Vec<_>>();
     for index in [0, 3] {
         let links = rule(index);
         assert_eq!(links.len(), 1, "rule {index}");
