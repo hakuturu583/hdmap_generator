@@ -323,10 +323,32 @@ furniture manifest（IR object ↔ xodr signal ↔ actor 名）で追える。
 | OpenDRIVE | road / section 内 lane / junction / connection / signal / object / building / controller | `Numbering` を流用。純関数 |
 | Lanelet2 | lanelet / linestring / regulatory_element | 連番。exporter の private 表を返すだけ |
 | OSM | node / way / relation | 信号等はノードに統合（`merged`）、restriction は腕のペア単位で複数 connection に対応 |
-| SUMO | node / edge / lane / connection | plain XML の ID を記録。netconvert が生成する内部 lane（`:j_x_0_0`）は対象外（plain XML に無いため） |
+| SUMO | node / edge / lane / connection | plain XML の ID を記録。netconvert が作る内部 lane（`:j_x_0_0`）は、`.net.xml` の `<connection from to fromLane toLane via>` を読んで connection 経由で解決する（§8.1） |
 | ClipGT | `<layer>:<row>` | 行番号が唯一の ID。走行不可 lane は出力されない（リンク無し）、lane_line は重複排除で `merged` |
 | GPUDrive | `road:<index>` / `agent:<id>` | 行番号。edge/line は重複排除で `merged`。agent は走行ルートの lane 列に `part` で対応 |
 | CARLA（xodr・furniture のみ） | opendrive の ref + actor 名 | FBX メッシュは対象外 |
+
+### 8.1 SUMO の内部 lane
+
+内部 lane（`:j_x_0_0`）は netconvert が作るもので、roadgen が書く plain XML には無い。
+`netconvert --output.original-names true` を試したが（SUMO 1.18、crossroads シナリオ）、
+`origId` は 1 つも出力されなかった。plain XML には元の名前という概念が無いため、
+このオプションは効かない。
+
+一方、`.net.xml` の `<connection>` は次の形で内部 lane を名指ししている:
+
+```xml
+<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0" via=":j_x_0_0" .../>
+```
+
+`from` / `to` / `fromLane` / `toLane` は roadgen が付けた ID そのままなので、
+トレースファイルに記録した connection（`connection:north.fwd_0>west.bwd_0` → IR の
+connection）と突き合わせれば `via` の内部 lane も IR まで追える。
+`TraceIndex` が `.net.xml` を任意で受け取り、その場でこの対応を足す。netconvert の
+オプションには依存しない。
+
+netconvert が独自に足す接続（行き止まりの U ターン `north.bwd → north.fwd` など）は
+IR に対応物が無いので、リンクなしとして扱う。
 
 | フェーズ | 内容 |
 | --- | --- |
