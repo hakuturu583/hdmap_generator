@@ -10,7 +10,12 @@
 //!
 //! The [fingerprint](IrDocument::fingerprint) is a digest of the dump's body. Every
 //! trace file records the fingerprint of the map it was written from, so that files
-//! written apart can be checked to belong together before they are joined.
+//! written apart can be checked to belong together before they are joined. The body
+//! leaves the geometry out but not unaccounted for: its
+//! [`geometry`](IrCatalog::geometry) field is a digest of everything the catalogue
+//! does not spell out, so two maps with the same elements in different places — a stop
+//! line moved onto a light's node, which changes what OpenStreetMap merges — have
+//! different fingerprints, and their traces are not joined.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -91,6 +96,15 @@ pub struct IrCatalog {
     pub objects: Vec<ObjectEntry>,
     pub rules: Vec<RuleEntry>,
     pub buildings: Vec<BuildingEntry>,
+    /// `sha256:<hex>` of the whole IR — geometry, sampling, footprints and every
+    /// other field the entries above leave out — so the fingerprint covers what the
+    /// exports are written from, and not only what a lookup reads.
+    ///
+    /// Taken over the elements' `Debug` rendering in the IR's own order, which is
+    /// deterministic for a given build of roadgen; like every fingerprint here it is
+    /// for telling whether files came from the same map, not for comparing across
+    /// versions.
+    pub geometry: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -318,6 +332,7 @@ impl IrCatalog {
                         .map(|frontage| frontage.road.to_string()),
                 })
                 .collect(),
+            geometry: geometry_digest(map),
         }
     }
 
@@ -329,6 +344,30 @@ impl IrCatalog {
         let bytes = serde_json::to_vec(self).expect("a catalogue is plain data");
         format!("sha256:{}", hex(&Sha256::digest(bytes)))
     }
+}
+
+/// A digest of every element of `map`, field by field.
+///
+/// Element by element rather than of the `Map` as a whole, because an arena's lookup
+/// table is a hash map, whose `Debug` order is not the same from one run to the next.
+fn geometry_digest(map: &Map) -> String {
+    let mut digest = Sha256::new();
+    let mut feed = |text: String| {
+        digest.update(text.as_bytes());
+        digest.update(b"\n");
+    };
+    feed(format!("{:?}", map.metadata));
+    map.roads.iter().for_each(|x| feed(format!("{x:?}")));
+    map.lanes.iter().for_each(|x| feed(format!("{x:?}")));
+    map.junctions.iter().for_each(|x| feed(format!("{x:?}")));
+    map.connections.iter().for_each(|x| feed(format!("{x:?}")));
+    map.objects.iter().for_each(|x| feed(format!("{x:?}")));
+    map.rules.iter().for_each(|x| feed(format!("{x:?}")));
+    map.buildings.iter().for_each(|x| feed(format!("{x:?}")));
+    map.building_parts
+        .iter()
+        .for_each(|x| feed(format!("{x:?}")));
+    format!("sha256:{}", hex(&digest.finalize()))
 }
 
 fn link_entry(target: &RoadLinkTarget) -> LinkEntry {

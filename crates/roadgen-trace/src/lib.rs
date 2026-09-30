@@ -148,6 +148,34 @@ mod tests {
     }
 
     #[test]
+    fn the_same_elements_in_another_place_are_another_map() {
+        let moved = |end: f64| {
+            let mut builder = MapBuilder::default();
+            builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(0.0, 0.0, 0.0),
+                        Point3::new(end, 0.0, 0.0),
+                        vec![LaneSpec::new(
+                            PositiveWidth::new(3.5).unwrap(),
+                            Direction::Forward,
+                        )],
+                    )
+                    .unwrap()
+                    .with_name("a"),
+                )
+                .unwrap();
+            IrCatalog::of(&builder.finish().unwrap().validate().unwrap())
+        };
+        let (near, far) = (moved(100.0), moved(120.0));
+        // Nothing a lookup reads tells them apart; the fingerprint still does.
+        assert_eq!(near.roads.len(), far.roads.len());
+        assert_eq!(near.lanes[0].id, far.lanes[0].id);
+        assert_ne!(near.fingerprint(), far.fingerprint());
+        assert_eq!(near.fingerprint(), moved(100.0).fingerprint());
+    }
+
+    #[test]
     fn a_dump_reads_back_to_the_fingerprint_it_was_written_with() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("map.ir.json");
