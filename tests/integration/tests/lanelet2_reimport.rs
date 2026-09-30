@@ -399,3 +399,22 @@ fn a_map_read_from_lanelet2_keeps_its_lanes_through_opendrive() {
         }
     }
 }
+
+#[test]
+fn the_same_file_reads_the_same_every_time() {
+    for (name, map) in every_scenario() {
+        let xml = to_osm_xml(&map).unwrap();
+        let written = || {
+            let back = from_osm_str(&xml, &options_for(&map))
+                .unwrap()
+                .map
+                .validate()
+                .unwrap();
+            roadgen_opendrive::to_xml(&back).unwrap()
+        };
+        let first = written();
+        for _ in 0..4 {
+            assert!(written() == first, "{name}: two reads of one file differ");
+        }
+    }
+}

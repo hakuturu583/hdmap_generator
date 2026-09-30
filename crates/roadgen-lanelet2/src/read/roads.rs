@@ -46,8 +46,8 @@ const MAX_REACH: f64 = 50.0;
 
 /// What the lanes became, for the steps that follow.
 pub(crate) struct Built {
-    pub lane_of: HashMap<Id, LaneId>,
-    pub road_of: HashMap<Id, RoadId>,
+    pub lane_of: BTreeMap<Id, LaneId>,
+    pub road_of: BTreeMap<Id, RoadId>,
     /// The lanelets of each road, from the reference line outwards.
     pub lanelets_of: BTreeMap<RoadId, Vec<Id>>,
     /// Lanelets that became junction connectors.
@@ -71,8 +71,8 @@ pub(crate) fn build(
     approximations: &mut Approximations,
 ) -> Result<Built, ImportError> {
     let mut built = Built {
-        lane_of: HashMap::new(),
-        road_of: HashMap::new(),
+        lane_of: BTreeMap::new(),
+        road_of: BTreeMap::new(),
         lanelets_of: BTreeMap::new(),
         connectors: BTreeSet::new(),
     };
