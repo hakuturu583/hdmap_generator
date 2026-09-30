@@ -71,6 +71,36 @@ pub fn track(
     steps: usize,
     time_step: f64,
 ) -> Result<Object, ExportError> {
+    track_with_route(map, agent, id, steps, time_step).map(|(object, _)| object)
+}
+
+/// The lanes a written track is made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Driven {
+    /// The lanes the track covers, from its first position to its last, in the order
+    /// it drives them.
+    pub lanes: Vec<LaneId>,
+    /// The lane the goal is at, when the track stops short of it — a scene too short
+    /// for the route, or an agent that stands still. The goal is written all the
+    /// same, so the lane is part of the agent even where no position is on it; and
+    /// it is named even when the track does cover that lane — a route of one lane, or
+    /// one that comes back to a lane it left — since what matters is that the goal is
+    /// still ahead, not whether the lane is.
+    pub goal: Option<LaneId>,
+}
+
+/// [`track`], with the lanes the track was driven along.
+///
+/// Not the whole route: a scene that ends before the route does, or an agent with no
+/// speed, covers only the start of it, and a lane the track never reaches is not
+/// part of what was written — except the last, where the goal is.
+pub(crate) fn track_with_route(
+    map: &ValidatedMap,
+    agent: &Agent,
+    id: u32,
+    steps: usize,
+    time_step: f64,
+) -> Result<(Object, Driven), ExportError> {
     if !(time_step.is_finite() && time_step > 0.0) {
         return Err(ExportError::NoRoute(format!(
             "a timestep of {time_step} s gets nowhere"
@@ -89,7 +119,7 @@ pub fn track(
     }
 
     let route = route_of(map, agent)?;
-    let path = path(map, &route)?;
+    let (path, starts) = path(map, &route)?;
     if path.len() < 2 {
         return Err(ExportError::NoRoute(
             "the route is shorter than one segment".into(),
@@ -138,8 +168,24 @@ pub fn track(
         });
     }
 
+    // The farthest the track gets, and so which lanes it covers: a lane is driven when
+    // it starts before that. The first always is, since the track starts on it.
+    let reached = ((steps - 1) as f64 * agent.speed * time_step).min(total);
+    let driven_count = starts
+        .iter()
+        .enumerate()
+        .take_while(|(index, &start)| *index == 0 || travelled[start] < reached)
+        .count();
+    let lanes = route[..driven_count].to_vec();
+    let goal = if reached < total {
+        route.last().cloned()
+    } else {
+        None
+    };
+    let driven = Driven { lanes, goal };
+
     let goal = path.last().copied().expect("non-empty");
-    Ok(Object {
+    let object = Object {
         position,
         width: agent.width,
         length: agent.length,
@@ -151,7 +197,8 @@ pub fn track(
         goal_position: Vector2::new(goal.x, goal.y),
         kind: agent.kind,
         mark_as_expert: agent.mark_as_expert,
-    })
+    };
+    Ok((object, driven))
 }
 
 /// The route's path, in travel order.
@@ -159,14 +206,30 @@ pub fn track(
 /// The heights ride along unused: what the track is paced and aimed by is plan-view
 /// distance, because GPUDrive is a plane, and flattening at the last moment keeps this
 /// function saying only what order the lanes come in.
-fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<Vec<Point3>, ExportError> {
+///
+/// Also where along it each lane starts, as the index of its first vertex — which,
+/// for a lane that picks up where the last left off, is the vertex the two share, and
+/// for one that does not, is its own first vertex after the jump.
+fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<(Vec<Point3>, Vec<usize>), ExportError> {
     let config = map.metadata.sampling;
     let mut path: Vec<Point3> = Vec::new();
+    let mut starts = Vec::with_capacity(route.len());
     for id in route {
         let lane = map
             .lane(id)
             .ok_or_else(|| ExportError::NoRoute(format!("{id} is not a lane of this map")))?;
-        for point in lane.travel_polyline(config)?.points() {
+        let polyline = lane.travel_polyline(config)?;
+        // The lane starts at the vertex it shares with the last one when the two
+        // meet, and at its own first vertex when they do not: the jump between them
+        // is no part of either lane.
+        let welded = match (path.last(), polyline.points().first()) {
+            (Some(previous), Some(first)) => {
+                previous.horizontal_distance_to(*first) < WELD_TOLERANCE
+            }
+            _ => false,
+        };
+        starts.push(if welded { path.len() - 1 } else { path.len() });
+        for point in polyline.points() {
             match path.last() {
                 Some(previous) if previous.horizontal_distance_to(*point) < WELD_TOLERANCE => {
                     continue
@@ -175,7 +238,7 @@ fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<Vec<Point3>, ExportError
             }
         }
     }
-    Ok(path)
+    Ok((path, starts))
 }
 
 /// The default size of an agent of each kind, metres.
@@ -189,5 +252,57 @@ pub fn default_size(kind: ObjectKind) -> (f64, f64, f64) {
         ObjectKind::Vehicle => (4.6, 2.0, 1.6),
         ObjectKind::Pedestrian => (0.6, 0.6, 1.8),
         ObjectKind::Cyclist => (1.8, 0.7, 1.7),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roadgen_core::prelude::*;
+
+    #[test]
+    fn a_lane_that_does_not_meet_the_last_starts_after_the_jump() {
+        let mut builder = MapBuilder::default();
+        let lanes = || {
+            vec![LaneSpec::new(
+                PositiveWidth::new(3.5).unwrap(),
+                Direction::Forward,
+            )]
+        };
+        let a = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    lanes(),
+                )
+                .unwrap()
+                .with_name("a"),
+            )
+            .unwrap();
+        let b = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 50.0, 0.0),
+                    Point3::new(100.0, 50.0, 0.0),
+                    lanes(),
+                )
+                .unwrap()
+                .with_name("b"),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let route = vec![LaneId::of_road(&a, 0), LaneId::of_road(&b, 0)];
+
+        let (path, starts) = path(&map, &route).unwrap();
+        let first_of_b = map
+            .lane(&route[1])
+            .unwrap()
+            .travel_polyline(map.metadata.sampling)
+            .unwrap()
+            .points()[0];
+        assert_eq!(starts[0], 0);
+        assert!(path[starts[1]].horizontal_distance_to(first_of_b) < WELD_TOLERANCE);
+        assert!(path[starts[1] - 1].horizontal_distance_to(first_of_b) > 1.0);
     }
 }

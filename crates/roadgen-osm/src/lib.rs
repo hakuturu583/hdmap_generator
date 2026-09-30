@@ -49,6 +49,21 @@
 //! that meets the ground rather than by their union, and the frontage that says which
 //! street a building faces has no tag at all. [`check`] says each of those rather
 //! than letting the file look like a round trip.
+//!
+//! # Tracing
+//!
+//! Every id in the file comes off one negative counter, in the order things were
+//! built, so nothing about the IR says which way a road became. The `_traced`
+//! entry points keep a [`Trace`] of it as the ids are handed out, naming what was
+//! written `node:<id>`, `way:<id>` or `relation:<id>`:
+//!
+//! - a road is its way, and a junction its node, one for one; a connector has no
+//!   counterpart at all, since OSM draws the movement as two ways sharing a node;
+//! - furniture is `merged` into the road node that carries it as a tag, with the tag
+//!   as the role, and a crossing is also the footway across the road;
+//! - a restriction is a `part` of its junction: it says what the junction forbids,
+//!   and the IR has no element for a movement that does not exist;
+//! - a building is its outline way, and each of its parts the way drawn for it.
 
 pub mod error;
 pub mod tags;
@@ -63,7 +78,9 @@ use roadgen_core::geometry::Point3;
 use roadgen_core::map::{Map, Projection, Road};
 use roadgen_core::semantics::{MapObject, MapObjectKind, ObjectGeometry};
 use roadgen_core::topology::{RoadEnd, RoadLinkTarget};
-use roadgen_core::{JunctionId, RoadId, ValidatedMap};
+// OSM has a relation of its own, which is the one this file means by the bare name.
+use roadgen_core::trace::Relation as Link;
+use roadgen_core::{JunctionId, RoadId, Trace, ValidatedMap};
 
 pub use error::ExportError;
 
@@ -82,22 +99,41 @@ const WELD_TOLERANCE: f64 = 1e-6;
 /// precedence below is what decides which control the one node carries.
 const NODE_SPACING: f64 = 0.5;
 
+/// The name a [`Trace`] of this exporter gives its format.
+pub const TRACE_FORMAT: &str = "osm";
+
 /// Renders `map` as an OpenStreetMap XML document.
 pub fn to_xml(map: &ValidatedMap) -> Result<String, ExportError> {
-    let document = to_document(map)?;
+    to_xml_traced(map).map(|(xml, _)| xml)
+}
+
+/// Renders `map` as an OpenStreetMap XML document, along with where each element of
+/// the IR went in it. The trace names no file, because none was written.
+pub fn to_xml_traced(map: &ValidatedMap) -> Result<(String, Trace), ExportError> {
+    let (document, trace) = to_document(map)?;
     let xml = document.to_xml(WriteParams::default());
     // The writer is Lanelet2's, because it is a general OSM document model and there
     // is no reason to have a second one — but this file is not a Lanelet2 map, and
     // `generator` is the one attribute that says who wrote the data rather than what
     // is in it. The literal appears once, in the root element.
-    Ok(xml.replacen("generator=\"lanelet2\"", "generator=\"roadgen\"", 1))
+    let xml = xml.replacen("generator=\"lanelet2\"", "generator=\"roadgen\"", 1);
+    Ok((xml, trace))
 }
 
 /// Writes `map` to `path` as OpenStreetMap XML.
 pub fn write(map: &ValidatedMap, path: impl AsRef<Path>) -> Result<(), ExportError> {
+    write_traced(map, path).map(drop)
+}
+
+/// Writes `map` to `path` as OpenStreetMap XML, and returns where each element of
+/// the IR went in it.
+pub fn write_traced(map: &ValidatedMap, path: impl AsRef<Path>) -> Result<Trace, ExportError> {
     let path = path.as_ref();
-    std::fs::write(path, to_xml(map)?)
-        .map_err(|error| ExportError::Io(format!("{}: {error}", path.display())))
+    let (xml, mut trace) = to_xml_traced(map)?;
+    std::fs::write(path, xml)
+        .map_err(|error| ExportError::Io(format!("{}: {error}", path.display())))?;
+    trace.files.push(path.to_path_buf());
+    Ok(trace)
 }
 
 /// What this map loses on the way into OpenStreetMap.
@@ -262,10 +298,25 @@ fn building_losses(map: &ValidatedMap) -> Vec<String> {
 // Building the document
 // --------------------------------------------------------------------------- //
 
-fn to_document(map: &ValidatedMap) -> Result<Document, ExportError> {
+fn to_document(map: &ValidatedMap) -> Result<(Document, Trace), ExportError> {
     let mut exporter = Exporter::new(map)?;
     exporter.build()?;
-    Ok(exporter.document)
+    Ok((exporter.document, exporter.trace))
+}
+
+/// How a trace names a node of the file.
+fn node_ref(id: i64) -> String {
+    format!("node:{id}")
+}
+
+/// How a trace names a way of the file.
+fn way_ref(id: i64) -> String {
+    format!("way:{id}")
+}
+
+/// How a trace names a relation of the file.
+fn relation_ref(id: i64) -> String {
+    format!("relation:{id}")
 }
 
 /// The projector that turns the map's metres into latitudes and longitudes.
@@ -306,6 +357,9 @@ struct Exporter<'a> {
     ways: HashMap<RoadId, i64>,
     /// The node each junction collapsed to.
     junction_nodes: HashMap<JunctionId, i64>,
+    /// Where each IR element went, written down as each id is handed out: the ids
+    /// come off one counter in build order, so they cannot be worked out afterwards.
+    trace: Trace,
 }
 
 impl<'a> Exporter<'a> {
@@ -319,6 +373,7 @@ impl<'a> Exporter<'a> {
             positions: HashMap::new(),
             ways: HashMap::new(),
             junction_nodes: HashMap::new(),
+            trace: Trace::new(TRACE_FORMAT),
         })
     }
 
@@ -329,6 +384,8 @@ impl<'a> Exporter<'a> {
             if let Some(centre) = centre {
                 let node = self.node_at(centre)?;
                 self.junction_nodes.insert(junction.id.clone(), node);
+                self.trace
+                    .link(junction.id.clone(), node_ref(node), Link::Exact);
             }
         }
 
@@ -342,6 +399,7 @@ impl<'a> Exporter<'a> {
             }
             let way = self.road_way(road)?;
             self.ways.insert(road.id.clone(), way);
+            self.trace.link(road.id.clone(), way_ref(way), Link::Exact);
         }
 
         self.add_furniture()?;
@@ -371,13 +429,28 @@ impl<'a> Exporter<'a> {
             let ground = lowest.solid.base_height();
 
             let outline = lowest.solid.footprint.points().to_vec();
-            self.add_closed_way(&outline, tags::building_tags(building, &parts, ground))?;
+            let way =
+                self.add_closed_way(&outline, tags::building_tags(building, &parts, ground))?;
+            if let Some(way) = way {
+                self.trace
+                    .link_as(building.id.clone(), way_ref(way), Link::Exact, "outline");
+            }
             if parts.len() == 1 {
+                // The one way is the part as much as the building: its heights and
+                // roof are written on it, so the part is traced to it too.
+                if let Some(way) = way {
+                    self.trace
+                        .link_as(parts[0].id.clone(), way_ref(way), Link::Exact, "outline");
+                }
                 continue;
             }
             for part in &parts {
                 let ring = part.solid.footprint.points().to_vec();
-                self.add_closed_way(&ring, tags::building_part_tags(part, ground))?;
+                if let Some(way) =
+                    self.add_closed_way(&ring, tags::building_part_tags(part, ground))?
+                {
+                    self.trace.link(part.id.clone(), way_ref(way), Link::Exact);
+                }
             }
         }
         Ok(())
@@ -387,21 +460,21 @@ impl<'a> Exporter<'a> {
     ///
     /// Two buildings in a terrace share the corner nodes between them, which is
     /// welding doing what it does for roads and is what OSM expects of a terrace.
-    fn add_closed_way(&mut self, ring: &[Point3], tags: Tags) -> Result<(), ExportError> {
+    fn add_closed_way(&mut self, ring: &[Point3], tags: Tags) -> Result<Option<i64>, ExportError> {
         let mut nodes = Vec::with_capacity(ring.len() + 1);
         for point in ring {
             nodes.push(self.node_at(*point)?);
         }
         nodes.dedup();
         if nodes.len() < 3 {
-            return Ok(());
+            return Ok(None);
         }
         // A closed way is one whose first node is also its last.
         nodes.push(nodes[0]);
 
         let id = self.take_id();
         self.document.ways.insert(id, Way { id, nodes, tags });
-        Ok(())
+        Ok(Some(id))
     }
 
     fn take_id(&mut self) -> i64 {
@@ -523,15 +596,30 @@ impl<'a> Exporter<'a> {
                         .tags
                         .get("highway")
                         .is_some_and(|existing| control_rank(existing) >= control_rank(&value));
+                // Traced with its own tag as the role whether or not that tag won.
+                // The node is where the object's information went either way — a
+                // stop line under a signal is what `traffic_signals` means — and the
+                // winner can change as later objects land on the node, so the tag the
+                // node ends up with is not known yet. A sign's code varies, so its
+                // role is the key it is written under.
+                let role = match key {
+                    "highway" => value.clone(),
+                    _ => key.to_owned(),
+                };
                 if !keep {
                     node.tags.insert(key.into(), value);
                 }
+                self.trace
+                    .link_as(object.id.clone(), node_ref(node.id), Link::Merged, role);
             }
 
             // A crossing is also a footway in its own right, so that it is a thing
             // pedestrians can be routed along rather than only a tag on the road.
             if is_crossing {
-                self.add_crossing_way(object, node)?;
+                if let Some(way) = self.add_crossing_way(object, node)? {
+                    self.trace
+                        .link_as(object.id.clone(), way_ref(way), Link::Exact, "crossing");
+                }
             }
         }
         Ok(())
@@ -545,14 +633,14 @@ impl<'a> Exporter<'a> {
         &mut self,
         object: &MapObject,
         crossing_node: i64,
-    ) -> Result<(), ExportError> {
+    ) -> Result<Option<i64>, ExportError> {
         let ObjectGeometry::Band { left, right } = &object.geometry else {
-            return Ok(());
+            return Ok(None);
         };
         let config = self.map.metadata.sampling;
         let (left, right) = (left.to_polyline(config)?, right.to_polyline(config)?);
         if left.len() != right.len() {
-            return Ok(());
+            return Ok(None);
         }
         // Down the middle of the painted strip, which is where someone crossing
         // actually walks.
@@ -562,7 +650,7 @@ impl<'a> Exporter<'a> {
         }
         nodes.dedup();
         if nodes.len() < 2 {
-            return Ok(());
+            return Ok(None);
         }
         // The road's node goes in where the footway passes it: after every vertex
         // that lies before it along the footway.
@@ -585,7 +673,7 @@ impl<'a> Exporter<'a> {
         tags.insert("highway".into(), "footway".into());
         tags.insert("footway".into(), "crossing".into());
         self.document.ways.insert(id, Way { id, nodes, tags });
-        Ok(())
+        Ok(Some(id))
     }
 
     fn road_of(&self, object: &MapObject) -> Option<RoadId> {
@@ -673,7 +761,8 @@ impl<'a> Exporter<'a> {
     /// relation takes something away. The IR reads the other way round, so what is
     /// written here is the complement of what it holds.
     fn add_restrictions(&mut self) {
-        let mut relations: Vec<Relation> = Vec::new();
+        // Each with the junction it restricts, for the trace.
+        let mut relations: Vec<(JunctionId, Relation)> = Vec::new();
         for junction in self.map.junctions.iter() {
             let Some(via) = self.junction_nodes.get(&junction.id).copied() else {
                 continue;
@@ -704,33 +793,44 @@ impl<'a> Exporter<'a> {
                     let mut tags = Tags::new();
                     tags.insert("type".into(), "restriction".into());
                     tags.insert("restriction".into(), restriction.into());
-                    relations.push(Relation {
-                        id: 0, // assigned below, once the borrow of `self` has ended
-                        members: vec![
-                            Member {
-                                kind: MemberType::Way,
-                                reference: self.ways[*from],
-                                role: "from".into(),
-                            },
-                            Member {
-                                kind: MemberType::Node,
-                                reference: via,
-                                role: "via".into(),
-                            },
-                            Member {
-                                kind: MemberType::Way,
-                                reference: self.ways[*to],
-                                role: "to".into(),
-                            },
-                        ],
-                        tags,
-                    });
+                    relations.push((
+                        junction.id.clone(),
+                        Relation {
+                            id: 0, // assigned below, once the borrow of `self` has ended
+                            members: vec![
+                                Member {
+                                    kind: MemberType::Way,
+                                    reference: self.ways[*from],
+                                    role: "from".into(),
+                                },
+                                Member {
+                                    kind: MemberType::Node,
+                                    reference: via,
+                                    role: "via".into(),
+                                },
+                                Member {
+                                    kind: MemberType::Way,
+                                    reference: self.ways[*to],
+                                    role: "to".into(),
+                                },
+                            ],
+                            tags,
+                        },
+                    ));
                 }
             }
         }
 
-        for mut relation in relations {
+        for (junction, mut relation) in relations {
             relation.id = self.take_id();
+            // A part of the junction rather than of any connection: it is a movement
+            // the IR does not hold, and only the junction it is missing from does.
+            self.trace.link_as(
+                junction,
+                relation_ref(relation.id),
+                Link::Part,
+                "restriction",
+            );
             self.document.relations.insert(relation.id, relation);
         }
     }

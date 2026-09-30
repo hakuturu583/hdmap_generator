@@ -87,13 +87,21 @@ pub fn build(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork) {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let prefix = roadgen_sumo::write(map, directory.path()).expect("the map should export as SUMO");
 
+    let path = netconvert(directory.path(), &prefix);
+    (directory, SumoNetwork::read(&path))
+}
+
+/// Runs `netconvert` on the SUMO export in `directory` whose files are named after
+/// `prefix`, checks that it built the network without complaint, and returns the
+/// path of the `.net.xml` it wrote.
+pub fn netconvert(directory: &Path, prefix: &str) -> PathBuf {
     // Through the generated configuration, which is how a user runs it: if the
     // `.netccfg` names the wrong files or asks for the wrong processing, that is a
     // fault in the export and the test should see it.
     let output = Command::new(tool("netconvert").expect("netconvert"))
         .arg("-c")
         .arg(format!("{prefix}.netccfg"))
-        .current_dir(directory.path())
+        .current_dir(directory)
         .output()
         .expect("netconvert should run");
 
@@ -114,10 +122,7 @@ pub fn build(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork) {
         complaints.join("\n")
     );
 
-    let path = directory.path().join(format!("{prefix}.net.xml"));
-    let xml = std::fs::read_to_string(&path).expect("netconvert should have written a network");
-    let network = SumoNetwork::parse(&xml);
-    (directory, network)
+    directory.join(format!("{prefix}.net.xml"))
 }
 
 /// Loads a built network into the simulator itself.
@@ -214,6 +219,12 @@ pub struct SumoConnection {
 }
 
 impl SumoNetwork {
+    /// Reads the `.net.xml` at `path`.
+    pub fn read(path: &Path) -> SumoNetwork {
+        let xml = std::fs::read_to_string(path).expect("netconvert should have written a network");
+        SumoNetwork::parse(&xml)
+    }
+
     fn parse(xml: &str) -> SumoNetwork {
         let mut reader = Reader::from_str(xml);
         let mut network = SumoNetwork {

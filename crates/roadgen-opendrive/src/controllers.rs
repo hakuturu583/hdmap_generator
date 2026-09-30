@@ -35,6 +35,9 @@ pub struct SignalGroup {
     pub junction: Option<JunctionId>,
     /// The lights, in the map's own order.
     pub lights: Vec<ObjectId>,
+    /// The traffic-light rule the group was made from, by its position in the map's
+    /// rules; `None` for lights no rule names, which are grouped by approach.
+    pub rule: Option<usize>,
 }
 
 /// The controllers a map's traffic lights fall into, in the order they are written.
@@ -47,11 +50,11 @@ pub fn signal_groups(map: &Map) -> Vec<SignalGroup> {
             .get(id)
             .is_some_and(|object| object.kind.is_traffic_light())
     };
-    let mut groups: Vec<(Option<JunctionId>, Vec<ObjectId>)> = Vec::new();
+    let mut groups: Vec<(Option<JunctionId>, Vec<ObjectId>, Option<usize>)> = Vec::new();
     let mut assigned: Vec<ObjectId> = Vec::new();
 
     // The rules first: they are the caller saying which lights are one phase.
-    for rule in &map.rules {
+    for (index, rule) in map.rules.iter().enumerate() {
         let TrafficRule::TrafficLight { lights, .. } = rule else {
             continue;
         };
@@ -69,7 +72,7 @@ pub fn signal_groups(map: &Map) -> Vec<SignalGroup> {
             .get(&members[0])
             .and_then(|object| junction_ahead(map, object));
         assigned.extend(members.iter().cloned());
-        groups.push((junction, members));
+        groups.push((junction, members, Some(index)));
     }
 
     // Then whatever is left, by approach: the same road into the same junction.
@@ -85,7 +88,7 @@ pub fn signal_groups(map: &Map) -> Vec<SignalGroup> {
         let index = match approaches.iter().find(|(held, _)| *held == key) {
             Some((_, index)) => *index,
             None => {
-                groups.push((junction, Vec::new()));
+                groups.push((junction, Vec::new(), None));
                 approaches.push((key, groups.len() - 1));
                 groups.len() - 1
             }
@@ -97,11 +100,12 @@ pub fn signal_groups(map: &Map) -> Vec<SignalGroup> {
     groups
         .into_iter()
         .enumerate()
-        .map(|(index, (junction, lights))| SignalGroup {
+        .map(|(index, (junction, lights, rule))| SignalGroup {
             id: index.to_string(),
             name: lights[0].to_string(),
             junction,
             lights,
+            rule,
         })
         .collect()
 }

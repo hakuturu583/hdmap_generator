@@ -550,4 +550,60 @@ fn the_export_is_a_netconvert_run_ready_to_go() {
             "the configuration should name {prefix}{suffix}:\n{config}"
         );
     }
+    // The IR has no U-turns, so netconvert is not to invent one at every dead end.
+    assert!(
+        config.contains(r#"<no-turnarounds value="true"/>"#),
+        "{config}"
+    );
+}
+
+/// The trace names each connection by its two lanes as the built network names them,
+/// so every movement netconvert built from the export's connections is found in it —
+/// and with it the internal lane netconvert generated in place of the IR's connector.
+/// There is nothing left over: the configuration keeps netconvert from adding the
+/// turnarounds the IR never stated, so every movement is one of the export's.
+#[test]
+fn every_movement_netconvert_built_is_in_the_trace() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::crossroads();
+    let (_directory, network) = sumo_build::build(&map);
+    let trace = roadgen_sumo::to_plain_xml(&map)
+        .expect("the map should export as SUMO")
+        .trace;
+    let traced_lanes: std::collections::HashSet<&str> = trace
+        .links
+        .iter()
+        .filter_map(|link| link.local.strip_prefix("lane:"))
+        .collect();
+
+    let mut matched = 0;
+    for connection in &network.connections {
+        if connection.from.starts_with(':') || connection.via.is_none() {
+            continue;
+        }
+        let from = format!("{}_{}", connection.from, connection.from_lane);
+        let to = format!("{}_{}", connection.to, connection.to_lane);
+        if !traced_lanes.contains(from.as_str()) || !traced_lanes.contains(to.as_str()) {
+            continue;
+        }
+        let local = format!("connection:{from}>{to}");
+        let links: Vec<_> = trace.links_to(&local).collect();
+        assert_ne!(
+            connection.direction.as_deref(),
+            Some("t"),
+            "{local} is a turnaround, which the IR has none of"
+        );
+        assert!(!links.is_empty(), "{local} is not in the trace");
+        assert!(
+            links
+                .iter()
+                .any(|link| link.relation == roadgen_core::Relation::Collapsed),
+            "{local} crosses the junction, so a connector lane should be collapsed into it"
+        );
+        matched += 1;
+    }
+    // Every pair of the four arms, both ways.
+    assert_eq!(matched, 12);
 }

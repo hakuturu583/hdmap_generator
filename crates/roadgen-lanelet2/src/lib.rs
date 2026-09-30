@@ -22,9 +22,18 @@
 //! lanes that the IR says are connected end up sharing point objects, and a Lanelet2
 //! routing graph then finds the same topology the IR holds. Lateral adjacency works
 //! the same way, through the shared boundary linestring between neighbouring lanes.
+//!
+//! ## Tracing ids back to the IR
+//!
+//! Every id here comes from a counter, in the order the primitives are built, so no
+//! lanelet id can be worked out from the IR alone. The `_traced` entry points return
+//! a [`Trace`] read off the same tables the export built the map from, naming each
+//! lanelet, linestring and regulatory element as `lanelet:<id>`, `linestring:<id>`
+//! and `regulatory_element:<id>`. Points are left out: there are far more of them
+//! than anything else, and none has an IR element of its own.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ll2_core::attribute::AttributeMap;
@@ -42,6 +51,7 @@ use roadgen_core::id::{LaneId, ObjectId, RoadId};
 use roadgen_core::map::{Lane, Map, Projection};
 use roadgen_core::semantics::{MapObjectKind, ObjectGeometry, TrafficRule};
 use roadgen_core::topology::Direction;
+use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::validation::ValidatedMap;
 
 mod error;
@@ -60,28 +70,51 @@ const WELD_TOLERANCE: f64 = 1e-6;
 
 /// Builds the Lanelet2 map.
 pub fn to_lanelet_map(map: &ValidatedMap) -> Result<Arc<LaneletMap>, ExportError> {
+    Ok(to_lanelet_map_traced(map)?.0)
+}
+
+/// Builds the Lanelet2 map, and the trace of which IR element became which of its
+/// primitives.
+pub fn to_lanelet_map_traced(map: &ValidatedMap) -> Result<(Arc<LaneletMap>, Trace), ExportError> {
     Exporter::new(map)?.run()
 }
 
 /// Builds the Lanelet2 map and renders it as OSM XML.
 pub fn to_osm_xml(map: &ValidatedMap) -> Result<String, ExportError> {
-    let lanelet_map = to_lanelet_map(map)?;
+    Ok(to_osm_xml_traced(map)?.0)
+}
+
+/// Builds the Lanelet2 map, renders it as OSM XML, and traces it.
+///
+/// The OSM writer keeps every primitive's id, so the trace of the in-memory map is
+/// also the trace of the XML.
+pub fn to_osm_xml_traced(map: &ValidatedMap) -> Result<(String, Trace), ExportError> {
+    let (lanelet_map, trace) = to_lanelet_map_traced(map)?;
     let projector = projector_for(map)?;
     let (document, problems) = ll2_io::save::from_map(&lanelet_map, projector.as_ref());
     if !problems.is_empty() {
         return Err(ExportError::Serialization(problems.join("; ")));
     }
-    Ok(document.to_xml(WriteParams {
+    let xml = document.to_xml(WriteParams {
         josm_upload: false,
         josm_format_elevation: false,
-    }))
+    });
+    Ok((xml, trace))
 }
 
 /// Writes the map as a `.osm` Lanelet2 file.
 pub fn write(map: &ValidatedMap, path: impl AsRef<Path>) -> Result<(), ExportError> {
-    let xml = to_osm_xml(map)?;
+    write_traced(map, path).map(drop)
+}
+
+/// Writes the map as a `.osm` Lanelet2 file, and returns the trace of what it wrote,
+/// with the file among its [`files`](Trace::files).
+pub fn write_traced(map: &ValidatedMap, path: impl AsRef<Path>) -> Result<Trace, ExportError> {
+    let (xml, mut trace) = to_osm_xml_traced(map)?;
     std::fs::write(path.as_ref(), xml)
-        .map_err(|error| ExportError::Io(format!("{}: {error}", path.as_ref().display())))
+        .map_err(|error| ExportError::Io(format!("{}: {error}", path.as_ref().display())))?;
+    trace.files.push(PathBuf::from(path.as_ref()));
+    Ok(trace)
 }
 
 /// Constraints Lanelet2 imposes that the IR does not.
@@ -389,6 +422,13 @@ struct Exporter<'a> {
     own_boundaries: HashMap<(LaneId, i32), LineString>,
     lanelets: HashMap<LaneId, Lanelet>,
     objects: HashMap<ObjectId, Vec<LineString>>,
+    /// The lanelet a crosswalk object became, besides its two linestrings.
+    crosswalks: HashMap<ObjectId, Id>,
+    /// The regulatory element each traffic rule became, by its index in
+    /// [`Map::rules`]. A rule missing here was written as nothing at all.
+    regulatory_elements: BTreeMap<usize, Id>,
+    /// The lanelets a speed limit was written onto as a tag, by rule index.
+    speed_limits: BTreeMap<usize, Vec<Id>>,
     /// The `light_bulbs` way of each traffic light that has lamps.
     bulbs: HashMap<ObjectId, LineString>,
 }
@@ -410,6 +450,9 @@ impl<'a> Exporter<'a> {
             own_boundaries: HashMap::new(),
             lanelets: HashMap::new(),
             objects: HashMap::new(),
+            crosswalks: HashMap::new(),
+            regulatory_elements: BTreeMap::new(),
+            speed_limits: BTreeMap::new(),
             bulbs: HashMap::new(),
         })
     }
@@ -424,12 +467,123 @@ impl<'a> Exporter<'a> {
         id
     }
 
-    fn run(mut self) -> Result<Arc<LaneletMap>, ExportError> {
+    fn run(mut self) -> Result<(Arc<LaneletMap>, Trace), ExportError> {
         self.build_boundaries()?;
         self.build_lanelets()?;
         self.build_objects()?;
         self.build_rules()?;
-        Ok(self.lanelet_map)
+        let trace = self.trace();
+        Ok((self.lanelet_map, trace))
+    }
+
+    /// Folds the tables the map was built from into a trace.
+    ///
+    /// It walks the IR's own arenas rather than the hash maps, so two exports of the
+    /// same map give the same trace, link for link.
+    fn trace(&self) -> Trace {
+        let mut trace = Trace::new("lanelet2");
+
+        // A boundary between two lanelets is one linestring both refer to — the very
+        // sharing that makes them neighbours — so each lane is only part of the
+        // reason it exists. Counted by id, since an inverted bound is the same line.
+        let mut bound_users: HashMap<Id, usize> = HashMap::new();
+        for lanelet in self.lanelets.values() {
+            for bound in [lanelet.left_bound(), lanelet.right_bound()] {
+                *bound_users.entry(bound.id()).or_default() += 1;
+            }
+        }
+
+        for lane in self.map.lanes.iter() {
+            let Some(lanelet) = self.lanelets.get(&lane.id) else {
+                continue;
+            };
+            let ir = IrRef::Lane(lane.id.clone());
+            trace.link_as(
+                ir.clone(),
+                format!("lanelet:{}", lanelet.id()),
+                Relation::Exact,
+                "lanelet",
+            );
+            trace.link_as(
+                ir.clone(),
+                format!("linestring:{}", lanelet.centerline().id()),
+                Relation::Exact,
+                "centerline",
+            );
+            // The lanelet's bounds, which for a backward lane are the IR's swapped:
+            // the role is the side the written element is on, the driver's.
+            for (role, bound) in [
+                ("left_boundary", lanelet.left_bound()),
+                ("right_boundary", lanelet.right_bound()),
+            ] {
+                let relation =
+                    Relation::shared_by(bound_users.get(&bound.id()).copied().unwrap_or(0));
+                trace.link_as(
+                    ir.clone(),
+                    format!("linestring:{}", bound.id()),
+                    relation,
+                    role,
+                );
+            }
+        }
+
+        for object in self.map.objects.iter() {
+            let Some(lines) = self.objects.get(&object.id) else {
+                continue;
+            };
+            // A band is two lines; either one alone is only a piece of the object.
+            let relation = if lines.len() == 1 {
+                Relation::Exact
+            } else {
+                Relation::Part
+            };
+            for line in lines {
+                trace.link(
+                    object.id.clone(),
+                    format!("linestring:{}", line.id()),
+                    relation,
+                );
+            }
+            if let Some(crosswalk) = self.crosswalks.get(&object.id) {
+                trace.link_as(
+                    object.id.clone(),
+                    format!("lanelet:{crosswalk}"),
+                    Relation::Exact,
+                    "crosswalk",
+                );
+            }
+            // A light's lamps are a way of their own, as its crosswalk lanelet is
+            // for a crosswalk: the whole light again, seen as what it shows.
+            if let Some(bulbs) = self.bulbs.get(&object.id) {
+                trace.link_as(
+                    object.id.clone(),
+                    format!("linestring:{}", bulbs.id()),
+                    Relation::Exact,
+                    LIGHT_BULBS,
+                );
+            }
+        }
+
+        for (index, element) in &self.regulatory_elements {
+            trace.link(
+                IrRef::Rule(*index),
+                format!("regulatory_element:{element}"),
+                Relation::Exact,
+            );
+        }
+        // A speed limit is a tag on each lanelet it covers, and no lanelet is only
+        // the limit, so each is a part of how the rule was written.
+        for (index, lanelets) in &self.speed_limits {
+            for lanelet in lanelets {
+                trace.link_as(
+                    IrRef::Rule(*index),
+                    format!("lanelet:{lanelet}"),
+                    Relation::Part,
+                    "speed_limit",
+                );
+            }
+        }
+        trace
     }
 
     /// One linestring per cross-section edge of each road.
@@ -623,6 +777,7 @@ impl<'a> Exporter<'a> {
                                 (tags::participant("crosswalk"), "yes".to_owned()),
                             ]),
                         );
+                        self.crosswalks.insert(object.id.clone(), crosswalk.id());
                         self.lanelet_map.add(Primitive::Lanelet(crosswalk));
                     }
                     vec![left_line, right_line]
@@ -671,7 +826,7 @@ impl<'a> Exporter<'a> {
     }
 
     fn build_rules(&mut self) -> Result<(), ExportError> {
-        for rule in self.map.rules.clone() {
+        for (index, rule) in self.map.rules.clone().into_iter().enumerate() {
             match rule {
                 TrafficRule::TrafficLight {
                     lights,
@@ -709,12 +864,13 @@ impl<'a> Exporter<'a> {
                                 .collect(),
                         );
                     }
-                    self.attach(
+                    let element = self.attach(
                         RegElemKind::TrafficLight,
                         "traffic_light",
                         parameters,
                         &lanes,
                     )?;
+                    self.regulatory_elements.insert(index, element);
                 }
                 TrafficRule::RightOfWay {
                     right_of_way,
@@ -750,12 +906,13 @@ impl<'a> Exporter<'a> {
                     }
                     let attached: Vec<LaneId> =
                         right_of_way.iter().chain(&yielding).cloned().collect();
-                    self.attach(
+                    let element = self.attach(
                         RegElemKind::RightOfWay,
                         "right_of_way",
                         parameters,
                         &attached,
                     )?;
+                    self.regulatory_elements.insert(index, element);
                 }
                 // Lanelet2's `SpeedLimit` is a kind of traffic sign and needs one to
                 // refer to. A limit with no sign behind it belongs on the lanelet,
@@ -769,6 +926,10 @@ impl<'a> Exporter<'a> {
                                 ll2_core::attribute::Attribute::new(format!("{:.0}", limit.kph())),
                             );
                             lanelet.set_attributes(attributes);
+                            self.speed_limits
+                                .entry(index)
+                                .or_default()
+                                .push(lanelet.id());
                         }
                     }
                 }
@@ -783,7 +944,7 @@ impl<'a> Exporter<'a> {
         subtype: &str,
         parameters: RuleParameterMap,
         lanes: &[LaneId],
-    ) -> Result<(), ExportError> {
+    ) -> Result<Id, ExportError> {
         let id = self.take_id();
         let element = RegulatoryElement::new(
             kind,
@@ -800,6 +961,6 @@ impl<'a> Exporter<'a> {
             }
         }
         self.lanelet_map.add(Primitive::RegulatoryElement(element));
-        Ok(())
+        Ok(id)
     }
 }

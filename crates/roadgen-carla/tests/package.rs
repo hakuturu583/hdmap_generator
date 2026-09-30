@@ -792,3 +792,145 @@ fn a_package_without_furniture_leaves_the_signals_where_the_ir_put_them() {
         .iter()
         .any(|warning| warning.contains("CARLA spawns its own")));
 }
+
+/// Every element a written `.xodr` holds, named the way the OpenDRIVE trace names
+/// them.
+fn xodr_elements(path: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let drive = opendrive::core::OpenDrive::from_xml_str(&fs::read_to_string(path).unwrap())
+        .expect("the .xodr parses");
+    let mut found = std::collections::BTreeSet::new();
+    for road in &drive.road {
+        found.insert(format!("road:{}", road.id));
+        for (index, section) in road.lanes.lane_section.iter().enumerate() {
+            let left = section.left.iter().flat_map(|left| left.lane.iter());
+            let right = section.right.iter().flat_map(|right| right.lane.iter());
+            for id in left.map(|lane| lane.id).chain(right.map(|lane| lane.id)) {
+                found.insert(format!("lane:{}/{index}/{id}", road.id));
+            }
+        }
+        for signal in road.signals.iter().flat_map(|signals| &signals.signal) {
+            found.insert(format!("signal:{}", signal.id));
+        }
+        for object in road.objects.iter().flat_map(|objects| &objects.object) {
+            found.insert(format!("object:{}", object.id));
+            for outline in object
+                .outlines
+                .iter()
+                .flat_map(|outlines| &outlines.outline)
+            {
+                found.insert(format!("outline:{}/{}", object.id, outline.id.unwrap()));
+            }
+        }
+    }
+    for junction in &drive.junction {
+        found.insert(format!("junction:{}", junction.id));
+        for connection in junction.connection.iter() {
+            found.insert(format!("connection:{}/{}", junction.id, connection.id));
+        }
+    }
+    for controller in &drive.controller {
+        found.insert(format!("controller:{}", controller.id));
+    }
+    found
+}
+
+#[test]
+fn the_trace_names_what_the_package_holds() {
+    use roadgen_core::trace::{IrRef, Relation};
+
+    let map = signalised("Town01");
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let config = PackageConfig::for_map(&map);
+    let (package, trace) =
+        roadgen_carla::write_traced(&map, directory.path(), &config).expect("a package");
+    assert_eq!(trace.format, "carla");
+    for file in [&package.descriptor, &package.xodr, &package.script] {
+        assert!(
+            trace.files.contains(file),
+            "{} is not listed",
+            file.display()
+        );
+    }
+    // The meshes are not: no link points into them.
+    assert!(!trace.files.contains(&package.fbx));
+    assert!(trace.files.contains(package.furniture.as_ref().unwrap()));
+    for file in &trace.files {
+        assert!(file.is_file(), "{} was not written", file.display());
+    }
+
+    // Everything but the actors is in the `.xodr`, under the name the OpenDRIVE
+    // trace gives it.
+    let xodr = xodr_elements(&package.xodr);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(package.furniture.as_ref().unwrap()).unwrap())
+            .unwrap();
+    let placed: Vec<(String, String)> = ["lights", "signs"]
+        .iter()
+        .flat_map(|kind| manifest[kind].as_array().unwrap().iter())
+        .map(|entry| {
+            (
+                entry["object"].as_str().unwrap().to_owned(),
+                entry["name"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let mut actors = 0;
+    for link in &trace.links {
+        match link.local.strip_prefix("actor:") {
+            Some(name) => {
+                actors += 1;
+                assert_eq!(link.relation, Relation::Exact);
+                assert!(
+                    placed.contains(&(link.ir.to_string(), name.to_owned())),
+                    "{} is traced to actor {name}, which the manifest does not place",
+                    link.ir
+                );
+            }
+            None => assert!(
+                xodr.contains(&link.local),
+                "{} is traced to {}, which the .xodr does not hold",
+                link.ir,
+                link.local
+            ),
+        }
+    }
+    assert_eq!(actors, placed.len());
+    assert_eq!(actors, package.lights + package.signs);
+
+    for road in map.roads.iter() {
+        let ir = IrRef::Road(road.id.clone());
+        let exact = trace
+            .links_of(&ir)
+            .filter(|link| link.relation == Relation::Exact)
+            .count();
+        assert_eq!(exact, 1, "{}", road.id);
+    }
+    for lane in map.lanes.iter() {
+        let ir = IrRef::Lane(lane.id.clone());
+        let exact = trace
+            .links_of(&ir)
+            .filter(|link| link.relation == Relation::Exact)
+            .count();
+        assert_eq!(exact, 1, "{}", lane.id);
+    }
+}
+
+#[test]
+fn the_same_map_is_traced_the_same_twice() {
+    let map = signalised("Town01");
+    let config = PackageConfig::for_map(&map);
+    let trace = || {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let (_, trace) =
+            roadgen_carla::write_traced(&map, directory.path(), &config).expect("a package");
+        let files: Vec<_> = trace
+            .files
+            .iter()
+            .map(|file| file.strip_prefix(directory.path()).unwrap().to_path_buf())
+            .collect();
+        (trace.links, files)
+    };
+    let one = trace();
+    assert!(!one.0.is_empty());
+    assert_eq!(one, trace());
+}

@@ -10,6 +10,7 @@ members = [
     "crates/roadgen-gpudrive",
     "crates/roadgen-osm",
     "crates/roadgen-sumo",
+    "crates/roadgen-trace",
     "crates/roadgen-viewer",
     "crates/roadgen-python",
     "tests/integration",
@@ -33,6 +34,7 @@ roadgen-clipgt = { path = "crates/roadgen-clipgt" }
 roadgen-gpudrive = { path = "crates/roadgen-gpudrive" }
 roadgen-osm = { path = "crates/roadgen-osm" }
 roadgen-sumo = { path = "crates/roadgen-sumo" }
+roadgen-trace = { path = "crates/roadgen-trace" }
 roadgen-viewer = { path = "crates/roadgen-viewer" }
 
 # OpenDRIVE 1.7 data model, parser and writer. MIT, which an Apache-2.0 project may
@@ -78,6 +80,11 @@ bytes = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
+
+# sha2, for the digests a trace file keeps of the files it describes and of the IR
+# it came from. MIT/Apache-2.0. A trace whose file was rewritten gives wrong answers
+# without complaint, so the digest is what lets a reader refuse it instead.
+sha2 = "0.10"
 
 # symbios-shape: a derivation engine for CGA shape grammars, the CityEngine
 # formalism. MIT, which an Apache-2.0 project may redistribute. Used so that the

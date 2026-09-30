@@ -14,3 +14,7 @@ ll2-projection.workspace = true
 opendrive.workspace = true
 uom.workspace = true
 vec1.workspace = true
+
+[dev-dependencies]
+roadgen-buildings.workspace = true
+tempfile.workspace = true

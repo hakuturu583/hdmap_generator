@@ -148,3 +148,51 @@ fn opendrive_carries_the_housing_height_and_the_lamps() {
         }
     }
 }
+
+#[test]
+fn a_lights_lamp_way_traces_back_to_the_light() {
+    use roadgen_core::trace::{IrRef, Relation};
+
+    let map = lit_crossroads();
+    let (written, trace) = roadgen_lanelet2::to_lanelet_map_traced(&map).unwrap();
+    let lines: Vec<_> = written
+        .line_strings
+        .all()
+        .iter()
+        .filter_map(ll2_core::map::as_linestring)
+        .cloned()
+        .collect();
+    let named = |local: &str| {
+        lines
+            .iter()
+            .find(|line| format!("linestring:{}", line.id()) == local)
+            .unwrap_or_else(|| panic!("{local} is not in the export"))
+    };
+    let tag = |line: &ll2_core::linestring::LineString, key: &str| {
+        line.attributes()
+            .read()
+            .get(key)
+            .map(|value| value.value().to_owned())
+    };
+
+    let mut lights = 0;
+    for object in map.objects.iter().filter(|o| o.kind.is_traffic_light()) {
+        lights += 1;
+        let links: Vec<_> = trace.links_of(&IrRef::Object(object.id.clone())).collect();
+        let housing = links.iter().find(|link| link.role.is_none()).unwrap();
+        let bulbs: Vec<_> = links
+            .iter()
+            .filter(|link| link.role.as_deref() == Some("light_bulbs"))
+            .collect();
+        assert_eq!(bulbs.len(), 1, "{}", object.id);
+        assert_eq!(bulbs[0].relation, Relation::Exact);
+        // The traced way is the lamps of the traced housing, by Autoware's own tag.
+        let way = named(&bulbs[0].local);
+        assert_eq!(tag(way, "type").as_deref(), Some("light_bulbs"));
+        assert_eq!(
+            format!("linestring:{}", tag(way, "traffic_light_id").unwrap()),
+            housing.local
+        );
+    }
+    assert!(lights > 0);
+}
