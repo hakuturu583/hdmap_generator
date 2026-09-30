@@ -2341,6 +2341,19 @@ impl RoadSpec {
                 if let Ok(width) = WidthProfile::new(knots, taper) {
                     lane.width = width;
                 }
+                // A lift is by station too: where it ramps or peaks has to stay
+                // where it was on the ground, not at a number the arc has moved.
+                if !lane.height.is_flat() {
+                    let knots: Vec<(f64, f64, f64)> = lane
+                        .height
+                        .knots()
+                        .iter()
+                        .map(|(station, inner, outer)| (map(*station), *inner, *outer))
+                        .collect();
+                    if let Ok(height) = LaneHeight::new(knots) {
+                        lane.height = height;
+                    }
+                }
             }
         }
         let pieces: Vec<Poly3Piece> = self
@@ -2558,6 +2571,51 @@ mod tests {
             "{:?}",
             there.point
         );
+    }
+
+    #[test]
+    fn a_lift_moves_with_the_rounded_corner_too() {
+        let mut builder = MapBuilder::default();
+        let a = straight(
+            &mut builder,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(100.0, 0.0, 0.0),
+            "a",
+        );
+        // Road b's first lane ramps up to a kerb's height 30 m in from the joint.
+        let ramp = LaneHeight::new([(0.0, 0.0, 0.0), (30.0, 0.15, 0.15)]).unwrap();
+        let mut lanes = two_way();
+        lanes[0] = lanes[0].clone().with_height(ramp);
+        let b = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(100.0, 0.0, 0.0),
+                    Point3::new(100.0, 100.0, 0.0),
+                    lanes,
+                )
+                .unwrap()
+                .with_name("b"),
+            )
+            .unwrap();
+        builder.connect(&a, &b).unwrap();
+        let map = builder.finish().unwrap().into_map();
+
+        let radius = 3.5 + CORNER_INNER_RADIUS;
+        let (setback, half_arc) = (radius, radius * std::f64::consts::FRAC_PI_4);
+        let lifted: Vec<&Lane> = map
+            .lanes_of(&b)
+            .into_iter()
+            .filter(|lane| !lane.height.is_flat())
+            .collect();
+        assert_eq!(lifted.len(), 1);
+        // The top of the ramp is where it was on the ground -- 30 m along the
+        // straight part -- which is a different station now the joint is an arc.
+        let top = lifted[0].height.knots().last().copied().unwrap();
+        assert!(
+            (top.0 - (30.0 - setback + half_arc)).abs() < 1e-9,
+            "{top:?}"
+        );
+        assert_eq!((top.1, top.2), (0.15, 0.15));
     }
 
     #[test]
