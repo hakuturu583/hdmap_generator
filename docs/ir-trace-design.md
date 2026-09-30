@@ -1,6 +1,6 @@
 # IR ダンプとフォーマット間 ID トレース — 設計案
 
-*2026-09 設計ドラフト。未実装。*
+*2026-09 設計ドラフト（改訂 2: エクスポータごとのトレースファイル方式）。未実装。*
 
 ## 1. 何を解きたいか
 
@@ -50,60 +50,104 @@ A→B の変換は `A → IR ID(s) → B` の合成で行う。フォーマッ�
 ハブになれるのは IR ID が「呼び出し側の入力から導かれ、カウンタではない」からで、
 これは既存設計（`id.rs`）がすでに保証している性質。
 
-## 4. 成果物: `map.trace.json`（1 ファイル）
+## 4. 成果物: IR ダンプ 1 本 + エクスポータごとのトレースファイル
+
+各エクスポータが自分の出力の横にトレースファイルを書き出す。IR は別に 1 本ダンプする。
+追跡するときはこれらを IR ID で突き合わせる。
+
+```
+out/
+├── map.ir.json                        ← IR ダンプ（export_ir）
+├── map.xodr
+├── map.xodr.trace.json                ← OpenDRIVE エクスポータが書く
+├── lanelet2_map.osm
+├── lanelet2_map.osm.trace.json        ← Lanelet2 エクスポータが書く
+└── sumo/
+    ├── net.nod.xml …
+    └── trace.json                     ← SUMO エクスポータが書く（ディレクトリ出力は中に置く）
+```
+
+例: Lanelet2 の lanelet `1000123` → SUMO
+
+```
+lanelet2_map.osm.trace.json で逆引き   lanelet:1000123 → lane/north/0
+sumo/trace.json で正引き               lane/north/0    → lane:north.fwd_0
+```
+
+1 ファイルにまとめる案（旧版）ではなくこの形にする理由:
+
+- **エクスポータ同士が独立したままになる。** 各エクスポータは自分の対応表を書くだけで、
+  PyMap 側に「ここまでの export を溜めておく」状態を持たなくてよい
+- **別の時点・別プロセスで書き出したファイル同士も突き合わせられる。**
+  同じ IR から出たものかは `ir_fingerprint` で判定する
+- **書き出したフォーマットの分だけファイルができる。** 使わないフォーマットの trace は存在しない
+- エクスポータを 1 つ足しても、既存のトレースファイルにも IR ダンプにも影響しない
+
+### 4.0 IR ダンプとトレースファイルの役割分担
+
+- 両方のフォーマットに対応物がある要素（lane ↔ lanelet ↔ SUMO lane など）なら、
+  **トレースファイル 2 本を IR ID で join するだけで追える。** IR ダンプは使わない
+- IR ダンプが必要になるのは次の 3 つ:
+  1. **片方にしかない要素**。例えば交差点内の lane は SUMO に存在しない。
+     IR の関係（connector lane → それを通る connection、lane → road）をたどって、
+     近い対応物に広げる
+  2. **正しい組み合わせかの検証**。`fingerprint` を持ち、各トレースファイルの
+     `ir_fingerprint` と照合する
+  3. **IR ID の意味を人が読む**。どの road のどの section の何番目の lane か
+
+**`map.ir.json`**
+
+```jsonc
+{
+  "schema": "roadgen-ir/1",
+  "generator": { "name": "roadgen", "version": "0.3.2" },
+  "fingerprint": "sha256:…",           // 以下の本体を正規化した JSON のハッシュ
+  "metadata": { "name": "town", "handedness": "right", "projection": "…", "origin": {…} },
+  "roads":       [{ "id": "road/north", "name": "north", "junction": null,
+                    "sections": [{ "station": 0.0, "lanes": ["lane/north/0", "lane/north/1"] }],
+                    "predecessor": null, "successor": {"junction": "junction/j0"} }],
+  "lanes":       [{ "id": "lane/north/0", "road": "road/north", "section": 0,
+                    "side": "right", "ordinal": 1, "direction": "forward", "type": "driving" }],
+  "junctions":   [{ "id": "junction/j0", "incoming": [...], "connecting": [...] }],
+  "connections": [{ "id": "connection/j0/north_0/east_0",
+                    "from": "lane/north/0", "to": "lane/j0_c3/0", "junction": "junction/j0" }],
+  "objects":     [{ "id": "object/tl_0", "kind": "traffic_light", "lanes": ["lane/north/0"] }],
+  "rules":       [{ "kind": "right_of_way", "lanes": [...] }],
+  "buildings":   [{ "id": "building/north/left/3/0", "parts": ["part/north/left/3/0/0"] }]
+}
+```
+
+**`<出力>.trace.json`**（全フォーマットで同じスキーマ）
 
 ```jsonc
 {
   "schema": "roadgen-trace/1",
   "generator": { "name": "roadgen", "version": "0.3.2" },
-  "ir": {
-    "fingerprint": "sha256:…",          // 下記 ir セクションの正規化 JSON のハッシュ
-    "metadata": { "name": "town", "handedness": "right", "projection": "…", "origin": {…} },
-    "roads":       [{ "id": "road/north", "name": "north", "junction": null,
-                      "sections": [{ "station": 0.0, "lanes": ["lane/north/0", "lane/north/1"] }],
-                      "predecessor": null, "successor": {"junction": "junction/j0"} }],
-    "lanes":       [{ "id": "lane/north/0", "road": "road/north", "section": 0,
-                      "side": "right", "ordinal": 1, "direction": "forward", "type": "driving" }],
-    "junctions":   [{ "id": "junction/j0", "incoming": [...], "connecting": [...] }],
-    "connections": [{ "id": "connection/j0/north_0/east_0",
-                      "from": "lane/north/0", "to": "lane/j0_c3/0", "junction": "junction/j0" }],
-    "objects":     [{ "id": "object/tl_0", "kind": "traffic_light", "lanes": ["lane/north/0"] }],
-    "rules":       [{ "kind": "right_of_way", "lanes": [...] }],
-    "buildings":   [{ "id": "building/north/left/3/0", "parts": ["part/north/left/3/0/0"] }]
-  },
-  "exports": {
-    "opendrive": {
-      "files":   [{ "path": "map.xodr", "sha256": "…" }],
-      "options": { … },                   // 採番に影響するオプションだけ
-      "links": [
-        { "ir": "road/north",   "ref": "road:0",      "rel": "exact" },
-        { "ir": "lane/north/0", "ref": "lane:0/0/-1", "rel": "exact" },
-        { "ir": "connection/j0/north_0/east_0", "ref": "connection:4/0", "rel": "merged" }
-      ]
-    },
-    "lanelet2": {
-      "files": [{ "path": "map.osm", "sha256": "…" }],
-      "links": [
-        { "ir": "lane/north/0", "ref": "lanelet:1000123",    "rel": "exact",  "role": "lanelet" },
-        { "ir": "lane/north/0", "ref": "linestring:1000124", "rel": "exact",  "role": "centerline" },
-        { "ir": "lane/north/0", "ref": "linestring:1000010", "rel": "merged", "role": "left_boundary" },
-        { "ir": "object/tl_0",  "ref": "regulatory_element:1000500", "rel": "exact" }
-      ]
-    },
-    "sumo":     { "links": [{ "ir": "road/north", "ref": "edge:north.fwd", "rel": "part" }, …] },
-    "osm":      { … }, "carla": { … }, "clipgt": { "links": [{ "ir": "lane/north/0", "ref": "lane:17" }] },
-    "gpudrive": { … }
-  }
+  "format": "lanelet2",
+  "direction": "export",                 // "export"（IR→ファイル）か "import"（ファイル→IR、§5.3）
+  "ir_fingerprint": "sha256:…",          // どの IR ダンプと組になるか
+  "files":   [{ "path": "lanelet2_map.osm", "sha256": "…" }],
+  "options": { … },                      // 採番に影響するオプションだけ
+  "links": [
+    { "ir": "lane/north/0", "ref": "lanelet:1000123",    "rel": "exact",  "role": "lanelet" },
+    { "ir": "lane/north/0", "ref": "linestring:1000124", "rel": "exact",  "role": "centerline" },
+    { "ir": "lane/north/0", "ref": "linestring:1000010", "rel": "merged", "role": "left_boundary" },
+    { "ir": "object/tl_0",  "ref": "regulatory_element:1000500", "rel": "exact" }
+  ]
 }
 ```
 
-### 4.1 `ir` セクション = IR ダンプ（フェーズ 1 は「カタログ」）
+OpenDRIVE なら `{"ir": "lane/north/0", "ref": "lane:0/0/-1"}`、
+SUMO なら `{"ir": "road/north", "ref": "edge:north.fwd", "rel": "part"}` のように、
+`links` の形は全フォーマットで共通。
+
+### 4.1 IR ダンプの範囲（フェーズ 1 は「カタログ」）
 
 トレースに要るのは **ID・所属・トポロジ・意味属性**で、幾何は要らない。
 フェーズ 1 のダンプはこの「IR カタログ」に絞る:
 
 - 小さい（数千 lane でも数百 KB）、diff が読める、スキーマが安定しやすい
-- 再生成前後の `ir` を diff すれば「ID が変わった / 消えた」が一目で分かる（副次効果）
+- 再生成前後の `map.ir.json` を diff すれば「ID が変わった / 消えた」が一目で分かる（副次効果）
 
 幾何まで含む完全ダンプ（再読込で `Map` を復元できるもの）はフェーズ 3 に回す（§8）。
 
@@ -144,8 +188,10 @@ IR とフォーマットは 1:1 とは限らない。これを明示しないと
 Lanelet2 / OSM / ClipGT の ID は構築順で決まるので、ファイルを作り直すと古い trace は
 **黙って間違った答え**を返す。これを防ぐため:
 
-- `exports.<fmt>.files[].sha256` — 読込時に実ファイルと照合し、不一致なら警告/エラー
-- `ir.fingerprint` — 同じ IR から出たエクスポートかどうかの判定
+- `files[].sha256` — 読込時に実ファイルと照合し、不一致なら警告/エラー
+- `ir_fingerprint` — トレースファイル同士、およびトレースファイルと `map.ir.json` が
+  同じ IR から出たものかの判定。ファイルが分かれる分、これが突き合わせの前提になる。
+  一致しない組み合わせは `TraceIndex` が読込時に拒否する
 - `generator.version` — 採番規則の変更を追うため
 
 ## 5. Rust 側の設計
@@ -197,15 +243,18 @@ OpenDRIVE の `signal_id` 等のように「別途 `Numbering::new` を呼び直
   `run()` 終了時に捨てられる）
 - object は `name` が `object/…` ならそれ、なければ `object/<xodr id>`（重複時 `-N`）
 
-→ `Imported` に `source_trace: Trace`（format = `"opendrive"`, `rel` は `exact` 固定）を
-追加し、`Reader.lanes` と `signal_ids` / building 名をそこへ出す。
-trace ファイル上は `"sources": { "opendrive": {…} }` として `exports` と対称に置く。
-これで「入力 xodr の lane → 出力 lanelet」が同じ合成で引ける。
+→ `Imported` に `trace: Trace`（format = `"opendrive"`）を追加し、`Reader.lanes` と
+`signal_ids` / building 名をそこへ出す。ファイルとしては `direction: "import"` の
+トレースファイル（例 `input.xodr.trace.json`）になり、スキーマはエクスポート側と同じ。
+これで「入力 xodr の lane → 出力 lanelet」も、入力側のトレースファイルと
+Lanelet2 のトレースファイルの join で引ける。
 
 ### 5.4 検索 API: `TraceIndex`
 
 ```rust
-let index = TraceIndex::load("map.trace.json")?;          // sha256 照合もここで
+let index = TraceIndex::open("out/map.ir.json")?          // IR ダンプ（任意だが推奨）
+    .with_trace("out/lanelet2_map.osm.trace.json")?       // fingerprint / sha256 照合はここで
+    .with_trace("out/sumo/trace.json")?;
 index.to_ir("lanelet2", "lanelet:1000123")                 // -> Vec<(IrRef, Relation)>
 index.from_ir(&IrRef::Lane(id), "sumo")                    // -> Vec<&TraceLink>
 index.translate("lanelet2", "lanelet:1000123", "opendrive") // 合成
@@ -214,38 +263,41 @@ index.translate("lanelet2", "lanelet:1000123", "opendrive") // 合成
 `translate` の合成規則:
 
 1. `from` の ref → IR 要素集合（`merged` なら複数）
-2. 対象フォーマットにリンクがない IR 要素は、IR の関係で**1 段だけ**広げる
+2. 対象フォーマットにリンクがない IR 要素は、IR ダンプの関係で**1 段だけ**広げる
    （lane → その road、connector lane → それを通る connection）。広げた場合は
    結果に `via` を付けて「近似」であることを返す
 3. 各 IR 要素 → `to` の ref 集合
 
-結果は常に集合で返し、1:1 を仮定しない。
+結果は常に集合で返し、1:1 を仮定しない。IR ダンプを読んでいない場合は 2 を飛ばし、
+対応物がなければ空集合を返す（トレースファイルだけでも join はできる）。
 
 ## 6. Python / CLI
 
-PyMap は既に `*_warnings` をエクスポートごとに保持しているので、同じ形で
-**エクスポート時に Trace を蓄積**し、最後にまとめて書く:
+トレースファイルはエクスポート時に出力の横へ書く。既存の呼び出しはそのまま動き、
+`trace=False` で書かないこともできる:
 
 ```python
-m.export_opendrive("out/map.xodr")
-m.export_lanelet2("out/lanelet2_map.osm")
-m.export_sumo("out/sumo/")
-m.export_trace("out/map.trace.json")      # IR カタログ + ここまでの全 exports
+m.export_opendrive("out/map.xodr")         # + out/map.xodr.trace.json
+m.export_lanelet2("out/lanelet2_map.osm")  # + out/lanelet2_map.osm.trace.json
+m.export_sumo("out/sumo/")                 # + out/sumo/trace.json
+m.export_ir("out/map.ir.json")             # IR ダンプ
 
-t = roadgen.Trace.load("out/map.trace.json")
-t.to_ir("lanelet2", 1000123)               # ['lane/north/0']
-t.translate("lanelet2", 1000123, to="opendrive")   # [('lane', '0/0/-1')]
+t = roadgen.Trace.load("out/map.ir.json",
+                       "out/lanelet2_map.osm.trace.json",
+                       "out/sumo/trace.json")
+t.to_ir("lanelet2", 1000123)                       # ['lane/north/0']
+t.translate("lanelet2", 1000123, to="sumo")        # [('lane', 'north.fwd_0')]
 t.translate("sumo", "north.fwd_0", to="lanelet2")
 ```
 
 ```
-python -m roadgen trace out/map.trace.json lanelet2:lanelet:1000123 --to opendrive sumo
+python -m roadgen trace out/map.ir.json out/*.trace.json out/sumo/trace.json \
+    lanelet2:lanelet:1000123 --to sumo
 ```
 
-`export_trace` を書き出し関数ごとのサイドカー（`map.xodr.trace.json`）にしない理由:
-合成には全フォーマットが 1 か所に揃っている必要があり、ファイルを集める手間を
-ユーザに渡したくないから。ただし `Trace` 単体の JSON 化も公開しておけば、
-サイドカー運用が欲しい人はそれで足りる。
+トレースファイルの既定を「書く」にするか「書かない」にするかは §9 で決める。
+書く場合は出力ディレクトリにファイルが 1 本増えるが、後から同じ IR を再現できない限り
+トレースは作り直せないので、既定で書くほうを推す。
 
 Web デモ（viewer）では、同じ Trace を使って「あるフォーマットで要素をクリック →
 他フォーマットの対応要素をハイライト」ができる。フェーズ 2 以降の候補。
@@ -257,7 +309,7 @@ Web デモ（viewer）では、同じ Trace を使って「あるフォーマッ
   trace が lane A ↔ lanelet X と言うなら、両者の中心線が一致すること
 - 各 exporter: 出力ファイルを再パースし、trace の全 `ref` が実在すること、
   `exact` の IR 要素が重複しないこと
-- `reimport.rs`: xodr → IR → xodr で `sources` と `exports` を合成すると
+- `reimport.rs`: xodr → IR → xodr で 入力側（import）と出力側（export）のトレースファイルを join すると
   元の lane 番号に戻ること
 - 決定性: 同じ入力から 2 回作った trace が byte 単位で一致すること
 
@@ -265,11 +317,13 @@ Web デモ（viewer）では、同じ Trace を使って「あるフォーマッ
 
 | フェーズ | 内容 |
 | --- | --- |
-| 1 | `roadgen-core::trace` 型、IR カタログ JSON、OpenDRIVE / SUMO / Lanelet2 の trace、`TraceIndex`、Python `export_trace` / `Trace.load` / `translate`。core には serde を入れず、JSON 化は専用の小 crate（`roadgen-trace`）に置く |
+| 1 | `roadgen-core::trace` 型、IR カタログ JSON、OpenDRIVE / SUMO / Lanelet2 の trace、`TraceIndex`、各エクスポータのトレースファイル出力、Python `export_ir` / `Trace.load` / `translate`。core には serde を入れず、JSON 化は専用の小 crate（`roadgen-trace`）に置く |
 | 2 | OSM / ClipGT / GPUDrive / CARLA（furniture と xodr 分）、`read_opendrive` の source trace、CLI |
 | 3 | 完全 IR ダンプ（幾何込み）。`roadgen-core` に `serde` feature を足し、`Curve3` / `WidthProfile` 等まで derive、`Map` を JSON から復元 → `validate()`。再現性・バグ報告添付・生成器を通さない再エクスポートに使える。スキーマ維持コストが大きいので需要を見てから |
 
 ## 9. 決めてほしいこと
+
+0. トレースファイルを既定で書き出すか（推奨: 書く。`trace=False` で抑止）。
 
 1. **ダンプの範囲**: フェーズ 1 は「ID/トポロジ/属性のカタログ」で良いか、最初から
    幾何込みの完全ダンプ（再読込可能）が欲しいか。
