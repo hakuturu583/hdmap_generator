@@ -292,6 +292,32 @@ mod tests {
     }
 
     #[test]
+    fn one_element_in_two_roles_is_two_answers() {
+        let map = two_roads();
+        let fingerprint = IrCatalog::of(&map).fingerprint();
+        let lane = map.lanes.iter().next().unwrap().id.clone();
+        let mut lanes = Trace::new("lanes");
+        lanes.link(lane.clone(), "lane:1", Relation::Exact);
+        let mut agents = Trace::new("agents");
+        agents.link_as(lane.clone(), "agent:1", Relation::Part, "route");
+        agents.link_as(lane.clone(), "agent:1", Relation::Part, "goal");
+
+        let mut index = TraceIndex::new();
+        index.add_trace(&lanes, &fingerprint).unwrap();
+        index.add_trace(&agents, &fingerprint).unwrap();
+        let roles: Vec<_> = index
+            .translate("lanes", "lane:1", "agents")
+            .unwrap()
+            .into_iter()
+            .map(|answer| answer.role)
+            .collect();
+        assert_eq!(
+            roles,
+            vec![Some("route".to_owned()), Some("goal".to_owned())]
+        );
+    }
+
+    #[test]
     fn bare_elements_take_the_formats_usual_kind() {
         let map = two_roads();
         let mut sumo = Trace::new("sumo");

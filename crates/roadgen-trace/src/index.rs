@@ -310,10 +310,20 @@ impl TraceIndex {
                 }
             }
         }
+        // A link is the same answer only when everything it says is the same: one
+        // element can stand for one IR element in two roles — a lane an agent drives
+        // and the lane its goal is on — and each is an answer of its own.
         let mut seen = BTreeSet::new();
         let answers = found
             .into_iter()
-            .filter(|(link, _)| seen.insert((link.local.as_str(), link.ir.as_str())))
+            .filter(|(link, _)| {
+                seen.insert((
+                    link.local.as_str(),
+                    link.ir.as_str(),
+                    link.relation,
+                    link.role.as_deref(),
+                ))
+            })
             .map(|(link, via)| Translation {
                 local: link.local.clone(),
                 ir: link.ir.clone(),
