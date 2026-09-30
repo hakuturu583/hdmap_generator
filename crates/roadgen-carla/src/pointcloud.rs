@@ -54,6 +54,21 @@ pub struct PointCloudConfig {
     pub cell_size: f64,
 }
 
+impl PointCloudConfig {
+    /// Refuses a spacing or cell size that is not a length: a spacing of zero
+    /// samples a triangle without end, and a cell of zero divides by it.
+    pub fn validate(&self) -> Result<(), ExportError> {
+        for (what, value) in [("spacing", self.spacing), ("cell_size", self.cell_size)] {
+            if !(value.is_finite() && value > 0.0) {
+                return Err(ExportError::Config(format!(
+                    "{what} is a length in metres, greater than zero; got {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for PointCloudConfig {
     fn default() -> Self {
         PointCloudConfig {
@@ -135,18 +150,32 @@ pub fn write(
     directory: impl AsRef<Path>,
     config: &PointCloudConfig,
 ) -> Result<PointCloudMap, ExportError> {
+    config.validate()?;
     let root = directory.as_ref();
     let cells_dir = root.join(DIRECTORY);
     fs::create_dir_all(&cells_dir).map_err(|error| io(&cells_dir, error))?;
+    // A map written here before -- smaller, or cut on another grid -- leaves cells
+    // the new metadata does not list, and a loader that reads the directory would
+    // still load them. Only this format's own files go: the cells.
+    for entry in fs::read_dir(&cells_dir).map_err(|error| io(&cells_dir, error))? {
+        let path = entry.map_err(|error| io(&cells_dir, error))?.path();
+        if path.extension().is_some_and(|extension| extension == "pcd") {
+            fs::remove_file(&path).map_err(|error| io(&path, error))?;
+        }
+    }
 
     let size = config.cell_size;
-    let mut cells: BTreeMap<(i64, i64), Vec<[f64; 3]>> = BTreeMap::new();
+    let mut cells: BTreeMap<(i64, i64), Vec<[f32; 3]>> = BTreeMap::new();
     for point in points {
+        // The cell is decided by the coordinates the file holds, which are 32-bit:
+        // a point a few millimetres inside a boundary in f64 can round across it,
+        // and then it would lie outside the cell the metadata says its file covers.
+        let stored = point.map(|value| value as f32);
         let cell = (
-            (point[0] / size).floor() as i64,
-            (point[1] / size).floor() as i64,
+            (f64::from(stored[0]) / size).floor() as i64,
+            (f64::from(stored[1]) / size).floor() as i64,
         );
-        cells.entry(cell).or_default().push(*point);
+        cells.entry(cell).or_default().push(stored);
     }
 
     let mut metadata = format!("x_resolution: {size:?}\ny_resolution: {size:?}\n");
@@ -175,7 +204,7 @@ pub fn write(
 }
 
 /// One `.pcd`: binary, `x y z` as 32-bit floats, which is what Autoware's maps are.
-pub fn pcd(points: &[[f64; 3]]) -> Vec<u8> {
+pub fn pcd(points: &[[f32; 3]]) -> Vec<u8> {
     let n = points.len();
     let mut out = format!(
         "# .PCD v0.7 - Point Cloud Data file format\n\
@@ -186,7 +215,7 @@ pub fn pcd(points: &[[f64; 3]]) -> Vec<u8> {
     out.reserve(12 * n);
     for point in points {
         for value in point {
-            out.extend_from_slice(&(*value as f32).to_le_bytes());
+            out.extend_from_slice(&value.to_le_bytes());
         }
     }
     out
@@ -256,5 +285,69 @@ mod tests {
             header.contains("POINTS 2\n") && header.contains("FIELDS x y z\n"),
             "{header}"
         );
+    }
+
+    #[test]
+    fn a_spacing_or_a_cell_that_is_not_a_length_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for config in [
+            PointCloudConfig {
+                spacing: 0.0,
+                ..Default::default()
+            },
+            PointCloudConfig {
+                spacing: f64::NAN,
+                ..Default::default()
+            },
+            PointCloudConfig {
+                cell_size: -20.0,
+                ..Default::default()
+            },
+            PointCloudConfig {
+                cell_size: f64::INFINITY,
+                ..Default::default()
+            },
+        ] {
+            assert!(config.validate().is_err(), "{config:?}");
+            assert!(write(&[[1.0, 1.0, 0.0]], dir.path(), &config).is_err());
+        }
+        // Nothing was written for any of them.
+        assert!(!dir.path().join(METADATA).exists());
+    }
+
+    #[test]
+    fn writing_over_an_earlier_map_leaves_none_of_its_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PointCloudConfig::default();
+        write(&[[1.0, 1.0, 0.0], [45.0, 1.0, 0.0]], dir.path(), &config).unwrap();
+        let unrelated = dir.path().join(DIRECTORY).join("README");
+        fs::write(&unrelated, "not a cell").unwrap();
+        // A smaller map, into the same place.
+        write(&[[1.0, 1.0, 0.0]], dir.path(), &config).unwrap();
+        let mut cells: Vec<String> = fs::read_dir(dir.path().join(DIRECTORY))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".pcd"))
+            .collect();
+        cells.sort();
+        assert_eq!(cells, ["0_0.pcd"]);
+        // Only cells are the writer's to remove.
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn a_point_is_filed_by_the_coordinates_its_file_holds() {
+        // 99 999.999 is in the cell below 100 000 as an f64, and *is* 100 000 as the
+        // f32 the file stores -- so it belongs to the cell that starts there.
+        let dir = tempfile::tempdir().unwrap();
+        let x = 100_000.0 - 0.001;
+        assert_eq!(x as f32, 100_000.0_f32);
+        write(&[[x, 5.0, 0.0]], dir.path(), &PointCloudConfig::default()).unwrap();
+        let metadata = fs::read_to_string(dir.path().join(METADATA)).unwrap();
+        assert!(
+            metadata.contains("5000_0.pcd: [100000.0, 0.0]\n"),
+            "{metadata}"
+        );
+        assert!(dir.path().join(DIRECTORY).join("5000_0.pcd").exists());
     }
 }

@@ -18,6 +18,8 @@ pub enum ExportError {
     Io(String),
     /// A point could not be put in the frame the point-cloud map is written in.
     Projection(String),
+    /// A setting the exporter was given cannot be used.
+    Config(String),
 }
 
 impl From<GeometryError> for ExportError {
@@ -51,6 +53,7 @@ impl fmt::Display for ExportError {
                 "a point of the point-cloud map could not be put in the Lanelet2 \
                  map's frame: {detail}"
             ),
+            ExportError::Config(detail) => write!(f, "{detail}"),
         }
     }
 }

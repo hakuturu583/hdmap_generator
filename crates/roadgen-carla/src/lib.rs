@@ -275,6 +275,8 @@ pub fn write_pointcloud_map<E: std::fmt::Display>(
     pointcloud: &PointCloudConfig,
     mut locate: impl FnMut(Point3) -> Result<[f64; 3], E>,
 ) -> Result<PointCloudMap, ExportError> {
+    // Before sampling: a spacing of zero would never finish doing it.
+    pointcloud.validate()?;
     let mut meshes = surfaces::build(map, &config.map, &config.surfaces);
     if config.buildings != BuildingPlacement::Omitted {
         let mut ordinals = surfaces::Ordinals::default();
