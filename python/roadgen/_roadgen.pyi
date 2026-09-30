@@ -190,6 +190,17 @@ class Map:
         sun_altitude: Optional[float] = None,
         sun_azimuth: Optional[float] = None,
     ) -> dict[str, Any]: ...
+    def export_pointcloud_map(
+        self,
+        directory: str,
+        name: Optional[str] = None,
+        buildings: Optional[str] = None,
+        kerb_height: Optional[float] = None,
+        verge_width: Optional[float] = None,
+        ground_extent: Optional[float] = None,
+        spacing: Optional[float] = None,
+        cell_size: Optional[float] = None,
+    ) -> dict[str, Any]: ...
     def to_gpudrive_json(
         self,
         scenario: Optional[str] = None,

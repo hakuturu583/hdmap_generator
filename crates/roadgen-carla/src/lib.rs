@@ -74,6 +74,7 @@ pub mod materials;
 pub mod mesh;
 pub mod obj;
 pub mod package;
+pub mod pointcloud;
 pub mod script;
 pub mod surfaces;
 pub mod tags;
@@ -83,6 +84,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use roadgen_core::geometry::Point3;
 use roadgen_core::semantics::MapObjectKind;
 use roadgen_core::ValidatedMap;
 
@@ -91,6 +93,7 @@ pub use furniture::{FurnitureConfig, SignKind};
 pub use materials::Material;
 pub use mesh::Mesh;
 pub use package::{Descriptor, MapEntry, PropEntry, TextureManifest};
+pub use pointcloud::{PointCloudConfig, PointCloudMap};
 pub use surfaces::SurfaceConfig;
 pub use tags::{Folder, Label, Role};
 
@@ -255,6 +258,33 @@ pub fn to_meshes(map: &ValidatedMap, config: &PackageConfig) -> Vec<Mesh> {
         meshes.extend(surfaces::buildings(map, &config.map, &mut ordinals));
     }
     meshes
+}
+
+/// Writes Autoware's point-cloud map of the surface the package's level is built
+/// of into `directory` — see [`pointcloud`] for the layout.
+///
+/// The meshes are the ones [`write`] puts in the FBX, and the town wherever it goes
+/// (in the map, or as props the package's script stands in the level): what the
+/// simulated LiDAR sees. `locate` turns a point in the map's frame into the frame
+/// Autoware reads the map in — the Lanelet2 map's `local_x`, `local_y` and `ele` —
+/// which only the Lanelet2 exporter knows how to work out for every projection.
+pub fn write_pointcloud_map<E: std::fmt::Display>(
+    map: &ValidatedMap,
+    directory: impl AsRef<Path>,
+    config: &PackageConfig,
+    pointcloud: &PointCloudConfig,
+    mut locate: impl FnMut(Point3) -> Result<[f64; 3], E>,
+) -> Result<PointCloudMap, ExportError> {
+    let mut meshes = surfaces::build(map, &config.map, &config.surfaces);
+    if config.buildings != BuildingPlacement::Omitted {
+        let mut ordinals = surfaces::Ordinals::default();
+        meshes.extend(surfaces::buildings(map, &config.map, &mut ordinals));
+    }
+    let points = pointcloud::sample(&meshes, pointcloud.spacing)
+        .into_iter()
+        .map(|point| locate(point).map_err(|error| ExportError::Projection(error.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    pointcloud::write(&points, directory, pointcloud)
 }
 
 /// Writes the package into `directory`, creating it if it is not there.
