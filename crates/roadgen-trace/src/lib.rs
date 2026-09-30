@@ -244,6 +244,22 @@ mod tests {
     }
 
     #[test]
+    fn a_trace_whose_links_were_edited_is_refused() {
+        let map = two_roads();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        let trace_path = sidecar_path(&file, "alpha");
+        write_trace(&counted(&map, "alpha", 100, &file), &map, &trace_path).unwrap();
+        TraceIndex::new().load(&trace_path).unwrap();
+
+        // Another plausible value, with the file it describes left alone.
+        let text = std::fs::read_to_string(&trace_path).unwrap();
+        std::fs::write(&trace_path, text.replacen("lane:100", "lane:101", 1)).unwrap();
+        let error = TraceIndex::new().load(&trace_path).unwrap_err();
+        assert!(matches!(error, TraceError::Altered { .. }), "{error}");
+    }
+
+    #[test]
     fn a_missing_counterpart_steps_to_a_neighbour_in_the_dump() {
         let map = two_roads();
         let fingerprint = IrCatalog::of(&map).fingerprint();

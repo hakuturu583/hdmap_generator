@@ -19,9 +19,9 @@ pub enum TraceError {
         trace: String,
         file: String,
     },
-    /// An IR dump whose body no longer hashes to the fingerprint it states: edited or
-    /// damaged since it was written, so the traces it would be joined to describe a
-    /// different map from the one it now holds.
+    /// A file whose contents no longer hash to the digest it states: an IR dump or a
+    /// trace edited or damaged since it was written, so what it says is no longer
+    /// what was recorded.
     Altered {
         path: String,
         stated: String,
@@ -66,8 +66,8 @@ impl fmt::Display for TraceError {
                 actual,
             } => write!(
                 f,
-                "{path} states the fingerprint {stated} but its contents hash to {actual}; \
-                 it has been changed since it was written"
+                "{path} states {stated} but its contents hash to {actual}; it has been \
+                 changed since it was written"
             ),
             TraceError::Mismatch {
                 path,

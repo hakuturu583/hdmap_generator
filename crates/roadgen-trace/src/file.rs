@@ -37,6 +37,11 @@ pub struct TraceFile {
     pub ir_fingerprint: String,
     pub files: Vec<FileDigest>,
     pub links: Vec<LinkRecord>,
+    /// `sha256:<hex>` of everything above, serialised compactly, so that a link
+    /// edited in the file — an `ir` or a `ref` changed to another plausible value —
+    /// is refused rather than answered with. The digests of the files it describes
+    /// say nothing about the mapping itself.
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +78,7 @@ impl TraceFile {
                 })
             })
             .collect::<Result<Vec<_>, TraceError>>()?;
-        Ok(TraceFile {
+        let mut file = TraceFile {
             schema: TRACE_SCHEMA.into(),
             generator: Generator::this(),
             format: trace.format.clone(),
@@ -90,7 +95,20 @@ impl TraceFile {
                     role: link.role.clone(),
                 })
                 .collect(),
-        })
+            digest: String::new(),
+        };
+        file.digest = file.contents_digest();
+        Ok(file)
+    }
+
+    /// The digest of the file with its own [`digest`](Self::digest) left empty.
+    fn contents_digest(&self) -> String {
+        let unsigned = TraceFile {
+            digest: String::new(),
+            ..self.clone()
+        };
+        let bytes = serde_json::to_vec(&unsigned).expect("a trace is plain data");
+        format!("sha256:{}", hex(&Sha256::digest(bytes)))
     }
 
     pub fn read(path: &Path) -> Result<Self, TraceError> {
@@ -102,6 +120,14 @@ impl TraceFile {
                 path: path.display().to_string(),
                 found: file.schema,
                 expected: TRACE_SCHEMA,
+            });
+        }
+        let actual = file.contents_digest();
+        if actual != file.digest {
+            return Err(TraceError::Altered {
+                path: path.display().to_string(),
+                stated: file.digest,
+                actual,
             });
         }
         for link in &file.links {
