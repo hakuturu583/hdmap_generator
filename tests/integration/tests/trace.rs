@@ -279,16 +279,27 @@ fn an_internal_lane_netconvert_drew_translates_to_the_connector_it_carries() {
         .filter_map(|rest| rest.split('"').next())
         .filter(|id| id.starts_with(":j_"))
     {
+        // One OpenDRIVE lane, reached through the connector lane itself and through
+        // the connections into and out of it, which OpenDRIVE writes as that lane's
+        // predecessor and successor.
         let answers = index.translate("sumo", internal, "opendrive").unwrap();
-        let lanes: Vec<_> = answers
+        let lanes: std::collections::BTreeSet<&str> = answers
             .iter()
             .filter(|answer| answer.local.starts_with("lane:"))
+            .map(|answer| answer.local.as_str())
             .collect();
         assert_eq!(lanes.len(), 1, "{internal}: {answers:?}");
+        let exact: Vec<_> = answers
+            .iter()
+            .filter(|answer| {
+                answer.local.starts_with("lane:") && answer.relation == Relation::Exact
+            })
+            .collect();
+        assert_eq!(exact.len(), 1, "{internal}: {answers:?}");
         let lane = connectors
             .iter()
-            .find(|lane| lane.id.as_str() == lanes[0].ir)
-            .unwrap_or_else(|| panic!("{internal} traced to {}, not a connector", lanes[0].ir));
+            .find(|lane| lane.id.as_str() == exact[0].ir)
+            .unwrap_or_else(|| panic!("{internal} traced to {}, not a connector", exact[0].ir));
         reached.insert(lane.id.clone());
     }
     assert_eq!(reached.len(), connectors.len());

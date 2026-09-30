@@ -1094,6 +1094,10 @@ impl<'a> Exporter<'a> {
     /// OpenDRIVE expresses those in the `<junction>` element, and duplicating them
     /// on the lane would claim a continuation that does not exist. The connecting
     /// road's own lanes do link to the lanes at either side of it.
+    ///
+    /// Each IR connection written here has no element of its own — it is the
+    /// successor of one lane and the predecessor of the other — so it is traced as
+    /// `collapsed` into both lanes, with the side of the link as the role.
     fn lane_link(&self, lane: &Lane) -> Result<Option<LaneLink>, ExportError> {
         let is_connector = self
             .map
@@ -1102,6 +1106,20 @@ impl<'a> Exporter<'a> {
             .unwrap_or(false);
         let mut predecessor = Vec::new();
         let mut successor = Vec::new();
+        let local = format!(
+            "lane:{}/{}/{}",
+            self.road_id(&lane.road)?,
+            lane.section,
+            self.lane_id(&lane.id)?
+        );
+        let record = |connection: &ConnectionId, role: &str| {
+            self.trace.borrow_mut().link_as(
+                connection.clone(),
+                local.clone(),
+                Relation::Collapsed,
+                role,
+            );
+        };
 
         for connection in self.map.connections_from(&lane.id) {
             if connection.junction.is_some() && !is_connector {
@@ -1117,6 +1135,13 @@ impl<'a> Exporter<'a> {
                 LaneEnd::End => successor.push(entry),
                 LaneEnd::Start => predecessor.push(entry),
             }
+            record(
+                &connection.id,
+                match connection.from.end {
+                    LaneEnd::End => "successor",
+                    LaneEnd::Start => "predecessor",
+                },
+            );
         }
         for connection in self.map.connections_to(&lane.id) {
             if connection.junction.is_some() && !is_connector {
@@ -1132,6 +1157,13 @@ impl<'a> Exporter<'a> {
                 LaneEnd::End => successor.push(entry),
                 LaneEnd::Start => predecessor.push(entry),
             }
+            record(
+                &connection.id,
+                match connection.to.end {
+                    LaneEnd::End => "successor",
+                    LaneEnd::Start => "predecessor",
+                },
+            );
         }
 
         if predecessor.is_empty() && successor.is_empty() {

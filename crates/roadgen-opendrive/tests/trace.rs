@@ -200,11 +200,42 @@ fn every_road_and_lane_is_traced_exactly_once() {
             continue;
         }
         let ir = IrRef::Connection(connection.id.clone());
-        let links: Vec<_> = trace.links_of(&ir).collect();
+        let links: Vec<_> = trace
+            .links_of(&ir)
+            .filter(|link| link.relation == Relation::Merged)
+            .collect();
         assert_eq!(links.len(), 1, "{}", connection.id);
-        assert_eq!(links[0].relation, Relation::Merged);
         let id = roadgen_opendrive::junction_id(&map, junction).unwrap();
         assert!(links[0].local.starts_with(&format!("connection:{id}/")));
+    }
+    // Every connection is written somewhere — as a `<connection>`'s lane link, or as
+    // the successor of one lane and the predecessor of the other — and a lane it is
+    // collapsed into is one of its two ends.
+    for connection in map.connections.iter() {
+        let ir = IrRef::Connection(connection.id.clone());
+        let links: Vec<_> = trace.links_of(&ir).collect();
+        assert!(!links.is_empty(), "{} is not traced", connection.id);
+        let ends: Vec<String> = [&connection.from.lane, &connection.to.lane]
+            .into_iter()
+            .map(|lane| {
+                trace
+                    .links_of(&IrRef::Lane(lane.clone()))
+                    .next()
+                    .unwrap()
+                    .local
+                    .clone()
+            })
+            .collect();
+        for link in links
+            .iter()
+            .filter(|link| link.relation == Relation::Collapsed)
+        {
+            assert!(ends.contains(&link.local), "{link:?} is not an end of it");
+            assert!(matches!(
+                link.role.as_deref(),
+                Some("successor" | "predecessor")
+            ));
+        }
     }
     // Every light is switched by exactly one controller.
     for object in map.objects.iter() {
@@ -224,4 +255,56 @@ fn the_same_map_traces_the_same_twice() {
     let two = roadgen_opendrive::trace(&map, &Options::default()).unwrap();
     assert!(!one.links.is_empty());
     assert_eq!(one, two);
+}
+
+#[test]
+fn a_connection_between_two_roads_is_collapsed_into_the_lanes_it_links() {
+    let mut builder = MapBuilder::default();
+    let lanes = || {
+        vec![
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+        ]
+    };
+    let a = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(100.0, 0.0, 0.0),
+                lanes(),
+            )
+            .unwrap()
+            .with_name("a"),
+        )
+        .unwrap();
+    let b = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(100.0, 0.0, 0.0),
+                Point3::new(200.0, 0.0, 0.0),
+                lanes(),
+            )
+            .unwrap()
+            .with_name("b"),
+        )
+        .unwrap();
+    builder.connect(&a, &b).unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let trace = roadgen_opendrive::trace(&map, &Options::default()).unwrap();
+
+    assert!(!map.connections.is_empty());
+    for connection in map.connections.iter() {
+        let ir = IrRef::Connection(connection.id.clone());
+        let links: Vec<_> = trace.links_of(&ir).collect();
+        // The successor of one lane and the predecessor of the other.
+        assert_eq!(links.len(), 2, "{}: {links:?}", connection.id);
+        assert!(links
+            .iter()
+            .all(|link| link.relation == Relation::Collapsed && link.local.starts_with("lane:")));
+        let roles: BTreeSet<_> = links
+            .iter()
+            .filter_map(|link| link.role.as_deref())
+            .collect();
+        assert_eq!(roles, BTreeSet::from(["predecessor", "successor"]));
+    }
 }
