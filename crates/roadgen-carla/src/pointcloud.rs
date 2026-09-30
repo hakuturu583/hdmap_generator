@@ -20,7 +20,7 @@
 //! ```yaml
 //! x_resolution: 20.0
 //! y_resolution: 20.0
-//! 0_-1.pcd: [0.0, -20.0]      # 0 <= x < 20, -20 <= y < 0
+//! 0_-1.pcd: [0, -20]          # 0 <= x < 20, -20 <= y < 0
 //! ```
 //!
 //! Points are in the frame Autoware reads the Lanelet2 map in — its `local_x` /
@@ -64,6 +64,17 @@ impl PointCloudConfig {
                     "{what} is a length in metres, greater than zero; got {value}"
                 )));
             }
+        }
+        // Autoware's map loader reads each cell's corner as an integer
+        // (`as<int>`), and refuses the whole map over one that is not -- so every
+        // corner, a whole number of cells from the origin, has to be a whole
+        // number of metres.
+        if self.cell_size.fract() != 0.0 {
+            return Err(ExportError::Config(format!(
+                "cell_size is a whole number of metres, since Autoware's map loader \
+                 reads a cell's corner as an integer; got {}",
+                self.cell_size
+            )));
         }
         Ok(())
     }
@@ -184,13 +195,10 @@ pub fn write(
         let path = cells_dir.join(&name);
         fs::write(&path, pcd(cell)).map_err(|error| io(&path, error))?;
         // Where the cell starts: the loader takes a cell to run one resolution on
-        // from here in x and in y.
-        let _ = writeln!(
-            metadata,
-            "{name}: [{:?}, {:?}]",
-            *ix as f64 * size,
-            *iy as f64 * size
-        );
+        // from here in x and in y. As integers, which is how it reads them:
+        // `[0.0, -20.0]` fails its YAML conversion and takes the map down with it.
+        let step = size as i64;
+        let _ = writeln!(metadata, "{name}: [{}, {}]", ix * step, iy * step);
     }
     let metadata_path = root.join(METADATA);
     fs::write(&metadata_path, metadata).map_err(|error| io(&metadata_path, error))?;
@@ -265,8 +273,9 @@ mod tests {
             metadata.starts_with("x_resolution: 20.0\ny_resolution: 20.0\n"),
             "{metadata}"
         );
-        assert!(metadata.contains("0_0.pcd: [0.0, 0.0]\n"), "{metadata}");
-        assert!(metadata.contains("1_-1.pcd: [20.0, -20.0]\n"), "{metadata}");
+        // Corners as integers: Autoware's loader reads them `as<int>`.
+        assert!(metadata.contains("0_0.pcd: [0, 0]\n"), "{metadata}");
+        assert!(metadata.contains("1_-1.pcd: [20, -20]\n"), "{metadata}");
 
         let cell = fs::read(dir.path().join(DIRECTORY).join("1_-1.pcd")).unwrap();
         let body = cell
@@ -307,6 +316,11 @@ mod tests {
                 cell_size: f64::INFINITY,
                 ..Default::default()
             },
+            // A corner Autoware's loader could not read as an integer.
+            PointCloudConfig {
+                cell_size: 12.5,
+                ..Default::default()
+            },
         ] {
             assert!(config.validate().is_err(), "{config:?}");
             assert!(write(&[[1.0, 1.0, 0.0]], dir.path(), &config).is_err());
@@ -344,10 +358,7 @@ mod tests {
         assert_eq!(x as f32, 100_000.0_f32);
         write(&[[x, 5.0, 0.0]], dir.path(), &PointCloudConfig::default()).unwrap();
         let metadata = fs::read_to_string(dir.path().join(METADATA)).unwrap();
-        assert!(
-            metadata.contains("5000_0.pcd: [100000.0, 0.0]\n"),
-            "{metadata}"
-        );
+        assert!(metadata.contains("5000_0.pcd: [100000, 0]\n"), "{metadata}");
         assert!(dir.path().join(DIRECTORY).join("5000_0.pcd").exists());
     }
 }

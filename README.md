@@ -1428,7 +1428,7 @@ autoware/Town01/
 
 That is Autoware's *divided* point-cloud map, which its map loader reads for partial
 loading: `x_resolution` and `y_resolution` are the cell size, and each cell's file
-name maps to the corner it starts at (`0_-1.pcd: [0.0, -20.0]` covers x 0–20,
+name maps to the corner it starts at (`0_-1.pcd: [0, -20]` covers x 0–20,
 y −20–0). Run Autoware with `pointcloud_map_file:=pointcloud_map`.
 
 - **The frame is the Lanelet2 map's.** Every point is put through the conversion
@@ -1445,7 +1445,9 @@ y −20–0). Run Autoware with `pointcloud_map_file:=pointcloud_map`.
   the size of the voxel that keeps one of the points that land in it: triangles
   share edges and the roads lie over the land, so the same place is sampled many
   times. It is finer than the voxels Autoware downsamples the map and its scans to.
-  **`cell_size`** (20 m) is the side of a cell.
+  **`cell_size`** (20 m) is the side of a cell, in whole metres: Autoware's loader
+  reads each corner as an integer, and a map with one it cannot read is not loaded
+  at all.
 
 ### What it cannot carry
 

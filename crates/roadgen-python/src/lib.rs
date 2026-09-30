@@ -1295,7 +1295,8 @@ impl PyMap {
     /// built from are exactly what the simulated LiDAR sees. They are sampled every
     /// `spacing` metres, one point per voxel of that size, and written the way
     /// Autoware's map loader reads a divided map: a `pointcloud_map/` directory of
-    /// `.pcd` cells `cell_size` metres square, and `pointcloud_map_metadata.yaml`
+    /// `.pcd` cells `cell_size` metres square (a whole number, since Autoware's
+    /// loader reads a cell's corner as an integer), and `pointcloud_map_metadata.yaml`
     /// beside it, in `directory` — which is the Autoware map directory, next to
     /// `lanelet2_map.osm`. Points are in the Lanelet2 map's frame (`local_x`,
     /// `local_y`, `ele`), MGRS included.
@@ -1339,19 +1340,16 @@ impl PyMap {
             Some(false),
         )?;
         let mut pointcloud = roadgen_carla::PointCloudConfig::default();
-        for (value, field, what) in [
-            (spacing, &mut pointcloud.spacing, "spacing"),
-            (cell_size, &mut pointcloud.cell_size, "cell_size"),
-        ] {
-            if let Some(value) = value {
-                if !(value.is_finite() && value > 0.0) {
-                    return Err(PyValueError::new_err(format!(
-                        "{what} is a length in metres, greater than zero; got {value}"
-                    )));
-                }
-                *field = value;
-            }
+        if let Some(spacing) = spacing {
+            pointcloud.spacing = spacing;
         }
+        if let Some(cell_size) = cell_size {
+            pointcloud.cell_size = cell_size;
+        }
+        // The exporter's own rules, raised as the caller's mistake they are.
+        pointcloud
+            .validate()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let map = self.built.as_ref().expect("just built");
         let frame = roadgen_lanelet2::LocalCoordinates::for_map(map).map_err(runtime_error)?;
         let written =
