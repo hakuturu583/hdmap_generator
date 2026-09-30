@@ -1,0 +1,282 @@
+# IR ダンプとフォーマット間 ID トレース — 設計案
+
+*2026-09 設計ドラフト。未実装。*
+
+## 1. 何を解きたいか
+
+roadgen は 1 つの Canonical Road IR から 7 つのフォーマットを書く。書かれた側の ID は
+それぞれ別の規則で振られ、IR 側には何も戻らない（`id.rs` の doc: "OpenDRIVE ids and
+Lanelet2 ids are assigned by the exporters, from these, and never flow back"）。
+その結果、次のような問いに今は答えられない:
+
+- Autoware で問題が出た lanelet `1000123` は、OpenDRIVE のどの road / lane か？
+- SUMO の `north.fwd_1` は Lanelet2 のどの lanelet か？
+- 外部から読んだ `.xodr` の road 12 / lane -2 は、書き出した Lanelet2 のどれになったか？
+
+実際 `tests/integration/tests/cross_format.rs` は IR→OpenDRIVE の対応
+（road 番号 = arena 順、lane 番号 = ±ordinal）を**テスト側で手書きで再導出**している。
+この知識をライブラリの出力にしたい、というのが本提案。
+
+## 2. 重要な前提: IR ダンプ単体ではトレースできない
+
+調査結果（各 exporter の ID 採番規則）:
+
+| フォーマット | 出力 ID の決まり方 | IR から純関数で再計算できるか | 既存の対応表 |
+| --- | --- | --- | --- |
+| OpenDRIVE | road = arena 順の番号、junction = roads.len()+順、lane = ±ordinal（section 内）、signal/object = objects 順、building = objects.len()+順 | ○（`Numbering`） | private `Numbering`、public な `lane_id`/`junction_id`/`signal_id` |
+| SUMO | 文字列。edge = `<road>[.<section>].<fwd\|bwd>`、lane = `<edge>_<右から数えた index>`、node = `j_<junction>` 等 | ○（ただしオプションとセクション構成に依存） | public `PlainNetwork.lanes` のみ |
+| Lanelet2 | **連番**（points 1000〜、その他 1001000〜、構築順） | ✕（構築過程をなぞる必要がある） | private `Exporter.lanelets` / `objects` / `boundaries`、`run()` で捨てられる |
+| OSM | **負の連番**（ノード・ウェイ・リレーション共通） | ✕ | private `ways` / `junction_nodes` |
+| CARLA | `.xodr` は OpenDRIVE と同一。メッシュ名は `<map>_<kind>_<subtype>_<ordinal>` | 部分的 | furniture manifest（object ↔ signal ↔ actor）は既に JSON 出力 |
+| ClipGT | Parquet の**行番号**のみ | ✕ | なし |
+| GPUDrive | 配列 index のみ | ✕ | なし |
+
+→ Lanelet2 / OSM / ClipGT / GPUDrive の ID は IR に含まれない情報（構築順・フィルタ・
+重複排除）で決まる。**IR をダンプしただけでは対応は復元できない**。
+トレースは「IR ダンプ」＋「各 exporter が書き出し時に記録した対応表」の組で初めて成立する。
+
+## 3. 全体像: IR ID をハブにしたスター型
+
+```
+   lanelet2:lanelet:1000123 ─┐                     ┌─ opendrive:lane:0/1/-1
+   sumo:lane:north.fwd_0 ────┼──▶  lane/north/0  ──┼─ clipgt:lane:17
+   osm:way:-42 ──────────────┘   (IR の安定 ID)     └─ gpudrive:road:5
+```
+
+フォーマット間を直接つなぐ表は作らない。各フォーマットは **IR ID との対応だけ**を持ち、
+A→B の変換は `A → IR ID(s) → B` の合成で行う。フォーマットが 7 個あっても表は 7 本で済み、
+新しい exporter を足しても既存の表に触らない。
+
+ハブになれるのは IR ID が「呼び出し側の入力から導かれ、カウンタではない」からで、
+これは既存設計（`id.rs`）がすでに保証している性質。
+
+## 4. 成果物: `map.trace.json`（1 ファイル）
+
+```jsonc
+{
+  "schema": "roadgen-trace/1",
+  "generator": { "name": "roadgen", "version": "0.3.2" },
+  "ir": {
+    "fingerprint": "sha256:…",          // 下記 ir セクションの正規化 JSON のハッシュ
+    "metadata": { "name": "town", "handedness": "right", "projection": "…", "origin": {…} },
+    "roads":       [{ "id": "road/north", "name": "north", "junction": null,
+                      "sections": [{ "station": 0.0, "lanes": ["lane/north/0", "lane/north/1"] }],
+                      "predecessor": null, "successor": {"junction": "junction/j0"} }],
+    "lanes":       [{ "id": "lane/north/0", "road": "road/north", "section": 0,
+                      "side": "right", "ordinal": 1, "direction": "forward", "type": "driving" }],
+    "junctions":   [{ "id": "junction/j0", "incoming": [...], "connecting": [...] }],
+    "connections": [{ "id": "connection/j0/north_0/east_0",
+                      "from": "lane/north/0", "to": "lane/j0_c3/0", "junction": "junction/j0" }],
+    "objects":     [{ "id": "object/tl_0", "kind": "traffic_light", "lanes": ["lane/north/0"] }],
+    "rules":       [{ "kind": "right_of_way", "lanes": [...] }],
+    "buildings":   [{ "id": "building/north/left/3/0", "parts": ["part/north/left/3/0/0"] }]
+  },
+  "exports": {
+    "opendrive": {
+      "files":   [{ "path": "map.xodr", "sha256": "…" }],
+      "options": { … },                   // 採番に影響するオプションだけ
+      "links": [
+        { "ir": "road/north",   "ref": "road:0",      "rel": "exact" },
+        { "ir": "lane/north/0", "ref": "lane:0/0/-1", "rel": "exact" },
+        { "ir": "connection/j0/north_0/east_0", "ref": "connection:4/0", "rel": "merged" }
+      ]
+    },
+    "lanelet2": {
+      "files": [{ "path": "map.osm", "sha256": "…" }],
+      "links": [
+        { "ir": "lane/north/0", "ref": "lanelet:1000123",    "rel": "exact",  "role": "lanelet" },
+        { "ir": "lane/north/0", "ref": "linestring:1000124", "rel": "exact",  "role": "centerline" },
+        { "ir": "lane/north/0", "ref": "linestring:1000010", "rel": "merged", "role": "left_boundary" },
+        { "ir": "object/tl_0",  "ref": "regulatory_element:1000500", "rel": "exact" }
+      ]
+    },
+    "sumo":     { "links": [{ "ir": "road/north", "ref": "edge:north.fwd", "rel": "part" }, …] },
+    "osm":      { … }, "carla": { … }, "clipgt": { "links": [{ "ir": "lane/north/0", "ref": "lane:17" }] },
+    "gpudrive": { … }
+  }
+}
+```
+
+### 4.1 `ir` セクション = IR ダンプ（フェーズ 1 は「カタログ」）
+
+トレースに要るのは **ID・所属・トポロジ・意味属性**で、幾何は要らない。
+フェーズ 1 のダンプはこの「IR カタログ」に絞る:
+
+- 小さい（数千 lane でも数百 KB）、diff が読める、スキーマが安定しやすい
+- 再生成前後の `ir` を diff すれば「ID が変わった / 消えた」が一目で分かる（副次効果）
+
+幾何まで含む完全ダンプ（再読込で `Map` を復元できるもの）はフェーズ 3 に回す（§8）。
+
+### 4.2 `ref` = フォーマット内ローカル参照
+
+`"<kind>:<local>"` の文字列。フォーマット名は外側のキー。
+グローバルに書くときは `"<format>:<kind>:<local>"`（例 `lanelet2:lanelet:1000123`）。
+
+| format | kind 例 | local の形 |
+| --- | --- | --- |
+| opendrive | `road` `junction` `lane` `signal` `object` `building` `connection` `controller` | `lane:<road>/<section index>/<lane no>`、`connection:<junction>/<connection id>` |
+| lanelet2 | `lanelet` `linestring` `point` `regulatory_element` | 整数 |
+| sumo | `edge` `lane` `node` `connection` `tls` | SUMO の ID 文字列、connection は `<fromLane>><toLane>` |
+| osm | `node` `way` `relation` | 負の整数 |
+| carla | `mesh` `actor` + `.xodr` 分は opendrive を参照 | 名前 |
+| clipgt | レイヤ名 (`lane` `lane_line` `wait_line` …) | 行番号 |
+| gpudrive | `road` `agent` | 配列 index |
+
+OpenDRIVE の lane 番号は section 内でしか一意でないので、section index を必ず含める。
+
+### 4.3 `rel` = 多重度
+
+IR とフォーマットは 1:1 とは限らない。これを明示しないと逆引きが嘘をつく。
+
+| rel | 意味 | 例 |
+| --- | --- | --- |
+| `exact` | 1 IR 要素 ↔ 1 出力要素 | lane ↔ lanelet、lane ↔ SUMO lane |
+| `part` | 1 IR 要素が複数出力に分割され、この出力はその一部 | road → SUMO edge（方向×section）、building → OSM part way |
+| `merged` | 複数 IR 要素が 1 出力に統合され、この IR はその一部 | 共有境界 linestring、OpenDRIVE `<connection>`、OSM ノードに乗った信号 |
+| `collapsed` | 出力に対応物がなく、別の要素に吸収された | SUMO では connector road の lane → そのまま `<connection>` に畳まれる |
+
+`role` は同じ IR 要素から複数出力が出るときの区別（`lanelet` / `centerline` /
+`left_boundary` …）。出力に現れない IR 要素（ClipGT の非走行 lane 等）は
+**リンクを書かない**＝「このフォーマットには存在しない」を意味する。
+
+### 4.4 整合性チェック
+
+Lanelet2 / OSM / ClipGT の ID は構築順で決まるので、ファイルを作り直すと古い trace は
+**黙って間違った答え**を返す。これを防ぐため:
+
+- `exports.<fmt>.files[].sha256` — 読込時に実ファイルと照合し、不一致なら警告/エラー
+- `ir.fingerprint` — 同じ IR から出たエクスポートかどうかの判定
+- `generator.version` — 採番規則の変更を追うため
+
+## 5. Rust 側の設計
+
+### 5.1 `roadgen-core::trace`（フォーマット非依存）
+
+core はフォーマットを知らないという既存の分離を守り、型だけを置く:
+
+```rust
+pub enum IrRef { Road(RoadId), Lane(LaneId), Junction(JunctionId),
+                 Connection(ConnectionId), Object(ObjectId),
+                 Building(BuildingId), BuildingPart(BuildingPartId), Rule(usize) }
+
+pub enum Relation { Exact, Part, Merged, Collapsed }
+
+pub struct TraceLink { pub ir: IrRef, pub local: String /* "<kind>:<local>" */,
+                       pub relation: Relation, pub role: Option<&'static str> }
+
+#[derive(Default)]
+pub struct Trace { pub format: &'static str, pub links: Vec<TraceLink> }
+```
+
+`IrRef` は「任意の IR 要素を 1 つの型で指す」もので、`TrafficRule` には ID が無いので
+`rules` の index で指す（ルールに ID を振るのは別途検討）。
+
+### 5.2 各 exporter: `*_traced` を追加（既存 API は不変）
+
+| crate | 追加 API | 実装方針 | 手間 |
+| --- | --- | --- | --- |
+| roadgen-opendrive | `trace(&map, &options) -> Trace` | `Numbering` をそのまま Trace に変換。純関数なので書き出し不要。junction `<connection>` / controller は `junction()` / `signal_groups` の採番を関数に切り出して共有 | 小 |
+| roadgen-sumo | `PlainNetwork.trace` | 既存 `lanes` に加え、`edge_id()` / node 命名 / connection の BTreeSet から road→edge、junction→node、connection を記録 | 小 |
+| roadgen-lanelet2 | `export_traced() -> (Arc<LaneletMap>, Trace)` | `Exporter::run` の最後に `lanelets` / `objects` / `boundaries` / `own_boundaries` を Trace に畳む。reg-elem は `build_rules` で記録を追加 | 小〜中 |
+| roadgen-osm | 同上 | `ways` / `junction_nodes` を流用。furniture のノード統合・building way・restriction relation は記録を追加 | 中 |
+| roadgen-clipgt | 各レイヤの行を push する箇所で `(IrRef, layer, row)` を記録 | 行番号 = ID なので push 時に記録するのが唯一の方法 | 中 |
+| roadgen-gpudrive | 同上（`roads.len()` を採番している箇所） | | 中 |
+| roadgen-carla | `.xodr` 分は opendrive の Trace を再利用。furniture manifest は既存。メッシュは `Mesh` に `sources: Vec<IrRef>` を持たせる | メッシュ対応が最大の手間。フェーズ 2 に回す | 大 |
+
+**鉄則: 採番ロジックを二重に書かない。** trace は exporter が実際に使った表から作る。
+OpenDRIVE の `signal_id` 等のように「別途 `Numbering::new` を呼び直す」形は、
+採番と trace がずれる余地があるので、trace は同じインスタンスから出す。
+
+### 5.3 リーダ側: `read_opendrive` にも Trace を
+
+外部 `.xodr` → IR → Lanelet2 のトレースが本機能で一番価値のあるユースケースになる
+（「元データのこの lane が Autoware のどの lanelet か」）。現状:
+
+- road / junction は `road/<xodr id>` として IR ID に残る → そのまま追える
+- **lane 番号は失われる**（`Reader.lanes: HashMap<(RoadId, section, i64), LaneId>` が
+  `run()` 終了時に捨てられる）
+- object は `name` が `object/…` ならそれ、なければ `object/<xodr id>`（重複時 `-N`）
+
+→ `Imported` に `source_trace: Trace`（format = `"opendrive"`, `rel` は `exact` 固定）を
+追加し、`Reader.lanes` と `signal_ids` / building 名をそこへ出す。
+trace ファイル上は `"sources": { "opendrive": {…} }` として `exports` と対称に置く。
+これで「入力 xodr の lane → 出力 lanelet」が同じ合成で引ける。
+
+### 5.4 検索 API: `TraceIndex`
+
+```rust
+let index = TraceIndex::load("map.trace.json")?;          // sha256 照合もここで
+index.to_ir("lanelet2", "lanelet:1000123")                 // -> Vec<(IrRef, Relation)>
+index.from_ir(&IrRef::Lane(id), "sumo")                    // -> Vec<&TraceLink>
+index.translate("lanelet2", "lanelet:1000123", "opendrive") // 合成
+```
+
+`translate` の合成規則:
+
+1. `from` の ref → IR 要素集合（`merged` なら複数）
+2. 対象フォーマットにリンクがない IR 要素は、IR の関係で**1 段だけ**広げる
+   （lane → その road、connector lane → それを通る connection）。広げた場合は
+   結果に `via` を付けて「近似」であることを返す
+3. 各 IR 要素 → `to` の ref 集合
+
+結果は常に集合で返し、1:1 を仮定しない。
+
+## 6. Python / CLI
+
+PyMap は既に `*_warnings` をエクスポートごとに保持しているので、同じ形で
+**エクスポート時に Trace を蓄積**し、最後にまとめて書く:
+
+```python
+m.export_opendrive("out/map.xodr")
+m.export_lanelet2("out/lanelet2_map.osm")
+m.export_sumo("out/sumo/")
+m.export_trace("out/map.trace.json")      # IR カタログ + ここまでの全 exports
+
+t = roadgen.Trace.load("out/map.trace.json")
+t.to_ir("lanelet2", 1000123)               # ['lane/north/0']
+t.translate("lanelet2", 1000123, to="opendrive")   # [('lane', '0/0/-1')]
+t.translate("sumo", "north.fwd_0", to="lanelet2")
+```
+
+```
+python -m roadgen trace out/map.trace.json lanelet2:lanelet:1000123 --to opendrive sumo
+```
+
+`export_trace` を書き出し関数ごとのサイドカー（`map.xodr.trace.json`）にしない理由:
+合成には全フォーマットが 1 か所に揃っている必要があり、ファイルを集める手間を
+ユーザに渡したくないから。ただし `Trace` 単体の JSON 化も公開しておけば、
+サイドカー運用が欲しい人はそれで足りる。
+
+Web デモ（viewer）では、同じ Trace を使って「あるフォーマットで要素をクリック →
+他フォーマットの対応要素をハイライト」ができる。フェーズ 2 以降の候補。
+
+## 7. テスト
+
+- `cross_format.rs` の手書き対応（`opendrive_lane_id`、「n 番目の road は n 番目」）を
+  `trace` に置き換え、**trace 自体を既存の幾何比較で検証する**:
+  trace が lane A ↔ lanelet X と言うなら、両者の中心線が一致すること
+- 各 exporter: 出力ファイルを再パースし、trace の全 `ref` が実在すること、
+  `exact` の IR 要素が重複しないこと
+- `reimport.rs`: xodr → IR → xodr で `sources` と `exports` を合成すると
+  元の lane 番号に戻ること
+- 決定性: 同じ入力から 2 回作った trace が byte 単位で一致すること
+
+## 8. 段階的導入
+
+| フェーズ | 内容 |
+| --- | --- |
+| 1 | `roadgen-core::trace` 型、IR カタログ JSON、OpenDRIVE / SUMO / Lanelet2 の trace、`TraceIndex`、Python `export_trace` / `Trace.load` / `translate`。core には serde を入れず、JSON 化は専用の小 crate（`roadgen-trace`）に置く |
+| 2 | OSM / ClipGT / GPUDrive / CARLA（furniture と xodr 分）、`read_opendrive` の source trace、CLI |
+| 3 | 完全 IR ダンプ（幾何込み）。`roadgen-core` に `serde` feature を足し、`Curve3` / `WidthProfile` 等まで derive、`Map` を JSON から復元 → `validate()`。再現性・バグ報告添付・生成器を通さない再エクスポートに使える。スキーマ維持コストが大きいので需要を見てから |
+
+## 9. 決めてほしいこと
+
+1. **ダンプの範囲**: フェーズ 1 は「ID/トポロジ/属性のカタログ」で良いか、最初から
+   幾何込みの完全ダンプ（再読込可能）が欲しいか。
+2. **ファイル形式**: JSON で良いか（大規模マップで重ければ `links` だけ
+   Parquet/CSV に逃がす選択肢もある）。
+3. **優先フォーマット**: フェーズ 1 の 3 つ（OpenDRIVE / SUMO / Lanelet2）で
+   想定ユースケースが満たせるか。特に外部 xodr 起点の追跡（§5.3）を先にやるべきか。
+4. **出力への ID 埋め込み**: 補助として、Lanelet2 の lanelet に `roadgen:id=lane/north/0`
+   タグを付ける等、ファイル自体に IR ID を書く案もある（trace ファイルが無くても
+   追える）。Autoware の読み込みに影響しない範囲で併用するか。
