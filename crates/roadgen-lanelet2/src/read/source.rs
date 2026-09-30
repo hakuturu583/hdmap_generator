@@ -9,7 +9,7 @@ use ll2_projection::LocalCartesian;
 
 use roadgen_core::geometry::Point3;
 
-use super::{project, Approximations};
+use super::{project, Approximations, ReadOptions};
 use crate::error::ImportError;
 
 /// One lanelet, with its boundaries pointing the way it runs.
@@ -58,13 +58,15 @@ pub(crate) struct Source<'a> {
     pub predecessors: HashMap<Id, Vec<Id>>,
     /// Lanelets of the file read as part of another, and which.
     pub merged_into: HashMap<Id, Id>,
+    /// What the caller said of the file, and how it is to be read.
+    pub options: &'a ReadOptions,
 }
 
 impl<'a> Source<'a> {
     pub fn new(
         document: &'a Document,
         projector: &LocalCartesian,
-        max_seam_along: Option<f64>,
+        options: &'a ReadOptions,
         approximations: &mut Approximations,
     ) -> Result<Self, ImportError> {
         let mut points = HashMap::with_capacity(document.nodes.len());
@@ -92,7 +94,7 @@ impl<'a> Source<'a> {
             }
         }
 
-        let merged_into = match max_seam_along {
+        let merged_into = match options.max_seam_along {
             Some(limit) => merge_oblique_seams(&mut lanelets, &points, limit, approximations),
             None => HashMap::new(),
         };
@@ -123,6 +125,7 @@ impl<'a> Source<'a> {
             successors,
             predecessors,
             merged_into,
+            options,
         })
     }
 
@@ -240,7 +243,7 @@ fn lanelet(
 
 /// Reads each lanelet that runs into exactly one other across a seam running more
 /// than `max_seam_along` metres along the lane — see
-/// [`ReadOptions::max_seam_along`](super::ReadOptions::max_seam_along) — and that one out of exactly it, as one lanelet
+/// [`ReadOptions::max_seam_along`] — and that one out of exactly it, as one lanelet
 /// with the other: their boundaries joined end to end, keeping the first one's id
 /// and its boundaries' ways. Where the seam lies is lost, and nothing else: the two
 /// must be ordinary lanes of one kind, going one way at one speed, and whatever

@@ -46,8 +46,9 @@ fn outside(polygon: &[(f64, f64)], p: (f64, f64)) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-#[test]
-fn a_lane_rounding_a_corner_with_steep_ends_stays_on_the_road() {
+/// How far OpenDRIVE draws any lane edge off the two lanelets, metres, read with
+/// a reference line that turns at most `max_end_lean_degrees` at each end.
+fn worst_overhang(max_end_lean_degrees: f64) -> f64 {
     // Lanelets 468 and 471 of Autoware's Nishi-Shinjuku map, as drawn: the two
     // lanes of a U-shaped corner under left-hand traffic, sharing the line between
     // them. 468 is the outer one, and its ends are drawn at 64° and 75° across it.
@@ -129,6 +130,7 @@ fn a_lane_rounding_a_corner_with_steep_ends_stays_on_the_road() {
         &osm.xml(),
         &ReadOptions {
             handedness: TrafficHandedness::LeftHand,
+            max_end_lean_degrees,
             ..ReadOptions::default()
         },
     )
@@ -186,10 +188,24 @@ fn a_lane_rounding_a_corner_with_steep_ends_stays_on_the_road() {
             }
         }
     }
-    // Before the reader could turn a reference line more than 45°, the outer lane
-    // swung 1.2 m out past its ends.
+    worst
+}
+
+#[test]
+fn a_lane_rounding_a_corner_with_steep_ends_stays_on_the_road() {
+    let worst = worst_overhang(roadgen_lanelet2::DEFAULT_MAX_END_LEAN_DEGREES);
     assert!(
         worst < 0.05,
         "OpenDRIVE draws a lane {worst} m off the road"
+    );
+}
+
+#[test]
+fn how_far_a_reference_line_turns_at_an_end_is_an_option() {
+    // Turning no more than 45°, the outer lane swings out past its ends.
+    let worst = worst_overhang(45.0);
+    assert!(
+        worst > 0.5,
+        "OpenDRIVE draws a lane only {worst} m off the road"
     );
 }

@@ -67,6 +67,8 @@ pub enum ImportError {
     /// not there, a way that names a node that is not there.
     Inconsistent(String),
     Io(String),
+    /// A [`ReadOptions`](crate::ReadOptions) value the reader cannot use.
+    Option(String),
 }
 
 impl From<GeometryError> for ImportError {
@@ -90,6 +92,7 @@ impl fmt::Display for ImportError {
             ImportError::Unsupported(what) => write!(f, "the IR cannot hold {what}"),
             ImportError::Inconsistent(what) => write!(f, "the map contradicts itself: {what}"),
             ImportError::Io(detail) => write!(f, "{detail}"),
+            ImportError::Option(detail) => write!(f, "{detail}"),
         }
     }
 }

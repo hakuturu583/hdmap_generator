@@ -82,12 +82,59 @@ pub struct ReadOptions {
     /// By default [`DEFAULT_MAX_SEAM_ALONG`]. At zero every such pair with a seam
     /// not square to the lane is joined, and whole runs of lanelets become one lane.
     pub max_seam_along: Option<f64>,
+    /// How far a road's reference line may turn at an end to meet the end square,
+    /// degrees, below 90.
+    ///
+    /// OpenDRIVE ends every lane on the reference line's normal, and a lanelet's
+    /// end is rarely drawn square to the lane, so the reference line turns near
+    /// each end until its normal lies along the end. The further it turns, the
+    /// more steeply drawn an end it meets; turned too hard, the normals fan so fast
+    /// near the end that the lanes laid out along them fold. A turn that would take
+    /// more than this is not made, and the lanes end on the reference line's
+    /// normal where the file draws them slantwise. By default
+    /// [`DEFAULT_MAX_END_LEAN_DEGREES`].
+    pub max_end_lean_degrees: f64,
+    /// How far OpenDRIVE may draw a lane edge from where the file draws it, metres,
+    /// before the reader tries harder: lanes side by side are split into roads of
+    /// their own, and a lone lane is laid out from its middle or its far side. By
+    /// default [`DEFAULT_MAX_EDGE_MISS`].
+    pub max_edge_miss: f64,
+    /// How far a lane's height off the road's tilted surface may stray from the
+    /// file's before another knot is kept, metres. By default
+    /// [`DEFAULT_LIFT_TOLERANCE`].
+    pub lift_tolerance: f64,
+    /// How close the ends of two `turn_direction` lanelets have to come for them to
+    /// be one junction, metres. By default [`DEFAULT_JUNCTION_END_DISTANCE`]: about
+    /// a lane's width, how far apart the two movements round one corner of a
+    /// crossroads start and finish — they neither cross nor share a lane.
+    pub junction_end_distance: f64,
+    /// How far apart in height two `turn_direction` lanelets that cross in plan, or
+    /// whose ends meet, may be and still be one junction, metres: further apart,
+    /// one passes over the other. By default [`DEFAULT_GRADE_SEPARATION`].
+    pub grade_separation: f64,
 }
 
 /// [`ReadOptions::max_seam_along`] by default, metres. On Autoware's
 /// Nishi-Shinjuku map two seams run 19 and 22 m along the lane and the next
 /// longest 3.5 m.
 pub const DEFAULT_MAX_SEAM_ALONG: f64 = 10.0;
+
+/// [`ReadOptions::max_end_lean_degrees`] by default. On Autoware's Nishi-Shinjuku
+/// map a lane rounding a corner whose ends are drawn at 64° and 75° across it
+/// needs this much; at 45° its outer edge swung 1.2 m past its ends.
+pub const DEFAULT_MAX_END_LEAN_DEGREES: f64 = 80.0;
+
+/// [`ReadOptions::max_edge_miss`] by default, metres.
+pub const DEFAULT_MAX_EDGE_MISS: f64 = 0.1;
+
+/// [`ReadOptions::lift_tolerance`] by default, metres.
+pub const DEFAULT_LIFT_TOLERANCE: f64 = 0.005;
+
+/// [`ReadOptions::junction_end_distance`] by default, metres.
+pub const DEFAULT_JUNCTION_END_DISTANCE: f64 = 4.0;
+
+/// [`ReadOptions::grade_separation`] by default, metres.
+pub const DEFAULT_GRADE_SEPARATION: f64 = 3.0;
 
 impl Default for ReadOptions {
     fn default() -> Self {
@@ -96,7 +143,47 @@ impl Default for ReadOptions {
             origin: None,
             sampling: SamplingConfig::default(),
             max_seam_along: Some(DEFAULT_MAX_SEAM_ALONG),
+            max_end_lean_degrees: DEFAULT_MAX_END_LEAN_DEGREES,
+            max_edge_miss: DEFAULT_MAX_EDGE_MISS,
+            lift_tolerance: DEFAULT_LIFT_TOLERANCE,
+            junction_end_distance: DEFAULT_JUNCTION_END_DISTANCE,
+            grade_separation: DEFAULT_GRADE_SEPARATION,
         }
+    }
+}
+
+impl ReadOptions {
+    /// Whether every option is one the reader can use: each length finite and not
+    /// negative, the edge miss above zero, and the end lean below a right angle.
+    pub fn check(&self) -> Result<(), ImportError> {
+        let length = |name: &str, value: f64| {
+            if value.is_finite() && value >= 0.0 {
+                Ok(())
+            } else {
+                Err(ImportError::Option(format!(
+                    "{name} must be a length of zero or more, not {value}"
+                )))
+            }
+        };
+        if let Some(limit) = self.max_seam_along {
+            length("max_seam_along", limit)?;
+        }
+        length("lift_tolerance", self.lift_tolerance)?;
+        length("junction_end_distance", self.junction_end_distance)?;
+        length("grade_separation", self.grade_separation)?;
+        if !(self.max_edge_miss.is_finite() && self.max_edge_miss > 0.0) {
+            return Err(ImportError::Option(format!(
+                "max_edge_miss must be a length above zero, not {}",
+                self.max_edge_miss
+            )));
+        }
+        if !(0.0..90.0).contains(&self.max_end_lean_degrees) {
+            return Err(ImportError::Option(format!(
+                "max_end_lean_degrees must be at least 0 and below 90, not {}",
+                self.max_end_lean_degrees
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -111,6 +198,7 @@ pub struct Imported {
 
 /// Reads a Lanelet2 map from OSM XML already in memory.
 pub fn from_osm_str(xml: &str, options: &ReadOptions) -> Result<Imported, ImportError> {
+    options.check()?;
     let (document, errors) = ll2_io::osm::parse(xml).map_err(ImportError::Parse)?;
     let mut approximations = Approximations::default();
     if !errors.is_empty() {
@@ -127,12 +215,7 @@ pub fn from_osm_str(xml: &str, options: &ReadOptions) -> Result<Imported, Import
         metadata.origin.longitude(),
         metadata.origin.altitude(),
     )));
-    let source = Source::new(
-        &document,
-        &projector,
-        options.max_seam_along,
-        &mut approximations,
-    )?;
+    let source = Source::new(&document, &projector, options, &mut approximations)?;
 
     let mut map = Map::new(metadata);
     let built = roads::build(&source, &mut map, &mut approximations)?;

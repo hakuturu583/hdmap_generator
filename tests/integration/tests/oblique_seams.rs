@@ -147,3 +147,61 @@ fn a_seam_drawn_along_the_lane_is_read_as_one_lane() {
          {left_out} m of it"
     );
 }
+
+#[test]
+fn an_option_the_reader_cannot_use_is_refused() {
+    let (xml, _, _) = seam_along_the_lane();
+    let refused = |options: ReadOptions| {
+        roadgen_lanelet2::from_osm_str(&xml, &options)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+    };
+    let default = ReadOptions::default;
+    for (options, name) in [
+        (
+            ReadOptions {
+                max_seam_along: Some(-1.0),
+                ..default()
+            },
+            "max_seam_along",
+        ),
+        (
+            ReadOptions {
+                max_end_lean_degrees: 90.0,
+                ..default()
+            },
+            "max_end_lean_degrees",
+        ),
+        (
+            ReadOptions {
+                max_edge_miss: 0.0,
+                ..default()
+            },
+            "max_edge_miss",
+        ),
+        (
+            ReadOptions {
+                lift_tolerance: f64::NAN,
+                ..default()
+            },
+            "lift_tolerance",
+        ),
+        (
+            ReadOptions {
+                junction_end_distance: -0.5,
+                ..default()
+            },
+            "junction_end_distance",
+        ),
+        (
+            ReadOptions {
+                grade_separation: f64::INFINITY,
+                ..default()
+            },
+            "grade_separation",
+        ),
+    ] {
+        assert!(refused(options).contains(name), "{name} was not refused");
+    }
+}

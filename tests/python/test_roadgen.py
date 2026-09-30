@@ -1437,6 +1437,28 @@ def test_how_long_a_seam_is_before_two_lanelets_are_one_lane_is_an_option(tmp_pa
         roadgen.read_lanelet2(path, max_seam_along=-1.0)
 
 
+def test_the_lanelet2_reconstruction_takes_its_tuning_as_options(tmp_path):
+    path = seam_along_the_lane(tmp_path / "seam.osm")
+    defaults = dict(
+        max_end_lean_degrees=80.0,
+        max_edge_miss=0.1,
+        lift_tolerance=0.005,
+        junction_end_distance=4.0,
+        grade_separation=3.0,
+    )
+    tuned = roadgen.read_lanelet2(path, handedness="LHT", **defaults)
+    assert tuned.road_ids() == roadgen.read_lanelet2(path, handedness="LHT").road_ids()
+    for name, value in [
+        ("max_end_lean_degrees", 90.0),
+        ("max_edge_miss", 0.0),
+        ("lift_tolerance", -1.0),
+        ("junction_end_distance", math.nan),
+        ("grade_separation", math.inf),
+    ]:
+        with pytest.raises(ValueError, match=name):
+            roadgen.read_lanelet2(path, **{name: value})
+
+
 def test_reading_a_file_that_is_not_lanelet2_says_so(tmp_path):
     with pytest.raises(ValueError):
         roadgen.read_lanelet2(str(tmp_path / "nothing.osm"))

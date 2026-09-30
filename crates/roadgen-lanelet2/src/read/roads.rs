@@ -196,9 +196,10 @@ fn make_road(
         // twenty metres before its neighbour — cannot share one pair of ends, and
         // lanes on either side of a crown cannot share one tilt. Each run of them
         // that can becomes a road of its own.
-        Ok(built_road) if built_road.miss > MAX_MISS && group.len() > 1 => {
+        Ok(built_road) if built_road.miss > source.options.max_edge_miss && group.len() > 1 => {
             let fits = |run: &[&Lanelet]| {
-                road(source, map, &id, run, connector).is_ok_and(|built| built.miss <= MAX_MISS)
+                road(source, map, &id, run, connector)
+                    .is_ok_and(|built| built.miss <= source.options.max_edge_miss)
             };
             let mut runs = Vec::new();
             let mut start = 0;
@@ -215,7 +216,7 @@ fn make_road(
             }
         }
         Ok(BuiltRoad { road, lanes, miss }) => {
-            if miss > MAX_MISS {
+            if miss > source.options.max_edge_miss {
                 approximations.count(
                     "OpenDRIVE ends a road's lanes square to its reference line, so {n} \
                      lanelets whose end is drawn along the way they run come out more than \
@@ -266,10 +267,6 @@ struct BuiltRoad {
     lanes: Vec<Lane>,
     miss: f64,
 }
-
-/// How far OpenDRIVE may move a lane edge before the lanes are split into separate
-/// roads, metres.
-const MAX_MISS: f64 = 0.1;
 
 /// How far the reference line turns to meet each end square, as fractions of the
 /// full turn: tried in this order until the lanes it lays out stay on the file's
@@ -336,7 +333,12 @@ fn road(
     // may be laid out from its middle or its far side instead. The reference line
     // then no longer ends where the next road's does, so the two are joined by a
     // stub in a junction of their own rather than linked, which is no loss.
-    if !connector && group.len() == 1 && best.as_ref().is_some_and(|built| built.miss > MAX_MISS) {
+    if !connector
+        && group.len() == 1
+        && best
+            .as_ref()
+            .is_some_and(|built| built.miss > source.options.max_edge_miss)
+    {
         for base in [midline(&edges[0], &edges[1]), edges[1].clone()] {
             for lean in LEANS {
                 match road_along(source, map, id, group, &edges, &base, lean) {
@@ -367,7 +369,14 @@ fn road_along(
     let config = map.metadata.sampling;
     let side = map.metadata.handedness.side_for(Direction::Forward);
 
-    let reference_line = smooth_reference(edges, base, side, config, lean)?;
+    let reference_line = smooth_reference(
+        edges,
+        base,
+        side,
+        config,
+        lean,
+        source.options.max_end_lean_degrees.to_radians(),
+    )?;
     let length = reference_line.horizontal_length()?;
     let mut road = Road {
         id: id.clone(),
@@ -523,7 +532,11 @@ fn road_along(
             direction: Direction::Forward,
             lane_type: lane_type(&lanelet.subtype).unwrap_or(LaneType::Driving),
             width,
-            height: lane_height(&lifts[index], &lifts[index + 1])?,
+            height: lane_height(
+                &lifts[index],
+                &lifts[index + 1],
+                source.options.lift_tolerance,
+            )?,
             speed_limit: lanelet
                 .speed_limit_kph
                 .map(SpeedLimit::from_kph)
@@ -677,16 +690,6 @@ fn station_of(samples: &[Sample], point: Point3) -> Option<f64> {
     best.map(|(station, _)| station)
 }
 
-/// How far a road's end may lean before the reference line stops turning to meet
-/// it square, radians. Beyond this the end is drawn along the way the road runs
-/// far more than across it. Short of it the turn is only tried: a turn that folds
-/// the cross-section strays from the file's boundaries, and the search keeps the
-/// reference line that strays least. On Nishi-Shinjuku a limit of 45° left a lane
-/// rounding a corner, its ends drawn at 64° and 75°, overhanging the road by six
-/// square metres at each end; at 80° it overhangs by none, and no lane's path
-/// jumps where it hands over to the next.
-const MAX_END_LEAN: f64 = 80.0 * std::f64::consts::PI / 180.0;
-
 /// Vertices of the reference boundary closer together than this are one vertex,
 /// metres; a cubic through two nearly coincident points only wobbles.
 const MIN_SPACING: f64 = 0.05;
@@ -712,6 +715,7 @@ fn smooth_reference(
     side: LateralSide,
     config: SamplingConfig,
     lean: f64,
+    max_end_lean: f64,
 ) -> Result<Curve3, ImportError> {
     let mut points: Vec<Point3> = vec![base[0]];
     for point in &base[1..base.len() - 1] {
@@ -757,7 +761,7 @@ fn smooth_reference(
         let (lx, ly) = (side.sign() * cx / across, side.sign() * cy / across);
         let (tx, ty) = (ly, -lx);
         let turn = (dx * ty - dy * tx).atan2(dx * tx + dy * ty);
-        if turn.abs() <= MAX_END_LEAN {
+        if turn.abs() <= max_end_lean {
             // `lean` of the way from the boundary's own direction to square.
             let (sin, cos) = (turn * lean).sin_cos();
             tangents[index] = (dx * cos - dy * sin, dx * sin + dy * cos, grade);
@@ -845,9 +849,13 @@ fn crossing(frame: &Frame3, polyline: &[Point3]) -> Option<(f64, Point3)> {
 ///
 /// Measured at every station the widths are, which is far more knots than the lift
 /// needs: a knot a straight run through its neighbours already passes within
-/// [`LIFT_TOLERANCE`] of is left out, so a lane that sits on the surface is flat
+/// `tolerance` of is left out, so a lane that sits on the surface is flat
 /// and a kerb is a handful of knots.
-fn lane_height(inner: &[(f64, f64)], outer: &[(f64, f64)]) -> Result<LaneHeight, ImportError> {
+fn lane_height(
+    inner: &[(f64, f64)],
+    outer: &[(f64, f64)],
+    tolerance: f64,
+) -> Result<LaneHeight, ImportError> {
     let knots: Vec<(f64, f64, f64)> = outer
         .iter()
         .filter_map(|(station, out)| {
@@ -859,7 +867,7 @@ fn lane_height(inner: &[(f64, f64)], outer: &[(f64, f64)]) -> Result<LaneHeight,
         .collect();
     if knots
         .iter()
-        .all(|(_, inner, outer)| inner.abs() <= LIFT_TOLERANCE && outer.abs() <= LIFT_TOLERANCE)
+        .all(|(_, inner, outer)| inner.abs() <= tolerance && outer.abs() <= tolerance)
     {
         return Ok(LaneHeight::flat());
     }
@@ -877,8 +885,8 @@ fn lane_height(inner: &[(f64, f64)], outer: &[(f64, f64)]) -> Result<LaneHeight,
                 } else {
                     0.0
                 };
-                (a.1 + (b.1 - a.1) * t - knot.1).abs() <= LIFT_TOLERANCE
-                    && (a.2 + (b.2 - a.2) * t - knot.2).abs() <= LIFT_TOLERANCE
+                (a.1 + (b.1 - a.1) * t - knot.1).abs() <= tolerance
+                    && (a.2 + (b.2 - a.2) * t - knot.2).abs() <= tolerance
             });
             if !fits {
                 break;
@@ -890,10 +898,6 @@ fn lane_height(inner: &[(f64, f64)], outer: &[(f64, f64)]) -> Result<LaneHeight,
     }
     Ok(LaneHeight::new(kept)?)
 }
-
-/// How far a lane's lift may stray from the heights measured along it before
-/// another knot is kept, metres.
-const LIFT_TOLERANCE: f64 = 0.005;
 
 /// A profile running straight from each `(station, value)` to the next.
 fn linear_profile(knots: &[(f64, f64)]) -> Result<Poly3Profile, ImportError> {

@@ -1727,7 +1727,13 @@ fn read_opendrive(
 /// longitude, altitude)` for the map's `(0, 0)`, by default the middle of its nodes.
 /// Two lanelets one after the other whose seam runs more than `max_seam_along`
 /// metres along the lane are read as one lane, as OpenDRIVE cannot end a lane
-/// along such a seam; `None` never joins them.
+/// along such a seam; `None` never joins them. The rest tune the reconstruction:
+/// `max_end_lean_degrees`, how far a reference line turns to meet a slanted end
+/// square; `max_edge_miss`, metres a lane edge may stray before the reader tries
+/// other layouts; `lift_tolerance`, metres a lane's height may stray before another
+/// knot is kept; `junction_end_distance` and `grade_separation`, metres within
+/// which the ends of two turns make one junction, and the height apart beyond
+/// which two turns are on different levels.
 ///
 /// `Map.read_warnings()` says what the file stated that the map could not keep.
 #[pyfunction]
@@ -1738,21 +1744,25 @@ fn read_opendrive(
     sampling = 2.0,
     origin = None,
     max_seam_along = Some(roadgen_lanelet2::DEFAULT_MAX_SEAM_ALONG),
+    max_end_lean_degrees = roadgen_lanelet2::DEFAULT_MAX_END_LEAN_DEGREES,
+    max_edge_miss = roadgen_lanelet2::DEFAULT_MAX_EDGE_MISS,
+    lift_tolerance = roadgen_lanelet2::DEFAULT_LIFT_TOLERANCE,
+    junction_end_distance = roadgen_lanelet2::DEFAULT_JUNCTION_END_DISTANCE,
+    grade_separation = roadgen_lanelet2::DEFAULT_GRADE_SEPARATION,
 ))]
+#[allow(clippy::too_many_arguments)]
 fn read_lanelet2(
     path: PathBuf,
     handedness: &str,
     sampling: f64,
     origin: Option<(f64, f64, f64)>,
     max_seam_along: Option<f64>,
+    max_end_lean_degrees: f64,
+    max_edge_miss: f64,
+    lift_tolerance: f64,
+    junction_end_distance: f64,
+    grade_separation: f64,
 ) -> PyResult<PyMap> {
-    if let Some(limit) = max_seam_along {
-        if !(limit.is_finite() && limit >= 0.0) {
-            return Err(PyValueError::new_err(format!(
-                "max_seam_along must be a length of zero or more, not {limit}"
-            )));
-        }
-    }
     let options = roadgen_lanelet2::ReadOptions {
         handedness: TrafficHandedness::parse(handedness)
             .ok_or_else(|| PyValueError::new_err(format!("unknown handedness {handedness:?}")))?,
@@ -1762,6 +1772,11 @@ fn read_lanelet2(
             .map_err(value_error)?,
         sampling: SamplingConfig::new(sampling).map_err(value_error)?,
         max_seam_along,
+        max_end_lean_degrees,
+        max_edge_miss,
+        lift_tolerance,
+        junction_end_distance,
+        grade_separation,
     };
     let imported = roadgen_lanelet2::read_with(&path, &options).map_err(value_error)?;
     Ok(PyMap {

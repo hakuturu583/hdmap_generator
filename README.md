@@ -1821,6 +1821,22 @@ let map = imported.map.validate()?;
 roadgen_opendrive::write(&map, "map.xodr")?;
 ```
 
+How the reconstruction below judges a map can be tuned, in `ReadOptions` and as
+keyword arguments of `read_lanelet2`; each default is a `DEFAULT_*` constant of
+`roadgen_lanelet2`:
+
+| Option | Default | What it decides |
+|---|---|---|
+| `max_seam_along` | 10 m | How far along the lane a seam between two lanelets may run before they are read as one lane; `None` never joins them. |
+| `max_end_lean_degrees` | 80° | How far a reference line turns at an end to meet a slanted lanelet end square (below 90°). |
+| `max_edge_miss` | 0.1 m | How far a lane edge may stray from the file before side-by-side lanes become roads of their own, or a lone lane is laid out from its middle or far side. |
+| `lift_tolerance` | 5 mm | How far a lane's height off the tilted road surface may stray before another knot is kept. |
+| `junction_end_distance` | 4 m | How close the ends of two `turn_direction` lanelets come for them to be one junction. |
+| `grade_separation` | 3 m | How far apart in height two turns that cross or meet may be and still be one junction. |
+
+A value the reader cannot use — a negative length, a lean of 90° or more — is
+refused with an error naming the option.
+
 A Lanelet2 map holds every lane — both boundaries, in 3D, and the points two lanes
 share — and no road and no junction. So nothing about the lanes is regenerated: each
 lanelet a vehicle, a bicycle or a pedestrian moves along becomes one lane with the

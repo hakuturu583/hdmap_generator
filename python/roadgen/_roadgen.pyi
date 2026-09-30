@@ -255,6 +255,11 @@ def read_lanelet2(
     sampling: float = 2.0,
     origin: Optional[Point] = None,
     max_seam_along: Optional[float] = 10.0,
+    max_end_lean_degrees: float = 80.0,
+    max_edge_miss: float = 0.1,
+    lift_tolerance: float = 0.005,
+    junction_end_distance: float = 4.0,
+    grade_separation: float = 3.0,
 ) -> Map:
     """The Lanelet2 map at `path`, read as a map that exports like any other and
     cannot be added to. Lanelets that share a boundary become one road, and
@@ -262,8 +267,15 @@ def read_lanelet2(
     "LHT", which the file does not record. Two lanelets one after the other whose
     seam runs more than `max_seam_along` metres along the lane become one lane,
     named "lanelet a+b", as OpenDRIVE cannot end a lane along such a seam; `None`
-    never joins them. `Map.read_warnings()` says what the file stated that the map
-    could not keep."""
+    never joins them. The rest tune the reconstruction: `max_end_lean_degrees`
+    (below 90) is how far a reference line turns to meet a slanted lanelet end
+    square; `max_edge_miss` is metres a lane edge may stray before the reader
+    splits side-by-side lanes into roads of their own or lays a lone lane out from
+    its middle or far side; `lift_tolerance` is metres a lane's height may stray
+    before another knot is kept; `junction_end_distance` is metres within which the
+    ends of two turns make them one junction, and `grade_separation` the height
+    apart beyond which two turns are on different levels. `Map.read_warnings()`
+    says what the file stated that the map could not keep."""
 
 def render_opendrive(path: str) -> str:
     """The OpenDRIVE file at `path`, drawn as an SVG document."""

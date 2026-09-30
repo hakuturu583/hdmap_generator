@@ -30,17 +30,8 @@ use roadgen_core::topology::{
 
 use super::roads::Built;
 use super::source::Source;
-use super::Approximations;
+use super::{Approximations, ReadOptions};
 use crate::error::ImportError;
-
-/// Two connectors that cross in plan with more than this between their heights are
-/// on different levels, metres: one passes over the other.
-const GRADE_SEPARATION: f64 = 3.0;
-
-/// Two connectors whose ends come this close are at the same intersection, metres:
-/// about a lane's width, which is how far apart the two movements round one corner
-/// of a crossroads start and finish — they neither cross nor share a lane.
-const SAME_PLACE: f64 = 4.0;
 
 /// How close two roads' reference lines have to end to be linked, metres — the
 /// validation's own tolerance.
@@ -185,10 +176,18 @@ fn cluster(source: &Source, built: &Built) -> BTreeMap<Id, JunctionId> {
     let boxes: Vec<[f64; 4]> = lines.iter().map(|line| bounds(line)).collect();
     for i in 0..lines.len() {
         for j in i + 1..lines.len() {
-            if sets.find(i) == sets.find(j) || !overlap(&grown(&boxes[i]), &boxes[j]) {
+            if sets.find(i) == sets.find(j)
+                || !overlap(
+                    &grown(&boxes[i], source.options.junction_end_distance),
+                    &boxes[j],
+                )
+            {
                 continue;
             }
-            if ends_meet(&lines[i], &lines[j]) || cross_at_level(&lines[i], &lines[j]) {
+            let options = source.options;
+            if ends_meet(&lines[i], &lines[j], options)
+                || cross_at_level(&lines[i], &lines[j], options.grade_separation)
+            {
                 sets.union(i, j);
             }
         }
@@ -221,22 +220,18 @@ fn bounds(line: &[Point3]) -> [f64; 4] {
     )
 }
 
-fn grown(a: &[f64; 4]) -> [f64; 4] {
-    [
-        a[0] - SAME_PLACE,
-        a[1] - SAME_PLACE,
-        a[2] + SAME_PLACE,
-        a[3] + SAME_PLACE,
-    ]
+fn grown(a: &[f64; 4], by: f64) -> [f64; 4] {
+    [a[0] - by, a[1] - by, a[2] + by, a[3] + by]
 }
 
-/// Whether an end of one line is within [`SAME_PLACE`] of an end of the other, at
-/// the same level.
-fn ends_meet(a: &[Point3], b: &[Point3]) -> bool {
+/// Whether an end of one line is within `options.junction_end_distance` of an end
+/// of the other, at the same level.
+fn ends_meet(a: &[Point3], b: &[Point3], options: &ReadOptions) -> bool {
     let ends = |line: &[Point3]| [line[0], line[line.len() - 1]];
     ends(a).iter().any(|p| {
         ends(b).iter().any(|q| {
-            p.horizontal_distance_to(*q) <= SAME_PLACE && (p.z - q.z).abs() <= GRADE_SEPARATION
+            p.horizontal_distance_to(*q) <= options.junction_end_distance
+                && (p.z - q.z).abs() <= options.grade_separation
         })
     })
 }
@@ -246,8 +241,8 @@ fn overlap(a: &[f64; 4], b: &[f64; 4]) -> bool {
 }
 
 /// Whether two polylines cross in plan where their heights are within
-/// [`GRADE_SEPARATION`] of each other.
-fn cross_at_level(a: &[Point3], b: &[Point3]) -> bool {
+/// `grade_separation` of each other.
+fn cross_at_level(a: &[Point3], b: &[Point3], grade_separation: f64) -> bool {
     for p in a.windows(2) {
         for q in b.windows(2) {
             let (rx, ry) = (p[1].x - p[0].x, p[1].y - p[0].y);
@@ -262,7 +257,7 @@ fn cross_at_level(a: &[Point3], b: &[Point3]) -> bool {
             if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
                 let za = p[0].z + (p[1].z - p[0].z) * t;
                 let zb = q[0].z + (q[1].z - q[0].z) * u;
-                if (za - zb).abs() <= GRADE_SEPARATION {
+                if (za - zb).abs() <= grade_separation {
                     return true;
                 }
             }
