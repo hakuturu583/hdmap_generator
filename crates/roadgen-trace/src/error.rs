@@ -35,6 +35,12 @@ pub enum TraceError {
     },
     /// A second trace of a format already loaded.
     Duplicate(String),
+    /// A built network that was not built from the export the loaded trace
+    /// describes: another map whose names happen to match, most likely.
+    Foreign {
+        path: String,
+        reason: String,
+    },
     /// A lookup needed a trace that has not been loaded.
     Missing(String),
 }
@@ -76,6 +82,11 @@ impl fmt::Display for TraceError {
             } => write!(
                 f,
                 "{path} was written from a different map ({found}, expected {expected})"
+            ),
+            TraceError::Foreign { path, reason } => write!(
+                f,
+                "{path} was not built from the export the loaded SUMO trace describes: \
+                 {reason}"
             ),
             TraceError::Duplicate(format) => {
                 write!(f, "a `{format}` trace is already loaded")

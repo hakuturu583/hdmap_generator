@@ -1934,6 +1934,10 @@ t.add_sumo_net("out/sumo/demo_town.net.xml")
 t.to_ir("sumo", ":j_x_0_0")                  # the junction connector it runs along
 ```
 
+A network is taken only if it was built from the export the trace describes: the same
+edges, lanes and connections, and a junction where the export's `.nod.xml` put each
+node. A network of another map whose roads happen to share their names is refused.
+
 A turn that waits inside the junction gets two internal lanes, and both trace to the
 same connector. Every internal lane traces to something: the exported `.netccfg` tells
 netconvert not to add the U-turn it otherwise puts at every dead end, which the IR —

@@ -2,7 +2,7 @@
 //! element, and from one format to another through the IR.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -68,6 +68,9 @@ struct FormatLinks {
     by_ir: HashMap<String, Vec<usize>>,
     /// The kinds of written element this format has: `lanelet`, `linestring`.
     kinds: BTreeSet<String>,
+    /// Where the files the trace describes are, when they are known: a SUMO
+    /// network built from them is checked against its `.nod.xml`.
+    files: Vec<PathBuf>,
 }
 
 impl FormatLinks {
@@ -174,7 +177,11 @@ impl TraceIndex {
         if self.check_files {
             file.verify_files(path)?;
         }
-        self.add_trace_file(&path.display().to_string(), file)
+        let base = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        self.add_trace_file(&path.display().to_string(), file, &base)
     }
 
     /// Adds a trace already in memory, of the map `ir_fingerprint` identifies.
@@ -189,12 +196,25 @@ impl TraceIndex {
                 role: link.role.clone(),
             });
         }
+        links.files = trace.files.clone();
         self.insert(&trace.format, links)
     }
 
-    fn add_trace_file(&mut self, name: &str, file: TraceFile) -> Result<(), TraceError> {
+    fn add_trace_file(
+        &mut self,
+        name: &str,
+        file: TraceFile,
+        base: &Path,
+    ) -> Result<(), TraceError> {
         self.agree(name, &file.ir_fingerprint)?;
-        let mut links = FormatLinks::default();
+        let mut links = FormatLinks {
+            files: file
+                .files
+                .iter()
+                .map(|described| base.join(&described.path))
+                .collect(),
+            ..FormatLinks::default()
+        };
         for link in file.links {
             links.push(Link {
                 relation: Relation::parse(&link.rel).expect("checked when read"),
@@ -428,16 +448,26 @@ impl TraceIndex {
     /// turn across oncoming traffic does, gets a second internal lane, which the
     /// built network reaches from the first; both are linked.
     ///
-    /// Needs the SUMO trace to be loaded first.
+    /// Needs the SUMO trace to be loaded first, and refuses a network that was not
+    /// built from the export it describes. A built network records nothing of the
+    /// files it was built from, and a network of another map can share every name —
+    /// `north.fwd`, `j_x` — so the check is on what the two must agree on: the same
+    /// edges and lanes, every connection the export wrote, and every node of the
+    /// export's `.nod.xml` where the network put its junction.
     pub fn load_sumo_net(&mut self, path: impl AsRef<Path>) -> Result<SumoNetReport, TraceError> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|error| TraceError::io(path, error))?;
-        let connections = net_connections(&text)
+        let net = parse_net(&text)
             .map_err(|detail| TraceError::Parse(path.display().to_string(), detail))?;
         let sumo = self
             .formats
             .get_mut("sumo")
             .ok_or_else(|| TraceError::Missing("sumo".to_owned()))?;
+        built_from(sumo, &net).map_err(|reason| TraceError::Foreign {
+            path: path.display().to_string(),
+            reason,
+        })?;
+        let connections = net.connections;
 
         let mut report = SumoNetReport::default();
         // The IR elements each internal lane carries, filled from the connections that
@@ -488,6 +518,79 @@ impl TraceIndex {
     }
 }
 
+/// Whether `net` is the network netconvert built from the export `sumo` traces.
+fn built_from(sumo: &FormatLinks, net: &Net) -> Result<(), String> {
+    let written = |kind: &str| -> BTreeSet<&str> {
+        sumo.links
+            .iter()
+            .filter_map(|link| link.local.strip_prefix(kind))
+            // An internal lane traced from an earlier network is not the export's.
+            .filter(|local| !local.starts_with(':'))
+            .collect()
+    };
+    let edges: BTreeSet<&str> = net.edges.iter().map(String::as_str).collect();
+    if written("edge:") != edges {
+        return Err("its edges are not the ones the export wrote".into());
+    }
+    let lanes: BTreeSet<&str> = net.lanes.iter().map(String::as_str).collect();
+    if written("lane:") != lanes {
+        return Err("its lanes are not the ones the export wrote".into());
+    }
+    let connections: BTreeSet<String> = net
+        .connections
+        .iter()
+        .filter(|c| !c.from.starts_with(':'))
+        .map(|c| format!("{}_{}>{}_{}", c.from, c.from_lane, c.to, c.to_lane))
+        .collect();
+    if let Some(missing) = written("connection:")
+        .into_iter()
+        .find(|connection| !connections.contains(*connection))
+    {
+        return Err(format!(
+            "it has no connection {missing}, which the export wrote"
+        ));
+    }
+    let nodes = sumo
+        .files
+        .iter()
+        .find(|file| file.to_string_lossy().ends_with(".nod.xml"));
+    if let Some(nodes) = nodes {
+        let text = std::fs::read_to_string(nodes)
+            .map_err(|error| format!("{}: {error}", nodes.display()))?;
+        for (id, (x, y)) in parse_nodes(&text)? {
+            let Some(&(net_x, net_y)) = net.junctions.get(&id) else {
+                return Err(format!("it has no junction {id}, which the export wrote"));
+            };
+            // The network's coordinates are the export's moved by its offset, and
+            // rounded to the centimetre.
+            let (net_x, net_y) = (net_x - net.offset.0, net_y - net.offset.1);
+            if (net_x - x).hypot(net_y - y) > NODE_TOLERANCE {
+                return Err(format!(
+                    "its junction {id} is at ({net_x:.2}, {net_y:.2}), not at ({x:.2}, {y:.2}) \
+                     where the export put it"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How far a built junction may sit from the node it was built from: netconvert
+/// writes coordinates to the centimetre.
+const NODE_TOLERANCE: f64 = 0.02;
+
+/// What a built network says that the trace can be checked against.
+#[derive(Default)]
+struct Net {
+    connections: Vec<NetConnection>,
+    /// The edges that are not internal: the export's.
+    edges: BTreeSet<String>,
+    /// Their lanes.
+    lanes: BTreeSet<String>,
+    junctions: HashMap<String, Position>,
+    offset: Position,
+}
+
 struct NetConnection {
     from: String,
     to: String,
@@ -496,23 +599,94 @@ struct NetConnection {
     via: Option<String>,
 }
 
-fn net_connections(text: &str) -> Result<Vec<NetConnection>, String> {
+/// A plan-view position, metres.
+type Position = (f64, f64);
+
+/// An XML element's attributes, by name.
+type Attributes = HashMap<Vec<u8>, String>;
+
+fn attributes(element: &quick_xml::events::BytesStart) -> Result<Attributes, String> {
+    let mut attributes = HashMap::new();
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| error.to_string())?;
+        let value = attribute
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|error| error.to_string())?;
+        attributes.insert(attribute.key.as_ref().to_vec(), value.into_owned());
+    }
+    Ok(attributes)
+}
+
+fn coordinate(attributes: &Attributes, key: &[u8]) -> Result<f64, String> {
+    attributes
+        .get(key)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("a missing or unreadable {}", String::from_utf8_lossy(key)))
+}
+
+fn parse_net(text: &str) -> Result<Net, String> {
     let mut reader = Reader::from_str(text);
-    let mut out = Vec::new();
+    let mut net = Net::default();
+    // The edge whose lanes are being read, when it is one of the export's.
+    let mut edge: Option<String> = None;
     loop {
-        match reader.read_event().map_err(|error| error.to_string())? {
+        let (element, empty) = match reader.read_event().map_err(|error| error.to_string())? {
             Event::Eof => break,
-            Event::Start(element) | Event::Empty(element)
-                if element.name().as_ref() == b"connection" =>
-            {
-                let mut attributes: HashMap<Vec<u8>, String> = HashMap::new();
-                for attribute in element.attributes() {
-                    let attribute = attribute.map_err(|error| error.to_string())?;
-                    let value = attribute
-                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                        .map_err(|error| error.to_string())?;
-                    attributes.insert(attribute.key.as_ref().to_vec(), value.into_owned());
+            Event::End(end) => {
+                if end.name().as_ref() == b"edge" {
+                    edge = None;
                 }
+                continue;
+            }
+            Event::Start(element) => (element, false),
+            Event::Empty(element) => (element, true),
+            _ => continue,
+        };
+        let mut attributes = attributes(&element)?;
+        match element.name().as_ref() {
+            b"location" => {
+                if let Some(offset) = attributes.get(b"netOffset".as_slice()) {
+                    let (x, y) = offset
+                        .split_once(',')
+                        .ok_or_else(|| format!("an unreadable netOffset {offset}"))?;
+                    net.offset = (
+                        x.trim()
+                            .parse()
+                            .map_err(|_| format!("an unreadable netOffset {offset}"))?,
+                        y.trim()
+                            .parse()
+                            .map_err(|_| format!("an unreadable netOffset {offset}"))?,
+                    );
+                }
+            }
+            b"edge" => {
+                let internal =
+                    attributes.get(b"function".as_slice()).map(String::as_str) == Some("internal");
+                let id = attributes.remove(b"id".as_slice()).unwrap_or_default();
+                if !internal {
+                    net.edges.insert(id.clone());
+                    if !empty {
+                        edge = Some(id);
+                    }
+                }
+            }
+            b"lane" if edge.is_some() => {
+                if let Some(id) = attributes.remove(b"id".as_slice()) {
+                    net.lanes.insert(id);
+                }
+            }
+            b"junction" => {
+                if attributes.get(b"type".as_slice()).map(String::as_str) != Some("internal") {
+                    let position = (
+                        coordinate(&attributes, b"x")?,
+                        coordinate(&attributes, b"y")?,
+                    );
+                    if let Some(id) = attributes.remove(b"id".as_slice()) {
+                        net.junctions.insert(id, position);
+                    }
+                }
+            }
+            b"connection" => {
                 let mut take = |key: &[u8]| attributes.remove(key);
                 if let (Some(from), Some(to), Some(from_lane), Some(to_lane)) = (
                     take(b"from"),
@@ -520,7 +694,7 @@ fn net_connections(text: &str) -> Result<Vec<NetConnection>, String> {
                     take(b"fromLane"),
                     take(b"toLane"),
                 ) {
-                    out.push(NetConnection {
+                    net.connections.push(NetConnection {
                         from,
                         to,
                         from_lane,
@@ -532,5 +706,28 @@ fn net_connections(text: &str) -> Result<Vec<NetConnection>, String> {
             _ => {}
         }
     }
-    Ok(out)
+    Ok(net)
+}
+
+/// The nodes of a plain `.nod.xml`, by id.
+fn parse_nodes(text: &str) -> Result<Vec<(String, Position)>, String> {
+    let mut reader = Reader::from_str(text);
+    let mut nodes = Vec::new();
+    loop {
+        match reader.read_event().map_err(|error| error.to_string())? {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element) if element.name().as_ref() == b"node" => {
+                let attributes = attributes(&element)?;
+                let position = (
+                    coordinate(&attributes, b"x")?,
+                    coordinate(&attributes, b"y")?,
+                );
+                if let Some(id) = attributes.get(b"id".as_slice()) {
+                    nodes.push((id.clone(), position));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(nodes)
 }

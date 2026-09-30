@@ -231,16 +231,10 @@ fn a_rewritten_export_is_not_joined_with_a_stale_trace() {
     );
 }
 
-#[test]
-fn an_internal_lane_netconvert_drew_translates_to_the_connector_it_carries() {
-    if !sumo_available() {
-        return;
-    }
-    let map = scenarios::crossroads();
-    let directory = tempfile::tempdir().unwrap();
-    export_everything(&map, directory.path());
-    let sumo = directory.path().join("sumo");
-    let config = std::fs::read_dir(&sumo)
+/// Runs netconvert on the SUMO export in `sumo`, through the configuration the export
+/// wrote, and hands back the network it built.
+fn build_network(sumo: &Path) -> std::path::PathBuf {
+    let config = std::fs::read_dir(sumo)
         .unwrap()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -252,11 +246,51 @@ fn an_internal_lane_netconvert_drew_translates_to_the_connector_it_carries() {
     let status = std::process::Command::new("netconvert")
         .arg("-c")
         .arg(&config)
-        .current_dir(&sumo)
+        .current_dir(sumo)
         .output()
         .expect("netconvert should run");
     assert!(status.status.success());
-    let net = config.with_extension("net.xml");
+    config.with_extension("net.xml")
+}
+
+#[test]
+fn a_network_built_from_another_map_with_the_same_names_is_refused() {
+    if !sumo_available() {
+        return;
+    }
+    let ours = tempfile::tempdir().unwrap();
+    export_everything(&scenarios::crossroads(), ours.path());
+
+    // Every road, lane, junction and connection named as ours are, with arms 20 m
+    // longer: a network netconvert builds from it shares every name ours has.
+    let other = scenarios::crossroads_builder("crossroads", 90.0)
+        .finish()
+        .unwrap()
+        .validate()
+        .unwrap();
+    let theirs = tempfile::tempdir().unwrap();
+    roadgen_sumo::write(&other, theirs.path()).unwrap();
+    let net = build_network(theirs.path());
+
+    let mut index = load_everything(ours.path());
+    let error = index.load_sumo_net(&net).unwrap_err();
+    assert!(
+        matches!(error, roadgen_trace::TraceError::Foreign { .. }),
+        "{error}"
+    );
+    // Nothing was added from it.
+    assert!(index.to_ir("sumo", ":j_x_0_0").unwrap().is_empty());
+}
+
+#[test]
+fn an_internal_lane_netconvert_drew_translates_to_the_connector_it_carries() {
+    if !sumo_available() {
+        return;
+    }
+    let map = scenarios::crossroads();
+    let directory = tempfile::tempdir().unwrap();
+    export_everything(&map, directory.path());
+    let net = build_network(&directory.path().join("sumo"));
 
     let mut index = load_everything(directory.path());
     let report = index.load_sumo_net(&net).unwrap();
