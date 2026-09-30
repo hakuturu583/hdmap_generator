@@ -74,14 +74,30 @@ pub fn track(
     track_with_route(map, agent, id, steps, time_step).map(|(object, _)| object)
 }
 
-/// [`track`], with the lanes the track was driven along, in the order it drove them.
+/// The lanes a written track is made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Driven {
+    /// The lanes the track covers, from its first position to its last, in the order
+    /// it drives them.
+    pub lanes: Vec<LaneId>,
+    /// The lane the goal is at, when the track stops short of it — a scene too short
+    /// for the route, or an agent that stands still. The goal is written all the
+    /// same, so the lane is part of the agent even though no position is on it.
+    pub goal: Option<LaneId>,
+}
+
+/// [`track`], with the lanes the track was driven along.
+///
+/// Not the whole route: a scene that ends before the route does, or an agent with no
+/// speed, covers only the start of it, and a lane the track never reaches is not
+/// part of what was written — except the last, where the goal is.
 pub(crate) fn track_with_route(
     map: &ValidatedMap,
     agent: &Agent,
     id: u32,
     steps: usize,
     time_step: f64,
-) -> Result<(Object, Vec<LaneId>), ExportError> {
+) -> Result<(Object, Driven), ExportError> {
     if !(time_step.is_finite() && time_step > 0.0) {
         return Err(ExportError::NoRoute(format!(
             "a timestep of {time_step} s gets nowhere"
@@ -100,7 +116,7 @@ pub(crate) fn track_with_route(
     }
 
     let route = route_of(map, agent)?;
-    let path = path(map, &route)?;
+    let (path, starts) = path(map, &route)?;
     if path.len() < 2 {
         return Err(ExportError::NoRoute(
             "the route is shorter than one segment".into(),
@@ -149,6 +165,18 @@ pub(crate) fn track_with_route(
         });
     }
 
+    // The farthest the track gets, and so which lanes it covers: a lane is driven when
+    // it starts before that. The first always is, since the track starts on it.
+    let reached = ((steps - 1) as f64 * agent.speed * time_step).min(total);
+    let driven_count = starts
+        .iter()
+        .enumerate()
+        .take_while(|(index, &start)| *index == 0 || travelled[start] < reached)
+        .count();
+    let lanes = route[..driven_count].to_vec();
+    let goal = route.last().filter(|last| !lanes.contains(last)).cloned();
+    let driven = Driven { lanes, goal };
+
     let goal = path.last().copied().expect("non-empty");
     let object = Object {
         position,
@@ -163,7 +191,7 @@ pub(crate) fn track_with_route(
         kind: agent.kind,
         mark_as_expert: agent.mark_as_expert,
     };
-    Ok((object, route))
+    Ok((object, driven))
 }
 
 /// The route's path, in travel order.
@@ -171,13 +199,18 @@ pub(crate) fn track_with_route(
 /// The heights ride along unused: what the track is paced and aimed by is plan-view
 /// distance, because GPUDrive is a plane, and flattening at the last moment keeps this
 /// function saying only what order the lanes come in.
-fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<Vec<Point3>, ExportError> {
+///
+/// Also where along it each lane starts, as the index of its first vertex — which,
+/// for a lane that picks up where the last left off, is the vertex the two share.
+fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<(Vec<Point3>, Vec<usize>), ExportError> {
     let config = map.metadata.sampling;
     let mut path: Vec<Point3> = Vec::new();
+    let mut starts = Vec::with_capacity(route.len());
     for id in route {
         let lane = map
             .lane(id)
             .ok_or_else(|| ExportError::NoRoute(format!("{id} is not a lane of this map")))?;
+        starts.push(path.len().saturating_sub(1));
         for point in lane.travel_polyline(config)?.points() {
             match path.last() {
                 Some(previous) if previous.horizontal_distance_to(*point) < WELD_TOLERANCE => {
@@ -187,7 +220,7 @@ fn path(map: &ValidatedMap, route: &[LaneId]) -> Result<Vec<Point3>, ExportError
             }
         }
     }
-    Ok(path)
+    Ok((path, starts))
 }
 
 /// The default size of an agent of each kind, metres.

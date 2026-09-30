@@ -209,8 +209,10 @@ pub fn to_scene(map: &ValidatedMap, config: &SceneConfig) -> Result<Scene, Expor
 ///
 /// A road element is `road:<id>` and an agent `agent:<id>`, with the id the scene
 /// writes. A lane centreline, a crossing and a stop sign are each one IR element; an
-/// edge or line two lanes share is `merged` from both; an agent is linked from every
-/// lane of its route as a `part` of it, since the lanes are what its track is made of.
+/// edge or line two lanes share is `merged` from both; an agent is linked, as a `part`
+/// of it, from every lane its track covers (role `route`) and from the lane its goal
+/// is on when the track stops short of it (role `goal`) — not from the lanes of a
+/// planned route it never reaches.
 /// Nothing is written, so the trace names no files.
 pub fn to_scene_traced(
     map: &ValidatedMap,
@@ -223,17 +225,20 @@ pub fn to_scene_traced(
         // the padding the simulator fills unused slots with — cannot be confused for
         // the first agent.
         let id = index as u32 + 1;
-        let (object, route) =
+        let (object, driven) =
             objects::track_with_route(map, agent, id, config.steps, config.time_step)?;
         let local = format!("agent:{}", object.id);
-        let mut linked: Vec<&LaneId> = Vec::with_capacity(route.len());
-        for lane in &route {
+        let mut linked: Vec<&LaneId> = Vec::with_capacity(driven.lanes.len());
+        for lane in &driven.lanes {
             // A route that passes through a lane twice is still made of it once.
             if linked.contains(&lane) {
                 continue;
             }
             linked.push(lane);
             trace.link_as(lane.clone(), local.clone(), Relation::Part, "route");
+        }
+        if let Some(goal) = driven.goal {
+            trace.link_as(goal, local.clone(), Relation::Part, "goal");
         }
         agents.push(object);
     }

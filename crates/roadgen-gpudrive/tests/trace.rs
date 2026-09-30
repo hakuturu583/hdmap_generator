@@ -195,10 +195,53 @@ fn edges_are_merged_when_shared_and_agents_are_parts_of_their_routes() {
         assert!(!links.is_empty());
         for link in links {
             assert_eq!(link.relation, Relation::Part);
-            assert_eq!(link.role.as_deref(), Some("route"));
+            assert!(
+                matches!(link.role.as_deref(), Some("route" | "goal")),
+                "{link:?}"
+            );
             assert!(matches!(&link.ir, IrRef::Lane(id) if map.lane(id).is_some()));
         }
     }
+}
+
+/// The lanes linked to the one agent of `agent`'s scene, by role.
+fn agent_lanes(map: &ValidatedMap, agent: Agent) -> (Vec<LaneId>, Vec<LaneId>) {
+    let config = SceneConfig::new("traced").with_agents(vec![agent]);
+    let (_, trace) = roadgen_gpudrive::to_scene_traced(map, &config).unwrap();
+    let of_role = |role: &str| {
+        trace
+            .links_to("agent:1")
+            .filter(|link| link.role.as_deref() == Some(role))
+            .map(|link| match &link.ir {
+                IrRef::Lane(id) => id.clone(),
+                other => panic!("an agent is made of lanes, not {other}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    (of_role("route"), of_role("goal"))
+}
+
+#[test]
+fn an_agent_is_made_of_the_lanes_its_track_reaches_and_its_goal() {
+    let map = crossroads();
+    let route = map.route_from(&map.default_start().unwrap());
+    assert!(route.len() > 2, "{route:?}");
+
+    // Fast enough to reach the end of the route inside the scene: every lane of it.
+    let (driven, goal) = agent_lanes(&map, Agent::new(ObjectKind::Vehicle).with_speed(50.0));
+    assert_eq!(driven, route);
+    assert!(goal.is_empty());
+
+    // Standing still: the lane it stands on, and the one its goal is on — nothing in
+    // between, since nothing written is there.
+    let (driven, goal) = agent_lanes(&map, Agent::new(ObjectKind::Vehicle).with_speed(0.0));
+    assert_eq!(driven, route[..1]);
+    assert_eq!(goal, route[route.len() - 1..]);
+
+    // 9 s at 5 m/s is 45 m, short of the end of a 56 m approach.
+    let (driven, goal) = agent_lanes(&map, Agent::new(ObjectKind::Vehicle).with_speed(5.0));
+    assert_eq!(driven, route[..1]);
+    assert_eq!(goal, route[route.len() - 1..]);
 }
 
 #[test]
