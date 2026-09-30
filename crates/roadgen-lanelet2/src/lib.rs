@@ -308,7 +308,8 @@ fn same_line(a: &Curve3, b: &Curve3, config: SamplingConfig) -> Result<bool, Exp
             .all(|(p, q)| p.distance_to(*q) <= WELD_TOLERANCE))
 }
 
-/// The role of a traffic light element's lamps: Autoware's, not Lanelet2's own.
+/// The type of a traffic light's lamp way, and its role in the light's regulatory
+/// element: Autoware's, not Lanelet2's own.
 const LIGHT_BULBS: &str = "light_bulbs";
 
 /// Interns vertices so that coincident positions become one `Point`.
@@ -341,23 +342,7 @@ impl PointWelder {
         if let Some(existing) = self.interned.get(&Self::key(point)) {
             return Ok(existing.clone());
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        // Autoware's OSM parsers read the metric position from `local_x`/`local_y`
-        // rather than re-projecting the latitude and longitude, so both are written.
-        // Which metres those are is the projection's business: the map's own, or the
-        // position within an MGRS square.
-        let (local_x, local_y) = self.coordinates.of(point)?;
-        let interned = Point::new(
-            id,
-            point.x,
-            point.y,
-            point.z,
-            tags::attributes([
-                ("local_x", format!("{local_x:.6}")),
-                ("local_y", format!("{local_y:.6}")),
-            ]),
-        );
+        let interned = self.tagged(point, Vec::new())?;
         self.interned.insert(Self::key(point), interned.clone());
         Ok(interned)
     }
@@ -371,6 +356,10 @@ impl PointWelder {
     ) -> Result<Point, ExportError> {
         let id = self.next_id;
         self.next_id += 1;
+        // Autoware's OSM parsers read the metric position from `local_x`/`local_y`
+        // rather than re-projecting the latitude and longitude, so both are written.
+        // Which metres those are is the projection's business: the map's own, or the
+        // position within an MGRS square.
         let (local_x, local_y) = self.coordinates.of(point)?;
         let mut attributes = vec![
             ("local_x", format!("{local_x:.6}")),
@@ -661,7 +650,7 @@ impl<'a> Exporter<'a> {
                         id,
                         points,
                         tags::attributes([
-                            ("type", "light_bulbs".to_owned()),
+                            ("type", LIGHT_BULBS.to_owned()),
                             ("traffic_light_id", light.id().to_string()),
                         ]),
                     );

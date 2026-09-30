@@ -196,6 +196,8 @@ pub enum LightColor {
 }
 
 impl LightColor {
+    pub const ALL: [LightColor; 3] = [LightColor::Red, LightColor::Yellow, LightColor::Green];
+
     pub fn as_str(self) -> &'static str {
         match self {
             LightColor::Red => "red",
@@ -205,12 +207,13 @@ impl LightColor {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        Some(match value.trim().to_ascii_lowercase().as_str() {
-            "red" => LightColor::Red,
-            "yellow" | "amber" => LightColor::Yellow,
-            "green" => LightColor::Green,
-            _ => return None,
-        })
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("amber") {
+            return Some(LightColor::Yellow);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|color| color.as_str().eq_ignore_ascii_case(value))
     }
 }
 
@@ -229,6 +232,17 @@ pub enum LightArrow {
 }
 
 impl LightArrow {
+    pub const ALL: [LightArrow; 8] = [
+        LightArrow::Up,
+        LightArrow::Down,
+        LightArrow::Left,
+        LightArrow::Right,
+        LightArrow::UpLeft,
+        LightArrow::UpRight,
+        LightArrow::DownLeft,
+        LightArrow::DownRight,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             LightArrow::Up => "up",
@@ -243,17 +257,10 @@ impl LightArrow {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        Some(match value.trim().to_ascii_lowercase().as_str() {
-            "up" => LightArrow::Up,
-            "down" => LightArrow::Down,
-            "left" => LightArrow::Left,
-            "right" => LightArrow::Right,
-            "up_left" => LightArrow::UpLeft,
-            "up_right" => LightArrow::UpRight,
-            "down_left" => LightArrow::DownLeft,
-            "down_right" => LightArrow::DownRight,
-            _ => return None,
-        })
+        let value = value.trim();
+        Self::ALL
+            .into_iter()
+            .find(|arrow| arrow.as_str().eq_ignore_ascii_case(value))
     }
 }
 
@@ -304,6 +311,14 @@ impl MapObjectKind {
 
     pub fn is_traffic_light(&self) -> bool {
         matches!(self, MapObjectKind::TrafficLight { .. })
+    }
+
+    /// A traffic light's housing and lamps; `None` for anything else.
+    pub fn light_head(&self) -> Option<&LightHead> {
+        match self {
+            MapObjectKind::TrafficLight { head } => Some(head),
+            _ => None,
+        }
     }
 
     pub fn as_str(&self) -> &str {

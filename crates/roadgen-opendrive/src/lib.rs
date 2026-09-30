@@ -1263,10 +1263,11 @@ impl<'a> Exporter<'a> {
                 country_revision: None,
                 dynamic,
                 // A light's housing, up from the bottom edge `zOffset` stands at.
-                height: match &object.kind {
-                    MapObjectKind::TrafficLight { head } => head.height.map(Length::new::<meter>),
-                    _ => None,
-                },
+                height: object
+                    .kind
+                    .light_head()
+                    .and_then(|head| head.height)
+                    .map(Length::new::<meter>),
                 // Typed as a length by the schema crate; the attribute is radians.
                 h_offset: h_offset.map(Length::new::<meter>),
                 id: self.object_id(&object.id)?.to_owned(),
@@ -1284,10 +1285,10 @@ impl<'a> Exporter<'a> {
                 width: (placement.is_none() && width > 0.0).then(|| Length::new::<meter>(width)),
                 z_offset: Length::new::<meter>(stands.height),
                 additional_data: AdditionalData {
-                    user_data: match &object.kind {
-                        MapObjectKind::TrafficLight { head } => bulbs::to_user_data(&head.bulbs),
-                        _ => Vec::new(),
-                    },
+                    user_data: object
+                        .kind
+                        .light_head()
+                        .map_or_else(Vec::new, |head| bulbs::to_user_data(&head.bulbs)),
                     ..AdditionalData::default()
                 },
             });
