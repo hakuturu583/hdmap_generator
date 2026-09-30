@@ -248,7 +248,7 @@ fn traffic_lights(map: &ValidatedMap, trace: &mut Trace) -> Result<Layer, Export
         map,
         "traffic_light",
         trace,
-        |kind| matches!(kind, MapObjectKind::TrafficLight),
+        |kind| kind.is_traffic_light(),
         LIGHT_DIMENSIONS,
     )?;
     let record = Record::new()

@@ -243,7 +243,7 @@ fn every_road_and_lane_is_traced_exactly_once() {
             .links_of(&IrRef::Object(object.id.clone()))
             .filter(|link| link.role.as_deref() == Some("controller"))
             .count();
-        let expected = usize::from(object.kind == MapObjectKind::TrafficLight);
+        let expected = usize::from(object.kind.is_traffic_light());
         assert_eq!(lights, expected, "{}", object.id);
     }
     // A controller made from a traffic-light rule is that rule, so the rule reaches

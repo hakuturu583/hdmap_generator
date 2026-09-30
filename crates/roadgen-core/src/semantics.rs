@@ -187,10 +187,111 @@ pub enum ObjectGeometry {
     Band { left: Curve3, right: Curve3 },
 }
 
+/// The colour a traffic light's lamp shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LightColor {
+    Red,
+    Yellow,
+    Green,
+}
+
+impl LightColor {
+    pub const ALL: [LightColor; 3] = [LightColor::Red, LightColor::Yellow, LightColor::Green];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LightColor::Red => "red",
+            LightColor::Yellow => "yellow",
+            LightColor::Green => "green",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("amber") {
+            return Some(LightColor::Yellow);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|color| color.as_str().eq_ignore_ascii_case(value))
+    }
+}
+
+/// The way an arrow lamp points, as seen by the driver facing it: `Up` is straight
+/// on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LightArrow {
+    Up,
+    Down,
+    Left,
+    Right,
+    UpLeft,
+    UpRight,
+    DownLeft,
+    DownRight,
+}
+
+impl LightArrow {
+    pub const ALL: [LightArrow; 8] = [
+        LightArrow::Up,
+        LightArrow::Down,
+        LightArrow::Left,
+        LightArrow::Right,
+        LightArrow::UpLeft,
+        LightArrow::UpRight,
+        LightArrow::DownLeft,
+        LightArrow::DownRight,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LightArrow::Up => "up",
+            LightArrow::Down => "down",
+            LightArrow::Left => "left",
+            LightArrow::Right => "right",
+            LightArrow::UpLeft => "up_left",
+            LightArrow::UpRight => "up_right",
+            LightArrow::DownLeft => "down_left",
+            LightArrow::DownRight => "down_right",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL
+            .into_iter()
+            .find(|arrow| arrow.as_str().eq_ignore_ascii_case(value))
+    }
+}
+
+/// One lamp of a traffic light: where it is, and what it shows when lit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LightBulb {
+    pub position: Point3,
+    pub color: LightColor,
+    /// `None` for a round lamp.
+    pub arrow: Option<LightArrow>,
+}
+
+/// What a traffic light looks like beyond where it stands: how tall its housing is
+/// and which lamps it carries. A light placed by the builder knows neither, and a
+/// consumer that needs them — a perception stack that looks for the lit lamp —
+/// falls back on its own defaults.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LightHead {
+    /// How far the housing reaches up from the object's geometry, which is its
+    /// bottom edge, metres.
+    pub height: Option<f64>,
+    /// The lamps, in the order they are listed.
+    pub bulbs: Vec<LightBulb>,
+}
+
 /// Kinds of physical furniture the IR knows about.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MapObjectKind {
-    TrafficLight,
+    TrafficLight {
+        head: LightHead,
+    },
     /// `code` is the sign's identifier in whatever catalogue the caller uses; the IR
     /// does not define one.
     TrafficSign {
@@ -201,9 +302,28 @@ pub enum MapObjectKind {
 }
 
 impl MapObjectKind {
+    /// A traffic light with nothing known of its housing or lamps.
+    pub fn traffic_light() -> Self {
+        MapObjectKind::TrafficLight {
+            head: LightHead::default(),
+        }
+    }
+
+    pub fn is_traffic_light(&self) -> bool {
+        matches!(self, MapObjectKind::TrafficLight { .. })
+    }
+
+    /// A traffic light's housing and lamps; `None` for anything else.
+    pub fn light_head(&self) -> Option<&LightHead> {
+        match self {
+            MapObjectKind::TrafficLight { head } => Some(head),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
-            MapObjectKind::TrafficLight => "traffic_light",
+            MapObjectKind::TrafficLight { .. } => "traffic_light",
             MapObjectKind::TrafficSign { .. } => "traffic_sign",
             MapObjectKind::StopLine => "stop_line",
             MapObjectKind::Crosswalk => "crosswalk",

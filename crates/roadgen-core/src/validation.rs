@@ -72,6 +72,7 @@ impl UnvalidatedMap {
         check_connections(&self.0, config, &mut issues);
         check_junctions(&self.0, &mut issues);
         check_buildings(&self.0, &mut issues);
+        check_traffic_lights(&self.0, &mut issues);
         issues
     }
 
@@ -227,6 +228,39 @@ fn check_buildings(map: &Map, issues: &mut Vec<ValidationIssue>) {
                 part: part.id.clone(),
                 detail: "no storeys; a part of a building has at least one".to_owned(),
             });
+        }
+    }
+}
+
+/// A traffic light's housing height and lamp positions are written verbatim, as a
+/// Lanelet2 `height` tag, lamp points and OpenDRIVE `userData`, so a height that is
+/// not a positive length or a lamp that is nowhere would be a malformed file.
+fn check_traffic_lights(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for object in map.objects.iter() {
+        let Some(head) = object.kind.light_head() else {
+            continue;
+        };
+        let mut report = |detail: String| {
+            issues.push(ValidationIssue::ImplausibleTrafficLight {
+                object: object.id.clone(),
+                detail,
+            })
+        };
+        if let Some(height) = head.height {
+            if !height.is_finite() || height <= 0.0 {
+                report(format!(
+                    "a housing {height} m tall; a housing rises above its bottom edge"
+                ));
+            }
+        }
+        for (index, bulb) in head.bulbs.iter().enumerate() {
+            let at = bulb.position;
+            if !at.is_finite() {
+                report(format!(
+                    "lamp {index} is at ({}, {}, {}), which is not a place",
+                    at.x, at.y, at.z
+                ));
+            }
         }
     }
 }
@@ -693,9 +727,10 @@ fn check_junctions(map: &Map, issues: &mut Vec<ValidationIssue>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::{LaneSpec, MapBuilder, RoadSpec};
+    use crate::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
     use crate::geometry::Point3;
     use crate::id::{BuildingId, BuildingPartId};
+    use crate::semantics::MapObjectKind;
     use crate::topology::Direction;
     use crate::units::PositiveWidth;
 
@@ -1058,5 +1093,50 @@ mod tests {
             "{:?}",
             error.issues
         );
+    }
+    #[test]
+    fn a_traffic_light_has_to_be_a_light_someone_could_build() {
+        use crate::semantics::{LightBulb, LightColor, LightHead};
+
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    lanes(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let light = builder
+            .add_traffic_light(&LaneRef::new(road, 0), LaneEnd::End, 5.0)
+            .unwrap();
+        let mut map = builder.finish().unwrap();
+        map.as_map_mut().objects.get_mut(&light).unwrap().kind = MapObjectKind::TrafficLight {
+            head: LightHead {
+                height: Some(0.0),
+                bulbs: vec![LightBulb {
+                    position: Point3::new(1.0, f64::INFINITY, 5.0),
+                    color: LightColor::Red,
+                    arrow: None,
+                }],
+            },
+        };
+
+        let error = map.validate().unwrap_err();
+        let details: Vec<_> = error
+            .issues
+            .iter()
+            .filter_map(|issue| match issue {
+                ValidationIssue::ImplausibleTrafficLight { object, detail } if *object == light => {
+                    Some(detail.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(details.len(), 2, "{:?}", error.issues);
+        assert!(details[0].contains("0 m tall"), "{details:?}");
+        assert!(details[1].contains("lamp 0"), "{details:?}");
     }
 }

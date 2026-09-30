@@ -826,7 +826,7 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
     let lights = map
         .objects
         .iter()
-        .filter(|object| object.kind == MapObjectKind::TrafficLight)
+        .filter(|object| object.kind.is_traffic_light())
         .count();
     let signs = map
         .objects

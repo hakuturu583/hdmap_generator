@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, RoadId};
+use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 
 /// Something that cannot be expressed as geometry.
 #[derive(Debug, Clone, PartialEq)]
@@ -293,6 +293,11 @@ pub enum ValidationIssue {
         part: BuildingPartId,
         detail: String,
     },
+    /// A traffic light's housing or lamps are not ones a light could have.
+    ImplausibleTrafficLight {
+        object: ObjectId,
+        detail: String,
+    },
     Geometry {
         detail: String,
     },
@@ -352,6 +357,9 @@ impl fmt::Display for ValidationIssue {
             }
             ValidationIssue::ImplausibleBuildingPart { part, detail } => {
                 write!(f, "building part {part}: {detail}")
+            }
+            ValidationIssue::ImplausibleTrafficLight { object, detail } => {
+                write!(f, "traffic light {object}: {detail}")
             }
             ValidationIssue::Geometry { detail } => write!(f, "geometry error: {detail}"),
         }

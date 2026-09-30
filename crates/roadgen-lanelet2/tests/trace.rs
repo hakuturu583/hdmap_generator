@@ -181,7 +181,7 @@ fn objects_and_rules_are_traced_to_what_they_became() {
     let light = map
         .objects
         .iter()
-        .find(|object| object.kind == MapObjectKind::TrafficLight)
+        .find(|object| object.kind.is_traffic_light())
         .unwrap();
     let links: Vec<_> = trace.links_of(&IrRef::Object(light.id.clone())).collect();
     assert_eq!(links.len(), 1);

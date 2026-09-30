@@ -81,8 +81,8 @@ pub use geometry::{
 pub use id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 pub use map::{CrossSection, Lane, Map, MapMetadata, Projection, Road, Route, TrafficHandedness};
 pub use semantics::{
-    BoundaryMarking, LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
-    RoadType, TrafficRule,
+    BoundaryMarking, LaneType, LightArrow, LightBulb, LightColor, LightHead, MapObject,
+    MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType, TrafficRule,
 };
 pub use topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
@@ -107,8 +107,8 @@ pub mod prelude {
     };
     pub use crate::map::{Map, MapMetadata, Projection, Route, TrafficHandedness};
     pub use crate::semantics::{
-        BoundaryMarking, LaneType, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
-        RoadType, TrafficRule,
+        BoundaryMarking, LaneType, LightArrow, LightBulb, LightColor, LightHead, MapObjectKind,
+        MarkingColor, ObjectGeometry, RoadMarking, RoadType, TrafficRule,
     };
     pub use crate::topology::{Direction, LaneEnd, LateralSide, RoadEnd};
     pub use crate::units::{GeoOrigin, PositiveWidth, SpeedLimit};
