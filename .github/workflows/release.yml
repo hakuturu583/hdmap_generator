@@ -90,6 +90,13 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          # Checkout leaves GITHUB_TOKEN behind as an Authorization header in the
+          # local git config, and git sends that header in preference to the
+          # credentials in a URL. So the push below, for all it names RELEASE_TOKEN,
+          # went out as github-actions[bot] -- which cannot bypass the ruleset on
+          # `main` -- and was refused (GH013, the release-label check). Without the
+          # header it goes out as the token's owner, which is the point of it.
+          persist-credentials: false
 
       - name: read the release labels off the PRs merged since the last release
         id: pr
