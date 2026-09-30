@@ -350,6 +350,22 @@ connection）と突き合わせれば `via` の内部 lane も IR まで追え�
 netconvert が独自に足す接続（行き止まりの U ターン `north.bwd → north.fwd` など）は
 IR に対応物が無いので、リンクなしとして扱う。
 
+注意点が 1 つある。左折のように交差点内で一時停止する動きでは、netconvert が内部 lane を
+**2 本に分ける**（`:j_x_2_0` の後に `:j_x_12_0`）。後半は内部 edge 起点の接続
+`<connection from=":j_x_2" to="east.bwd" ... via=":j_x_12_0"/>` として現れるので、
+`via` の連鎖をたどり、どちらも同じ IR connector lane に `rel: part` で対応させる。
+
+**検証結果**（SUMO 1.18、公開 API だけで書いた検証用プログラム。コミットはしていない）:
+
+| シナリオ | `.net.xml` の接続（`via` 付き） | IR connector lane まで解決 | IR に対応なし |
+| --- | --- | --- | --- |
+| crossroads | 16 | 12（全 movement。例: `:j_x_0_0` → `lane/x/north_0_west_1/0` → OpenDRIVE road 8 / lane -1） | 4（行き止まりの U ターン） |
+| controlled_crossroads | 4 | 2 | 2（同上） |
+
+解決の手順: `via` の接続の `from`+`fromLane` と `to`+`toLane` を SUMO のトレースで
+IR lane に戻し、IR 上で「進入 lane → connector lane → 退出 lane」となる connector lane を
+探す。候補はどのケースでも 1 本に決まった。
+
 | フェーズ | 内容 |
 | --- | --- |
 | 1 | `roadgen-core::trace` 型、IR ダンプ（カタログ）、上表の全フォーマットのトレースファイル（既定で書き出し、`trace=False` で抑止）、`TraceIndex`、Python `export_ir` / `Trace.load` / `translate`。core には serde を入れず、JSON 化は専用の小 crate（`roadgen-trace`）に置く |
