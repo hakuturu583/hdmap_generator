@@ -568,6 +568,17 @@ impl<'a> Exporter<'a> {
                     "controller",
                 );
             }
+            // The rule the group was made from is the controller itself: the
+            // caller saying these lights are one phase, which is what a
+            // `<controller>` says. Lights no rule names have none.
+            if let Some(rule) = group.rule {
+                self.trace.borrow_mut().link_as(
+                    IrRef::Rule(rule),
+                    format!("controller:{}", group.id),
+                    Relation::Exact,
+                    "controller",
+                );
+            }
             drive.controller.push(Controller {
                 control,
                 id: group.id.clone(),

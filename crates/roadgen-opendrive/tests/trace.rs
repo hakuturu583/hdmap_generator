@@ -246,6 +246,28 @@ fn every_road_and_lane_is_traced_exactly_once() {
         let expected = usize::from(object.kind == MapObjectKind::TrafficLight);
         assert_eq!(lights, expected, "{}", object.id);
     }
+    // A controller made from a traffic-light rule is that rule, so the rule reaches
+    // the controller, and through it whatever another format wrote for the rule.
+    let groups = roadgen_opendrive::signal_groups(&map);
+    assert!(groups.iter().any(|group| group.rule.is_some()));
+    for (index, rule) in map.rules.iter().enumerate() {
+        let ir = IrRef::Rule(index);
+        let links: Vec<_> = trace
+            .links_of(&ir)
+            .filter(|link| link.role.as_deref() == Some("controller"))
+            .collect();
+        match groups.iter().find(|group| group.rule == Some(index)) {
+            Some(group) => {
+                assert_eq!(links.len(), 1, "rule {index}");
+                assert_eq!(links[0].local, format!("controller:{}", group.id));
+                assert_eq!(links[0].relation, Relation::Exact);
+            }
+            None => assert!(
+                links.is_empty(),
+                "rule {index} ({rule:?}) made no controller"
+            ),
+        }
+    }
 }
 
 #[test]
