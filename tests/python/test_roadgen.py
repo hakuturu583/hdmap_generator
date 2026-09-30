@@ -1682,7 +1682,10 @@ def read_pointcloud_map(directory):
     assert sorted(metadata) == [cell.name for cell in cells]
     points = []
     for cell in cells:
-        x0, y0 = (float(v) for v in metadata[cell.name].strip("[]").split(","))
+        corner = metadata[cell.name].strip("[]").split(",")
+        # Autoware's loader reads a corner `as<int>`: 0.0 would sink the whole map.
+        assert all(re.fullmatch(r"\s*-?\d+", v) for v in corner), metadata[cell.name]
+        x0, y0 = (float(v) for v in corner)
         data = cell.read_bytes()
         header, body = data.split(b"DATA binary\n", 1)
         assert b"FIELDS x y z\n" in header and b"TYPE F F F\n" in header
@@ -1733,6 +1736,9 @@ def test_the_pointcloud_map_lies_where_the_lanelet2_map_does(tmp_path, projectio
 def test_a_pointcloud_map_refuses_a_spacing_that_is_not_a_length(tmp_path):
     with pytest.raises(ValueError, match="spacing"):
         carla_street().export_pointcloud_map(tmp_path, spacing=0.0)
+    # A cell's corner Autoware's loader could not read as an integer.
+    with pytest.raises(ValueError, match="whole number"):
+        carla_street().export_pointcloud_map(tmp_path, cell_size=12.5)
 
 
 def test_the_report_says_what_carla_will_call_each_mesh(tmp_path):
