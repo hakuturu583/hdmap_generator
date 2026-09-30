@@ -82,7 +82,10 @@ pub(crate) struct Driven {
     pub lanes: Vec<LaneId>,
     /// The lane the goal is at, when the track stops short of it — a scene too short
     /// for the route, or an agent that stands still. The goal is written all the
-    /// same, so the lane is part of the agent even though no position is on it.
+    /// same, so the lane is part of the agent even where no position is on it; and
+    /// it is named even when the track does cover that lane — a route of one lane, or
+    /// one that comes back to a lane it left — since what matters is that the goal is
+    /// still ahead, not whether the lane is.
     pub goal: Option<LaneId>,
 }
 
@@ -174,7 +177,11 @@ pub(crate) fn track_with_route(
         .take_while(|(index, &start)| *index == 0 || travelled[start] < reached)
         .count();
     let lanes = route[..driven_count].to_vec();
-    let goal = route.last().filter(|last| !lanes.contains(last)).cloned();
+    let goal = if reached < total {
+        route.last().cloned()
+    } else {
+        None
+    };
     let driven = Driven { lanes, goal };
 
     let goal = path.last().copied().expect("non-empty");

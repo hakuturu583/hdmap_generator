@@ -238,6 +238,14 @@ fn an_agent_is_made_of_the_lanes_its_track_reaches_and_its_goal() {
     assert_eq!(driven, route[..1]);
     assert_eq!(goal, route[route.len() - 1..]);
 
+    // A route of one lane, standing still: the goal is on the lane it stands on, and
+    // is still ahead of it.
+    let mut still = Agent::new(ObjectKind::Vehicle).with_speed(0.0);
+    still.route = Some(Route::Lanes(route[..1].to_vec()));
+    let (driven, goal) = agent_lanes(&map, still);
+    assert_eq!(driven, route[..1]);
+    assert_eq!(goal, route[..1]);
+
     // 9 s at 5 m/s is 45 m, short of the end of a 56 m approach.
     let (driven, goal) = agent_lanes(&map, Agent::new(ObjectKind::Vehicle).with_speed(5.0));
     assert_eq!(driven, route[..1]);
