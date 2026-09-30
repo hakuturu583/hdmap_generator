@@ -241,7 +241,11 @@ pub fn grid_for(map: &ValidatedMap) -> Result<Option<MgrsGrid>, ExportError> {
 }
 
 /// How a node's `local_x` and `local_y` are worked out.
-enum LocalCoordinates {
+///
+/// Public because it is the frame Autoware reads everything beside the Lanelet2
+/// map in — a point-cloud map written for the same map has to agree with it point
+/// for point, MGRS included.
+pub enum LocalCoordinates {
     /// The map's own metres, which is what every projection but MGRS reports.
     AsIs,
     /// Metres within an MGRS square, computed for each node from its own position.
@@ -252,7 +256,7 @@ enum LocalCoordinates {
 }
 
 impl LocalCoordinates {
-    fn for_map(map: &ValidatedMap) -> Result<Self, ExportError> {
+    pub fn for_map(map: &ValidatedMap) -> Result<Self, ExportError> {
         match grid_for(map)? {
             None => Ok(LocalCoordinates::AsIs),
             Some(grid) => Ok(LocalCoordinates::Mgrs {
@@ -266,7 +270,8 @@ impl LocalCoordinates {
         }
     }
 
-    fn of(&self, point: Point3) -> Result<(f64, f64), ExportError> {
+    /// `point`'s `local_x` and `local_y`.
+    pub fn of(&self, point: Point3) -> Result<(f64, f64), ExportError> {
         match self {
             LocalCoordinates::AsIs => Ok((point.x, point.y)),
             LocalCoordinates::Mgrs { grid, projector } => {

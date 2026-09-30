@@ -1626,6 +1626,73 @@ def test_a_carla_package_is_a_descriptor_a_mesh_and_a_road_network(tmp_path):
     assert descriptor["props"] == []
 
 
+def read_pointcloud_map(directory):
+    """Every cell of an Autoware divided point-cloud map, checked against its metadata."""
+    import struct
+
+    metadata = {}
+    for line in (directory / "pointcloud_map_metadata.yaml").read_text().splitlines():
+        key, _, value = line.partition(": ")
+        metadata[key] = value
+    resolution = float(metadata.pop("x_resolution"))
+    assert float(metadata.pop("y_resolution")) == resolution
+    cells = sorted((directory / "pointcloud_map").glob("*.pcd"))
+    assert sorted(metadata) == [cell.name for cell in cells]
+    points = []
+    for cell in cells:
+        x0, y0 = (float(v) for v in metadata[cell.name].strip("[]").split(","))
+        data = cell.read_bytes()
+        header, body = data.split(b"DATA binary\n", 1)
+        assert b"FIELDS x y z\n" in header and b"TYPE F F F\n" in header
+        count = len(body) // 12
+        assert f"POINTS {count}\n".encode() in header
+        for i in range(count):
+            x, y, z = struct.unpack_from("<fff", body, 12 * i)
+            # Each point in the cell the metadata says the file covers.
+            assert x0 - 1e-3 <= x < x0 + resolution + 1e-3
+            assert y0 - 1e-3 <= y < y0 + resolution + 1e-3
+            points.append((x, y, z))
+    return points
+
+
+@pytest.mark.parametrize("projection", ["local_cartesian", "mgrs"])
+def test_the_pointcloud_map_lies_where_the_lanelet2_map_does(tmp_path, projection):
+    """Autoware reads both in one frame: the nodes' local_x, local_y and ele."""
+    m = roadgen.Map(name="Town01", origin=(35.6586, 139.7454, 0.0), projection=projection)
+    m.add_road(
+        start=(0.0, 0.0, 0.0),
+        end=(60.0, 0.0, 3.0),
+        lanes=[roadgen.Lane(width=3.5, direction="backward"),
+               roadgen.Lane(width=3.5, direction="forward")],
+    )
+    report = m.export_pointcloud_map(tmp_path, ground_extent=5.0, spacing=0.5)
+    points = read_pointcloud_map(tmp_path)
+    assert report["points"] == len(points) and report["cells"] >= 1
+
+    m.export_lanelet2(tmp_path / "lanelet2_map.osm")
+    osm = ET.parse(tmp_path / "lanelet2_map.osm").getroot()
+    nodes = []
+    for node in osm.iter("node"):
+        tags = {t.get("k"): t.get("v") for t in node.iter("tag")}
+        nodes.append((float(tags["local_x"]), float(tags["local_y"]),
+                      float(tags.get("ele", 0.0))))  # 0 is written as no tag at all
+    # Every lane-boundary node stands on the sampled surface.
+    grid = {}
+    for p in points:
+        grid.setdefault((round(p[0]), round(p[1])), []).append(p)
+    for x, y, z in nodes:
+        near = [p for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                for p in grid.get((round(x) + dx, round(y) + dy), [])]
+        closest = min(((p[0] - x) ** 2 + (p[1] - y) ** 2, p) for p in near)
+        assert closest[0] ** 0.5 < 0.6, (x, y, closest)
+        assert abs(closest[1][2] - z) < 0.3, (z, closest)
+
+
+def test_a_pointcloud_map_refuses_a_spacing_that_is_not_a_length(tmp_path):
+    with pytest.raises(ValueError, match="spacing"):
+        carla_street().export_pointcloud_map(tmp_path, spacing=0.0)
+
+
 def test_the_report_says_what_carla_will_call_each_mesh(tmp_path):
     """The point of the exporter, from Python.
 

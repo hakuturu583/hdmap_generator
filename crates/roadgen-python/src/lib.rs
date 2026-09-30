@@ -1260,6 +1260,86 @@ impl PyMap {
         Ok(report.into())
     }
 
+    /// Writes Autoware's point-cloud map of the surface a CARLA package is built of.
+    ///
+    /// Autoware localizes by matching its LiDAR against a point-cloud map, and a
+    /// generated map has no survey to take one from — but the meshes CARLA's level is
+    /// built from are exactly what the simulated LiDAR sees. They are sampled every
+    /// `spacing` metres, one point per voxel of that size, and written the way
+    /// Autoware's map loader reads a divided map: a `pointcloud_map/` directory of
+    /// `.pcd` cells `cell_size` metres square, and `pointcloud_map_metadata.yaml`
+    /// beside it, in `directory` — which is the Autoware map directory, next to
+    /// `lanelet2_map.osm`. Points are in the Lanelet2 map's frame (`local_x`,
+    /// `local_y`, `ele`), MGRS included.
+    ///
+    /// `name`, `buildings`, `kerb_height`, `verge_width` and `ground_extent` mean what
+    /// they mean to `export_carla`, and should be given the same values: the cloud is
+    /// of the surface *that* call builds. The town is in it wherever it goes, since
+    /// the package's script stands props in the level too; the lights and signs are
+    /// not.
+    #[pyo3(signature = (
+        directory,
+        name = None,
+        buildings = None,
+        kerb_height = None,
+        verge_width = None,
+        ground_extent = None,
+        spacing = None,
+        cell_size = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn export_pointcloud_map(
+        &mut self,
+        py: Python<'_>,
+        directory: PathBuf,
+        name: Option<&str>,
+        buildings: Option<&str>,
+        kerb_height: Option<f64>,
+        verge_width: Option<f64>,
+        ground_extent: Option<f64>,
+        spacing: Option<f64>,
+        cell_size: Option<f64>,
+    ) -> PyResult<Py<PyDict>> {
+        let config = self.carla_config(
+            name,
+            None,
+            buildings,
+            None,
+            kerb_height,
+            verge_width,
+            ground_extent,
+            Some(false),
+        )?;
+        let mut pointcloud = roadgen_carla::PointCloudConfig::default();
+        for (value, field, what) in [
+            (spacing, &mut pointcloud.spacing, "spacing"),
+            (cell_size, &mut pointcloud.cell_size, "cell_size"),
+        ] {
+            if let Some(value) = value {
+                if !(value.is_finite() && value > 0.0) {
+                    return Err(PyValueError::new_err(format!(
+                        "{what} is a length in metres, greater than zero; got {value}"
+                    )));
+                }
+                *field = value;
+            }
+        }
+        let map = self.built.as_ref().expect("just built");
+        let frame = roadgen_lanelet2::LocalCoordinates::for_map(map).map_err(runtime_error)?;
+        let written =
+            roadgen_carla::write_pointcloud_map(map, directory, &config, &pointcloud, |point| {
+                frame.of(point).map(|(x, y)| [x, y, point.z])
+            })
+            .map_err(runtime_error)?;
+
+        let report = PyDict::new(py);
+        report.set_item("directory", written.directory.to_string_lossy())?;
+        report.set_item("metadata", written.metadata.to_string_lossy())?;
+        report.set_item("cells", written.cells)?;
+        report.set_item("points", written.points)?;
+        Ok(report.into())
+    }
+
     /// What a CARLA package cannot carry, and what its import will get wrong quietly.
     ///
     /// Kept apart from `format_warnings` for the same reason ClipGT's and GPUDrive's

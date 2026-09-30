@@ -16,6 +16,8 @@ pub enum ExportError {
     /// is wrong.
     Json(String),
     Io(String),
+    /// A point could not be put in the frame the point-cloud map is written in.
+    Projection(String),
 }
 
 impl From<GeometryError> for ExportError {
@@ -44,6 +46,11 @@ impl fmt::Display for ExportError {
                 write!(f, "the package descriptor is malformed: {detail}")
             }
             ExportError::Io(detail) => write!(f, "{detail}"),
+            ExportError::Projection(detail) => write!(
+                f,
+                "a point of the point-cloud map could not be put in the Lanelet2 \
+                 map's frame: {detail}"
+            ),
         }
     }
 }

@@ -255,6 +255,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
 | `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=, furniture=, carla_root=, engine=, sun_altitude=, sun_azimuth=)` | write a CARLA UE5 package and the script that imports it; returns what was written and what each mesh will be tagged |
+| `export_pointcloud_map(directory, name=, buildings=, kerb_height=, verge_width=, ground_extent=, spacing=, cell_size=)` | write Autoware's point-cloud map of the surface a CARLA package is built of: `pointcloud_map/*.pcd` and `pointcloud_map_metadata.yaml`, in the Lanelet2 map's frame |
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
 | `carla_sky(carla_root, package, map_name, engine=, sun_altitude=, sun_azimuth=)` | after `Import.py`: give the imported level a daylight sky, with the editor's own scripting |
 | `carla_furniture(carla_root, package, map_name, engine=, manifest=)` | after `Import.py`: stand the package's traffic lights, signs and props town in the level, and make CARLA adopt the lights and signs |
@@ -1375,6 +1376,50 @@ block the SDK checks. Text needs neither, so this crate has no compression depen
 no magic constants, and produces a file that can be opened in an editor and diffed when
 a map comes out wrong.
 
+### A point-cloud map for Autoware, from the same surface
+
+Autoware localizes by matching its LiDAR against a point-cloud map (NDT), and a
+generated map has no survey to take one from. It does have the meshes CARLA's level
+is built from — which are exactly what the simulated LiDAR sees — so the point-cloud
+map is sampled from those:
+
+```python
+m.export_carla("Import/", name="Town01")
+m.export_lanelet2("autoware/Town01/lanelet2_map.osm")
+m.export_pointcloud_map("autoware/Town01", name="Town01")
+```
+
+```text
+autoware/Town01/
+├── lanelet2_map.osm
+├── pointcloud_map/
+│   ├── 0_0.pcd                 one grid cell each: binary, x y z as 32-bit floats
+│   ├── 0_-1.pcd
+│   └── …
+└── pointcloud_map_metadata.yaml
+```
+
+That is Autoware's *divided* point-cloud map, which its map loader reads for partial
+loading: `x_resolution` and `y_resolution` are the cell size, and each cell's file
+name maps to the corner it starts at (`0_-1.pcd: [0.0, -20.0]` covers x 0–20,
+y −20–0). Run Autoware with `pointcloud_map_file:=pointcloud_map`.
+
+- **The frame is the Lanelet2 map's.** Every point is put through the conversion
+  the Lanelet2 exporter gives its nodes' `local_x` and `local_y` — the map's own
+  metres, or metres within the MGRS square for an `mgrs` map, worked out point by
+  point as the nodes are — and its height is the map's `z`, which is the nodes'
+  `ele`. The two files agree because they are converted by the same code.
+- **The surface is `export_carla`'s.** `name`, `buildings`, `kerb_height`,
+  `verge_width` and `ground_extent` mean the same things and should be given the
+  same values. The town is in the cloud wherever it goes — in the map, or as props
+  the package's script stands in the level — because it is in the level either way.
+  The traffic lights and signs are not.
+- **`spacing`** (0.5 m) is how far apart samples are along a triangle's edges, and
+  the size of the voxel that keeps one of the points that land in it: triangles
+  share edges and the roads lie over the land, so the same place is sampled many
+  times. It is finer than the voxels Autoware downsamples the map and its scans to.
+  **`cell_size`** (20 m) is the side of a cell.
+
 ### What it cannot carry
 
 `Map.carla_warnings()` reports all of it. Beyond the tagging traps above and whichever
@@ -1796,7 +1841,8 @@ roadgen/
 │   │   ├── id/              typed identifiers
 │   │   └── validation/      UnvalidatedMap → ValidatedMap
 │   ├── roadgen-buildings/   a town beside the roads, from a CGA shape grammar
-│   ├── roadgen-carla/       meshes, FBX and the package CARLA UE5 imports
+│   ├── roadgen-carla/       meshes, FBX and the package CARLA UE5 imports, and
+│   │                        Autoware's point-cloud map of the same surface
 │   ├── roadgen-opendrive/   lowering onto the `opendrive` crate, and reading it back
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
