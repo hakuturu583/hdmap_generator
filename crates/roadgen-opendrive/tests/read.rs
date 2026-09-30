@@ -204,7 +204,7 @@ fn a_foreign_document_is_read_approximated_and_reported() {
     let light = map
         .objects
         .iter()
-        .find(|object| object.kind == MapObjectKind::TrafficLight)
+        .find(|object| object.kind.is_traffic_light())
         .unwrap();
     assert_eq!(
         light.lanes.len(),
@@ -304,7 +304,7 @@ fn a_light_governs_the_lanes_that_refer_to_it() {
     let light = map
         .objects
         .iter()
-        .find(|object| object.kind == MapObjectKind::TrafficLight)
+        .find(|object| object.kind.is_traffic_light())
         .unwrap_or_else(|| panic!("the light is read: {notes:#?}"));
     let mut governed = light.lanes.clone();
     governed.sort();

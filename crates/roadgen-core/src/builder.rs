@@ -766,7 +766,7 @@ impl MapBuilder {
                 end.as_str()
             ),
             ObjectSpec::AcrossLane {
-                kind: MapObjectKind::TrafficLight,
+                kind: MapObjectKind::traffic_light(),
                 lane: lane.clone(),
                 end,
                 height,
