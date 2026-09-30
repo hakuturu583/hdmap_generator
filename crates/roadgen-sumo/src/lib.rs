@@ -52,6 +52,27 @@
 //!
 //! This is why the arms are left exactly where the IR puts them, short of the
 //! junction: the gap is the junction, and netconvert fills it.
+//!
+//! # The trace
+//!
+//! [`PlainNetwork::trace`] records where each element of the IR went, naming the
+//! written elements as follows:
+//!
+//! | written element | IR element | relation |
+//! | --- | --- | --- |
+//! | `node:<id>` | a junction | exact |
+//! | `node:<id>` | a traffic light, role `traffic_light` | merged |
+//! | `edge:<id>` | a road — one edge per direction and cross-section | part |
+//! | `lane:<edge>_<index>` | a lane | exact |
+//! | `connection:<from edge>_<from lane>><to edge>_<to lane>` | a lane connection | exact, or merged |
+//! | the same connection | a connector lane it runs over | collapsed |
+//!
+//! A connection is named by its two lanes as the built network names them, so the
+//! `.net.xml` `<connection from fromLane to toLane via>` that netconvert writes for it
+//! is found from the trace by the same `<edge>_<index>` pair — and with it the
+//! internal lane (`via`) netconvert generated in place of the connector. A movement
+//! through a junction is two IR connections and one connector lane, all of them
+//! written as the one connection, so each is `merged` or `collapsed` into it.
 
 pub mod classes;
 pub mod error;
@@ -64,7 +85,8 @@ use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
 use roadgen_core::map::{Lane, Road};
 use roadgen_core::semantics::{MapObjectKind, TrafficRule};
 use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
-use roadgen_core::{JunctionId, LaneId, ValidatedMap};
+use roadgen_core::trace::{Relation, Trace};
+use roadgen_core::{ConnectionId, JunctionId, LaneId, RoadId, ValidatedMap};
 
 pub use classes::Permission;
 pub use error::ExportError;
@@ -93,6 +115,13 @@ pub struct PlainNetwork {
     /// lane of the map to the lane of the network — and the numbering is not the
     /// IR's: SUMO counts from the right of the direction of travel.
     pub lanes: BTreeMap<LaneId, String>,
+    /// Where each element of the IR ended up in the four files: nodes, edges, lanes
+    /// and connections, by the identifiers written for them. See the crate
+    /// documentation for how each is named.
+    ///
+    /// Its `files` are empty: the network is in memory until [`write_traced`] puts it
+    /// somewhere.
+    pub trace: Trace,
 }
 
 impl PlainNetwork {
@@ -142,9 +171,27 @@ pub fn to_plain_xml(map: &ValidatedMap) -> Result<PlainNetwork, ExportError> {
 /// Writes `map` into `directory` as a SUMO plain-XML network, and hands back the
 /// prefix its files were named with.
 pub fn write(map: &ValidatedMap, directory: impl AsRef<Path>) -> Result<String, ExportError> {
+    let (prefix, _) = write_traced(map, directory)?;
+    Ok(prefix)
+}
+
+/// Writes `map` into `directory` as [`write`] does, and hands back the trace of what
+/// was written alongside the prefix, with the four files' paths in it.
+pub fn write_traced(
+    map: &ValidatedMap,
+    directory: impl AsRef<Path>,
+) -> Result<(String, Trace), ExportError> {
+    let directory = directory.as_ref();
     let network = to_plain_xml(map)?;
     network.write_to(directory)?;
-    Ok(network.prefix)
+    let files = network
+        .files()
+        .into_iter()
+        .map(|(name, _)| directory.join(name))
+        .collect();
+    let mut trace = network.trace;
+    trace.files = files;
+    Ok((network.prefix, trace))
 }
 
 /// What this map loses on the way into a SUMO network.
@@ -322,10 +369,13 @@ struct Node {
     /// *decide* the junction rather than being one input among several. See
     /// [`Exporter::priority_of`].
     edge_priority: bool,
+    /// The junction this node is, when it is one rather than a road end.
+    junction: Option<JunctionId>,
 }
 
 struct Edge {
     id: String,
+    road: RoadId,
     from: String,
     to: String,
     name: Option<String>,
@@ -336,6 +386,7 @@ struct Edge {
 }
 
 struct EdgeLane {
+    lane: LaneId,
     width: f64,
     speed: Option<f64>,
     permission: Option<Permission>,
@@ -349,6 +400,14 @@ struct Slot {
     index: usize,
 }
 
+/// The IR behind one written connection: the lane connections it was followed along,
+/// and the connector lanes it crossed a junction on.
+#[derive(Default)]
+struct Movement {
+    connections: BTreeSet<ConnectionId>,
+    connectors: BTreeSet<LaneId>,
+}
+
 struct Exporter<'a> {
     map: &'a ValidatedMap,
     sampling: SamplingConfig,
@@ -357,6 +416,8 @@ struct Exporter<'a> {
     /// Ordered, and a set, because a junction with several connectors between one
     /// pair of lanes would otherwise write the same movement twice.
     connections: BTreeSet<(usize, usize, usize, usize)>,
+    /// What of the IR each written connection stands for.
+    movements: BTreeMap<(usize, usize, usize, usize), Movement>,
     slots: HashMap<LaneId, Slot>,
     /// Junctions a traffic light controls an approach to.
     signalised: HashSet<JunctionId>,
@@ -377,6 +438,7 @@ impl<'a> Exporter<'a> {
             nodes: BTreeMap::new(),
             edges: Vec::new(),
             connections: BTreeSet::new(),
+            movements: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: HashSet::new(),
             right_of_way: HashSet::new(),
@@ -461,11 +523,19 @@ impl<'a> Exporter<'a> {
     // Nodes
     // ----------------------------------------------------------------------- //
 
-    fn node(&mut self, id: String, point: Point3, kind: NodeKind, edge_priority: bool) -> String {
+    fn node(
+        &mut self,
+        id: String,
+        point: Point3,
+        kind: NodeKind,
+        edge_priority: bool,
+        junction: Option<JunctionId>,
+    ) -> String {
         self.nodes.entry(id.clone()).or_insert(Node {
             point,
             kind,
             edge_priority,
+            junction,
         });
         id
     }
@@ -489,6 +559,7 @@ impl<'a> Exporter<'a> {
                     point,
                     kind,
                     self.ruled.contains(&junction),
+                    Some(junction),
                 )
             }
             Some(RoadLinkTarget::Road(other)) => {
@@ -513,6 +584,7 @@ impl<'a> Exporter<'a> {
                     point,
                     NodeKind::Unstated,
                     false,
+                    None,
                 )
             }
             None => self.node(
@@ -520,6 +592,7 @@ impl<'a> Exporter<'a> {
                 road.endpoint(end),
                 NodeKind::DeadEnd,
                 false,
+                None,
             ),
         }
     }
@@ -534,6 +607,7 @@ impl<'a> Exporter<'a> {
             point,
             NodeKind::Unstated,
             false,
+            None,
         ))
     }
 
@@ -612,6 +686,7 @@ impl<'a> Exporter<'a> {
         for (position, lane) in lanes.iter().enumerate() {
             let travel = lane.travel_geometry(self.sampling)?;
             written.push(EdgeLane {
+                lane: lane.id.clone(),
                 width: self.mean_width(lane)?,
                 speed: lane.speed_limit.map(|limit| limit.mps()),
                 permission: classes::permission(lane.lane_type),
@@ -629,6 +704,7 @@ impl<'a> Exporter<'a> {
         let shape = self.carriageway_shape(lanes, &written)?;
         self.edges.push(Edge {
             id: edge_id(road, section, direction),
+            road: road.id.clone(),
             from,
             to,
             name: road.name.clone(),
@@ -751,22 +827,37 @@ impl<'a> Exporter<'a> {
     /// what makes netconvert draw the internal lane. So a movement is followed from an
     /// approach through however many connectors lie between it and the lane it comes
     /// out on, and only the two ends are written.
+    ///
+    /// Every IR connection walked along the way is kept with the connection it
+    /// became, as is every connector lane crossed, so the trace can say what each
+    /// written connection stands for.
     fn build_connections(&mut self) {
-        let mut successors: BTreeMap<LaneId, Vec<LaneId>> = BTreeMap::new();
+        let mut successors: BTreeMap<LaneId, Vec<(ConnectionId, LaneId)>> = BTreeMap::new();
         for connection in self.map.connections.iter() {
             successors
                 .entry(connection.from.lane.clone())
                 .or_default()
-                .push(connection.to.lane.clone());
+                .push((connection.id.clone(), connection.to.lane.clone()));
         }
+        let step = |lane: &LaneId| {
+            successors
+                .get(lane)
+                .into_iter()
+                .flatten()
+                .map(|(id, to)| (lane.clone(), id.clone(), to.clone()))
+                .collect::<Vec<_>>()
+        };
 
         let mut sources: Vec<LaneId> = self.slots.keys().cloned().collect();
         sources.sort();
         for source in sources {
             let mut reached: Vec<LaneId> = Vec::new();
             let mut seen: HashSet<LaneId> = HashSet::from([source.clone()]);
-            let mut frontier: Vec<LaneId> = successors.get(&source).cloned().unwrap_or_default();
-            while let Some(next) = frontier.pop() {
+            // Every connection followed, whether or not it led anywhere new.
+            let mut walked: Vec<(LaneId, ConnectionId, LaneId)> = Vec::new();
+            let mut frontier = step(&source);
+            while let Some((from, connection, next)) = frontier.pop() {
+                walked.push((from, connection, next.clone()));
                 if !seen.insert(next.clone()) {
                     continue;
                 }
@@ -777,13 +868,38 @@ impl<'a> Exporter<'a> {
                     // it leads to. A lane that is merely of a type SUMO has no place
                     // for is a different matter — the movement ends there, because
                     // nothing was written for traffic to arrive on.
-                    frontier.extend(successors.get(&next).cloned().unwrap_or_default());
+                    frontier.extend(step(&next));
                 }
             }
             for target in reached {
-                self.connect(&source, &target);
+                let movement = self.movement_between(&source, &target, &walked);
+                self.connect(&source, &target, movement);
             }
         }
+    }
+
+    /// The part of what was walked from `source` that lies on a way to `target`: the
+    /// connections into the target, and back from there through connectors to the
+    /// source.
+    fn movement_between(
+        &self,
+        source: &LaneId,
+        target: &LaneId,
+        walked: &[(LaneId, ConnectionId, LaneId)],
+    ) -> Movement {
+        let mut movement = Movement::default();
+        let mut ahead: HashSet<&LaneId> = HashSet::from([target]);
+        let mut pending: Vec<&LaneId> = vec![target];
+        while let Some(lane) = pending.pop() {
+            for (from, connection, _) in walked.iter().filter(|(_, _, to)| to == lane) {
+                movement.connections.insert(connection.clone());
+                if from != source && self.on_connector(from) && ahead.insert(from) {
+                    movement.connectors.insert(from.clone());
+                    pending.push(from);
+                }
+            }
+        }
+        movement
     }
 
     fn on_connector(&self, lane: &LaneId) -> bool {
@@ -793,7 +909,7 @@ impl<'a> Exporter<'a> {
             .is_some_and(Road::is_connector)
     }
 
-    fn connect(&mut self, from: &LaneId, to: &LaneId) {
+    fn connect(&mut self, from: &LaneId, to: &LaneId, movement: Movement) {
         let (Some(from), Some(to)) = (self.slots.get(from), self.slots.get(to)) else {
             return;
         };
@@ -802,8 +918,11 @@ impl<'a> Exporter<'a> {
             // connection.
             return;
         }
-        self.connections
-            .insert((from.edge, from.index, to.edge, to.index));
+        let key = (from.edge, from.index, to.edge, to.index);
+        self.connections.insert(key);
+        let merged = self.movements.entry(key).or_default();
+        merged.connections.extend(movement.connections);
+        merged.connectors.extend(movement.connectors);
     }
 
     // ----------------------------------------------------------------------- //
@@ -816,6 +935,7 @@ impl<'a> Exporter<'a> {
             edges: self.render_edges(),
             connections: self.render_connections(),
             config: render_config(&prefix),
+            trace: self.trace(),
             lanes: self
                 .slots
                 .iter()
@@ -828,6 +948,79 @@ impl<'a> Exporter<'a> {
                 .collect(),
             prefix,
         }
+    }
+
+    /// Where each element of the IR went, read off the nodes, edges and connections
+    /// as they are rendered, in the order they are written.
+    fn trace(&self) -> Trace {
+        let mut trace = Trace::new("sumo");
+
+        let mut junction_nodes: HashMap<&JunctionId, &str> = HashMap::new();
+        for (id, node) in &self.nodes {
+            if let Some(junction) = &node.junction {
+                trace.link(junction.clone(), format!("node:{id}"), Relation::Exact);
+                junction_nodes.insert(junction, id);
+            }
+        }
+        for object in self.map.objects.iter() {
+            if object.kind != MapObjectKind::TrafficLight {
+                continue;
+            }
+            let governed: BTreeSet<&str> = object
+                .lanes
+                .iter()
+                .filter_map(|lane| self.junction_ahead_of(lane))
+                .filter_map(|junction| junction_nodes.get(&junction).copied())
+                .collect();
+            for node in governed {
+                trace.link_as(
+                    object.id.clone(),
+                    format!("node:{node}"),
+                    Relation::Merged,
+                    "traffic_light",
+                );
+            }
+        }
+
+        for edge in &self.edges {
+            trace.link(
+                edge.road.clone(),
+                format!("edge:{}", edge.id),
+                Relation::Part,
+            );
+            for (index, lane) in edge.lanes.iter().enumerate() {
+                trace.link(
+                    lane.lane.clone(),
+                    format!("lane:{}_{index}", edge.id),
+                    Relation::Exact,
+                );
+            }
+        }
+
+        for key in &self.connections {
+            let (from_edge, from_lane, to_edge, to_lane) = *key;
+            let local = format!(
+                "connection:{}_{from_lane}>{}_{to_lane}",
+                self.edges[from_edge].id, self.edges[to_edge].id
+            );
+            let Some(movement) = self.movements.get(key) else {
+                continue;
+            };
+            // One IR connection straight from lane to lane is this connection; any
+            // more, or any connector between them, and it is one of several.
+            let relation = if movement.connectors.is_empty() && movement.connections.len() == 1 {
+                Relation::Exact
+            } else {
+                Relation::Merged
+            };
+            for connection in &movement.connections {
+                trace.link(connection.clone(), local.clone(), relation);
+            }
+            for connector in &movement.connectors {
+                trace.link(connector.clone(), local.clone(), Relation::Collapsed);
+            }
+        }
+        trace
     }
 
     fn render_nodes(&self) -> String {
@@ -1009,5 +1202,312 @@ mod tests {
         let line =
             Polyline3::new([Point3::new(0.0, 1.0, 2.0), Point3::new(3.0, 4.0, 5.0)]).unwrap();
         assert_eq!(shape(&line), "0.000,1.000,2.000 3.000,4.000,5.000");
+    }
+
+    // ----------------------------------------------------------------------- //
+    // The trace
+    // ----------------------------------------------------------------------- //
+
+    use quick_xml::events::Event;
+    use roadgen_core::prelude::*;
+    use roadgen_core::trace::{IrRef, TraceLink};
+
+    fn two_way() -> Vec<LaneSpec> {
+        let width = PositiveWidth::new(3.5).unwrap();
+        vec![
+            LaneSpec::new(width, Direction::Forward),
+            LaneSpec::new(width, Direction::Backward),
+        ]
+    }
+
+    fn metadata(name: &str) -> MapMetadata {
+        MapMetadata {
+            name: Some(name.to_owned()),
+            ..MapMetadata::default()
+        }
+    }
+
+    /// Four arms meeting at one junction, every pair of them connected, with a light
+    /// on the northern approach.
+    fn crossroads() -> ValidatedMap {
+        let mut builder = MapBuilder::new(metadata("crossroads"));
+        let arms = [
+            (
+                "north",
+                Point3::new(0.0, 70.0, 0.0),
+                Point3::new(0.0, 14.0, 0.0),
+            ),
+            (
+                "east",
+                Point3::new(70.0, 0.0, 0.0),
+                Point3::new(14.0, 0.0, 0.0),
+            ),
+            (
+                "south",
+                Point3::new(0.0, -70.0, 0.0),
+                Point3::new(0.0, -14.0, 0.0),
+            ),
+            (
+                "west",
+                Point3::new(-70.0, 0.0, 0.0),
+                Point3::new(-14.0, 0.0, 0.0),
+            ),
+        ];
+        let roads: Vec<RoadId> = arms
+            .into_iter()
+            .map(|(name, start, end)| {
+                builder
+                    .add_road(
+                        RoadSpec::line(start, end, two_way())
+                            .unwrap()
+                            .with_name(name),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let junction = builder.add_junction(Some("x"));
+        for (index, from) in roads.iter().enumerate() {
+            for to in roads.iter().skip(index + 1) {
+                builder
+                    .connect_ends(from, RoadEnd::End, to, RoadEnd::End, Some(&junction))
+                    .unwrap();
+            }
+        }
+        builder
+            .add_traffic_light(&LaneRef::new(roads[0].clone(), 0), LaneEnd::End, 5.0)
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// Two roads joined end to end, with no junction between them.
+    fn in_line() -> ValidatedMap {
+        let mut builder = MapBuilder::new(metadata("in-line"));
+        let a = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("a"),
+            )
+            .unwrap();
+        let b = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(100.0, 0.0, 0.0),
+                    Point3::new(200.0, 0.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("b"),
+            )
+            .unwrap();
+        builder.connect(&a, &b).unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// Every `<kind>:<local>` the rendered files actually contain, read back from the
+    /// XML rather than from the exporter's state.
+    fn written(network: &PlainNetwork) -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        let mut edge = String::new();
+        for (_, contents) in network.files() {
+            let mut reader = quick_xml::Reader::from_str(contents);
+            loop {
+                let event = reader.read_event().unwrap();
+                let element = match &event {
+                    Event::Eof => break,
+                    Event::Start(element) | Event::Empty(element) => element,
+                    _ => continue,
+                };
+                let attributes: HashMap<String, String> = element
+                    .attributes()
+                    .map(|attribute| {
+                        let attribute = attribute.unwrap();
+                        (
+                            String::from_utf8_lossy(attribute.key.as_ref()).into_owned(),
+                            String::from_utf8_lossy(&attribute.value).into_owned(),
+                        )
+                    })
+                    .collect();
+                match element.name().as_ref() {
+                    b"node" => {
+                        found.insert(format!("node:{}", attributes["id"]));
+                    }
+                    b"edge" => {
+                        edge = attributes["id"].clone();
+                        found.insert(format!("edge:{edge}"));
+                    }
+                    b"lane" => {
+                        found.insert(format!("lane:{edge}_{}", attributes["index"]));
+                    }
+                    b"connection" => {
+                        found.insert(format!(
+                            "connection:{}_{}>{}_{}",
+                            attributes["from"],
+                            attributes["fromLane"],
+                            attributes["to"],
+                            attributes["toLane"]
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
+
+    fn links_of(trace: &Trace, ir: IrRef) -> Vec<&TraceLink> {
+        trace.links.iter().filter(|link| link.ir == ir).collect()
+    }
+
+    #[test]
+    fn everything_the_trace_names_is_in_the_files() {
+        for map in [crossroads(), in_line()] {
+            let network = to_plain_xml(&map).unwrap();
+            let written = written(&network);
+            assert_eq!(network.trace.format, "sumo");
+            assert!(network.trace.files.is_empty());
+            for link in &network.trace.links {
+                assert!(
+                    written.contains(&link.local),
+                    "{} is traced to {}, which was not written",
+                    link.ir,
+                    link.local
+                );
+            }
+            // And every connection written is accounted for by the IR.
+            for local in written
+                .iter()
+                .filter(|local| local.starts_with("connection:"))
+            {
+                assert!(
+                    network.trace.links_to(local).next().is_some(),
+                    "{local} has no IR behind it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_written_lane_has_one_exact_link_matching_its_id() {
+        for map in [crossroads(), in_line()] {
+            let network = to_plain_xml(&map).unwrap();
+            assert!(!network.lanes.is_empty());
+            for (lane, id) in &network.lanes {
+                let exact: Vec<&str> = links_of(&network.trace, IrRef::Lane(lane.clone()))
+                    .into_iter()
+                    .filter(|link| link.relation == Relation::Exact)
+                    .map(|link| link.local.as_str())
+                    .collect();
+                assert_eq!(exact, vec![format!("lane:{id}")], "{lane}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_movement_through_a_junction_is_one_connection() {
+        let map = crossroads();
+        let network = to_plain_xml(&map).unwrap();
+        let trace = &network.trace;
+
+        let junction = &map.junctions.iter().next().unwrap().id;
+        let exact = links_of(trace, IrRef::Junction(junction.clone()));
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].local, "node:j_x");
+        assert_eq!(exact[0].relation, Relation::Exact);
+
+        let light = map
+            .objects
+            .iter()
+            .find(|object| object.kind == MapObjectKind::TrafficLight)
+            .unwrap();
+        let signal = links_of(trace, IrRef::Object(light.id.clone()));
+        assert_eq!(signal.len(), 1);
+        assert_eq!(signal[0].local, "node:j_x");
+        assert_eq!(signal[0].relation, Relation::Merged);
+        assert_eq!(signal[0].role.as_deref(), Some("traffic_light"));
+
+        // A two-way arm is two edges.
+        let north = map
+            .roads
+            .iter()
+            .find(|road| road.name.as_deref() == Some("north"))
+            .unwrap();
+        let edges: Vec<&str> = links_of(trace, IrRef::Road(north.id.clone()))
+            .into_iter()
+            .map(|link| link.local.as_str())
+            .collect();
+        assert_eq!(edges, ["edge:north.fwd", "edge:north.bwd"]);
+
+        // Every connector lane is collapsed into exactly one written connection, and
+        // every IR connection in the junction is merged into one.
+        for road in map.roads.iter().filter(|road| road.is_connector()) {
+            for lane in map.lanes.iter().filter(|lane| lane.road == road.id) {
+                let links = links_of(trace, IrRef::Lane(lane.id.clone()));
+                assert_eq!(links.len(), 1, "{}", lane.id);
+                assert_eq!(links[0].relation, Relation::Collapsed);
+                assert!(links[0].local.starts_with("connection:"));
+            }
+        }
+        for connection in map.connections.iter() {
+            let links = links_of(trace, IrRef::Connection(connection.id.clone()));
+            assert_eq!(links.len(), 1, "{}", connection.id);
+            assert_eq!(links[0].relation, Relation::Merged);
+        }
+        assert!(trace
+            .links
+            .iter()
+            .any(|link| link.local == "connection:north.fwd_0>west.bwd_0"));
+    }
+
+    #[test]
+    fn a_connection_between_two_roads_is_exact() {
+        let map = in_line();
+        let network = to_plain_xml(&map).unwrap();
+        let connections: Vec<&TraceLink> = network
+            .trace
+            .links
+            .iter()
+            .filter(|link| link.local.starts_with("connection:"))
+            .collect();
+        assert!(!connections.is_empty());
+        for link in connections {
+            assert_eq!(link.relation, Relation::Exact, "{}", link.local);
+            assert!(matches!(link.ir, IrRef::Connection(_)));
+        }
+    }
+
+    #[test]
+    fn the_trace_is_the_same_every_time() {
+        let map = crossroads();
+        let first = to_plain_xml(&map).unwrap();
+        for _ in 0..3 {
+            assert_eq!(to_plain_xml(&map).unwrap().trace, first.trace);
+        }
+    }
+
+    #[test]
+    fn a_written_trace_names_the_files() {
+        let map = in_line();
+        let directory =
+            std::env::temp_dir().join(format!("roadgen-sumo-trace-{}", std::process::id()));
+        let (prefix, trace) = write_traced(&map, &directory).unwrap();
+        let names: Vec<String> = ["nod.xml", "edg.xml", "con.xml", "netccfg"]
+            .iter()
+            .map(|suffix| format!("{prefix}.{suffix}"))
+            .collect();
+        assert_eq!(
+            trace.files,
+            names
+                .iter()
+                .map(|name| directory.join(name))
+                .collect::<Vec<_>>()
+        );
+        assert!(trace.files.iter().all(|path| path.is_file()));
+        assert_eq!(trace.links, to_plain_xml(&map).unwrap().trace.links);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

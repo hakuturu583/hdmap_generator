@@ -158,7 +158,9 @@ connection/j0/north_0/east_0
 ```
 
 OpenDRIVE and Lanelet2 ids are assigned by the exporters, in the IR's own iteration
-order, and never flow back into the IR.
+order, and never flow back into the IR. What does come back is a record of them:
+every export writes a trace file saying which of its elements each IR element
+became — see [following an element across formats](#following-an-element-across-formats).
 
 ## Installing
 
@@ -1856,6 +1858,86 @@ The mitre the IR applies where road ends meet is still there for the joints that
 remain — a junction's arms, and roads that meet along one tangent — and is what makes
 their boundary points the *same* points rather than merely nearby ones.
 
+## Following an element across formats
+
+Every format numbers its output its own way. OpenDRIVE numbers roads in the IR's
+order; Lanelet2 and OpenStreetMap count; SUMO names edges after roads and counts lanes
+from the right; ClipGT and GPUDrive have nothing but the row. None of those numbers
+flow back into the IR, so "which lanelet is OpenDRIVE road 4, lane -1?" has no answer
+in the files themselves.
+
+So every export writes, beside what it wrote, a **trace file** — which element of the
+file each road, lane, junction, connection, object, rule and building of the IR became
+— and `export_ir` writes the IR's own elements, without their geometry. Loaded
+together, they follow one element from any format to any other, through the IR:
+
+```python
+m.export_ir("out/map.ir.json")
+m.export_opendrive("out/map.xodr")           # + out/map.xodr.trace.json
+m.export_lanelet2("out/lanelet2_map.osm")    # + out/lanelet2_map.osm.trace.json
+m.export_sumo("out/sumo/")                   # + out/sumo/sumo.trace.json
+
+t = roadgen.Trace.load("out/map.ir.json",
+                       "out/map.xodr.trace.json",
+                       "out/lanelet2_map.osm.trace.json",
+                       "out/sumo/sumo.trace.json")
+t.to_ir("lanelet2", 1000123)                 # [{"ir": "lane/north/0", ...}]
+t.translate("lanelet2", 1000123, to="sumo")  # [{"ref": "lane:north.fwd_0", ...}]
+t.translate("sumo", "north.fwd_0", to="opendrive")
+```
+
+Formats are never mapped onto each other directly: a lanelet goes back to the IR lane
+it came from, and that lane forward into SUMO. Each export only has to record its own
+side, a trace written today joins one written tomorrow, and a format added later needs
+one more trace and changes none.
+
+| Format | Trace file | What an element is called |
+| --- | --- | --- |
+| OpenDRIVE | `<file>.trace.json` | `road:4`, `lane:4/0/-1` (road / section / lane), `junction:16`, `connection:16/2`, `signal:3`, `object:5`, `outline:9/0`, `controller:0` |
+| Lanelet2 | `<file>.trace.json` | `lanelet:1001004`, `linestring:1001000`, `regulatory_element:1001050` |
+| OpenStreetMap | `<file>.trace.json` | `way:-12`, `node:-3`, `relation:-40` |
+| SUMO | `<dir>/sumo.trace.json` | `edge:north.fwd`, `lane:north.fwd_0`, `node:j_x`, `connection:north.fwd_0>west.bwd_0` |
+| ClipGT | `<dir>/clipgt.trace.json` | `<layer>:<row>` — `lane:17`, `lane_line:3`, `wait_line:0` |
+| GPUDrive | `<file>.trace.json` | `road:42`, `agent:1` |
+| CARLA | `<dir>/carla.trace.json` | the package's `.xodr` as OpenDRIVE, and `actor:<name>` for each light and sign; the meshes are not traced |
+
+A bare element takes the kind that format is usually asked about — a lanelet id is a
+lanelet, a SUMO id a lane — so `1000123` and `"lanelet:1000123"` are the same question.
+
+**One element is not always one element.** A road is two SUMO edges; a boundary is
+shared by two lanelets; a junction connector has no SUMO lane of its own and becomes a
+connection. Every link says which: `exact`, `part` (the IR element was split and this
+is a piece), `merged` (several IR elements were written as one) or `collapsed` (the IR
+element was absorbed into this one). Answers therefore come as a list. When the target
+format has nothing for any IR element the source came from — a lane, asked of
+OpenStreetMap, which writes roads — the lookup steps one neighbour out in the IR dump
+(the lane's road) and says so in `via`.
+
+**A trace is refused rather than trusted.** Each one records a digest of every file it
+describes and a fingerprint of the IR it was written from. A file written again since
+— whose counters may now name different things — or a trace from another map is an
+error when loaded, not a wrong answer later. `trace=False` on any export skips the
+file; `check_files=False` on `Trace.load` reads one whose files are elsewhere.
+
+**SUMO's internal lanes.** netconvert draws a lane across the junction for every
+connection, and names it itself (`:j_x_0_0`), so the export cannot. The built network
+says which connection each carries, and those are in the trace:
+
+```python
+t = roadgen.Trace.load("out/sumo/sumo.trace.json")
+t.add_sumo_net("out/sumo/demo_town.net.xml")
+t.to_ir("sumo", ":j_x_0_0")                  # the junction connector it runs along
+```
+
+A turn that waits inside the junction gets two internal lanes, and both trace to the
+same connector. The turnarounds netconvert adds at dead ends have no IR counterpart
+and trace to nothing.
+
+In Rust, the exporters' `*_traced` functions return the `roadgen_core::trace::Trace`,
+and `roadgen-trace` writes it (`write_trace`, `write_ir`) and joins it (`TraceIndex`).
+The design, and why it is shaped this way, is in
+[docs/ir-trace-design.md](docs/ir-trace-design.md).
+
 ## Layout
 
 ```
@@ -1868,6 +1950,7 @@ roadgen/
 │   │   ├── semantics/       lane types, rules, markings, objects
 │   │   ├── buildings/       footprints, heights, storeys
 │   │   ├── id/              typed identifiers
+│   │   ├── trace/           what an export wrote for each IR element
 │   │   └── validation/      UnvalidatedMap → ValidatedMap
 │   ├── roadgen-buildings/   a town beside the roads, from a CGA shape grammar
 │   ├── roadgen-carla/       meshes, FBX and the package CARLA UE5 imports, and
@@ -1878,6 +1961,7 @@ roadgen/
 │   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON
 │   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
 │   ├── roadgen-sumo/        lowering onto SUMO's plain-XML network
+│   ├── roadgen-trace/       the IR dump, trace files, and lookups across them
 │   ├── roadgen-viewer/      reading the exports back, and drawing them as SVG
 │   └── roadgen-python/      PyO3 bindings
 ├── examples/                ClipGT and GPUDrive scenario files

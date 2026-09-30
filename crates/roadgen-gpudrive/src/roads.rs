@@ -19,6 +19,10 @@
 //! is the path through the intersection; its boundaries are not, because a
 //! `road_edge` is something an agent collides with and there is no wall down the
 //! middle of a junction.
+//!
+//! Every element also records, as it is pushed, which IR elements it came from. The
+//! row's index is the only identifier GPUDrive keeps, so the push is the one place the
+//! correspondence is known; the [`Trace`] names an element `road:<id>`.
 
 use std::collections::BTreeMap;
 
@@ -27,7 +31,7 @@ use roadgen_core::map::Lane;
 use roadgen_core::semantics::{
     BoundaryMarking, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType,
 };
-use roadgen_core::{LaneType, ValidatedMap};
+use roadgen_core::{IrRef, LaneType, Relation, Trace, ValidatedMap};
 
 use crate::error::ExportError;
 use crate::scene::{MapElement, Road, RoadKind, Vector2};
@@ -35,7 +39,15 @@ use crate::scene::{MapElement, Road, RoadKind, Vector2};
 /// Every road element of the scene, in the order they are written: lanes first, then
 /// the edges and lines of each road, then the crossings and signs.
 pub fn all(map: &ValidatedMap) -> Result<Vec<Road>, ExportError> {
-    let mut rows = Rows::default();
+    all_traced(map, &mut Trace::new(crate::TRACE_FORMAT))
+}
+
+/// The same, recording in `trace` which IR elements each road element came from.
+pub fn all_traced(map: &ValidatedMap, trace: &mut Trace) -> Result<Vec<Road>, ExportError> {
+    let mut rows = Rows {
+        roads: Vec::new(),
+        trace,
+    };
     lanes(map, &mut rows)?;
     edges_and_lines(map, &mut rows)?;
     crosswalks(map, &mut rows)?;
@@ -56,27 +68,63 @@ pub fn is_stop_sign(code: &str) -> bool {
     code.starts_with("stop") || code == "r1-1" || code == "206"
 }
 
-/// The rows under construction, numbered as they are added.
+/// The rows under construction, numbered as they are added, and the trace of where
+/// each came from.
 ///
 /// The identifier is the row's own index rather than anything from the IR: GPUDrive's
 /// ids are `uint32_t` and the IR's are strings, so a stable identifier cannot survive
 /// the crossing. `check` says so.
-#[derive(Default)]
-struct Rows {
+struct Rows<'t> {
     roads: Vec<Road>,
+    trace: &'t mut Trace,
 }
 
-impl Rows {
-    fn push(&mut self, kind: RoadKind, map_element_id: MapElement, geometry: Vec<Vector2>) {
+/// One IR element a road element is drawn from, and how.
+struct Source {
+    ir: IrRef,
+    relation: Relation,
+    role: Option<&'static str>,
+}
+
+impl Source {
+    fn exact(ir: impl Into<IrRef>) -> Self {
+        Source {
+            ir: ir.into(),
+            relation: Relation::Exact,
+            role: None,
+        }
+    }
+}
+
+impl Rows<'_> {
+    /// Adds an element drawn from `sources`, linking each of them to it in the trace
+    /// under the id it is written with.
+    fn push(
+        &mut self,
+        kind: RoadKind,
+        map_element_id: MapElement,
+        geometry: Vec<Vector2>,
+        sources: Vec<Source>,
+    ) {
         // An element with no geometry is one the reader would size as `-1` segments,
-        // so it is dropped here rather than written.
+        // so it is dropped here rather than written — and has nothing to link to.
         if geometry.is_empty() {
             return;
+        }
+        let id = self.roads.len() as u32;
+        let local = format!("road:{id}");
+        for source in sources {
+            match source.role {
+                Some(role) => self
+                    .trace
+                    .link_as(source.ir, local.clone(), source.relation, role),
+                None => self.trace.link(source.ir, local.clone(), source.relation),
+            }
         }
         self.roads.push(Road {
             kind,
             geometry,
-            id: self.roads.len() as u32,
+            id,
             map_element_id,
         });
     }
@@ -95,6 +143,7 @@ fn lanes(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportError> {
             RoadKind::Lane,
             lane_element(map, lane),
             flatten(centerline.points()),
+            vec![Source::exact(lane.id.clone())],
         );
     }
     Ok(())
@@ -142,6 +191,25 @@ impl<'a> Edge<'a> {
             .filter(|lane| lane.is_some_and(|lane| lane.lane_type.is_drivable()))
             .count()
     }
+
+    /// The lanes either side of the edge, each linked to the one element written for
+    /// it: `Merged` when two lanes share the edge, `Exact` when only one touches it.
+    fn sources(&self, role: &'static str) -> Vec<Source> {
+        let lanes: Vec<&Lane> = [self.left, self.right].into_iter().flatten().collect();
+        let relation = if lanes.len() > 1 {
+            Relation::Merged
+        } else {
+            Relation::Exact
+        };
+        lanes
+            .into_iter()
+            .map(|lane| Source {
+                ir: IrRef::Lane(lane.id.clone()),
+                relation,
+                role: Some(role),
+            })
+            .collect()
+    }
 }
 
 /// The boundaries of every cross-section, as one element each.
@@ -161,7 +229,11 @@ fn edges_and_lines(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportErro
                 let Some((kind, element)) = classify(edge, marking) else {
                     continue;
                 };
-                rows.push(kind, element, vertices(curve, config)?);
+                let role = match kind {
+                    RoadKind::RoadLine => "road_line",
+                    _ => "road_edge",
+                };
+                rows.push(kind, element, vertices(curve, config)?, edge.sources(role));
             }
         }
     }
@@ -229,7 +301,12 @@ fn crosswalks(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportError> {
             let mut back = vertices(right, config)?;
             back.reverse();
             polygon.extend(back);
-            rows.push(RoadKind::Crosswalk, MapElement::Crosswalk, polygon);
+            rows.push(
+                RoadKind::Crosswalk,
+                MapElement::Crosswalk,
+                polygon,
+                vec![Source::exact(object.id.clone())],
+            );
         }
     }
     Ok(())
@@ -251,6 +328,7 @@ fn stop_signs(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportError> {
             RoadKind::StopSign,
             MapElement::StopSign,
             vec![Vector2::new(point.x, point.y)],
+            vec![Source::exact(object.id.clone())],
         );
     }
     Ok(())

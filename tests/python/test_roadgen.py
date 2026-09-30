@@ -1070,6 +1070,93 @@ def test_a_sumo_lane_is_where_the_export_says_it_is(tmp_path):
             assert found == pytest.approx(wanted, abs=0.02)
 
 
+def test_every_export_writes_a_trace_and_they_join_through_the_ir(tmp_path):
+    m = clipgt_map()
+    m.export_ir(str(tmp_path / "map.ir.json"))
+    m.export_opendrive(str(tmp_path / "map.xodr"))
+    m.export_lanelet2(str(tmp_path / "lanelet2_map.osm"))
+    m.export_osm(str(tmp_path / "openstreetmap.osm"))
+    m.export_sumo(str(tmp_path / "sumo"))
+    m.export_clipgt(str(tmp_path / "clip"))
+    m.export_gpudrive(str(tmp_path / "scene.json"))
+    traces = [
+        "map.xodr.trace.json",
+        "lanelet2_map.osm.trace.json",
+        "openstreetmap.osm.trace.json",
+        "sumo/sumo.trace.json",
+        "clip/clipgt.trace.json",
+        "scene.json.trace.json",
+    ]
+    for name in traces:
+        written = json.loads((tmp_path / name).read_text())
+        assert written["schema"] == "roadgen-trace/1"
+        assert written["links"], name
+
+    t = roadgen.Trace.load(
+        str(tmp_path / "map.ir.json"), *(str(tmp_path / name) for name in traces)
+    )
+    assert t.formats() == ["clipgt", "gpudrive", "lanelet2", "opendrive", "osm", "sumo"]
+
+    # A lanelet, by its bare id, to the SUMO lane the export already reports for the
+    # same IR lane.
+    sumo_lanes = dict(m.sumo_lane_ids())
+    checked = 0
+    for lane in m.lane_ids():
+        lanelets = [link for link in t.from_ir(lane, "lanelet2") if link["role"] == "lanelet"]
+        if not lanelets or lane not in sumo_lanes:
+            continue
+        lanelet = int(lanelets[0]["ref"].split(":")[1])
+        assert [link["ir"] for link in t.to_ir("lanelet2", lanelet) if link["role"] == "lanelet"] == [lane]
+        answers = t.translate("lanelet2", lanelet, to="sumo")
+        assert [answer["ref"] for answer in answers] == [f"lane:{sumo_lanes[lane]}"]
+        assert answers[0]["via"] is None
+        checked += 1
+    assert checked >= 8
+
+
+def test_an_export_can_be_told_not_to_write_its_trace(tmp_path):
+    m = clipgt_map()
+    m.export_lanelet2(str(tmp_path / "lanelet2_map.osm"), trace=False)
+    m.export_sumo(str(tmp_path / "sumo"), trace=False)
+    assert not (tmp_path / "lanelet2_map.osm.trace.json").exists()
+    assert not (tmp_path / "sumo" / "sumo.trace.json").exists()
+
+
+def test_a_trace_refuses_a_file_written_again_from_another_map(tmp_path):
+    m = clipgt_map()
+    m.export_lanelet2(str(tmp_path / "lanelet2_map.osm"))
+    other = roadgen.Map()
+    other.add_road(start=(0.0, 0.0, 0.0), end=(50.0, 0.0, 0.0), lanes=two_way())
+    other.export_lanelet2(str(tmp_path / "lanelet2_map.osm"), trace=False)
+    with pytest.raises(ValueError, match="has changed"):
+        roadgen.Trace.load(str(tmp_path / "lanelet2_map.osm.trace.json"))
+    # Still readable on purpose, for a trace whose files are elsewhere.
+    roadgen.Trace.load(str(tmp_path / "lanelet2_map.osm.trace.json"), check_files=False)
+
+
+def test_netconverts_internal_lanes_trace_back_to_the_junction_connectors(tmp_path):
+    m = clipgt_map()
+    prefix, net = build_with_netconvert(m, tmp_path)
+    t = roadgen.Trace.load(str(tmp_path / "sumo.trace.json"))
+    traced, untraced = t.add_sumo_net(str(tmp_path / f"{prefix}.net.xml"))
+    assert traced > 0
+
+    connectors = {lane for lane in m.lane_ids() if lane.startswith("lane/x/")}
+    internal = [
+        lane.getID()
+        for edge in net.getEdges()
+        if edge.getFunction() == "internal" and edge.getID().startswith(":j_")
+        for lane in edge.getLanes()
+    ]
+    reached = set()
+    for lane in internal:
+        irs = {link["ir"] for link in t.to_ir("sumo", lane) if link["ir"].startswith("lane/")}
+        assert len(irs) == 1, (lane, irs)
+        assert irs <= connectors
+        reached |= irs
+    assert reached == connectors
+
+
 def test_sumo_says_what_it_cannot_carry():
     warnings = clipgt_map().sumo_warnings()
     assert any("markings" in warning for warning in warnings)

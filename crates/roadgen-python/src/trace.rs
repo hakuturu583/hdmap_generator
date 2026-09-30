@@ -90,7 +90,11 @@ impl PyTrace {
 
     /// The formats loaded.
     fn formats(&self) -> Vec<String> {
-        self.index.formats().into_iter().map(str::to_owned).collect()
+        self.index
+            .formats()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The IR elements `element` of `format` was written from.
@@ -113,6 +117,8 @@ impl PyTrace {
     }
 
     /// What the IR element `ir` was written as in `format`.
+    // The name reads as Python's lookups do: `to_ir` one way, `from_ir` the other.
+    #[allow(clippy::wrong_self_convention)]
     fn from_ir<'py>(
         &self,
         py: Python<'py>,

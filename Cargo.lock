@@ -1377,6 +1377,7 @@ dependencies = [
  "roadgen-opendrive",
  "roadgen-osm",
  "roadgen-sumo",
+ "roadgen-trace",
  "roadgen-viewer",
  "serde_json",
  "tempfile",

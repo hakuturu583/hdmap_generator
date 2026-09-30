@@ -1,6 +1,28 @@
 # IR ダンプとフォーマット間 ID トレース — 設計案
 
-*2026-09 設計ドラフト（改訂 2: エクスポータごとのトレースファイル方式）。未実装。*
+*2026-09 設計（改訂 2: エクスポータごとのトレースファイル方式）。フェーズ 1 実装済み。*
+
+## 0. 実装状況（フェーズ 1）
+
+| 部品 | 場所 |
+| --- | --- |
+| `IrRef` / `Relation` / `TraceLink` / `Trace` | `crates/roadgen-core/src/trace.rs` |
+| IR ダンプ、トレースファイル、`TraceIndex`、`.net.xml` 読込 | `crates/roadgen-trace` |
+| OpenDRIVE | `roadgen_opendrive::{trace, to_opendrive_traced, to_xml_traced, write_traced, write_with_traced}` |
+| Lanelet2 | `roadgen_lanelet2::{to_lanelet_map_traced, to_osm_xml_traced, write_traced}` |
+| OSM | `roadgen_osm::{to_xml_traced, write_traced}` |
+| SUMO | `PlainNetwork.trace`、`roadgen_sumo::write_traced` |
+| ClipGT | `roadgen_clipgt::{to_layers_traced, write_traced}` |
+| GPUDrive | `roadgen_gpudrive::{to_scene_traced, to_json_traced, write_traced}` |
+| CARLA | `roadgen_carla::write_traced`（xodr と信号・標識の actor のみ） |
+| Python | 全 `export_*` が既定でトレースファイルを書く（`trace=False` で抑止）、`Map.export_ir`、`roadgen.Trace` |
+
+設計からの変更点:
+
+- ディレクトリ出力のトレースファイル名は `<dir>/<format>.trace.json`（同じディレクトリに複数フォーマットを書いても衝突しない）。
+- `options` フィールドは入れていない。採番に効くオプションは OpenDRIVE の信号配置だけで、その影響はトレース自体に反映される（書かれなかった要素にはリンクが無い）。
+- `translate` の近傍への拡張は、元要素のどの IR 要素にも対象フォーマットの対応が無いときだけ行う。一部でも直接の対応があればそれだけを返す（SUMO の内部 lane → OpenDRIVE で、connector lane の答えに周辺の lane が混ざらないように）。
+- 読み込み側（`read_opendrive`）のトレース、CLI、Web デモのハイライトはフェーズ 2 のまま。
 
 ## 1. 何を解きたいか
 

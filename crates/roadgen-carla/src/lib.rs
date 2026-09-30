@@ -86,6 +86,7 @@ use std::path::{Path, PathBuf};
 
 use roadgen_core::geometry::Point3;
 use roadgen_core::semantics::MapObjectKind;
+use roadgen_core::trace::{Relation, Trace};
 use roadgen_core::ValidatedMap;
 
 pub use error::ExportError;
@@ -295,6 +296,24 @@ pub fn write(
     directory: impl AsRef<Path>,
     config: &PackageConfig,
 ) -> Result<Package, ExportError> {
+    write_traced(map, directory, config).map(|(package, _)| package)
+}
+
+/// Writes the package, and says where each element of the IR went.
+///
+/// The road network is the `.xodr`, so most of the trace is the OpenDRIVE
+/// exporter's own, with its names unchanged: a CARLA map *is* that document, and
+/// a lane is found in it the way it is found in any other. What the package adds is
+/// the furniture — `actor:<name>` for each light and sign the script stands in the
+/// level, which is the name CARLA's editor shows it by. The meshes are not traced:
+/// a surface is cut from many lanes at once and belongs to none of them.
+///
+/// The trace names every file the package wrote.
+pub fn write_traced(
+    map: &ValidatedMap,
+    directory: impl AsRef<Path>,
+    config: &PackageConfig,
+) -> Result<(Package, Trace), ExportError> {
     if config.map.is_empty() {
         return Err(ExportError::Name("the map has no name".into()));
     }
@@ -332,8 +351,13 @@ pub fn write(
     // map is a mesh and a road network and they have to be the same road network;
     // writing a second one here would be two chances to be wrong about it.
     let xodr_path = folder.join(format!("{}.xodr", config.map));
-    roadgen_opendrive::write_with(map, &xodr_path, &options)
+    let opendrive = roadgen_opendrive::write_with_traced(map, &xodr_path, &options)
         .map_err(|error| ExportError::OpenDrive(error.to_string()))?;
+    let mut trace = Trace {
+        format: "carla".to_owned(),
+        files: Vec::new(),
+        links: opendrive.links,
+    };
 
     let mut props_path = None;
     let mut props = Vec::new();
@@ -362,7 +386,9 @@ pub fn write(
     let mut furniture_path = None;
     let mut map_logic_path = None;
     if !furniture.is_empty() || !town.is_empty() {
-        let written = write_furniture(map, &folder, config, &furniture, &town, &mut props)?;
+        let written = write_furniture(
+            map, &folder, config, &furniture, &town, &mut props, &mut trace,
+        )?;
         lights_fbx = written.lights_fbx;
         signs_fbx = written.signs_fbx;
         furniture_path = Some(written.manifest);
@@ -410,13 +436,15 @@ pub fn write(
     };
     let entries = materials::manifest(&wanted);
     let manifest = TextureManifest::new(entries.clone());
+    let texture_manifest_path = textures.join("polyhaven.manifest");
     write_text(
-        &textures.join("polyhaven.manifest"),
+        &texture_manifest_path,
         &manifest
             .to_json()
             .map_err(|error| ExportError::Json(error.to_string()))?,
     )?;
-    write_text(&textures.join("CREDITS.md"), &materials::credits(&entries))?;
+    let credits_path = textures.join("CREDITS.md");
+    write_text(&credits_path, &materials::credits(&entries))?;
 
     let mut labels: BTreeMap<Label, usize> = BTreeMap::new();
     for mesh in &meshes {
@@ -429,7 +457,26 @@ pub fn write(
             .or_default() += 1;
     }
 
-    Ok(Package {
+    trace.files = [
+        Some(&descriptor_path),
+        Some(&fbx_path),
+        Some(&xodr_path),
+        props_path.as_ref(),
+        lights_fbx.as_ref(),
+        signs_fbx.as_ref(),
+        furniture_path.as_ref(),
+        map_logic_path.as_ref(),
+        Some(&obj_path),
+        Some(&script_path),
+        Some(&texture_manifest_path),
+        Some(&credits_path),
+    ]
+    .into_iter()
+    .flatten()
+    .cloned()
+    .collect();
+
+    let package = Package {
         script: script_path,
         obj: obj_path,
         descriptor: descriptor_path,
@@ -451,7 +498,8 @@ pub fn write(
             .into_iter()
             .filter(|entry| !folder.join(&entry.path).exists())
             .collect(),
-    })
+    };
+    Ok((package, trace))
 }
 
 /// What writing the furniture produced.
@@ -463,7 +511,8 @@ struct WrittenFurniture {
 }
 
 /// Writes the lights and the signs as props, the manifest that places them and
-/// the `map_logic.json` that makes CARLA adopt the lights.
+/// the `map_logic.json` that makes CARLA adopt the lights, and records in `trace`
+/// which actor each IR object is placed as.
 fn write_furniture(
     map: &ValidatedMap,
     folder: &Path,
@@ -471,6 +520,7 @@ fn write_furniture(
     furniture: &furniture::Furniture,
     town: &[Mesh],
     props: &mut Vec<PropEntry>,
+    trace: &mut Trace,
 ) -> Result<WrittenFurniture, ExportError> {
     let settings = config.furniture.unwrap_or_default();
     let mut placements: [Vec<package::Placement>; 2] = [Vec::new(), Vec::new()];
@@ -502,6 +552,12 @@ fn write_furniture(
             tag: tag.as_str().to_owned(),
         });
         for placed in placed {
+            // The manifest's name is the one the script labels the actor with.
+            trace.link(
+                placed.object.clone(),
+                format!("actor:{}", placed.mesh.name),
+                Relation::Exact,
+            );
             placements[index].push(package::Placement {
                 name: placed.mesh.name.clone(),
                 asset: package::prop_asset_path(

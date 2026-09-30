@@ -71,6 +71,17 @@ pub fn track(
     steps: usize,
     time_step: f64,
 ) -> Result<Object, ExportError> {
+    track_with_route(map, agent, id, steps, time_step).map(|(object, _)| object)
+}
+
+/// [`track`], with the lanes the track was driven along, in the order it drove them.
+pub(crate) fn track_with_route(
+    map: &ValidatedMap,
+    agent: &Agent,
+    id: u32,
+    steps: usize,
+    time_step: f64,
+) -> Result<(Object, Vec<LaneId>), ExportError> {
     if !(time_step.is_finite() && time_step > 0.0) {
         return Err(ExportError::NoRoute(format!(
             "a timestep of {time_step} s gets nowhere"
@@ -139,7 +150,7 @@ pub fn track(
     }
 
     let goal = path.last().copied().expect("non-empty");
-    Ok(Object {
+    let object = Object {
         position,
         width: agent.width,
         length: agent.length,
@@ -151,7 +162,8 @@ pub fn track(
         goal_position: Vector2::new(goal.x, goal.y),
         kind: agent.kind,
         mark_as_expert: agent.mark_as_expert,
-    })
+    };
+    Ok((object, route))
 }
 
 /// The route's path, in travel order.

@@ -273,11 +273,13 @@ impl TraceIndex {
     /// The elements of `to` that `element` of `from` corresponds to.
     ///
     /// Through the IR: `element` back to the IR elements it came from, and each of
-    /// those forward into `to`. An IR element `to` has no counterpart for — a junction
-    /// connector in SUMO, a lane in OpenStreetMap — is replaced by its neighbours in
-    /// the IR dump, one step out, and the answers say so in
-    /// [`via`](Translation::via). Without a dump there is no such step, and such an
-    /// element has no answer.
+    /// those forward into `to`. When none of them has a counterpart in `to` — a lane
+    /// in OpenStreetMap, which writes roads — they are replaced by their neighbours
+    /// in the IR dump, one step out, and the answers say so in
+    /// [`via`](Translation::via). Only then: an element written from several IR
+    /// elements, some of which `to` has, is answered by those alone, rather than
+    /// padded with the surroundings of the rest. Without a dump there is no such
+    /// step.
     ///
     /// Answers come as a set, never as the one answer: a lanelet boundary is two
     /// lanes, and a road is two SUMO edges.
@@ -288,31 +290,35 @@ impl TraceIndex {
         to: &str,
     ) -> Result<Vec<Translation>, TraceError> {
         let target = self.format(to)?;
-        let mut seen = BTreeSet::new();
-        let mut answers = Vec::new();
-        let mut add = |link: &Link, via: Option<&str>| {
-            if seen.insert((link.local.clone(), link.ir.clone())) {
-                answers.push(Translation {
-                    local: link.local.clone(),
-                    ir: link.ir.clone(),
-                    relation: link.relation,
-                    role: link.role.clone(),
-                    via: via.map(str::to_owned),
-                });
-            }
-        };
-        for source in self.to_ir(from, element)? {
-            let direct: Vec<&Link> = target.with_ir(&source.ir).collect();
-            if !direct.is_empty() {
-                direct.into_iter().for_each(|link| add(link, None));
-                continue;
-            }
-            for neighbour in self.neighbours(&source.ir) {
-                for link in target.with_ir(&neighbour) {
-                    add(link, Some(&source.ir));
+        let sources = self.to_ir(from, element)?;
+        // (target element, IR element it came from, the element stepped from)
+        let mut found: Vec<(&Link, Option<&str>)> = sources
+            .iter()
+            .flat_map(|source| target.with_ir(&source.ir).map(|link| (link, None)))
+            .collect();
+        if found.is_empty() {
+            for source in &sources {
+                for neighbour in self.neighbours(&source.ir) {
+                    found.extend(
+                        target
+                            .with_ir(&neighbour)
+                            .map(|link| (link, Some(source.ir.as_str()))),
+                    );
                 }
             }
         }
+        let mut seen = BTreeSet::new();
+        let answers = found
+            .into_iter()
+            .filter(|(link, _)| seen.insert((link.local.as_str(), link.ir.as_str())))
+            .map(|(link, via)| Translation {
+                local: link.local.clone(),
+                ir: link.ir.clone(),
+                relation: link.relation,
+                role: link.role.clone(),
+                via: via.map(str::to_owned),
+            })
+            .collect();
         Ok(answers)
     }
 

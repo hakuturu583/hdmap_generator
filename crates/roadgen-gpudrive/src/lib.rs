@@ -42,11 +42,11 @@ pub mod roads;
 pub mod scenario;
 pub mod scene;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use roadgen_core::map::Map;
 use roadgen_core::semantics::{MapObjectKind, TrafficRule};
-use roadgen_core::{LaneId, ValidatedMap};
+use roadgen_core::{LaneId, Relation, Trace, ValidatedMap};
 
 pub use error::ExportError;
 // The route is the IR's own: it names lanes of the map and follows the map's
@@ -56,6 +56,9 @@ pub use roadgen_core::Route;
 pub use scene::{
     MapElement, Metadata, Object, ObjectKind, Road, RoadKind, Scene, TrackToPredict, Vector2,
 };
+
+/// The format name a GPUDrive [`Trace`] is recorded under.
+pub const TRACE_FORMAT: &str = "gpudrive";
 
 /// One agent of the scene.
 #[derive(Debug, Clone, PartialEq)]
@@ -198,19 +201,41 @@ impl SceneConfig {
 
 /// Builds the scene `map` and `config` describe.
 pub fn to_scene(map: &ValidatedMap, config: &SceneConfig) -> Result<Scene, ExportError> {
+    to_scene_traced(map, config).map(|(scene, _)| scene)
+}
+
+/// [`to_scene`], with the [`Trace`] of which IR elements each written element came
+/// from.
+///
+/// A road element is `road:<id>` and an agent `agent:<id>`, with the id the scene
+/// writes. A lane centreline, a crossing and a stop sign are each one IR element; an
+/// edge or line two lanes share is `merged` from both; an agent is linked from every
+/// lane of its route as a `part` of it, since the lanes are what its track is made of.
+/// Nothing is written, so the trace names no files.
+pub fn to_scene_traced(
+    map: &ValidatedMap,
+    config: &SceneConfig,
+) -> Result<(Scene, Trace), ExportError> {
+    let mut trace = Trace::new(TRACE_FORMAT);
     let mut agents = Vec::with_capacity(config.agents.len());
     for (index, agent) in config.agents.iter().enumerate() {
         // Ids count from one so that a reader which treats zero as "no object" — and
         // the padding the simulator fills unused slots with — cannot be confused for
         // the first agent.
         let id = index as u32 + 1;
-        agents.push(objects::track(
-            map,
-            agent,
-            id,
-            config.steps,
-            config.time_step,
-        )?);
+        let (object, route) =
+            objects::track_with_route(map, agent, id, config.steps, config.time_step)?;
+        let local = format!("agent:{}", object.id);
+        let mut linked: Vec<&LaneId> = Vec::with_capacity(route.len());
+        for lane in &route {
+            // A route that passes through a lane twice is still made of it once.
+            if linked.contains(&lane) {
+                continue;
+            }
+            linked.push(lane);
+            trace.link_as(lane.clone(), local.clone(), Relation::Part, "route");
+        }
+        agents.push(object);
     }
 
     let tracks_to_predict = config
@@ -231,7 +256,8 @@ pub fn to_scene(map: &ValidatedMap, config: &SceneConfig) -> Result<Scene, Expor
         .map(|(_, object)| object.id)
         .collect();
 
-    Ok(Scene {
+    let roads = roads::all_traced(map, &mut trace)?;
+    let scene = Scene {
         name: scene::truncate_name(&config.name),
         scenario_id: scene::truncate_name(&config.scenario_id),
         metadata: Metadata {
@@ -242,14 +268,26 @@ pub fn to_scene(map: &ValidatedMap, config: &SceneConfig) -> Result<Scene, Expor
             objects_of_interest,
         },
         objects: agents,
-        roads: roads::all(map)?,
-    })
+        roads,
+    };
+    Ok((scene, trace))
 }
 
 /// Renders `map` as a GPUDrive scene document.
 pub fn to_json(map: &ValidatedMap, config: &SceneConfig) -> Result<String, ExportError> {
-    let scene = to_scene(map, config)?;
-    serde_json::to_string(&scene).map_err(|error| ExportError::Json(error.to_string()))
+    to_json_traced(map, config).map(|(json, _)| json)
+}
+
+/// [`to_json`], with the [`Trace`] of the scene it renders. Nothing is written, so the
+/// trace names no files.
+pub fn to_json_traced(
+    map: &ValidatedMap,
+    config: &SceneConfig,
+) -> Result<(String, Trace), ExportError> {
+    let (scene, trace) = to_scene_traced(map, config)?;
+    let json =
+        serde_json::to_string(&scene).map_err(|error| ExportError::Json(error.to_string()))?;
+    Ok((json, trace))
 }
 
 /// Writes `map` to `path` as a GPUDrive scene.
@@ -262,14 +300,26 @@ pub fn write(
     path: impl AsRef<Path>,
     config: &SceneConfig,
 ) -> Result<(), ExportError> {
+    write_traced(map, path, config).map(|_| ())
+}
+
+/// [`write`], with the [`Trace`] of the scene it wrote. The trace's one file is
+/// `path`.
+pub fn write_traced(
+    map: &ValidatedMap,
+    path: impl AsRef<Path>,
+    config: &SceneConfig,
+) -> Result<Trace, ExportError> {
     let path = path.as_ref();
-    let scene = to_scene(map, config)?;
+    let (scene, mut trace) = to_scene_traced(map, config)?;
     let io = |error: std::io::Error| ExportError::Io(format!("{}: {error}", path.display()));
     let file = std::fs::File::create(path).map_err(io)?;
     let mut writer = std::io::BufWriter::new(file);
     serde_json::to_writer(&mut writer, &scene)
         .map_err(|error| ExportError::Json(error.to_string()))?;
-    std::io::Write::flush(&mut writer).map_err(io)
+    std::io::Write::flush(&mut writer).map_err(io)?;
+    trace.files = vec![PathBuf::from(path)];
+    Ok(trace)
 }
 
 /// What this map loses on the way into GPUDrive, and what the scene runs up against.

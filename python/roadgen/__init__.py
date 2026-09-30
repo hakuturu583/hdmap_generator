@@ -86,6 +86,18 @@ long enough to reach over the lanes it governs — and written as props, which
 name)` places them, and does the bookkeeping that makes CARLA adopt them as its own
 lights and signs rather than spawn a second set over the middle of the road. The
 script written beside the package does both.
+
+Every export also writes a trace file beside what it wrote — which element of the
+file each road, lane, junction and object became — and `export_ir` writes the map's
+own elements. Loaded together they follow one element across formats:
+
+    m.export_ir("out/map.ir.json")
+    m.export_lanelet2("out/lanelet2_map.osm")    # + lanelet2_map.osm.trace.json
+    m.export_sumo("out/sumo/")                   # + sumo/sumo.trace.json
+    t = roadgen.Trace.load("out/map.ir.json",
+                           "out/lanelet2_map.osm.trace.json",
+                           "out/sumo/sumo.trace.json")
+    t.translate("lanelet2", 1000123, to="sumo")
 """
 
 from ._roadgen import (
@@ -95,6 +107,7 @@ from ._roadgen import (
     LaneRef,
     Map,
     Road,
+    Trace,
     __version__,
     building_presets,
     building_rules,
@@ -119,6 +132,7 @@ __all__ = [
     "Map",
     "Road",
     "TextureError",
+    "Trace",
     "__version__",
     "building_presets",
     "building_rules",
