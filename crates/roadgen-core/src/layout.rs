@@ -114,6 +114,11 @@ pub struct RoadGeometry {
     pub laterals: Vec<Vector3>,
     /// Superelevation at each station, radians.
     pub rolls: Vec<f64>,
+    /// The normal a lane is lifted along at each station, where it is not the
+    /// road's own banked up: a junction connector adopts the normal of the lane it
+    /// joins at each end, as it adopts that lane's lateral, so a lift that slopes
+    /// across the lane meets the lane's edges rather than missing them by the tilt.
+    pub ups: Vec<Option<Vector3>>,
 }
 
 impl RoadGeometry {
@@ -136,10 +141,12 @@ impl RoadGeometry {
             .iter()
             .map(|sample| superelevation.evaluate(sample.station))
             .collect();
+        let ups = vec![None; samples.len()];
         Ok(RoadGeometry {
             samples,
             laterals,
             rolls,
+            ups,
         })
     }
 
@@ -168,18 +175,41 @@ impl RoadGeometry {
         range: (f64, f64),
         offset: impl Fn(f64) -> f64,
     ) -> Result<Curve3, GeometryError> {
+        self.raised_boundary_over(range, offset, |_| 0.0)
+    }
+
+    /// [`RoadGeometry::boundary_over`], lifted `lift(station)` metres off the road
+    /// surface — along the surface's normal, which superelevation tilts with it, as
+    /// OpenDRIVE lifts a lane by its `<height>`.
+    pub fn raised_boundary_over(
+        &self,
+        range: (f64, f64),
+        offset: impl Fn(f64) -> f64,
+        lift: impl Fn(f64) -> f64,
+    ) -> Result<Curve3, GeometryError> {
         let tolerance = Polyline3::MIN_SEGMENT;
-        Ok(Curve3::Polyline(Polyline3::new(
-            self.samples
-                .iter()
-                .enumerate()
-                .filter(|(_, sample)| {
-                    sample.station >= range.0 - tolerance && sample.station <= range.1 + tolerance
-                })
-                .map(|(index, sample)| {
-                    sample.point + self.banked_lateral(index) * offset(sample.station)
-                }),
-        )?))
+        let mut points = Vec::with_capacity(self.samples.len());
+        for (index, sample) in self.samples.iter().enumerate() {
+            if sample.station < range.0 - tolerance || sample.station > range.1 + tolerance {
+                continue;
+            }
+            let mut point = sample.point + self.banked_lateral(index) * offset(sample.station);
+            let lift = lift(sample.station);
+            if lift != 0.0 {
+                point = point + self.banked_up(index)? * lift;
+            }
+            points.push(point);
+        }
+        Ok(Curve3::Polyline(Polyline3::new(points)?))
+    }
+
+    /// The road surface's normal at one station: up, tilted with the road's roll.
+    pub fn banked_up(&self, index: usize) -> Result<Vector3, GeometryError> {
+        if let Some(up) = self.ups[index] {
+            return Ok(up);
+        }
+        let sample = &self.samples[index];
+        Ok(sample.frame()?.banked(self.rolls[index]).up.get())
     }
 
     /// The lateral direction in plan at one end, before any roll. This is what a
@@ -187,6 +217,11 @@ impl RoadGeometry {
     /// whatever each of them is banked to.
     pub fn lateral_at(&self, end: RoadEnd) -> Vector3 {
         self.laterals[self.index_at(end)]
+    }
+
+    /// The normal a lane is lifted along at one end.
+    pub fn banked_up_at(&self, end: RoadEnd) -> Result<Vector3, GeometryError> {
+        self.banked_up(self.index_at(end))
     }
 
     /// The lateral direction at one end with the road's roll applied — the direction
@@ -228,6 +263,20 @@ pub fn section_lanes(
             LateralSide::Right => (1 - ordinal as i32, -(ordinal as i32)),
         };
         let index = index_offset + position;
+        // Which of the lane's two edges is its inner one, the one nearer the
+        // cross-section origin, decides which lift each boundary takes.
+        let height = &lane_spec.height;
+        let lift = |outer: bool| {
+            move |station: f64| {
+                let (inner, out) = height.evaluate(station);
+                if outer {
+                    out
+                } else {
+                    inner
+                }
+            }
+        };
+        let left_is_outer = side == LateralSide::Left;
         built.push(Lane {
             id: LaneId::of_road(road, index),
             road: road.clone(),
@@ -244,13 +293,22 @@ pub fn section_lanes(
             right_edge,
             left_offset: layout.edge_offset(left_edge, layout.station_range.0),
             right_offset: layout.edge_offset(right_edge, layout.station_range.0),
-            left_boundary: geometry
-                .boundary_over(layout.station_range, |s| layout.edge_offset(left_edge, s))?,
-            right_boundary: geometry
-                .boundary_over(layout.station_range, |s| layout.edge_offset(right_edge, s))?,
-            centerline: geometry.boundary_over(layout.station_range, |s| {
-                (layout.edge_offset(left_edge, s) + layout.edge_offset(right_edge, s)) / 2.0
-            })?,
+            left_boundary: geometry.raised_boundary_over(
+                layout.station_range,
+                |s| layout.edge_offset(left_edge, s),
+                lift(left_is_outer),
+            )?,
+            right_boundary: geometry.raised_boundary_over(
+                layout.station_range,
+                |s| layout.edge_offset(right_edge, s),
+                lift(!left_is_outer),
+            )?,
+            centerline: geometry.raised_boundary_over(
+                layout.station_range,
+                |s| (layout.edge_offset(left_edge, s) + layout.edge_offset(right_edge, s)) / 2.0,
+                |s| height.across(s, 0.5),
+            )?,
+            height: height.clone(),
             left_marking: lane_spec.left_marking,
             right_marking: lane_spec.right_marking,
         });

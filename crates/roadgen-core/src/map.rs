@@ -12,7 +12,8 @@ use crate::arena::Arena;
 use crate::buildings::{Building, BuildingPart};
 use crate::error::GeometryError;
 use crate::geometry::{
-    Curve3, Frame3, Point3, Poly3Profile, Polyline3, Sample, SamplingConfig, WidthProfile,
+    Curve3, Frame3, LaneHeight, Point3, Poly3Profile, Polyline3, Sample, SamplingConfig,
+    WidthProfile,
 };
 use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
@@ -148,12 +149,20 @@ impl Default for MapMetadata {
 /// the sampler happened to produce. And a stretch where a lane tapers needs vertices
 /// along it: a straight road is otherwise two points, and a width that varies between
 /// them would have nothing to vary over.
+///
+/// A lane lifted off the road surface needs a vertex at every knot of its lift, for
+/// the same reason: its edges climb straight between knots, and a straight road
+/// with no vertex between its ends would carry the lift straight past a knot.
 pub fn required_stations<'a>(
     section_stations: impl Iterator<Item = f64>,
     widths: impl Iterator<Item = &'a WidthProfile>,
+    heights: impl Iterator<Item = &'a LaneHeight>,
     config: SamplingConfig,
 ) -> Vec<f64> {
     let mut stations: Vec<f64> = section_stations.collect();
+    for height in heights {
+        stations.extend(height.knots().iter().map(|knot| knot.0));
+    }
     for width in widths {
         if width.is_constant() {
             continue;
@@ -281,6 +290,10 @@ pub struct Lane {
     pub lane_type: LaneType,
     /// How wide the lane is along its length. Never zero anywhere.
     pub width: WidthProfile,
+    /// How far the lane's inner and outer edges stand off the road surface. Flat
+    /// for almost every lane; a pavement a kerb above the carriageway is not. The
+    /// boundaries below already include it.
+    pub height: LaneHeight,
     pub speed_limit: Option<SpeedLimit>,
     /// Which of the road's cross-sections this lane belongs to.
     pub section: usize,
@@ -321,6 +334,16 @@ impl Lane {
     /// Lateral offset of the lane's middle at its start, metres.
     pub fn center_offset(&self) -> f64 {
         (self.left_offset + self.right_offset) / 2.0
+    }
+
+    /// How far the lane's edges stand off the road surface at `station`, as the
+    /// edge to the left of the reference line and the edge to its right.
+    pub fn reference_edge_heights(&self, station: f64) -> (f64, f64) {
+        let (inner, outer) = self.height.evaluate(station);
+        match self.side {
+            LateralSide::Left => (outer, inner),
+            LateralSide::Right => (inner, outer),
+        }
     }
 
     /// How wide the lane is at `station`.
@@ -496,6 +519,7 @@ impl Map {
         let required = required_stations(
             entry.sections.iter().map(|section| section.station),
             lanes.iter().map(|lane| &lane.width),
+            lanes.iter().map(|lane| &lane.height),
             self.metadata.sampling,
         );
         entry

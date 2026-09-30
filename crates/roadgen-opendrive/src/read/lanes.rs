@@ -25,7 +25,9 @@ use opendrive::road::Road as OdRoad;
 use uom::si::length::meter;
 
 use roadgen_core::builder::LaneSpec;
-use roadgen_core::geometry::{Poly3Piece, Poly3Profile, SamplingConfig, Taper, WidthProfile};
+use roadgen_core::geometry::{
+    LaneHeight, Poly3Piece, Poly3Profile, SamplingConfig, Taper, WidthProfile,
+};
 use roadgen_core::id::RoadId;
 use roadgen_core::map::TrafficHandedness;
 use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking};
@@ -172,6 +174,18 @@ impl SectionReader<'_> {
                 .with_type(self.lane_type(&lane.r#type))
                 .with_side(side)
                 .with_markings(left_marking, right_marking);
+            if !lane.height.is_empty() {
+                // `sOffset` counts from the section's start; the IR's stations
+                // count from the road's.
+                let knots = lane.height.iter().map(|height| {
+                    (
+                        self.range.0 + height.s_offset.get::<meter>(),
+                        height.inner.get::<meter>(),
+                        height.outer.get::<meter>(),
+                    )
+                });
+                spec = spec.with_height(LaneHeight::new(knots)?);
+            }
             if let Some(speed) = lane.speed.first() {
                 match SpeedLimit::from_mps(to_mps(speed.max, speed.unit.as_ref())) {
                     Ok(limit) => spec = spec.with_speed_limit(limit),

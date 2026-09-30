@@ -74,8 +74,8 @@ pub use builder::{CrossSectionSpec, LaneRef, LaneSpec, MapBuilder, RoadSpec};
 pub use buildings::{Building, BuildingPart, Face, Footprint, Frontage, Roof, RoofShape, Solid};
 pub use error::{BuildError, GeometryError, QuantityError, ValidationError, ValidationIssue};
 pub use geometry::{
-    Alignment, Arc3, Clothoid3, Curve3, Frame3, Point3, Poly3Piece, Poly3Profile, Polyline3,
-    SamplingConfig, Taper, Vector3, WidthProfile,
+    Alignment, Arc3, Clothoid3, Curve3, Frame3, LaneHeight, Point3, Poly3Piece, Poly3Profile,
+    Polyline3, SamplingConfig, Taper, Vector3, WidthProfile,
 };
 pub use id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 pub use map::{CrossSection, Lane, Map, MapMetadata, Projection, Road, Route, TrafficHandedness};
@@ -97,8 +97,8 @@ pub mod prelude {
         Building, BuildingPart, Footprint, Frontage, Roof, RoofShape, Solid,
     };
     pub use crate::geometry::{
-        Alignment, Arc3, Clothoid3, Curve3, Point3, Poly3Piece, Poly3Profile, SamplingConfig,
-        Taper, WidthProfile,
+        Alignment, Arc3, Clothoid3, Curve3, LaneHeight, Point3, Poly3Piece, Poly3Profile,
+        SamplingConfig, Taper, WidthProfile,
     };
     pub use crate::id::{
         BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId,

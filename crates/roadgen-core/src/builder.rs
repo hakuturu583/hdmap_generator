@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{BuildError, GeometryError};
 use crate::geometry::{
-    Arc3, Bezier3, Curve3, Point3, Poly3Piece, Poly3Profile, Polyline3, SamplingConfig, Taper,
-    UnitVector3, Vector3, WidthProfile,
+    Arc3, Bezier3, Curve3, LaneHeight, Point3, Poly3Piece, Poly3Profile, Polyline3, SamplingConfig,
+    Taper, UnitVector3, Vector3, WidthProfile,
 };
 use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::layout::{self, RoadGeometry, SectionLayout};
@@ -33,6 +33,9 @@ pub struct LaneSpec {
     /// How wide the lane is along its length. A plain [`PositiveWidth`] converts, so
     /// a lane of constant width reads exactly as it did before profiles existed.
     pub width: WidthProfile,
+    /// How far the lane's inner and outer edges stand off the road surface — a
+    /// pavement raised a kerb's height, say. Flat unless given.
+    pub height: LaneHeight,
     pub direction: Direction,
     pub lane_type: LaneType,
     pub speed_limit: Option<SpeedLimit>,
@@ -47,6 +50,7 @@ impl LaneSpec {
     pub fn new(width: impl Into<WidthProfile>, direction: Direction) -> Self {
         LaneSpec {
             width: width.into(),
+            height: LaneHeight::flat(),
             direction,
             lane_type: LaneType::Driving,
             speed_limit: None,
@@ -77,6 +81,13 @@ impl LaneSpec {
     /// the lane's cross-section, so a taper is written where it is on the map.
     pub fn with_width_profile(mut self, width: WidthProfile) -> Self {
         self.width = width;
+        self
+    }
+
+    /// Lifts the lane's edges off the road surface: `inner` at the edge nearer the
+    /// reference line, `outer` at the edge further out, stations along the road.
+    pub fn with_height(mut self, height: LaneHeight) -> Self {
+        self.height = height;
         self
     }
 
@@ -941,6 +952,7 @@ impl Generator {
                     .iter()
                     .map(|section| section.station),
                 draft.spec.all_lanes().map(|lane| &lane.width),
+                draft.spec.all_lanes().map(|lane| &lane.height),
                 config,
             );
             self.geometry.insert(
@@ -1899,6 +1911,11 @@ impl Generator {
         let last = geometry.laterals.len() - 1;
         geometry.laterals[0] = start_lateral;
         geometry.laterals[last] = end_lateral;
+        // And the normal each lane there is lifted along, for the same reason: a
+        // lift that slopes across the lane lands on the approach's edges only along
+        // the approach's tilt.
+        geometry.ups[0] = Some(self.geometry[&from_lane.road].banked_up_at(from_end)?);
+        geometry.ups[last] = Some(self.geometry[&to_lane.road].banked_up_at(to_end)?);
         self.geometry.insert(road_id.clone(), geometry);
 
         // The connector carries the source lane's width into the target's. Where the
@@ -1919,6 +1936,38 @@ impl Generator {
         // cross-section origin then sits half a lane the other way, so that the lane
         // is centred on the reference line, and follows the taper.
         let side = self.map.metadata.handedness.side_for(Direction::Forward);
+
+        // And it carries the heights of the lanes it joins across, edge for edge, so
+        // that a raised pavement turning a corner stays raised and meets both ends
+        // without a step. Which edge of the lane at each end is the connector's left
+        // depends on which way it leaves or enters that lane's reference line.
+        let travel = |lane: &Lane, end: RoadEnd, along: bool| {
+            let (left, right) = lane.reference_edge_heights(lane.station_at_end(end.as_lane_end()));
+            if along {
+                (left, right)
+            } else {
+                (right, left)
+            }
+        };
+        let (start_left, start_right) = travel(from_lane, from_end, from_end == RoadEnd::End);
+        let (end_left, end_right) = travel(to_lane, to_end, to_end == RoadEnd::Start);
+        // The connector's reference line runs through the ends of the lanes'
+        // centrelines, which are lifted already — by the middle of the lift across
+        // each lane — so its edges are lifted by what is left: each edge's lift less
+        // the middle's. A kerb the same height all across is then no lift at all.
+        let inner_outer = |left: f64, right: f64| {
+            let middle = (left + right) / 2.0;
+            match side {
+                LateralSide::Left => (right - middle, left - middle),
+                LateralSide::Right => (left - middle, right - middle),
+            }
+        };
+        let height = LaneHeight::tapered(
+            0.0,
+            reference_line.horizontal_length()?,
+            inner_outer(start_left, start_right),
+            inner_outer(end_left, end_right),
+        )?;
         let half_width = width.to_poly3(0.0).scaled(0.5);
         let lane_offset = match side {
             LateralSide::Right => half_width,
@@ -1932,6 +1981,7 @@ impl Generator {
                 station: 0.0,
                 lanes: vec![LaneSpec {
                     width,
+                    height,
                     direction: Direction::Forward,
                     lane_type: from_lane.lane_type,
                     speed_limit: from_lane.speed_limit,
@@ -2291,6 +2341,19 @@ impl RoadSpec {
                 if let Ok(width) = WidthProfile::new(knots, taper) {
                     lane.width = width;
                 }
+                // A lift is by station too: where it ramps or peaks has to stay
+                // where it was on the ground, not at a number the arc has moved.
+                if !lane.height.is_flat() {
+                    let knots: Vec<(f64, f64, f64)> = lane
+                        .height
+                        .knots()
+                        .iter()
+                        .map(|(station, inner, outer)| (map(*station), *inner, *outer))
+                        .collect();
+                    if let Ok(height) = LaneHeight::new(knots) {
+                        lane.height = height;
+                    }
+                }
             }
         }
         let pieces: Vec<Poly3Piece> = self
@@ -2508,6 +2571,51 @@ mod tests {
             "{:?}",
             there.point
         );
+    }
+
+    #[test]
+    fn a_lift_moves_with_the_rounded_corner_too() {
+        let mut builder = MapBuilder::default();
+        let a = straight(
+            &mut builder,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(100.0, 0.0, 0.0),
+            "a",
+        );
+        // Road b's first lane ramps up to a kerb's height 30 m in from the joint.
+        let ramp = LaneHeight::new([(0.0, 0.0, 0.0), (30.0, 0.15, 0.15)]).unwrap();
+        let mut lanes = two_way();
+        lanes[0] = lanes[0].clone().with_height(ramp);
+        let b = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(100.0, 0.0, 0.0),
+                    Point3::new(100.0, 100.0, 0.0),
+                    lanes,
+                )
+                .unwrap()
+                .with_name("b"),
+            )
+            .unwrap();
+        builder.connect(&a, &b).unwrap();
+        let map = builder.finish().unwrap().into_map();
+
+        let radius = 3.5 + CORNER_INNER_RADIUS;
+        let (setback, half_arc) = (radius, radius * std::f64::consts::FRAC_PI_4);
+        let lifted: Vec<&Lane> = map
+            .lanes_of(&b)
+            .into_iter()
+            .filter(|lane| !lane.height.is_flat())
+            .collect();
+        assert_eq!(lifted.len(), 1);
+        // The top of the ramp is where it was on the ground -- 30 m along the
+        // straight part -- which is a different station now the joint is an arc.
+        let top = lifted[0].height.knots().last().copied().unwrap();
+        assert!(
+            (top.0 - (30.0 - setback + half_arc)).abs() < 1e-9,
+            "{top:?}"
+        );
+        assert_eq!((top.1, top.2), (0.15, 0.15));
     }
 
     #[test]

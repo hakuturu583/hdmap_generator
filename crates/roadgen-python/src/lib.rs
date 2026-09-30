@@ -15,7 +15,7 @@ use pyo3::types::PyDict;
 use roadgen_core::builder::CrossSectionSpec;
 use roadgen_core::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
 use roadgen_core::geometry::{
-    Alignment, Curve3, Point3, Poly3Profile, SamplingConfig, Taper, WidthProfile,
+    Alignment, Curve3, LaneHeight, Point3, Poly3Profile, SamplingConfig, Taper, WidthProfile,
 };
 use roadgen_core::id::{BuildingId, BuildingPartId, JunctionId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::{MapMetadata, Projection, TrafficHandedness};
@@ -132,6 +132,8 @@ impl PyLane {
         marking_color = "white",
         width_profile = None,
         taper = "linear",
+        height = None,
+        height_profile = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -145,6 +147,8 @@ impl PyLane {
         marking_color: &str,
         width_profile: Option<Vec<(f64, f64)>>,
         taper: &str,
+        height: Option<(f64, f64)>,
+        height_profile: Option<Vec<(f64, f64, f64)>>,
     ) -> PyResult<Self> {
         // `width_profile` is `(station, metres)` pairs measured along the road, for a
         // lane that narrows or widens; `width` alone is the same width throughout.
@@ -173,6 +177,23 @@ impl PyLane {
         if let Some(side) = side {
             spec = spec.with_side(parse_side(side)?);
         }
+        // `height` is `(inner, outer)` metres off the road surface, the same all
+        // along; `height_profile` is `(station, inner, outer)` knots for a lane
+        // whose lift changes. Inner is the edge nearer the reference line.
+        match (height, height_profile) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "give height or height_profile, not both",
+                ))
+            }
+            (Some((inner, outer)), None) => {
+                spec = spec.with_height(LaneHeight::constant(inner, outer).map_err(value_error)?);
+            }
+            (None, Some(knots)) => {
+                spec = spec.with_height(LaneHeight::new(knots).map_err(value_error)?);
+            }
+            (None, None) => {}
+        }
         Ok(PyLane { spec })
     }
 
@@ -184,6 +205,13 @@ impl PyLane {
             .width
             .evaluate(self.spec.width.knots()[0].0)
             .metres()
+    }
+
+    /// How far the lane's edges stand off the road surface, as `(station, inner,
+    /// outer)` knots; empty for a lane on the surface.
+    #[getter]
+    fn height_profile(&self) -> Vec<(f64, f64, f64)> {
+        self.spec.height.knots().to_vec()
     }
 
     /// The lane's width as `(station, metres)` pairs.

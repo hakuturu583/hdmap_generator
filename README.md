@@ -413,6 +413,33 @@ routing graph will not drive off the end of it.
 The same machinery lets a junction connector **taper between lanes of different
 widths**, instead of picking one and missing the other.
 
+## A lane off the road surface
+
+A road's surface is its reference line, its elevation and its superelevation: one
+tilted plane across the road at every station. A pavement a kerb above the
+carriageway is not on it, so a lane can lift its two edges off the surface —
+`inner` at the edge nearer the reference line, `outer` at the edge further out,
+straight across the lane between them:
+
+```python
+kerbed = roadgen.Lane(width=2.0, type_="sidewalk", height=(0.15, 0.15))
+banked = roadgen.Lane(
+    width=2.0, type_="sidewalk",
+    height_profile=[(0.0, 0.15, 0.15), (50.0, 0.20, 0.25)],   # (station, inner, outer)
+)
+```
+
+The lift is along the surface's normal — which the road's grade and superelevation
+tilt with it — runs straight from one knot to the next and holds before the first
+and after the last. That is OpenDRIVE's `<height>`, with its meaning, and it is
+written as `<height>` and read back from it. The lane's boundaries carry the lift, so
+every other format receives the raised lane without knowing about heights at all;
+Lanelet2, which makes two lanes side by side share their boundary linestring, gives
+an edge the two lanes lift differently — a kerb — a line each. A junction carries a
+lane's lift across it, so a raised pavement turning a corner stays raised and meets
+both arms without a step, and validation refuses a lift that changes where two
+lanes meet end to end.
+
 ## Junctions
 
 A junction is not a bare list of permitted turns: each movement gets a generated
