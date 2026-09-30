@@ -64,11 +64,18 @@ pub(crate) fn build(
             referrers.entry(*element).or_default().push(lane.clone());
         }
     }
+    // Lanelets read as one lane name it once.
     let lanes_of = |lanelets: Vec<Id>| -> Vec<LaneId> {
-        lanelets
+        let mut lanes: Vec<LaneId> = Vec::new();
+        for lane in lanelets
             .iter()
-            .filter_map(|lanelet| built.lane_of.get(lanelet).cloned())
-            .collect()
+            .filter_map(|lanelet| built.lane_of.get(&source.resolve(*lanelet)))
+        {
+            if !lanes.contains(lane) {
+                lanes.push(lane.clone());
+            }
+        }
+        lanes
     };
 
     for relation in source.document.relations.values() {

@@ -29,6 +29,10 @@ pub(crate) struct Lanelet {
     pub right: Vec<Id>,
     /// Regulatory elements the lanelet refers to.
     pub regulatory_elements: Vec<Id>,
+    /// The lanelets of the file it is made of, in the order they run: itself, and
+    /// any that follow it across a seam OpenDRIVE cannot draw — see
+    /// [`merge_oblique_seams`].
+    pub parts: Vec<Id>,
 }
 
 impl Lanelet {
@@ -52,6 +56,8 @@ pub(crate) struct Source<'a> {
     /// Lanelets that start where each lanelet ends.
     pub successors: HashMap<Id, Vec<Id>>,
     pub predecessors: HashMap<Id, Vec<Id>>,
+    /// Lanelets of the file read as part of another, and which.
+    pub merged_into: HashMap<Id, Id>,
 }
 
 impl<'a> Source<'a> {
@@ -85,6 +91,8 @@ impl<'a> Source<'a> {
             }
         }
 
+        let merged_into = merge_oblique_seams(&mut lanelets, &points, approximations);
+
         let mut starting: HashMap<(Id, Id), Vec<Id>> = HashMap::new();
         for lanelet in lanelets.values() {
             starting
@@ -110,7 +118,13 @@ impl<'a> Source<'a> {
             lanelets,
             successors,
             predecessors,
+            merged_into,
         })
+    }
+
+    /// The lanelet a lanelet of the file was read as.
+    pub fn resolve(&self, lanelet: Id) -> Id {
+        self.merged_into.get(&lanelet).copied().unwrap_or(lanelet)
     }
 
     pub fn successors_of(&self, lanelet: Id) -> &[Id] {
@@ -216,7 +230,119 @@ fn lanelet(
         left,
         right,
         regulatory_elements: members(relation, MemberType::Relation, "regulatory_element"),
+        parts: vec![relation.id],
     })
+}
+
+/// How far along the lane the seam between two lanelets may run before they are
+/// read as one, metres.
+///
+/// OpenDRIVE ends a lane square to its road, so a seam drawn slantwise has to be
+/// met by turning the road's reference line until its normal lies along the seam.
+/// A seam a few metres long can be met that way. One drawn nearly along the lane —
+/// twenty metres of diagonal between two lanes three wide, as a map may draw where
+/// a lane changes shape — cannot: the lanes laid out square to the reference line
+/// come out metres from the file's on one side of the seam or the other. On
+/// Autoware's Nishi-Shinjuku map two seams run 19 and 22 m along the lane and the
+/// next longest 3.5 m.
+const MAX_SEAM_ALONG: f64 = 10.0;
+
+/// Reads each lanelet that runs into exactly one other across a seam longer than
+/// [`MAX_SEAM_ALONG`] along the lane, and that one out of exactly it, as one lanelet
+/// with the other: their boundaries joined end to end, keeping the first one's id
+/// and its boundaries' ways. Where the seam lies is lost, and nothing else: the two
+/// must be ordinary lanes of one kind, going one way at one speed, and whatever
+/// regulatory elements either refers to, the whole refers to.
+///
+/// Returns which lanelets were read as part of which.
+fn merge_oblique_seams(
+    lanelets: &mut BTreeMap<Id, Lanelet>,
+    points: &HashMap<Id, Point3>,
+    approximations: &mut Approximations,
+) -> HashMap<Id, Id> {
+    let mut merged_into: HashMap<Id, Id> = HashMap::new();
+    loop {
+        let mut starting: HashMap<(Id, Id), Vec<Id>> = HashMap::new();
+        let mut ending: HashMap<(Id, Id), Vec<Id>> = HashMap::new();
+        for lanelet in lanelets.values() {
+            starting
+                .entry(lanelet.start_key())
+                .or_default()
+                .push(lanelet.id);
+            ending
+                .entry(lanelet.end_key())
+                .or_default()
+                .push(lanelet.id);
+        }
+        let pair = lanelets.values().find_map(|first| {
+            let key = first.end_key();
+            let [next] = starting.get(&key)?.as_slice() else {
+                return None;
+            };
+            let ([_], true) = (ending.get(&key)?.as_slice(), *next != first.id) else {
+                return None;
+            };
+            let second = &lanelets[next];
+            let alike = !first.turn
+                && !second.turn
+                && first.subtype == second.subtype
+                && first.location == second.location
+                && first.one_way == second.one_way
+                && first.speed_limit_kph == second.speed_limit_kph;
+            (alike && seam_along(first, points) > MAX_SEAM_ALONG).then_some((first.id, *next))
+        });
+        let Some((first, second)) = pair else {
+            break;
+        };
+        let second = lanelets.remove(&second).expect("found above");
+        let whole = lanelets.get_mut(&first).expect("found above");
+        whole.left.extend_from_slice(&second.left[1..]);
+        whole.right.extend_from_slice(&second.right[1..]);
+        for element in second.regulatory_elements {
+            if !whole.regulatory_elements.contains(&element) {
+                whole.regulatory_elements.push(element);
+            }
+        }
+        whole.parts.extend(second.parts.iter().copied());
+        for part in &second.parts {
+            merged_into.insert(*part, first);
+        }
+        approximations.count(
+            "OpenDRIVE ends a lane square to its road, so {n} lanelets that follow \
+             another across a seam drawn nearly along the lane are read as one lane with \
+             it, and where the seam lies is lost",
+        );
+    }
+    merged_into
+}
+
+/// How far the seam a lanelet ends at runs along the lane, in plan: the seam
+/// across the direction its boundaries end in.
+fn seam_along(lanelet: &Lanelet, points: &HashMap<Id, Point3>) -> f64 {
+    let heading = |nodes: &[Id]| {
+        let (a, b) = (
+            points[&nodes[nodes.len() - 2]],
+            points[&nodes[nodes.len() - 1]],
+        );
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let length = dx.hypot(dy);
+        if length > 0.0 {
+            (dx / length, dy / length)
+        } else {
+            (0.0, 0.0)
+        }
+    };
+    let (left, right) = (heading(&lanelet.left), heading(&lanelet.right));
+    let (dx, dy) = (left.0 + right.0, left.1 + right.1);
+    let length = dx.hypot(dy);
+    if length == 0.0 {
+        return 0.0;
+    }
+    let (a, b) = (
+        points[lanelet.left.last().expect("a boundary has points")],
+        points[lanelet.right.last().expect("a boundary has points")],
+    );
+    ((b.x - a.x) * dx + (b.y - a.y) * dy).abs() / length
 }
 
 /// Points each boundary the way the lanelet runs, the way Lanelet2 does on load.

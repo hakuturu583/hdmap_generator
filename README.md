@@ -1848,7 +1848,10 @@ lanelet's own boundaries. What is reconstructed is everything above them:
   [height](#a-lane-off-the-road-surface) says: how far its edges stand off the
   tilted surface, kept to within 5 mm with as few knots as that takes. Lanes side
   by side whose ends are staggered along the road are split into roads that can
-  each be described this way.
+  each be described this way. Two lanelets one after the other whose seam is drawn
+  nearly along the lane — running more than 10 m along it, which no amount of
+  turning the reference line meets — are read as one lane, named `lanelet a+b`;
+  where the seam lay is lost.
 - **Junctions.** Autoware marks the lanelets that cross an intersection with
   `turn_direction`, and each becomes a junction connector — except one that
   branches into several turns, or that several turns run into, which is read as

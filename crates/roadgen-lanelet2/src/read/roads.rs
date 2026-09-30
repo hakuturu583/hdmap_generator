@@ -375,7 +375,14 @@ fn road_along(
             "lanelet {}",
             group
                 .iter()
-                .map(|lanelet| lanelet.id.to_string())
+                .map(|lanelet| {
+                    lanelet
+                        .parts
+                        .iter()
+                        .map(Id::to_string)
+                        .collect::<Vec<_>>()
+                        .join("+")
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
