@@ -41,7 +41,7 @@ fn translation_dict<'py>(py: Python<'py>, answer: &Translation) -> PyResult<Boun
 /// ```text
 /// t = roadgen.Trace.load("out/map.ir.json",
 ///                        "out/lanelet2_map.osm.trace.json",
-///                        "out/sumo/sumo.trace.json")
+///                        "out/sumo/demo_town.sumo.trace.json")
 /// t.translate("lanelet2", 1000123, to="sumo")
 /// ```
 ///

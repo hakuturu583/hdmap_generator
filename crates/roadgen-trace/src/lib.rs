@@ -13,7 +13,7 @@
 //! ├── lanelet2_map.osm.trace.json    the Lanelet2 trace   write_trace
 //! └── sumo/
 //!     ├── town.nod.xml …
-//!     └── sumo.trace.json            the SUMO trace
+//!     └── town.sumo.trace.json       the SUMO trace
 //! ```
 //!
 //! To go from lanelet `1000123` to SUMO, the Lanelet2 trace is read backwards to the
@@ -29,7 +29,7 @@ pub mod index;
 pub mod ir;
 
 pub use error::TraceError;
-pub use file::{read_ir, sidecar_path, write_ir, write_trace, TraceFile};
+pub use file::{directory_sidecar, read_ir, sidecar_path, write_ir, write_trace, TraceFile};
 pub use index::{Link, SumoNetReport, TraceIndex, Translation};
 pub use ir::{IrCatalog, IrDocument};
 
@@ -97,13 +97,13 @@ mod tests {
         write_trace(
             &counted(&map, "alpha", 100, &a_file),
             &map,
-            sidecar_path(&a_file, "alpha"),
+            sidecar_path(&a_file),
         )
         .unwrap();
         write_trace(
             &counted(&map, "beta", 7, &b_file),
             &map,
-            sidecar_path(&b_file, "beta"),
+            sidecar_path(&b_file),
         )
         .unwrap();
 
@@ -208,7 +208,7 @@ mod tests {
         let map = two_roads();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
-        let trace_path = sidecar_path(&file, "alpha");
+        let trace_path = sidecar_path(&file);
         write_trace(&counted(&map, "alpha", 1, &file), &map, &trace_path).unwrap();
 
         std::fs::write(&file, "rewritten").unwrap();
@@ -248,7 +248,7 @@ mod tests {
         let map = two_roads();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
-        let trace_path = sidecar_path(&file, "alpha");
+        let trace_path = sidecar_path(&file);
         write_trace(&counted(&map, "alpha", 100, &file), &map, &trace_path).unwrap();
         TraceIndex::new().load(&trace_path).unwrap();
 

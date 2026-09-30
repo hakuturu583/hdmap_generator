@@ -1880,12 +1880,12 @@ together, they follow one element from any format to any other, through the IR:
 m.export_ir("out/map.ir.json")
 m.export_opendrive("out/map.xodr")           # + out/map.xodr.trace.json
 m.export_lanelet2("out/lanelet2_map.osm")    # + out/lanelet2_map.osm.trace.json
-m.export_sumo("out/sumo/")                   # + out/sumo/sumo.trace.json
+m.export_sumo("out/sumo/")                   # + out/sumo/demo_town.sumo.trace.json
 
 t = roadgen.Trace.load("out/map.ir.json",
                        "out/map.xodr.trace.json",
                        "out/lanelet2_map.osm.trace.json",
-                       "out/sumo/sumo.trace.json")
+                       "out/sumo/demo_town.sumo.trace.json")
 t.to_ir("lanelet2", 1000123)                 # [{"ir": "lane/north/0", ...}]
 t.translate("lanelet2", 1000123, to="sumo")  # [{"ref": "lane:north.fwd_0", ...}]
 t.translate("sumo", "north.fwd_0", to="opendrive")
@@ -1901,10 +1901,10 @@ one more trace and changes none.
 | OpenDRIVE | `<file>.trace.json` | `road:4`, `lane:4/0/-1` (road / section / lane), `junction:16`, `connection:16/2`, `signal:3`, `object:5`, `outline:9/0`, `controller:0` |
 | Lanelet2 | `<file>.trace.json` | `lanelet:1001004`, `linestring:1001000`, `regulatory_element:1001050` |
 | OpenStreetMap | `<file>.trace.json` | `way:-12`, `node:-3`, `relation:-40` |
-| SUMO | `<dir>/sumo.trace.json` | `edge:north.fwd`, `lane:north.fwd_0`, `node:j_x`, `connection:north.fwd_0>west.bwd_0` |
-| ClipGT | `<dir>/clipgt.trace.json` | `<layer>:<row>` — `lane:17`, `lane_line:3`, `wait_line:0` |
+| SUMO | `<dir>/<prefix>.sumo.trace.json` | `edge:north.fwd`, `lane:north.fwd_0`, `node:j_x`, `connection:north.fwd_0>west.bwd_0` |
+| ClipGT | `<dir>/<clip id>.clipgt.trace.json` | `<layer>:<row>` — `lane:17`, `lane_line:3`, `wait_line:0` |
 | GPUDrive | `<file>.trace.json` | `road:42`, `agent:1` |
-| CARLA | `<dir>/carla.trace.json` | the package's `.xodr` as OpenDRIVE, and `actor:<name>` for each light and sign; the meshes are not traced |
+| CARLA | `<dir>/<name>.carla.trace.json` | the package's `.xodr` as OpenDRIVE, and `actor:<name>` for each light and sign; the meshes are not traced |
 
 A bare element takes the kind that format is usually asked about — a lanelet id is a
 lanelet, a SUMO id a lane — so `1000123` and `"lanelet:1000123"` are the same question.
@@ -1929,7 +1929,7 @@ connection, and names it itself (`:j_x_0_0`), so the export cannot. The built ne
 says which connection each carries, and those are in the trace:
 
 ```python
-t = roadgen.Trace.load("out/sumo/sumo.trace.json")
+t = roadgen.Trace.load("out/sumo/demo_town.sumo.trace.json")
 t.add_sumo_net("out/sumo/demo_town.net.xml")
 t.to_ir("sumo", ":j_x_0_0")                  # the junction connector it runs along
 ```

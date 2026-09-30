@@ -14,7 +14,7 @@ use roadgen_core::prelude::*;
 use roadgen_core::trace::Relation;
 use roadgen_integration_tests::scenarios;
 use roadgen_integration_tests::sumo_build::sumo_available;
-use roadgen_trace::{sidecar_path, write_ir, write_trace, TraceIndex};
+use roadgen_trace::{directory_sidecar, sidecar_path, write_ir, write_trace, TraceIndex};
 
 /// Every export the traces cover, written into `directory` with its trace beside it,
 /// and the IR dump.
@@ -23,46 +23,66 @@ fn export_everything(map: &ValidatedMap, directory: &Path) {
 
     let xodr = directory.join("map.xodr");
     let trace = roadgen_opendrive::write_traced(map, &xodr).unwrap();
-    write_trace(&trace, map, sidecar_path(&xodr, &trace.format)).unwrap();
+    write_trace(&trace, map, sidecar_path(&xodr)).unwrap();
 
     let lanelet2 = directory.join("lanelet2_map.osm");
     let trace = roadgen_lanelet2::write_traced(map, &lanelet2).unwrap();
-    write_trace(&trace, map, sidecar_path(&lanelet2, &trace.format)).unwrap();
+    write_trace(&trace, map, sidecar_path(&lanelet2)).unwrap();
 
     let osm = directory.join("openstreetmap.osm");
     let trace = roadgen_osm::write_traced(map, &osm).unwrap();
-    write_trace(&trace, map, sidecar_path(&osm, &trace.format)).unwrap();
+    write_trace(&trace, map, sidecar_path(&osm)).unwrap();
 
     let sumo = directory.join("sumo");
-    let (_, trace) = roadgen_sumo::write_traced(map, &sumo).unwrap();
-    write_trace(&trace, map, sidecar_path(&sumo, &trace.format)).unwrap();
+    let (prefix, trace) = roadgen_sumo::write_traced(map, &sumo).unwrap();
+    write_trace(
+        &trace,
+        map,
+        directory_sidecar(&sumo, &prefix, &trace.format),
+    )
+    .unwrap();
 
     let clip = directory.join("clip");
-    let (_, trace) =
+    let (id, trace) =
         roadgen_clipgt::write_traced(map, &clip, &roadgen_clipgt::ClipConfig::default()).unwrap();
-    write_trace(&trace, map, sidecar_path(&clip, &trace.format)).unwrap();
+    write_trace(&trace, map, directory_sidecar(&clip, &id, &trace.format)).unwrap();
 
     let scene = directory.join("scene.json");
     let trace =
         roadgen_gpudrive::write_traced(map, &scene, &roadgen_gpudrive::SceneConfig::default())
             .unwrap();
-    write_trace(&trace, map, sidecar_path(&scene, &trace.format)).unwrap();
+    write_trace(&trace, map, sidecar_path(&scene)).unwrap();
 }
 
 fn load_everything(directory: &Path) -> TraceIndex {
+    // A directory export names its trace after what it named its files, so those are
+    // found by looking.
+    let inside = |folder: &str| {
+        std::fs::read_dir(directory.join(folder))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.to_string_lossy().ends_with(".trace.json"))
+            .collect::<Vec<_>>()
+    };
+    let (sumo, clip) = (inside("sumo"), inside("clip"));
+    assert_eq!((sumo.len(), clip.len()), (1, 1), "{sumo:?} {clip:?}");
     let mut index = TraceIndex::new();
     for file in [
         "map.ir.json",
         "map.xodr.trace.json",
         "lanelet2_map.osm.trace.json",
         "openstreetmap.osm.trace.json",
-        "sumo/sumo.trace.json",
-        "clip/clipgt.trace.json",
         "scene.json.trace.json",
-    ] {
+    ]
+    .into_iter()
+    .map(|name| directory.join(name))
+    .chain(sumo)
+    .chain(clip)
+    {
         index
-            .load(directory.join(file))
-            .unwrap_or_else(|error| panic!("{file}: {error}"));
+            .load(&file)
+            .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
     }
     index
 }

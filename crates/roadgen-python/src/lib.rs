@@ -36,7 +36,7 @@ fn runtime_error<E: std::fmt::Display>(error: E) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
-/// Writes `trace` beside `output`, the file or directory the export wrote.
+/// Writes `trace` to `path`, beside or inside what the export wrote.
 ///
 /// Every export does this unless told not to: the ids a format assigns can only be
 /// recorded while it assigns them, and a trace not written then cannot be written
@@ -44,9 +44,8 @@ fn runtime_error<E: std::fmt::Display>(error: E) -> PyErr {
 fn write_sidecar(
     map: &ValidatedMap,
     trace: &roadgen_core::trace::Trace,
-    output: &std::path::Path,
+    path: PathBuf,
 ) -> PyResult<()> {
-    let path = roadgen_trace::sidecar_path(output, &trace.format);
     roadgen_trace::write_trace(trace, map, path).map_err(runtime_error)
 }
 
@@ -1049,7 +1048,7 @@ impl PyMap {
         let map = self.built.as_ref().expect("just built");
         let written = roadgen_opendrive::write_traced(map, &path).map_err(runtime_error)?;
         if trace {
-            write_sidecar(map, &written, &path)?;
+            write_sidecar(map, &written, roadgen_trace::sidecar_path(&path))?;
         }
         Ok(())
     }
@@ -1068,7 +1067,7 @@ impl PyMap {
         let map = self.built.as_ref().expect("just built");
         let written = roadgen_lanelet2::write_traced(map, &path).map_err(runtime_error)?;
         if trace {
-            write_sidecar(map, &written, &path)?;
+            write_sidecar(map, &written, roadgen_trace::sidecar_path(&path))?;
         }
         Ok(())
     }
@@ -1087,7 +1086,7 @@ impl PyMap {
         let map = self.built.as_ref().expect("just built");
         let written = roadgen_osm::write_traced(map, &path).map_err(runtime_error)?;
         if trace {
-            write_sidecar(map, &written, &path)?;
+            write_sidecar(map, &written, roadgen_trace::sidecar_path(&path))?;
         }
         Ok(())
     }
@@ -1113,7 +1112,7 @@ impl PyMap {
     /// job, it carries the shape of every junction and the right-of-way matrix, and
     /// producing one without netconvert would mean reimplementing it.
     ///
-    /// Also writes `sumo.trace.json` in `directory` — the edge, lane, node and
+    /// Also writes `<prefix>.sumo.trace.json` in `directory` — the edge, lane, node and
     /// connection each road, lane, junction and movement became — unless `trace` is
     /// false. The internal lanes netconvert draws across a junction are not in it,
     /// since netconvert names them; `Trace.add_sumo_net` reads them from the built
@@ -1125,7 +1124,8 @@ impl PyMap {
         let (prefix, written) =
             roadgen_sumo::write_traced(map, &directory).map_err(runtime_error)?;
         if trace {
-            write_sidecar(map, &written, &directory)?;
+            let path = roadgen_trace::directory_sidecar(&directory, &prefix, &written.format);
+            write_sidecar(map, &written, path)?;
         }
         Ok(prefix)
     }
@@ -1166,7 +1166,7 @@ impl PyMap {
     /// what the file says, and everything left as `None` keeps it, so a scenario can
     /// be used as written or nudged in one place.
     ///
-    /// Also writes `clipgt.trace.json` in `directory` — which row of which layer each
+    /// Also writes `<clip id>.clipgt.trace.json` in `directory` — which row of which layer each
     /// lane, object and junction became — unless `trace` is false.
     #[pyo3(signature = (
         directory,
@@ -1193,7 +1193,8 @@ impl PyMap {
         let (clip, written) =
             roadgen_clipgt::write_traced(map, &directory, &config).map_err(runtime_error)?;
         if trace {
-            write_sidecar(map, &written, &directory)?;
+            let path = roadgen_trace::directory_sidecar(&directory, &clip, &written.format);
+            write_sidecar(map, &written, path)?;
         }
         Ok(clip)
     }
@@ -1238,7 +1239,7 @@ impl PyMap {
         let map = self.built.as_ref().expect("just built");
         let written = roadgen_gpudrive::write_traced(map, &path, &config).map_err(runtime_error)?;
         if trace {
-            write_sidecar(map, &written, &path)?;
+            write_sidecar(map, &written, roadgen_trace::sidecar_path(&path))?;
         }
         Ok(())
     }
@@ -1273,7 +1274,7 @@ impl PyMap {
     /// off, CARLA spawns its own blueprints at the signals, which the `.xodr` then
     /// places where the IR put the bar: over the middle of the lane.
     ///
-    /// Also writes `carla.trace.json` in `directory` — the `.xodr`'s ids, as the
+    /// Also writes `<name>.carla.trace.json` in `directory` — the `.xodr`'s ids, as the
     /// OpenDRIVE export's, and the actor each light and sign became — unless `trace`
     /// is false. The meshes are not traced.
     #[pyo3(signature = (
@@ -1335,7 +1336,14 @@ impl PyMap {
         let (written, traced) =
             roadgen_carla::write_traced(map, &directory, &config).map_err(runtime_error)?;
         if trace {
-            write_sidecar(map, &traced, &directory)?;
+            // Named after the map, which names the `.xodr` and the `.fbx` too.
+            let name = written
+                .xodr
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let path = roadgen_trace::directory_sidecar(&directory, &name, &traced.format);
+            write_sidecar(map, &traced, path)?;
         }
 
         let report = PyDict::new(py);

@@ -193,22 +193,26 @@ pub fn read_ir(path: impl AsRef<Path>) -> Result<IrDocument, TraceError> {
     Ok(document)
 }
 
-/// Where the trace of an export belongs.
+/// Where the trace of an export that writes one file belongs: beside it, the file's
+/// name with `.trace.json` added — `lanelet2_map.osm.trace.json` — so the two sort
+/// together.
+pub fn sidecar_path(output: impl AsRef<Path>) -> PathBuf {
+    let mut name = output.as_ref().as_os_str().to_owned();
+    name.push(".trace.json");
+    PathBuf::from(name)
+}
+
+/// Where the trace of an export that writes a directory belongs: inside it, named
+/// after what the export named its files — a SUMO network's prefix, a clip's id —
+/// and the format, `demo_town.sumo.trace.json`.
 ///
-/// Beside a file, it is the file's name with `.trace.json` added —
-/// `lanelet2_map.osm.trace.json` — so the two sort together. An export that writes
-/// a directory gets `<format>.trace.json` inside it, named by format rather than
-/// just `trace.json` so that two exports sharing a directory do not overwrite each
-/// other's.
-pub fn sidecar_path(output: impl AsRef<Path>, format: &str) -> PathBuf {
-    let output = output.as_ref();
-    if output.is_dir() {
-        output.join(format!("{format}.trace.json"))
-    } else {
-        let mut name = output.as_os_str().to_owned();
-        name.push(".trace.json");
-        PathBuf::from(name)
-    }
+/// Not a fixed name: two networks, or two clips, can share a directory under their
+/// own prefixes, and a trace named only by format would be overwritten by the second
+/// and leave the first untraceable.
+pub fn directory_sidecar(directory: impl AsRef<Path>, name: &str, format: &str) -> PathBuf {
+    directory
+        .as_ref()
+        .join(format!("{name}.{format}.trace.json"))
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), TraceError> {

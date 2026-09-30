@@ -19,7 +19,7 @@
 
 設計からの変更点:
 
-- ディレクトリ出力のトレースファイル名は `<dir>/<format>.trace.json`（同じディレクトリに複数フォーマットを書いても衝突しない）。
+- ディレクトリ出力のトレースファイル名は `<dir>/<名前>.<format>.trace.json`。名前は SUMO の prefix、ClipGT の clip id、CARLA の地図名で、同じディレクトリに複数のフォーマットや複数のネットワーク・clip を書いても衝突しない。
 - `options` フィールドは入れていない。採番に効くオプションは OpenDRIVE の信号配置だけで、その影響はトレース自体に反映される（書かれなかった要素にはリンクが無い）。
 - `translate` の近傍への拡張は、元要素のどの IR 要素にも対象フォーマットの対応が無いときだけ行う。一部でも直接の対応があればそれだけを返す（SUMO の内部 lane → OpenDRIVE で、connector lane の答えに周辺の lane が混ざらないように）。
 - IR ダンプは形状を載せないが、fingerprint は形状も含めて計算する。カタログの `geometry` 欄に IR 全体（形状・sampling・建物の形など）の digest を入れ、それも fingerprint の対象にした。ID とつながりが同じでも形状の違う地図（例: 停止線を動かすと OSM でのノード統合が変わる）は別の地図として扱われ、トレースが突き合わされない。
@@ -89,14 +89,14 @@ out/
 ├── lanelet2_map.osm.trace.json        ← Lanelet2 エクスポータが書く
 └── sumo/
     ├── net.nod.xml …
-    └── sumo.trace.json                ← SUMO エクスポータが書く（ディレクトリ出力は中に `<format>.trace.json`）
+    └── town.sumo.trace.json           ← SUMO エクスポータが書く（ディレクトリ出力は中に `<名前>.<format>.trace.json`）
 ```
 
 例: Lanelet2 の lanelet `1000123` → SUMO
 
 ```
 lanelet2_map.osm.trace.json で逆引き   lanelet:1000123 → lane/north/0
-sumo/sumo.trace.json で正引き               lane/north/0    → lane:north.fwd_0
+sumo/town.sumo.trace.json で正引き               lane/north/0    → lane:north.fwd_0
 ```
 
 1 ファイルにまとめる案（旧版）ではなくこの形にする理由:
@@ -280,7 +280,7 @@ Lanelet2 のトレースファイルの join で引ける。
 let mut index = TraceIndex::new();                        // fingerprint / sha256 照合は load 時
 index.load("out/map.ir.json")?;                           // IR ダンプ（任意だが推奨）
 index.load("out/lanelet2_map.osm.trace.json")?;
-index.load("out/sumo/sumo.trace.json")?;
+index.load("out/sumo/town.sumo.trace.json")?;
 index.load_sumo_net("out/sumo/town.net.xml")?;            // 任意: 交差点内 lane（§8.1）
 index.to_ir("lanelet2", "lanelet:1000123")                 // -> Vec<&Link>
 index.from_ir("lane/north/0", "sumo")                      // -> Vec<&Link>
@@ -306,19 +306,19 @@ index.translate("lanelet2", "1000123", "sumo")             // 合成（種別は
 ```python
 m.export_opendrive("out/map.xodr")         # + out/map.xodr.trace.json
 m.export_lanelet2("out/lanelet2_map.osm")  # + out/lanelet2_map.osm.trace.json
-m.export_sumo("out/sumo/")                 # + out/sumo/sumo.trace.json
+m.export_sumo("out/sumo/")                 # + out/sumo/town.sumo.trace.json
 m.export_ir("out/map.ir.json")             # IR ダンプ
 
 t = roadgen.Trace.load("out/map.ir.json",
                        "out/lanelet2_map.osm.trace.json",
-                       "out/sumo/sumo.trace.json")
+                       "out/sumo/town.sumo.trace.json")
 t.to_ir("lanelet2", 1000123)                       # ['lane/north/0']
 t.translate("lanelet2", 1000123, to="sumo")        # [('lane', 'north.fwd_0')]
 t.translate("sumo", "north.fwd_0", to="lanelet2")
 ```
 
 ```
-python -m roadgen trace out/map.ir.json out/*.trace.json out/sumo/sumo.trace.json \
+python -m roadgen trace out/map.ir.json out/*.trace.json out/sumo/town.sumo.trace.json \
     lanelet2:lanelet:1000123 --to sumo
 ```
 

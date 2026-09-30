@@ -93,10 +93,10 @@ own elements. Loaded together they follow one element across formats:
 
     m.export_ir("out/map.ir.json")
     m.export_lanelet2("out/lanelet2_map.osm")    # + lanelet2_map.osm.trace.json
-    m.export_sumo("out/sumo/")                   # + sumo/sumo.trace.json
+    m.export_sumo("out/sumo/")                   # + sumo/<prefix>.sumo.trace.json
     t = roadgen.Trace.load("out/map.ir.json",
                            "out/lanelet2_map.osm.trace.json",
-                           "out/sumo/sumo.trace.json")
+                           "out/sumo/demo_town.sumo.trace.json")
     t.translate("lanelet2", 1000123, to="sumo")
 """
 

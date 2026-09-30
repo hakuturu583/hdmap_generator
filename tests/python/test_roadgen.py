@@ -1076,15 +1076,15 @@ def test_every_export_writes_a_trace_and_they_join_through_the_ir(tmp_path):
     m.export_opendrive(str(tmp_path / "map.xodr"))
     m.export_lanelet2(str(tmp_path / "lanelet2_map.osm"))
     m.export_osm(str(tmp_path / "openstreetmap.osm"))
-    m.export_sumo(str(tmp_path / "sumo"))
-    m.export_clipgt(str(tmp_path / "clip"))
+    prefix = m.export_sumo(str(tmp_path / "sumo"))
+    clip = m.export_clipgt(str(tmp_path / "clip"))
     m.export_gpudrive(str(tmp_path / "scene.json"))
     traces = [
         "map.xodr.trace.json",
         "lanelet2_map.osm.trace.json",
         "openstreetmap.osm.trace.json",
-        "sumo/sumo.trace.json",
-        "clip/clipgt.trace.json",
+        f"sumo/{prefix}.sumo.trace.json",
+        f"clip/{clip}.clipgt.trace.json",
         "scene.json.trace.json",
     ]
     for name in traces:
@@ -1119,7 +1119,18 @@ def test_an_export_can_be_told_not_to_write_its_trace(tmp_path):
     m.export_lanelet2(str(tmp_path / "lanelet2_map.osm"), trace=False)
     m.export_sumo(str(tmp_path / "sumo"), trace=False)
     assert not (tmp_path / "lanelet2_map.osm.trace.json").exists()
-    assert not (tmp_path / "sumo" / "sumo.trace.json").exists()
+    assert not list((tmp_path / "sumo").glob("*.trace.json"))
+
+
+def test_two_networks_in_one_directory_keep_a_trace_each(tmp_path):
+    first = clipgt_map()
+    second = roadgen.Map(name="other town")
+    second.add_road(start=(0.0, 0.0, 0.0), end=(50.0, 0.0, 0.0), lanes=two_way())
+    prefixes = [m.export_sumo(str(tmp_path)) for m in (first, second)]
+    assert prefixes[0] != prefixes[1]
+    for prefix in prefixes:
+        # Each still loads: the second export wrote beside the first, not over it.
+        roadgen.Trace.load(str(tmp_path / f"{prefix}.sumo.trace.json"))
 
 
 def test_a_trace_refuses_a_file_written_again_from_another_map(tmp_path):
@@ -1137,7 +1148,7 @@ def test_a_trace_refuses_a_file_written_again_from_another_map(tmp_path):
 def test_netconverts_internal_lanes_trace_back_to_the_junction_connectors(tmp_path):
     m = clipgt_map()
     prefix, net = build_with_netconvert(m, tmp_path)
-    t = roadgen.Trace.load(str(tmp_path / "sumo.trace.json"))
+    t = roadgen.Trace.load(str(tmp_path / f"{prefix}.sumo.trace.json"))
     traced, untraced = t.add_sumo_net(str(tmp_path / f"{prefix}.net.xml"))
     assert traced > 0
 
