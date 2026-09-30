@@ -66,6 +66,7 @@ pub mod layout;
 pub mod map;
 pub mod semantics;
 pub mod topology;
+pub mod trace;
 pub mod units;
 pub mod validation;
 
@@ -87,6 +88,7 @@ pub use topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
     RoadLink, RoadLinkTarget,
 };
+pub use trace::{IrRef, Relation, Trace, TraceLink};
 pub use units::{GeoOrigin, PositiveWidth, SpeedLimit};
 pub use validation::{UnvalidatedMap, ValidatedMap, ValidationConfig};
 

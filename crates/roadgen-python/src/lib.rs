@@ -26,6 +26,8 @@ use roadgen_core::validation::{UnvalidatedMap, ValidatedMap};
 
 use roadgen_buildings::Rules as BuildingRules;
 
+mod trace;
+
 fn value_error<E: std::fmt::Display>(error: E) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
@@ -1010,6 +1012,19 @@ impl PyMap {
         Ok(roadgen_gpudrive::check(map, config.as_ref()))
     }
 
+    /// Writes the IR dump: every road, lane, junction, connection, object, rule and
+    /// building by its identifier, with what it belongs to and connects to, and
+    /// none of its geometry.
+    ///
+    /// It is the other half of the trace files the exports write beside their
+    /// output: `roadgen.Trace.load` joins them, and uses the dump to step to a
+    /// neighbour when a format has nothing for an element itself.
+    fn export_ir(&mut self, path: PathBuf) -> PyResult<()> {
+        self.ensure_built()?;
+        roadgen_trace::write_ir(self.built.as_ref().expect("just built"), path)
+            .map_err(runtime_error)
+    }
+
     /// Writes the map as OpenDRIVE.
     fn export_opendrive(&mut self, path: PathBuf) -> PyResult<()> {
         self.ensure_built()?;
@@ -1890,6 +1905,7 @@ fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyJunction>()?;
     module.add_class::<PyLaneRef>()?;
     module.add_class::<PyAlignment>()?;
+    module.add_class::<trace::PyTrace>()?;
     module.add_function(wrap_pyfunction!(read_opendrive, module)?)?;
     module.add_function(wrap_pyfunction!(render_opendrive, module)?)?;
     module.add_function(wrap_pyfunction!(render_sumo, module)?)?;

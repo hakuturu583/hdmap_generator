@@ -64,14 +64,14 @@ out/
 ├── lanelet2_map.osm.trace.json        ← Lanelet2 エクスポータが書く
 └── sumo/
     ├── net.nod.xml …
-    └── trace.json                     ← SUMO エクスポータが書く（ディレクトリ出力は中に置く）
+    └── sumo.trace.json                ← SUMO エクスポータが書く（ディレクトリ出力は中に `<format>.trace.json`）
 ```
 
 例: Lanelet2 の lanelet `1000123` → SUMO
 
 ```
 lanelet2_map.osm.trace.json で逆引き   lanelet:1000123 → lane/north/0
-sumo/trace.json で正引き               lane/north/0    → lane:north.fwd_0
+sumo/sumo.trace.json で正引き               lane/north/0    → lane:north.fwd_0
 ```
 
 1 ファイルにまとめる案（旧版）ではなくこの形にする理由:
@@ -252,12 +252,14 @@ Lanelet2 のトレースファイルの join で引ける。
 ### 5.4 検索 API: `TraceIndex`
 
 ```rust
-let index = TraceIndex::open("out/map.ir.json")?          // IR ダンプ（任意だが推奨）
-    .with_trace("out/lanelet2_map.osm.trace.json")?       // fingerprint / sha256 照合はここで
-    .with_trace("out/sumo/trace.json")?;
-index.to_ir("lanelet2", "lanelet:1000123")                 // -> Vec<(IrRef, Relation)>
-index.from_ir(&IrRef::Lane(id), "sumo")                    // -> Vec<&TraceLink>
-index.translate("lanelet2", "lanelet:1000123", "opendrive") // 合成
+let mut index = TraceIndex::new();                        // fingerprint / sha256 照合は load 時
+index.load("out/map.ir.json")?;                           // IR ダンプ（任意だが推奨）
+index.load("out/lanelet2_map.osm.trace.json")?;
+index.load("out/sumo/sumo.trace.json")?;
+index.load_sumo_net("out/sumo/town.net.xml")?;            // 任意: 交差点内 lane（§8.1）
+index.to_ir("lanelet2", "lanelet:1000123")                 // -> Vec<&Link>
+index.from_ir("lane/north/0", "sumo")                      // -> Vec<&Link>
+index.translate("lanelet2", "1000123", "sumo")             // 合成（種別は省略可）
 ```
 
 `translate` の合成規則:
@@ -279,19 +281,19 @@ index.translate("lanelet2", "lanelet:1000123", "opendrive") // 合成
 ```python
 m.export_opendrive("out/map.xodr")         # + out/map.xodr.trace.json
 m.export_lanelet2("out/lanelet2_map.osm")  # + out/lanelet2_map.osm.trace.json
-m.export_sumo("out/sumo/")                 # + out/sumo/trace.json
+m.export_sumo("out/sumo/")                 # + out/sumo/sumo.trace.json
 m.export_ir("out/map.ir.json")             # IR ダンプ
 
 t = roadgen.Trace.load("out/map.ir.json",
                        "out/lanelet2_map.osm.trace.json",
-                       "out/sumo/trace.json")
+                       "out/sumo/sumo.trace.json")
 t.to_ir("lanelet2", 1000123)                       # ['lane/north/0']
 t.translate("lanelet2", 1000123, to="sumo")        # [('lane', 'north.fwd_0')]
 t.translate("sumo", "north.fwd_0", to="lanelet2")
 ```
 
 ```
-python -m roadgen trace out/map.ir.json out/*.trace.json out/sumo/trace.json \
+python -m roadgen trace out/map.ir.json out/*.trace.json out/sumo/sumo.trace.json \
     lanelet2:lanelet:1000123 --to sumo
 ```
 
