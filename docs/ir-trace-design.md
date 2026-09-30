@@ -295,9 +295,8 @@ python -m roadgen trace out/map.ir.json out/*.trace.json out/sumo/trace.json \
     lanelet2:lanelet:1000123 --to sumo
 ```
 
-トレースファイルの既定を「書く」にするか「書かない」にするかは §9 で決める。
-書く場合は出力ディレクトリにファイルが 1 本増えるが、後から同じ IR を再現できない限り
-トレースは作り直せないので、既定で書くほうを推す。
+トレースファイルは既定で書く（決定済み）。出力ディレクトリにファイルが 1 本増えるが、
+後から同じ IR を再現できない限りトレースは作り直せないため。
 
 Web デモ（viewer）では、同じ Trace を使って「あるフォーマットで要素をクリック →
 他フォーマットの対応要素をハイライト」ができる。フェーズ 2 以降の候補。
@@ -313,24 +312,38 @@ Web デモ（viewer）では、同じ Trace を使って「あるフォーマッ
   元の lane 番号に戻ること
 - 決定性: 同じ入力から 2 回作った trace が byte 単位で一致すること
 
-## 8. 段階的導入
+## 8. 対象範囲と段階的導入
+
+**対象**: 3D モデル（CARLA の FBX メッシュ）と点群地図**以外の全フォーマット**。
+CARLA パッケージ内の `.xodr` は OpenDRIVE のトレースで、信号・標識は既存の
+furniture manifest（IR object ↔ xodr signal ↔ actor 名）で追える。
+
+| フォーマット | ref の単位 | 注意点 |
+| --- | --- | --- |
+| OpenDRIVE | road / section 内 lane / junction / connection / signal / object / building / controller | `Numbering` を流用。純関数 |
+| Lanelet2 | lanelet / linestring / regulatory_element | 連番。exporter の private 表を返すだけ |
+| OSM | node / way / relation | 信号等はノードに統合（`merged`）、restriction は腕のペア単位で複数 connection に対応 |
+| SUMO | node / edge / lane / connection | plain XML の ID を記録。netconvert が生成する内部 lane（`:j_x_0_0`）は対象外（plain XML に無いため） |
+| ClipGT | `<layer>:<row>` | 行番号が唯一の ID。走行不可 lane は出力されない（リンク無し）、lane_line は重複排除で `merged` |
+| GPUDrive | `road:<index>` / `agent:<id>` | 行番号。edge/line は重複排除で `merged`。agent は走行ルートの lane 列に `part` で対応 |
+| CARLA（xodr・furniture のみ） | opendrive の ref + actor 名 | FBX メッシュは対象外 |
 
 | フェーズ | 内容 |
 | --- | --- |
-| 1 | `roadgen-core::trace` 型、IR カタログ JSON、OpenDRIVE / SUMO / Lanelet2 の trace、`TraceIndex`、各エクスポータのトレースファイル出力、Python `export_ir` / `Trace.load` / `translate`。core には serde を入れず、JSON 化は専用の小 crate（`roadgen-trace`）に置く |
-| 2 | OSM / ClipGT / GPUDrive / CARLA（furniture と xodr 分）、`read_opendrive` の source trace、CLI |
-| 3 | 完全 IR ダンプ（幾何込み）。`roadgen-core` に `serde` feature を足し、`Curve3` / `WidthProfile` 等まで derive、`Map` を JSON から復元 → `validate()`。再現性・バグ報告添付・生成器を通さない再エクスポートに使える。スキーマ維持コストが大きいので需要を見てから |
+| 1 | `roadgen-core::trace` 型、IR ダンプ（カタログ）、上表の全フォーマットのトレースファイル（既定で書き出し、`trace=False` で抑止）、`TraceIndex`、Python `export_ir` / `Trace.load` / `translate`。core には serde を入れず、JSON 化は専用の小 crate（`roadgen-trace`）に置く |
+| 2 | `read_opendrive` の読み込み側トレース、CLI、Web デモでの対応要素ハイライト |
+| 3 | 完全 IR ダンプ（幾何込み）。`roadgen-core` に `serde` feature を足し、`Curve3` / `WidthProfile` 等まで derive、`Map` を JSON から復元 → `validate()`。スキーマ維持コストが大きいので需要を見てから |
 
 ## 9. 決めてほしいこと
 
-0. トレースファイルを既定で書き出すか（推奨: 書く。`trace=False` で抑止）。
+0. ~~トレースファイルを既定で書き出すか~~ → **決定: 書き出す**（`trace=False` で抑止）。
 
 1. **ダンプの範囲**: フェーズ 1 は「ID/トポロジ/属性のカタログ」で良いか、最初から
    幾何込みの完全ダンプ（再読込可能）が欲しいか。
 2. **ファイル形式**: JSON で良いか（大規模マップで重ければ `links` だけ
    Parquet/CSV に逃がす選択肢もある）。
-3. **優先フォーマット**: フェーズ 1 の 3 つ（OpenDRIVE / SUMO / Lanelet2）で
-   想定ユースケースが満たせるか。特に外部 xodr 起点の追跡（§5.3）を先にやるべきか。
+3. ~~優先フォーマット~~ → **決定: 3D モデル・点群地図以外の全フォーマット**。
+   残る論点は外部 xodr 起点の追跡（§5.3）をフェーズ 1 に入れるか。
 4. **出力への ID 埋め込み**: 補助として、Lanelet2 の lanelet に `roadgen:id=lane/north/0`
    タグを付ける等、ファイル自体に IR ID を書く案もある（trace ファイルが無くても
    追える）。Autoware の読み込みに影響しない範囲で併用するか。
