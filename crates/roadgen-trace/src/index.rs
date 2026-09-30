@@ -45,8 +45,10 @@ pub struct Translation {
 pub struct SumoNetReport {
     /// Internal lanes traced back to the IR.
     pub internal_lanes: usize,
-    /// Connections netconvert made that the export did not ask for — the turnaround
-    /// at a dead end — and that therefore have no IR counterpart.
+    /// Connections netconvert made that the export did not ask for, and that
+    /// therefore have no IR counterpart. None for a network built with the export's
+    /// own configuration; a U-turn at every dead end for one built without it, since
+    /// netconvert adds those unless told not to.
     pub untraced: usize,
 }
 

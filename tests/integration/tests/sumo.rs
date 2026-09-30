@@ -550,13 +550,18 @@ fn the_export_is_a_netconvert_run_ready_to_go() {
             "the configuration should name {prefix}{suffix}:\n{config}"
         );
     }
+    // The IR has no U-turns, so netconvert is not to invent one at every dead end.
+    assert!(
+        config.contains(r#"<no-turnarounds value="true"/>"#),
+        "{config}"
+    );
 }
 
 /// The trace names each connection by its two lanes as the built network names them,
 /// so every movement netconvert built from the export's connections is found in it —
 /// and with it the internal lane netconvert generated in place of the IR's connector.
-/// The only movements it cannot find are netconvert's own turnarounds, which the IR
-/// never stated.
+/// There is nothing left over: the configuration keeps netconvert from adding the
+/// turnarounds the IR never stated, so every movement is one of the export's.
 #[test]
 fn every_movement_netconvert_built_is_in_the_trace() {
     if !sumo_build::sumo_available() {
@@ -585,13 +590,11 @@ fn every_movement_netconvert_built_is_in_the_trace() {
         }
         let local = format!("connection:{from}>{to}");
         let links: Vec<_> = trace.links_to(&local).collect();
-        if connection.direction.as_deref() == Some("t") {
-            assert!(
-                links.is_empty(),
-                "{local} is netconvert's turnaround, yet the trace has it"
-            );
-            continue;
-        }
+        assert_ne!(
+            connection.direction.as_deref(),
+            Some("t"),
+            "{local} is a turnaround, which the IR has none of"
+        );
         assert!(!links.is_empty(), "{local} is not in the trace");
         assert!(
             links

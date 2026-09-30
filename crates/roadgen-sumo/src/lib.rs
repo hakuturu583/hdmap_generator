@@ -1108,6 +1108,12 @@ impl<'a> Exporter<'a> {
 /// geographic origin: a network shifted so that its lowest corner is at zero would no
 /// longer line up with the OpenDRIVE, the Lanelet2 map or the clip written from the
 /// same IR.
+///
+/// Turnarounds are turned off because the IR has none. Left to itself netconvert adds
+/// a U-turn at every dead end — the far end of each arm — so a vehicle in SUMO could
+/// turn back where, in the OpenDRIVE and the Lanelet2 map written from the same IR,
+/// the lane simply ends; and the internal lane it draws for one would be the only
+/// lane in the network the trace could not follow back to the map.
 fn render_config(prefix: &str) -> String {
     let mut document = xml::Document::new(
         "configuration",
@@ -1126,6 +1132,7 @@ fn render_config(prefix: &str) -> String {
     document.close("output");
     document.open("processing", &[]);
     document.leaf("offset.disable-normalization", &[("value", "true".into())]);
+    document.leaf("no-turnarounds", &[("value", "true".into())]);
     document.close("processing");
     document.finish()
 }

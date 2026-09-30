@@ -261,9 +261,10 @@ fn an_internal_lane_netconvert_drew_translates_to_the_connector_it_carries() {
     let mut index = load_everything(directory.path());
     let report = index.load_sumo_net(&net).unwrap();
     // Twelve movements, two of them left turns that stop inside the junction and so
-    // are drawn as two internal lanes each; four turnarounds netconvert added.
+    // are drawn as two internal lanes each — and nothing netconvert made up, since
+    // the export's configuration keeps it from adding turnarounds.
     assert_eq!(report.internal_lanes, 14);
-    assert_eq!(report.untraced, 4);
+    assert_eq!(report.untraced, 0);
 
     let connectors: Vec<&Lane> = map
         .lanes

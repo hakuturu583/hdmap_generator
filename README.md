@@ -980,6 +980,11 @@ geometry, which is the one thing the OpenStreetMap export has to do.
 A junction with a traffic light on an approach becomes a `traffic_light` node.
 netconvert generates the phases, because the IR holds no signal timing to write.
 
+No U-turns. Left to itself netconvert adds one at every dead end, so a vehicle could
+turn back at the far end of an arm where the OpenDRIVE and Lanelet2 maps of the same
+IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
+`no-turnarounds`, and the network has the movements the map has and no others.
+
 ### What it cannot carry
 
 - **Lane markings.** Which line is painted between two lanes, and in what colour, has
@@ -1930,8 +1935,10 @@ t.to_ir("sumo", ":j_x_0_0")                  # the junction connector it runs al
 ```
 
 A turn that waits inside the junction gets two internal lanes, and both trace to the
-same connector. The turnarounds netconvert adds at dead ends have no IR counterpart
-and trace to nothing.
+same connector. Every internal lane traces to something: the exported `.netccfg` tells
+netconvert not to add the U-turn it otherwise puts at every dead end, which the IR —
+and so every other format — does not have. A network built without that
+configuration gets them back, and they trace to nothing.
 
 In Rust, the exporters' `*_traced` functions return the `roadgen_core::trace::Trace`,
 and `roadgen-trace` writes it (`write_trace`, `write_ir`) and joins it (`TraceIndex`).
