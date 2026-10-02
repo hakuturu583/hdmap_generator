@@ -1171,7 +1171,7 @@ def test_netconverts_internal_lanes_trace_back_to_the_junction_connectors(tmp_pa
 def test_sumo_says_what_it_cannot_carry():
     warnings = clipgt_map().sumo_warnings()
     assert any("markings" in warning for warning in warnings)
-    assert any("netconvert generates the phases" in warning for warning in warnings)
+    assert any("fixed-time program of the export's own" in warning for warning in warnings)
     # And, as with the OpenStreetMap export, it stays out of the general warnings.
     assert clipgt_map().format_warnings() == []
 

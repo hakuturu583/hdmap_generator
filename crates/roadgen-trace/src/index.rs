@@ -393,8 +393,9 @@ impl TraceIndex {
     /// built from the export it describes. A built network records nothing of the
     /// files it was built from, and a network of another map can share every name —
     /// `north.fwd`, `j_x` — so the check is on what the two must agree on: the same
-    /// edges and lanes, every connection the export wrote, and every node of the
-    /// export's `.nod.xml` where the network put its junction.
+    /// edges and lanes, every connection the export wrote, every traffic light and
+    /// link index it gave one, and every node of the export's `.nod.xml` where the
+    /// network put its junction.
     ///
     /// A crossing is netconvert's too: the export writes a `<crossing node edges>`,
     /// which has no id, and netconvert builds it as an edge `:<node>_c<n>` numbered in
@@ -403,6 +404,10 @@ impl TraceIndex {
     /// crossing's lane is linked to the crosswalk behind it with the role
     /// `crossing`. A crossing the export wrote that the network does not have —
     /// netconvert discards one it cannot build — makes the network not the export's.
+    /// At a signalised node with crossings, netconvert appends the crossings' links
+    /// to the light's program after the export's, from the export's last link index
+    /// on; those slots are netconvert's and are neither checked nor linked, while the
+    /// vehicle slots before them still must be the export's.
     pub fn load_sumo_net(&mut self, path: impl AsRef<Path>) -> Result<SumoNetReport, TraceError> {
         let path = path.as_ref();
         let text = crate::file::read_text(path)?;
@@ -610,6 +615,26 @@ fn built_from(sumo: &FormatLinks, net: &Net) -> Result<(), String> {
             "it has no connection {missing}, which the export wrote"
         ));
     }
+    // A traffic light is named by its program, and a slot of it by the light and the
+    // link index a connection was given: the export states both, so a network that
+    // numbered its links any other way is not the one the trace describes.
+    let slots: BTreeSet<&str> = net
+        .connections
+        .iter()
+        .filter_map(|c| c.slot.as_deref())
+        .collect();
+    for light in written("tls:") {
+        let found = if light.contains('/') {
+            slots.contains(light)
+        } else {
+            net.lights.contains(light)
+        };
+        if !found {
+            return Err(format!(
+                "it has no traffic light {light}, which the export wrote"
+            ));
+        }
+    }
     let crossings: BTreeSet<String> = net.crossings.iter().map(NetCrossing::key).collect();
     if let Some(missing) = written("crossing:")
         .into_iter()
@@ -647,6 +672,35 @@ fn built_from(sumo: &FormatLinks, net: &Net) -> Result<(), String> {
             }
         }
     }
+    // Which movement each slot is, the trace cannot say on its own — it names the slot
+    // and the light that governs it, not the connection — so that is checked against
+    // the `.tll.xml` the export wrote, as the junctions are against its `.nod.xml`. A
+    // network netconvert gave a program of its own numbers the same slots, and they
+    // would all be found; what they control would not be what the export said.
+    let lights = sumo
+        .files
+        .iter()
+        .find(|file| file.to_string_lossy().ends_with(".tll.xml"));
+    if let Some(lights) = lights {
+        let text = std::fs::read_to_string(lights)
+            .map_err(|error| format!("{}: {error}", lights.display()))?;
+        let built: HashMap<String, Option<&str>> = net
+            .connections
+            .iter()
+            .filter(|c| !c.from.starts_with(':'))
+            .map(|c| (c.key(), c.slot.as_deref()))
+            .collect();
+        for written in parse_controlled(&text)? {
+            let slot = written.slot.as_deref();
+            if built.get(&written.key()).copied().flatten() != slot {
+                return Err(format!(
+                    "its {} is not controlled as link {}, as the export wrote it",
+                    written.key(),
+                    slot.unwrap_or_default()
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -666,6 +720,8 @@ struct Net {
     lanes: BTreeSet<String>,
     junctions: HashMap<String, Position>,
     offset: Position,
+    /// The ids of its traffic-light programs.
+    lights: BTreeSet<String>,
 }
 
 struct NetConnection {
@@ -674,6 +730,9 @@ struct NetConnection {
     from_lane: String,
     to_lane: String,
     via: Option<String>,
+    /// `<tl>/<linkIndex>`, for a connection a traffic light controls: the slot of
+    /// the program it obeys, as a trace names it.
+    slot: Option<String>,
 }
 
 impl NetConnection {
@@ -817,6 +876,11 @@ fn parse_net(text: &str) -> Result<Net, String> {
                     }
                 }
             }
+            b"tlLogic" => {
+                if let Some(id) = attributes.remove(b"id".as_slice()) {
+                    net.lights.insert(id);
+                }
+            }
             b"connection" => {
                 let mut take = |key: &[u8]| attributes.remove(key);
                 if let (Some(from), Some(to), Some(from_lane), Some(to_lane)) = (
@@ -825,12 +889,17 @@ fn parse_net(text: &str) -> Result<Net, String> {
                     take(b"fromLane"),
                     take(b"toLane"),
                 ) {
+                    let slot = match (take(b"tl"), take(b"linkIndex")) {
+                        (Some(light), Some(index)) => Some(format!("{light}/{index}")),
+                        _ => None,
+                    };
                     net.connections.push(NetConnection {
                         from,
                         to,
                         from_lane,
                         to_lane,
                         via: take(b"via"),
+                        slot,
                     });
                 }
             }
@@ -838,6 +907,49 @@ fn parse_net(text: &str) -> Result<Net, String> {
         }
     }
     Ok(net)
+}
+
+/// The connections of a `.tll.xml` that a traffic light controls, each with its slot.
+fn parse_controlled(text: &str) -> Result<Vec<NetConnection>, String> {
+    let mut reader = Reader::from_str(text);
+    let mut connections = Vec::new();
+    loop {
+        match reader.read_event().map_err(|error| error.to_string())? {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element)
+                if element.name().as_ref() == b"connection" =>
+            {
+                let mut attributes = attributes(&element)?;
+                let mut take = |key: &[u8]| attributes.remove(key);
+                if let (
+                    Some(from),
+                    Some(to),
+                    Some(from_lane),
+                    Some(to_lane),
+                    Some(light),
+                    Some(index),
+                ) = (
+                    take(b"from"),
+                    take(b"to"),
+                    take(b"fromLane"),
+                    take(b"toLane"),
+                    take(b"tl"),
+                    take(b"linkIndex"),
+                ) {
+                    connections.push(NetConnection {
+                        from,
+                        to,
+                        from_lane,
+                        to_lane,
+                        via: None,
+                        slot: Some(format!("{light}/{index}")),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(connections)
 }
 
 /// The offset a plain `.nod.xml` declares in its `<location>` — zero when it has

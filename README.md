@@ -897,7 +897,8 @@ prefix = m.export_sumo("network/")     # returns the name the files were given
 | `<name>.nod.xml` | junctions and road ends, as points |
 | `<name>.edg.xml` | one edge per direction of travel, with its lanes |
 | `<name>.con.xml` | which lane may be left for which lane |
-| `<name>.netccfg` | the netconvert run that turns the three into a `.net.xml` |
+| `<name>.tll.xml` | the program of each signalised junction, when the map has one |
+| `<name>.netccfg` | the netconvert run that turns the rest into a `.net.xml` |
 | `<name>.safe.{src,dst,via}.xml` | `randomTrips.py` weights; see [Random traffic](#random-traffic-randomtripspy-weights) |
 
 ```bash
@@ -1197,8 +1198,8 @@ carriageways of the road:
 
 "Near" is within 15 m of the road end, measured to the crosswalk's nearer edge;
 `sumo_warnings()` says how far the furthest one moved. Pedestrians have priority on
-every crossing, because a crosswalk in the IR is a painted one, and at a signalised
-node netconvert gives the crossing a phase of its own. (`priority` is written as `1`
+every crossing, because a crosswalk in the IR is a painted one; at a signalised
+node the light decides instead (see [Traffic lights](#traffic-lights)). (`priority` is written as `1`
 rather than `true` because SUMO's schema types it as a number, and netconvert refuses
 `true` when it validates the file.) Two kinds of crosswalk are not written, and
 `sumo_warnings()` names each: one further along the road than that, a mid-block
@@ -1210,8 +1211,73 @@ id; once the built network is loaded, the crosswalk also reaches the lane of the
 crossing netconvert built for it (`:j_x_c0_0`, role `crossing`), matched by the
 `crossingEdges` netconvert records on it.
 
-A junction with a traffic light on an approach becomes a `traffic_light` node.
-netconvert generates the phases, because the IR holds no signal timing to write.
+### Traffic lights
+
+A junction with a traffic light on an approach — or on a lane a `TrafficLight` rule
+names — becomes a `traffic_light` node, and its light is named after it, so that the
+name follows from the map rather than from netconvert:
+
+```xml
+<node id="j_x" x="0.000" y="0.000" z="0.000" type="traffic_light" tl="j_x"/>
+```
+
+The IR holds no signal timing, and netconvert would happily make a program up — but
+its phases and its numbering of the movements would be netconvert's, moving whenever
+its version or its reading of the junction did, and nothing could say which slot of
+the program a light of the map controls. So the export decides the program itself and
+writes it to `<name>.tll.xml`: the phases, and the link index of every movement into
+the node, which fixes the position of each movement in every state string.
+
+For the four-arm crossroads of the exporter's tests, one lane each way, the program
+written is exactly this (links 0–2 leave the north arm for east, south and west, and
+so on round, 3–5 from the east, 6–8 from the south, 9–11 from the west):
+
+```xml
+<tlLogic id="j_x" type="static" programID="0" offset="0">
+    <phase duration="35" state="gGgrrrGggrrr"/>
+    <phase duration="3" state="yyyrrryyyrrr"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
+    <phase duration="35" state="rrrggGrrrgGg"/>
+    <phase duration="3" state="rrryyyrrryyy"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
+</tlLogic>
+<connection from="north.fwd" to="east.bwd" fromLane="0" toLane="0" tl="j_x" linkIndex="0"/>
+...
+```
+
+North and south go together, then east and west. The straights are protected; each
+left turn gives way to the oncoming traffic, and with one lane per exit a right turn
+gives way too, since it runs into the same lane as the left turn from opposite.
+
+The program is a static heuristic — the one Autoware's `lanelet2_to_sumo` writes:
+
+- Approaches are grouped by **axis**: two share a phase only if they arrive on
+  headings opposite to within 35° — so an approach and the one facing it run together
+  and the crossing road waits, however acute the angle the roads cross at.
+- Each group gets a **green** of 35 s (25 s when a junction has more than two groups),
+  then 3 s of **yellow** and 2 s of **all-red**.
+- In a green, a movement is **permissive** (`g`) if it turns across the oncoming
+  traffic released with it, or if another released movement runs into the same lane;
+  everything else released is protected (`G`), and the rest red.
+
+"Across the oncoming traffic" is a left turn where traffic keeps right and a right turn
+where it keeps left. It is read off the geometry and the map's handedness — the swing
+from the lane a movement leaves to the lane it joins — and not off netconvert's own
+`dir`, so the program does not depend on netconvert being told which side the map
+drives on. A turn with nothing facing it, off the stem of a tee, is protected.
+
+At a node with pedestrian crossings the built program is longer than the one
+written. netconvert accepts the export's program and extends it: it appends the
+crossings' links after the vehicle links, numbered on from the last of them, and
+splits each green to end it with a pedestrian clearance (a 35 s green becomes 30 s
+and then 5 s in which the crossings turn red), keeping the yellow and the all-red.
+The vehicle links and their indices are still the export's, and so is the order of
+green, yellow and red each of them goes through; the crossing slots are netconvert's,
+and the trace does not name them.
+
+The tests build the network and check that netconvert kept exactly this program and
+these link indices — at a node with crossings, the vehicle links of it — then drive
+traffic through every movement in `sumo`.
 
 No U-turns. Left to itself netconvert adds one at every dead end, so a vehicle could
 turn back at the far end of an arm where the OpenDRIVE and Lanelet2 maps of the same
@@ -1308,6 +1374,8 @@ for the map whenever it reaches a centimetre.
   footways.
 - **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
   right of way and no more.
+- **Signal timing.** The IR has none, so a signalised junction runs on the fixed-time
+  program above rather than one the map states.
 - **The stop line's paint.** Where it is survives as a stop offset, as above; a stop
   line with nowhere to go is named.
 - **A speed-limit rule on a lane that is not written.** The connector lanes inside a

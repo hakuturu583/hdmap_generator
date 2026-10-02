@@ -651,6 +651,42 @@ pub fn crosswalk_crossroads(handedness: TrafficHandedness) -> (ValidatedMap, [Ro
     (finish(builder), arms)
 }
 
+/// The crosswalk crossroads of [`crosswalk_crossroads`] with a traffic light, a stop
+/// line and a traffic-light rule on every approach: a signalised junction with a
+/// pedestrian crossing across every arm, which in SUMO is a light whose program has
+/// both vehicle and crossing links.
+///
+/// The arms are returned west, east, north, south.
+pub fn signalised_crosswalk_crossroads(
+    handedness: TrafficHandedness,
+) -> (ValidatedMap, [RoadId; 4]) {
+    let name = match handedness {
+        TrafficHandedness::RightHand => "signalised_crosswalks",
+        TrafficHandedness::LeftHand => "signalised_crosswalks_lht",
+    };
+    let (mut builder, arms) = sidewalk_crossroads_builder(handedness, name, false);
+    let [west, east, north, south] = &arms;
+    for (arm, fraction) in [(west, 0.95), (east, 0.05), (north, 0.05), (south, 0.95)] {
+        builder.add_crosswalk(arm, fraction, 4.0).unwrap();
+    }
+    builder.add_crosswalk(west, 0.5, 4.0).unwrap();
+    // West and south end at the junction, so their forward driving lane (the third
+    // of the cross-section) runs into it at its end; east and north start there, so
+    // it is their backward driving lane (the first), at its start.
+    for (arm, index, end) in [
+        (west, 2, LaneEnd::End),
+        (south, 2, LaneEnd::End),
+        (east, 0, LaneEnd::Start),
+        (north, 0, LaneEnd::Start),
+    ] {
+        let approach = LaneRef::new(arm.clone(), index);
+        let stop_line = builder.add_stop_line(&approach, end).unwrap();
+        let light = builder.add_traffic_light(&approach, end, 5.0).unwrap();
+        builder.add_traffic_light_rule(vec![light], Some(stop_line), vec![approach]);
+    }
+    (finish(builder), arms)
+}
+
 /// [`crosswalk_crossroads`] with the west arm one-way, towards the junction, and
 /// without the crosswalk half way along it: a footway at each kerb and a single
 /// driving lane between them, so the pavement on the far kerb runs against the

@@ -119,6 +119,12 @@ pub fn netconvert(directory: &Path, prefix: &str) -> PathBuf {
     path
 }
 
+/// [`netconvert`], for an export netconvert is right to warn about: what it said
+/// comes back alongside the network instead of failing the test.
+pub fn netconvert_with_warnings(directory: &Path, prefix: &str) -> (PathBuf, Vec<String>) {
+    run_netconvert(directory, prefix)
+}
+
 /// Runs `netconvert` as [`netconvert`] does and checks that it built the network,
 /// returning the `.net.xml` it wrote and every line it complained with.
 fn run_netconvert(directory: &Path, prefix: &str) -> (PathBuf, Vec<String>) {
