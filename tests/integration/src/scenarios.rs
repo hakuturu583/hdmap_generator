@@ -459,6 +459,62 @@ pub fn lane_drop() -> ValidatedMap {
     finish(builder)
 }
 
+/// A two-way road whose forward driving lane becomes a cycle lane halfway along,
+/// while the backward lane stays a driving lane all the way.
+///
+/// The forward lane does not carry on: a cycle lane is not more of the same lane, so
+/// the IR has no connection across the boundary on that side — and nothing at all
+/// from the first section's forward carriageway.
+pub fn lane_type_change() -> ValidatedMap {
+    let mut builder = MapBuilder::new(metadata("lane-type-change"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(200.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("r")
+            .with_cross_section(
+                100.0,
+                vec![
+                    lane(3.5, Direction::Forward).with_type(LaneType::Biking),
+                    lane(3.5, Direction::Backward),
+                ],
+            ),
+        )
+        .unwrap();
+    finish(builder)
+}
+
+/// A two-way road whose backward carriageway loses a lane: two lanes run backward
+/// past station 100 and one before it, so traffic running backward — from the far
+/// end — finds its outer lane ending at the boundary.
+pub fn backward_lane_drop() -> ValidatedMap {
+    let mut builder = MapBuilder::new(metadata("backward-lane-drop"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(200.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("r")
+            .with_cross_section(
+                100.0,
+                vec![
+                    lane(3.5, Direction::Forward),
+                    lane(3.5, Direction::Backward),
+                    lane(3.5, Direction::Backward),
+                ],
+            ),
+        )
+        .unwrap();
+    finish(builder)
+}
+
 /// A carriageway that widens out into a lay-by and narrows back again, without ever
 /// changing how many lanes it has.
 pub fn widening_road() -> ValidatedMap {

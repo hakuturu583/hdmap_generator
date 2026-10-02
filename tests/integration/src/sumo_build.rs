@@ -10,7 +10,7 @@
 //! helpers say so and the test skips, unless `ROADGEN_REQUIRE_SUMO` is set — which CI
 //! does set, so the checks that matter never silently stop running.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -95,10 +95,33 @@ pub fn build(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork) {
     (directory, SumoNetwork::read(&path))
 }
 
+/// [`build`], for a map netconvert is *right* to warn about: what it said comes back
+/// alongside the network instead of failing the test, so the test can check that it
+/// warned about exactly what the map holds and nothing else.
+pub fn build_with_warnings(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork, Vec<String>) {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let prefix = roadgen_sumo::write(map, directory.path()).expect("the map should export as SUMO");
+
+    let (path, warnings) = run_netconvert(directory.path(), &prefix);
+    (directory, SumoNetwork::read(&path), warnings)
+}
+
 /// Runs `netconvert` on the SUMO export in `directory` whose files are named after
 /// `prefix`, checks that it built the network without complaint, and returns the
 /// path of the `.net.xml` it wrote.
 pub fn netconvert(directory: &Path, prefix: &str) -> PathBuf {
+    let (path, complaints) = run_netconvert(directory, prefix);
+    assert!(
+        complaints.is_empty(),
+        "netconvert accepted the export but complained about it:\n{}",
+        complaints.join("\n")
+    );
+    path
+}
+
+/// Runs `netconvert` as [`netconvert`] does and checks that it built the network,
+/// returning the `.net.xml` it wrote and every line it complained with.
+fn run_netconvert(directory: &Path, prefix: &str) -> (PathBuf, Vec<String>) {
     // Through the generated configuration, which is how a user runs it: if the
     // `.netccfg` names the wrong files or asks for the wrong processing, that is a
     // fault in the export and the test should see it.
@@ -120,13 +143,8 @@ pub fn netconvert(directory: &Path, prefix: &str) -> PathBuf {
         output.status.success(),
         "netconvert rejected the export:\n{stderr}"
     );
-    assert!(
-        complaints.is_empty(),
-        "netconvert accepted the export but complained about it:\n{}",
-        complaints.join("\n")
-    );
 
-    directory.join(format!("{prefix}.net.xml"))
+    (directory.join(format!("{prefix}.net.xml")), complaints)
 }
 
 /// Every junction of the built network at `path`, as a longitude and latitude — worked
@@ -207,6 +225,57 @@ pub fn simulate(directory: &Path, prefix: &str) {
     );
 }
 
+/// Drives one passenger car down `edge` of a built network, from `depart_lane` to
+/// `arrival_lane`, and returns every lane it was on — so whether the lane change was
+/// allowed is what the simulator did, not what the attributes are taken to mean.
+pub fn lanes_driven(
+    directory: &Path,
+    prefix: &str,
+    edge: &str,
+    depart_lane: usize,
+    arrival_lane: usize,
+) -> BTreeSet<String> {
+    let routes = directory.join("drive.rou.xml");
+    std::fs::write(
+        &routes,
+        format!(
+            r#"<routes><vehicle id="car" depart="0" departLane="{depart_lane}" arrivalLane="{arrival_lane}" departSpeed="10"><route edges="{edge}"/></vehicle></routes>"#
+        ),
+    )
+    .expect("the route file");
+    let output = Command::new(tool("sumo").expect("sumo"))
+        .args(["-n", &format!("{prefix}.net.xml")])
+        .args(["-r", "drive.rou.xml"])
+        .args(["--fcd-output", "drive.fcd.xml"])
+        .args(["--no-step-log", "true"])
+        .args(["--no-warnings", "true"])
+        .current_dir(directory)
+        .output()
+        .expect("sumo should run");
+    assert!(
+        output.status.success(),
+        "sumo could not drive the network:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fcd = std::fs::read_to_string(directory.join("drive.fcd.xml")).expect("the fcd output");
+    let mut lanes = BTreeSet::new();
+    let mut reader = Reader::from_str(&fcd);
+    loop {
+        match reader.read_event().expect("well-formed fcd output") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element)
+                if element.name().as_ref() == b"vehicle" =>
+            {
+                if let Some(lane) = attributes(&element).remove("lane") {
+                    lanes.insert(lane);
+                }
+            }
+            _ => {}
+        }
+    }
+    lanes
+}
+
 // --------------------------------------------------------------------------- //
 // The network netconvert produced
 // --------------------------------------------------------------------------- //
@@ -259,6 +328,10 @@ pub struct SumoLane {
     pub length: f64,
     pub allow: Option<String>,
     pub disallow: Option<String>,
+    /// The vehicle classes that may change to the lane on the left and on the
+    /// right; absent where SUMO leaves the change open to everyone.
+    pub change_left: Option<String>,
+    pub change_right: Option<String>,
     pub shape: Vec<Point3>,
     /// How far short of the lane's end a vehicle waiting at the junction ahead stops,
     /// from the lane's `<stopOffset>`; `None` when it stops at the very end.
@@ -368,6 +441,8 @@ impl SumoNetwork {
                                 length: number(&attributes, "length"),
                                 allow: attributes.get("allow").cloned(),
                                 disallow: attributes.get("disallow").cloned(),
+                                change_left: attributes.get("changeLeft").cloned(),
+                                change_right: attributes.get("changeRight").cloned(),
                                 shape: points(attributes.get("shape").map(String::as_str)),
                                 stop_offset: None,
                             };

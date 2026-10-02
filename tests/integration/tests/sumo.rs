@@ -9,6 +9,8 @@
 //! When SUMO is not installed these skip, saying so; CI sets `ROADGEN_REQUIRE_SUMO`,
 //! which turns the skip into a failure.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use roadgen_core::prelude::*;
 use roadgen_integration_tests::scenarios;
 use roadgen_integration_tests::sumo_build::{self, SumoNetwork};
@@ -537,7 +539,6 @@ fn a_right_of_way_rule_decides_who_gives_way() {
 }
 
 /// A SUMO edge has one lane count from end to end, so a road that drops a lane is a
-/// A SUMO edge has one lane count from end to end, so a road that drops a lane is a
 /// chain of edges with a node between them.
 #[test]
 fn a_changing_cross_section_becomes_a_chain_of_edges() {
@@ -564,6 +565,107 @@ fn a_changing_cross_section_becomes_a_chain_of_edges() {
             .any(|(from, _, to, _)| *from == "wide.0.fwd" && *to == "wide.1.fwd"),
         "traffic should be able to get from one section to the next"
     );
+
+    // And which lane carries on into which is the IR's, not netconvert's: the
+    // connections the core makes across the boundary are written as the movements
+    // through the node, and the built network has exactly those.
+    let (stated, built) = across(&map, &network, "wide.0.fwd", "wide.1.fwd");
+    assert_eq!(stated.len(), 2, "the two lanes that carry on: {stated:?}");
+    assert_eq!(built, stated);
+}
+
+/// Movements as (from edge, from lane, to edge, to lane).
+type Movements = BTreeSet<(String, usize, String, usize)>;
+
+/// The movements from one edge into another, as the IR states them and as the built
+/// network has them.
+fn across(
+    map: &ValidatedMap,
+    network: &SumoNetwork,
+    from: &str,
+    to: &str,
+) -> (Movements, Movements) {
+    let lanes = roadgen_sumo::to_plain_xml(map).unwrap().lanes;
+    let sumo = |lane: &LaneId| {
+        let (edge, index) = lanes.get(lane)?.rsplit_once('_')?;
+        Some((edge.to_owned(), index.parse::<usize>().ok()?))
+    };
+    let stated = map
+        .connections
+        .iter()
+        .filter_map(|connection| {
+            let (from, from_lane) = sumo(&connection.from.lane)?;
+            let (to, to_lane) = sumo(&connection.to.lane)?;
+            Some((from, from_lane, to, to_lane))
+        })
+        .filter(|(edge, _, next, _)| edge == from && next == to)
+        .collect();
+    let built = network
+        .movements()
+        .into_iter()
+        .filter(|(edge, _, next, _)| *edge == from && *next == to)
+        .map(|(edge, from_lane, next, to_lane)| {
+            (edge.to_owned(), from_lane, next.to_owned(), to_lane)
+        })
+        .collect();
+    (stated, built)
+}
+
+/// Where no lane of an edge carries on across a cross-section boundary — here a
+/// driving lane that becomes a cycle lane — the IR states no movement from it, and
+/// the built network has none: every movement netconvert could guess from the edge
+/// is deleted rather than left to it, which would carry the driving lane on into the
+/// cycle lane. That it warns the edge goes nowhere is what the map says, and all it
+/// warns — in the same words from SUMO 1.18, which CI installs, to 1.26.
+#[test]
+fn a_lane_that_ends_where_its_type_changes_is_not_carried_on() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::lane_type_change();
+    let (directory, network, warnings) = sumo_build::build_with_warnings(&map);
+
+    let onward: Vec<_> = network
+        .movements()
+        .into_iter()
+        .filter(|(from, ..)| *from == "r.0.fwd")
+        .collect();
+    assert!(onward.is_empty(), "the driving lane ends, but: {onward:?}");
+
+    // The other carriageway is untouched by it, and carries on as the IR says.
+    let (stated, built) = across(&map, &network, "r.1.bwd", "r.0.bwd");
+    assert_eq!(stated.len(), 1, "{stated:?}");
+    assert_eq!(built, stated);
+
+    let warnings: BTreeSet<String> = warnings.into_iter().collect();
+    let expected: BTreeSet<String> = [
+        "Warning: Edge 'r.0.fwd' is not connected to outgoing edges at junction 'n_r_s1'.",
+        "Warning: Lane 'r.1.fwd_0' is not connected from any incoming edge at junction 'n_r_s1'.",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(warnings, expected);
+
+    // And it is a network the simulator runs.
+    sumo_build::simulate(directory.path(), &roadgen_sumo::network_name(&map));
+}
+
+/// A lane drop on a backward carriageway: traffic runs from the second section into
+/// the first, and the lane that carries on is the IR's, whichever way round.
+#[test]
+fn a_lane_dropped_on_a_backward_carriageway_is_the_irs() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::backward_lane_drop();
+    let (_directory, network) = sumo_build::build(&map);
+
+    assert_eq!(network.edge("r.1.bwd").lanes.len(), 2);
+    assert_eq!(network.edge("r.0.bwd").lanes.len(), 1);
+    let (stated, built) = across(&map, &network, "r.1.bwd", "r.0.bwd");
+    assert_eq!(stated.len(), 1, "the one lane that carries on: {stated:?}");
+    assert_eq!(built, stated);
 }
 
 /// What may use a lane is the whole of what SUMO knows about lane type, so it is what
@@ -597,6 +699,133 @@ fn a_footway_admits_pedestrians_and_a_driving_lane_keeps_them_out() {
     // sidewalk, and here it falls out of where the lane actually is.
     assert_eq!(street.lane(0).allow.as_deref(), Some("pedestrian"));
     assert_eq!(street.lane(1).disallow.as_deref(), Some("pedestrian"));
+}
+
+/// Two lanes the same way with `separator` painted between them, read off both of
+/// them.
+fn two_lanes_separated_by(separator: RoadMarking) -> ValidatedMap {
+    two_lanes_separated_in(TrafficHandedness::RightHand, separator)
+}
+
+fn two_lanes_separated_in(handedness: TrafficHandedness, separator: RoadMarking) -> ValidatedMap {
+    let marking = BoundaryMarking::new(separator, MarkingColor::White);
+    let mut builder = MapBuilder::new(scenarios::metadata("separated"));
+    builder.metadata_mut().handedness = handedness;
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(150.0, 0.0, 0.0),
+                (0..2)
+                    .map(|_| {
+                        scenarios::lane(3.5, Direction::Forward).with_markings(marking, marking)
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .with_name("road"),
+        )
+        .unwrap();
+    builder.finish().unwrap().validate().unwrap()
+}
+
+/// SUMO has no paint, but it has what a solid line between two lanes is for: the
+/// change across it is closed to everyone but emergency vehicles, in the plain XML
+/// that goes in and — which is what a simulation runs on — in the network netconvert
+/// builds from it.
+#[test]
+fn a_solid_line_between_lanes_closes_the_lane_change_and_a_broken_one_does_not() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+
+    let map = two_lanes_separated_by(RoadMarking::Solid);
+    let (directory, network) = sumo_build::build(&map);
+    let plain =
+        std::fs::read_to_string(directory.path().join("separated.edg.xml")).expect("the edge file");
+    assert_eq!(
+        plain.matches("changeLeft=\"emergency\"").count(),
+        1,
+        "{plain}"
+    );
+    assert_eq!(
+        plain.matches("changeRight=\"emergency\"").count(),
+        1,
+        "{plain}"
+    );
+
+    let road = network.edge("road.fwd");
+    assert_eq!(road.lanes.len(), 2);
+    // Lane 0 is on the right: its neighbour is to its left, and lane 1's to its right.
+    assert_eq!(road.lane(0).change_left.as_deref(), Some("emergency"));
+    assert_eq!(road.lane(1).change_right.as_deref(), Some("emergency"));
+    // The outer sides have no lane to change into and say nothing.
+    assert_eq!(road.lane(0).change_right, None);
+    assert_eq!(road.lane(1).change_left, None);
+    sumo_build::simulate(directory.path(), "separated");
+
+    let map = two_lanes_separated_by(RoadMarking::Broken);
+    let (directory, network) = sumo_build::build(&map);
+    let plain =
+        std::fs::read_to_string(directory.path().join("separated.edg.xml")).expect("the edge file");
+    assert!(!plain.contains("changeLeft"), "{plain}");
+    assert!(!plain.contains("changeRight"), "{plain}");
+    for lane in &network.edge("road.fwd").lanes {
+        assert_eq!(lane.change_left, None, "{}", lane.id);
+        assert_eq!(lane.change_right, None, "{}", lane.id);
+    }
+}
+
+/// `changeLeft` and `changeRight` are the driver's left and right in travel under
+/// either handedness — and a left-hand network counts its lanes from the left, so the
+/// next lane up from the kerb is on the driver's right. With a `solid broken` line
+/// between two forward lanes driving on the left, the outer lane 0 is left of the
+/// line looking along the road and faces its solid half, which is on its right: its
+/// `changeRight` is closed. Lane 1 faces the broken half and may change. The
+/// simulator is made to try both changes, so what is checked is what SUMO does with
+/// the attributes, not only that they arrive.
+#[test]
+fn under_left_hand_traffic_a_solid_broken_line_binds_the_lane_left_of_it() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = two_lanes_separated_in(TrafficHandedness::LeftHand, RoadMarking::SolidBroken);
+    let (directory, network) = sumo_build::build(&map);
+    assert!(network.lefthand);
+    let road = network.edge("road.fwd");
+    assert_eq!(road.lanes.len(), 2);
+    // Driving along +x on the left, lane 0 is the leftmost: the larger y.
+    assert!(road.lane(0).shape[0].y > road.lane(1).shape[0].y);
+    assert_eq!(road.lane(0).change_left, None);
+    assert_eq!(road.lane(0).change_right.as_deref(), Some("emergency"));
+    assert_eq!(road.lane(1).change_left, None);
+    assert_eq!(road.lane(1).change_right, None);
+    sumo_build::simulate(directory.path(), "separated");
+
+    let kept = sumo_build::lanes_driven(directory.path(), "separated", "road.fwd", 0, 1);
+    assert_eq!(kept.into_iter().collect::<Vec<_>>(), ["road.fwd_0"]);
+    let changed = sumo_build::lanes_driven(directory.path(), "separated", "road.fwd", 1, 0);
+    assert_eq!(
+        changed.into_iter().collect::<Vec<_>>(),
+        ["road.fwd_0", "road.fwd_1"]
+    );
+}
+
+/// A lane that drops has no way out but sideways, so the solid line the builder
+/// paints beside it by default does not close the change out of it — netconvert
+/// would refuse that prohibition, and `build` fails on its complaint — while the
+/// lanes that carry on keep theirs.
+#[test]
+fn a_lane_that_drops_may_always_be_left() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let (_directory, network) = sumo_build::build(&scenarios::lane_drop());
+    let before = network.edge("wide.0.fwd");
+    assert_eq!(before.lanes.len(), 3);
+    assert_eq!(before.lane(0).change_left, None);
+    assert_eq!(before.lane(1).change_right.as_deref(), Some("emergency"));
+    assert_eq!(before.lane(1).change_left.as_deref(), Some("emergency"));
 }
 
 /// A `SpeedLimit` rule is the speed of the lanes it names, in the network netconvert
@@ -708,8 +937,9 @@ fn what_the_format_cannot_carry_is_reported() {
     assert!(lost.is_empty(), "{crossroads}");
 }
 
-/// The four files are named after the map and refer to each other, so that building
-/// the network is one command over one configuration.
+/// The four network files are named after the map and refer to each other, so that
+/// building the network is one command over one configuration; the three
+/// `randomTrips.py` weight files sit beside them under the same name.
 #[test]
 fn the_export_is_a_netconvert_run_ready_to_go() {
     let map = scenarios::crossroads();
@@ -717,7 +947,15 @@ fn the_export_is_a_netconvert_run_ready_to_go() {
     let prefix = roadgen_sumo::write(&map, directory.path()).unwrap();
     assert_eq!(prefix, "crossroads");
 
-    for suffix in [".nod.xml", ".edg.xml", ".con.xml", ".netccfg"] {
+    for suffix in [
+        ".nod.xml",
+        ".edg.xml",
+        ".con.xml",
+        ".netccfg",
+        ".safe.src.xml",
+        ".safe.dst.xml",
+        ".safe.via.xml",
+    ] {
         let path = directory.path().join(format!("{prefix}{suffix}"));
         assert!(path.is_file(), "{} was not written", path.display());
     }
@@ -898,6 +1136,162 @@ fn a_stop_line_set_back_from_the_junction_is_where_sumo_stops() {
         stop.horizontal_distance_to(painted) < 0.05,
         "SUMO stops at {stop:?}, but the line is at {painted:?}"
     );
+}
+
+/// One of the `randomTrips.py` weight files the export wrote: each edge it names, and
+/// its weight.
+fn trip_weights(path: &std::path::Path) -> BTreeMap<String, f64> {
+    use quick_xml::events::Event;
+    let xml = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{} was not written: {error}", path.display()));
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut weights = BTreeMap::new();
+    loop {
+        match reader.read_event().expect("valid edgedata XML") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element) if element.name().as_ref() == b"edge" => {
+                let mut id = None;
+                let mut value = None;
+                for attribute in element.attributes().map(Result::unwrap) {
+                    let text = String::from_utf8_lossy(&attribute.value).into_owned();
+                    match attribute.key.as_ref() {
+                        b"id" => id = Some(text),
+                        b"value" => value = Some(text.parse::<f64>().expect("a number")),
+                        _ => {}
+                    }
+                }
+                weights.insert(id.expect("an edge id"), value.expect("a value"));
+            }
+            _ => {}
+        }
+    }
+    weights
+}
+
+/// The edges a weight file gives a weight to.
+fn weighted(weights: &BTreeMap<String, f64>) -> BTreeSet<String> {
+    weights
+        .iter()
+        .filter(|(_, value)| **value > 0.0)
+        .map(|(edge, _)| edge.clone())
+        .collect()
+}
+
+/// The `randomTrips.py` weights hold up against the network netconvert actually
+/// built: they name its edges and no others, every edge a trip may depart from can be
+/// left and leads somewhere a trip may arrive, every edge a trip may arrive on can be
+/// reached from somewhere a trip may depart, and none of it is anywhere a passenger
+/// car may not drive.
+///
+/// The check is made on the built `.net.xml`, read independently, and not on what the
+/// exporter thinks it wrote — including across a change of cross-section, where the
+/// continuation is netconvert's lane matching and not a written connection.
+#[test]
+fn the_trip_weights_agree_with_the_network_netconvert_built() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    // Not a lone road: with nothing at either end it has no edge a car can leave, so
+    // every weight is 0 — as `randomTrips.py`'s own fringe rule would have it too.
+    let scenarios: Vec<(&str, ValidatedMap)> = vec![
+        ("in-line", scenarios::two_roads_in_line()),
+        ("split", scenarios::split()),
+        ("merge", scenarios::merge()),
+        ("crossroads", scenarios::crossroads()),
+        ("controlled", scenarios::controlled_crossroads()),
+        ("lane drop", scenarios::lane_drop()),
+    ];
+
+    for (name, map) in scenarios {
+        let prefix = roadgen_sumo::network_name(&map);
+        let (directory, network) = sumo_build::build(&map);
+        let read = |suffix: &str| {
+            trip_weights(&directory.path().join(format!("{prefix}.safe.{suffix}.xml")))
+        };
+        let (src, dst, via) = (read("src"), read("dst"), read("via"));
+
+        let roads: BTreeSet<&str> = network
+            .roads()
+            .iter()
+            .map(|edge| edge.id.as_str())
+            .collect();
+        for weights in [&src, &dst, &via] {
+            let named: BTreeSet<&str> = weights.keys().map(String::as_str).collect();
+            assert_eq!(named, roads, "{name}: the weights should name every edge");
+        }
+
+        // The edges a passenger car may drive on, and where the built network lets it
+        // go from each — through a junction or straight on — leaving out turnarounds.
+        let admits = |classes: &str| classes.split_whitespace().any(|class| class == "passenger");
+        let drivable: BTreeSet<&str> = network
+            .roads()
+            .iter()
+            .filter(|edge| {
+                edge.lanes
+                    .iter()
+                    .any(|lane| match (&lane.allow, &lane.disallow) {
+                        (Some(allow), _) => admits(allow),
+                        (None, Some(disallow)) => !admits(disallow),
+                        (None, None) => true,
+                    })
+            })
+            .map(|edge| edge.id.as_str())
+            .collect();
+        let mut next: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for connection in &network.connections {
+            if connection.from.starts_with(':')
+                || connection.to.starts_with(':')
+                || connection.direction.as_deref() == Some("t")
+            {
+                continue;
+            }
+            next.entry(connection.from.as_str())
+                .or_default()
+                .insert(connection.to.as_str());
+        }
+        let reachable = |from: &str| {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            let mut pending: Vec<&str> = next.get(from).into_iter().flatten().copied().collect();
+            while let Some(edge) = pending.pop() {
+                if seen.insert(edge) {
+                    pending.extend(next.get(edge).into_iter().flatten().copied());
+                }
+            }
+            seen
+        };
+
+        let (departures, arrivals, way_points) = (weighted(&src), weighted(&dst), weighted(&via));
+        assert!(!departures.is_empty(), "{name}: nowhere to depart from");
+        assert!(!arrivals.is_empty(), "{name}: nowhere to arrive");
+        for edge in departures.iter().chain(&arrivals) {
+            assert!(
+                drivable.contains(edge.as_str()),
+                "{name}: {edge} is weighted, but no passenger car may drive on it"
+            );
+        }
+        for edge in &departures {
+            assert!(
+                reachable(edge)
+                    .iter()
+                    .any(|other| arrivals.contains(*other)),
+                "{name}: a trip departing on {edge} can reach no edge it may arrive on"
+            );
+        }
+        for edge in &arrivals {
+            assert!(
+                departures
+                    .iter()
+                    .any(|other| reachable(other).contains(edge.as_str())),
+                "{name}: no edge a trip may depart on leads to {edge}"
+            );
+        }
+        for edge in &way_points {
+            assert!(
+                departures.contains(edge) && arrivals.contains(edge),
+                "{name}: {edge} is a way point with no way in or no way out"
+            );
+        }
+    }
 }
 
 /// A crossroads with arms 2 km long, tied to the globe at `origin` through
