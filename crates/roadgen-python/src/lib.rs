@@ -1145,8 +1145,9 @@ impl PyMap {
     /// `<edge>_<index>` identifier the built network gives it.
     ///
     /// A SUMO lane has no name of its own — it is the n-th lane of an edge — and the
-    /// numbering is not the IR's: SUMO counts from the right of the direction of
-    /// travel, and a two-way road is two edges. So this is the only way back from a
+    /// numbering is not the IR's: SUMO counts from the outside of the carriageway —
+    /// the right of the direction of travel, or the left on a left-hand map — and a
+    /// two-way road is two edges. So this is the only way back from a
     /// lane of the map to a lane of the network.
     fn sumo_lane_ids(&mut self) -> PyResult<Vec<(String, String)>> {
         self.ensure_built()?;

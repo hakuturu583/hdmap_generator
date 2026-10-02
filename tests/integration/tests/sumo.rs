@@ -81,9 +81,10 @@ fn a_two_way_road_is_an_edge_in_each_direction() {
     );
 }
 
-/// SUMO numbers an edge's lanes from the right of the direction of travel. The IR
-/// counts outwards from the reference line, which for the opposing carriageway is the
-/// other way round, so getting this wrong mirrors one side of every road.
+/// SUMO numbers an edge's lanes from the outside, which on a right-hand map is the
+/// right of the direction of travel. The IR counts outwards from the reference line,
+/// which for the opposing carriageway is the other way round, so getting this wrong
+/// mirrors one side of every road.
 #[test]
 fn lanes_are_numbered_from_the_right_of_travel() {
     if !sumo_build::sumo_available() {
@@ -126,6 +127,118 @@ fn lanes_are_numbered_from_the_right_of_travel() {
     // Whichever carriageway, lane 0 is the outside of the road.
     assert!(forward.lane(0).shape[0].y < -3.5);
     assert!(backward.lane(0).shape[0].y > 3.5);
+}
+
+/// The same road, driving on the left. SUMO still numbers from the outside of the
+/// carriageway, and the outside is now the driver's left — which is what netconvert
+/// itself lays out when it spreads an edge's lanes with `lefthand` set. Numbered from
+/// the right instead, the kerb lane would be SUMO's overtaking lane.
+#[test]
+fn lanes_of_a_left_hand_map_are_numbered_from_the_left_of_travel() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let mut builder = MapBuilder::new(scenarios::metadata("numbering"));
+    builder.metadata_mut().handedness = TrafficHandedness::LeftHand;
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(200.0, 0.0, 0.0),
+                vec![
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Backward),
+                    scenarios::lane(3.5, Direction::Backward),
+                ],
+            )
+            .unwrap()
+            .with_name("dual"),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let (_directory, network) = sumo_build::build(&map);
+    assert!(
+        network.lefthand,
+        "netconvert should know the map drives on the left"
+    );
+
+    // Travelling along +x on the left of the road, the driver's left is +y, so lane 0
+    // is the one with the largest offset.
+    let forward = network.edge("dual.fwd");
+    assert!(
+        forward.lane(0).shape[0].y > forward.lane(1).shape[0].y,
+        "lane 0 of the forward carriageway should be its leftmost"
+    );
+    let backward = network.edge("dual.bwd");
+    assert!(
+        backward.lane(0).shape[0].y < backward.lane(1).shape[0].y,
+        "lane 0 of the backward carriageway should be its leftmost"
+    );
+    // Whichever carriageway, lane 0 is still the outside of the road — on the other
+    // side of it from where a right-hand map puts it.
+    assert!(forward.lane(0).shape[0].y > 3.5);
+    assert!(backward.lane(0).shape[0].y < -3.5);
+}
+
+/// netconvert assumes right-hand traffic unless it is told otherwise, and what it
+/// assumes decides who gives way. Driving on the left, the turn that crosses the
+/// oncoming carriageway is the *right* turn, so on a major approach that is the one
+/// that must yield, and the left turn — which stays on the kerb side — keeps right of
+/// way. A left-hand map built as a right-hand network gets exactly the opposite.
+#[test]
+fn a_left_hand_map_is_built_as_a_left_hand_network() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let (_directory, right) = sumo_build::build(&scenarios::crossroads());
+    assert!(!right.lefthand, "a right-hand map is netconvert's default");
+
+    let mut builder = scenarios::crossroads_builder("left-crossroads", 70.0);
+    builder.metadata_mut().handedness = TrafficHandedness::LeftHand;
+    let map = builder.finish().unwrap().validate().unwrap();
+    let prefix = roadgen_sumo::network_name(&map);
+    let (directory, left) = sumo_build::build(&map);
+    assert!(
+        left.lefthand,
+        "netconvert should know the map drives on the left"
+    );
+    sumo_build::simulate(directory.path(), &prefix);
+
+    // Which pair of arms netconvert makes the major road is its own call, so the
+    // check is made on whichever approaches it gave the straight-on movement to.
+    let state = |network: &SumoNetwork, from: &str, direction: &str| {
+        network
+            .connections
+            .iter()
+            .find(|connection| {
+                connection.from == from && connection.direction.as_deref() == Some(direction)
+            })
+            .and_then(|connection| connection.state.clone())
+            .unwrap_or_else(|| panic!("no {direction:?} movement from {from}"))
+    };
+    for (network, crossing, kerbside) in [(&right, "l", "r"), (&left, "r", "l")] {
+        let major: Vec<&str> = ["north.fwd", "east.fwd", "south.fwd", "west.fwd"]
+            .into_iter()
+            .filter(|from| state(network, from, "s") == "M")
+            .collect();
+        assert_eq!(major.len(), 2, "netconvert should pick one major road");
+        for from in major {
+            assert_eq!(
+                state(network, from, crossing),
+                "m",
+                "{from}: the turn across the oncoming carriageway should give way \
+                 (lefthand {})",
+                network.lefthand
+            );
+            assert_eq!(
+                state(network, from, kerbside),
+                "M",
+                "{from}: the kerb-side turn should keep right of way (lefthand {})",
+                network.lefthand
+            );
+        }
+    }
 }
 
 /// Every lane is written with its own shape, so what SUMO has is the geometry the
@@ -426,7 +539,6 @@ fn a_right_of_way_rule_decides_who_gives_way() {
 }
 
 /// A SUMO edge has one lane count from end to end, so a road that drops a lane is a
-/// A SUMO edge has one lane count from end to end, so a road that drops a lane is a
 /// chain of edges with a node between them.
 #[test]
 fn a_changing_cross_section_becomes_a_chain_of_edges() {
@@ -453,6 +565,107 @@ fn a_changing_cross_section_becomes_a_chain_of_edges() {
             .any(|(from, _, to, _)| *from == "wide.0.fwd" && *to == "wide.1.fwd"),
         "traffic should be able to get from one section to the next"
     );
+
+    // And which lane carries on into which is the IR's, not netconvert's: the
+    // connections the core makes across the boundary are written as the movements
+    // through the node, and the built network has exactly those.
+    let (stated, built) = across(&map, &network, "wide.0.fwd", "wide.1.fwd");
+    assert_eq!(stated.len(), 2, "the two lanes that carry on: {stated:?}");
+    assert_eq!(built, stated);
+}
+
+/// Movements as (from edge, from lane, to edge, to lane).
+type Movements = BTreeSet<(String, usize, String, usize)>;
+
+/// The movements from one edge into another, as the IR states them and as the built
+/// network has them.
+fn across(
+    map: &ValidatedMap,
+    network: &SumoNetwork,
+    from: &str,
+    to: &str,
+) -> (Movements, Movements) {
+    let lanes = roadgen_sumo::to_plain_xml(map).unwrap().lanes;
+    let sumo = |lane: &LaneId| {
+        let (edge, index) = lanes.get(lane)?.rsplit_once('_')?;
+        Some((edge.to_owned(), index.parse::<usize>().ok()?))
+    };
+    let stated = map
+        .connections
+        .iter()
+        .filter_map(|connection| {
+            let (from, from_lane) = sumo(&connection.from.lane)?;
+            let (to, to_lane) = sumo(&connection.to.lane)?;
+            Some((from, from_lane, to, to_lane))
+        })
+        .filter(|(edge, _, next, _)| edge == from && next == to)
+        .collect();
+    let built = network
+        .movements()
+        .into_iter()
+        .filter(|(edge, _, next, _)| *edge == from && *next == to)
+        .map(|(edge, from_lane, next, to_lane)| {
+            (edge.to_owned(), from_lane, next.to_owned(), to_lane)
+        })
+        .collect();
+    (stated, built)
+}
+
+/// Where no lane of an edge carries on across a cross-section boundary — here a
+/// driving lane that becomes a cycle lane — the IR states no movement from it, and
+/// the built network has none: every movement netconvert could guess from the edge
+/// is deleted rather than left to it, which would carry the driving lane on into the
+/// cycle lane. That it warns the edge goes nowhere is what the map says, and all it
+/// warns — in the same words from SUMO 1.18, which CI installs, to 1.26.
+#[test]
+fn a_lane_that_ends_where_its_type_changes_is_not_carried_on() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::lane_type_change();
+    let (directory, network, warnings) = sumo_build::build_with_warnings(&map);
+
+    let onward: Vec<_> = network
+        .movements()
+        .into_iter()
+        .filter(|(from, ..)| *from == "r.0.fwd")
+        .collect();
+    assert!(onward.is_empty(), "the driving lane ends, but: {onward:?}");
+
+    // The other carriageway is untouched by it, and carries on as the IR says.
+    let (stated, built) = across(&map, &network, "r.1.bwd", "r.0.bwd");
+    assert_eq!(stated.len(), 1, "{stated:?}");
+    assert_eq!(built, stated);
+
+    let warnings: BTreeSet<String> = warnings.into_iter().collect();
+    let expected: BTreeSet<String> = [
+        "Warning: Edge 'r.0.fwd' is not connected to outgoing edges at junction 'n_r_s1'.",
+        "Warning: Lane 'r.1.fwd_0' is not connected from any incoming edge at junction 'n_r_s1'.",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(warnings, expected);
+
+    // And it is a network the simulator runs.
+    sumo_build::simulate(directory.path(), &roadgen_sumo::network_name(&map));
+}
+
+/// A lane drop on a backward carriageway: traffic runs from the second section into
+/// the first, and the lane that carries on is the IR's, whichever way round.
+#[test]
+fn a_lane_dropped_on_a_backward_carriageway_is_the_irs() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::backward_lane_drop();
+    let (_directory, network) = sumo_build::build(&map);
+
+    assert_eq!(network.edge("r.1.bwd").lanes.len(), 2);
+    assert_eq!(network.edge("r.0.bwd").lanes.len(), 1);
+    let (stated, built) = across(&map, &network, "r.1.bwd", "r.0.bwd");
+    assert_eq!(stated.len(), 1, "the one lane that carries on: {stated:?}");
+    assert_eq!(built, stated);
 }
 
 /// What may use a lane is the whole of what SUMO knows about lane type, so it is what
@@ -486,6 +699,190 @@ fn a_footway_admits_pedestrians_and_a_driving_lane_keeps_them_out() {
     // sidewalk, and here it falls out of where the lane actually is.
     assert_eq!(street.lane(0).allow.as_deref(), Some("pedestrian"));
     assert_eq!(street.lane(1).disallow.as_deref(), Some("pedestrian"));
+}
+
+/// Two lanes the same way with `separator` painted between them, read off both of
+/// them.
+fn two_lanes_separated_by(separator: RoadMarking) -> ValidatedMap {
+    two_lanes_separated_in(TrafficHandedness::RightHand, separator)
+}
+
+fn two_lanes_separated_in(handedness: TrafficHandedness, separator: RoadMarking) -> ValidatedMap {
+    let marking = BoundaryMarking::new(separator, MarkingColor::White);
+    let mut builder = MapBuilder::new(scenarios::metadata("separated"));
+    builder.metadata_mut().handedness = handedness;
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(150.0, 0.0, 0.0),
+                (0..2)
+                    .map(|_| {
+                        scenarios::lane(3.5, Direction::Forward).with_markings(marking, marking)
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .with_name("road"),
+        )
+        .unwrap();
+    builder.finish().unwrap().validate().unwrap()
+}
+
+/// SUMO has no paint, but it has what a solid line between two lanes is for: the
+/// change across it is closed to everyone but emergency vehicles, in the plain XML
+/// that goes in and — which is what a simulation runs on — in the network netconvert
+/// builds from it.
+#[test]
+fn a_solid_line_between_lanes_closes_the_lane_change_and_a_broken_one_does_not() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+
+    let map = two_lanes_separated_by(RoadMarking::Solid);
+    let (directory, network) = sumo_build::build(&map);
+    let plain =
+        std::fs::read_to_string(directory.path().join("separated.edg.xml")).expect("the edge file");
+    assert_eq!(
+        plain.matches("changeLeft=\"emergency\"").count(),
+        1,
+        "{plain}"
+    );
+    assert_eq!(
+        plain.matches("changeRight=\"emergency\"").count(),
+        1,
+        "{plain}"
+    );
+
+    let road = network.edge("road.fwd");
+    assert_eq!(road.lanes.len(), 2);
+    // Lane 0 is on the right: its neighbour is to its left, and lane 1's to its right.
+    assert_eq!(road.lane(0).change_left.as_deref(), Some("emergency"));
+    assert_eq!(road.lane(1).change_right.as_deref(), Some("emergency"));
+    // The outer sides have no lane to change into and say nothing.
+    assert_eq!(road.lane(0).change_right, None);
+    assert_eq!(road.lane(1).change_left, None);
+    sumo_build::simulate(directory.path(), "separated");
+
+    let map = two_lanes_separated_by(RoadMarking::Broken);
+    let (directory, network) = sumo_build::build(&map);
+    let plain =
+        std::fs::read_to_string(directory.path().join("separated.edg.xml")).expect("the edge file");
+    assert!(!plain.contains("changeLeft"), "{plain}");
+    assert!(!plain.contains("changeRight"), "{plain}");
+    for lane in &network.edge("road.fwd").lanes {
+        assert_eq!(lane.change_left, None, "{}", lane.id);
+        assert_eq!(lane.change_right, None, "{}", lane.id);
+    }
+}
+
+/// `changeLeft` and `changeRight` are the driver's left and right in travel under
+/// either handedness — and a left-hand network counts its lanes from the left, so the
+/// next lane up from the kerb is on the driver's right. With a `solid broken` line
+/// between two forward lanes driving on the left, the outer lane 0 is left of the
+/// line looking along the road and faces its solid half, which is on its right: its
+/// `changeRight` is closed. Lane 1 faces the broken half and may change. The
+/// simulator is made to try both changes, so what is checked is what SUMO does with
+/// the attributes, not only that they arrive.
+#[test]
+fn under_left_hand_traffic_a_solid_broken_line_binds_the_lane_left_of_it() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = two_lanes_separated_in(TrafficHandedness::LeftHand, RoadMarking::SolidBroken);
+    let (directory, network) = sumo_build::build(&map);
+    assert!(network.lefthand);
+    let road = network.edge("road.fwd");
+    assert_eq!(road.lanes.len(), 2);
+    // Driving along +x on the left, lane 0 is the leftmost: the larger y.
+    assert!(road.lane(0).shape[0].y > road.lane(1).shape[0].y);
+    assert_eq!(road.lane(0).change_left, None);
+    assert_eq!(road.lane(0).change_right.as_deref(), Some("emergency"));
+    assert_eq!(road.lane(1).change_left, None);
+    assert_eq!(road.lane(1).change_right, None);
+    sumo_build::simulate(directory.path(), "separated");
+
+    let kept = sumo_build::lanes_driven(directory.path(), "separated", "road.fwd", 0, 1);
+    assert_eq!(kept.into_iter().collect::<Vec<_>>(), ["road.fwd_0"]);
+    let changed = sumo_build::lanes_driven(directory.path(), "separated", "road.fwd", 1, 0);
+    assert_eq!(
+        changed.into_iter().collect::<Vec<_>>(),
+        ["road.fwd_0", "road.fwd_1"]
+    );
+}
+
+/// A lane that drops has no way out but sideways, so the solid line the builder
+/// paints beside it by default does not close the change out of it — netconvert
+/// would refuse that prohibition, and `build` fails on its complaint — while the
+/// lanes that carry on keep theirs.
+#[test]
+fn a_lane_that_drops_may_always_be_left() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let (_directory, network) = sumo_build::build(&scenarios::lane_drop());
+    let before = network.edge("wide.0.fwd");
+    assert_eq!(before.lanes.len(), 3);
+    assert_eq!(before.lane(0).change_left, None);
+    assert_eq!(before.lane(1).change_right.as_deref(), Some("emergency"));
+    assert_eq!(before.lane(1).change_left.as_deref(), Some("emergency"));
+}
+
+/// A `SpeedLimit` rule is the speed of the lanes it names, in the network netconvert
+/// builds — not only in the file handed to it — and the lanes it does not name keep
+/// their road's.
+#[test]
+fn a_speed_limit_rule_sets_the_speed_of_the_lanes_it_names() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let mut builder = MapBuilder::new(scenarios::metadata("limited"));
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(150.0, 0.0, 0.0),
+                vec![
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Backward),
+                ],
+            )
+            .unwrap()
+            .with_name("street")
+            .with_speed_limit(SpeedLimit::from_kph(60.0).unwrap()),
+        )
+        .unwrap();
+    builder.add_speed_limit_rule(
+        SpeedLimit::from_kph(30.0).unwrap(),
+        vec![LaneRef::new(road.clone(), 0)],
+    );
+    let map = builder.finish().unwrap().validate().unwrap();
+
+    let plain = roadgen_sumo::to_plain_xml(&map).unwrap();
+    let limited = plain.lanes[&map.lanes.iter().find(|lane| lane.index == 0).unwrap().id].clone();
+    assert!(
+        plain.edges.contains("speed=\"8.333\""),
+        "the rule should be in the .edg.xml:\n{}",
+        plain.edges
+    );
+
+    let (_directory, network) = sumo_build::build(&map);
+    let lanes: Vec<_> = network
+        .roads()
+        .into_iter()
+        .flat_map(|edge| edge.lanes.iter())
+        .collect();
+    assert_eq!(lanes.len(), 3);
+    for lane in lanes {
+        let expected = if lane.id == limited { 30.0 } else { 60.0 } / 3.6;
+        assert!(
+            (lane.speed - expected).abs() < 0.01,
+            "{} runs at {} m/s, not {expected}",
+            lane.id,
+            lane.speed
+        );
+    }
 }
 
 /// The heights the generator computed reach SUMO, which is the one thing plain
@@ -566,6 +963,8 @@ fn the_export_is_a_netconvert_run_ready_to_go() {
         config.contains(r#"<no-turnarounds value="true"/>"#),
         "{config}"
     );
+    // A right-hand map is netconvert's default, so nothing is said about handedness.
+    assert!(!config.contains("lefthand"), "{config}");
 }
 
 /// The trace names each connection by its two lanes as the built network names them,
@@ -773,4 +1172,337 @@ fn the_trip_weights_agree_with_the_network_netconvert_built() {
             );
         }
     }
+}
+
+/// A crossroads with arms 2 km long, tied to the globe at `origin` through
+/// `projection`.
+fn located(origin: GeoOrigin, projection: Projection) -> ValidatedMap {
+    let mut builder = scenarios::crossroads_builder("located", 2_000.0);
+    builder.metadata_mut().origin = origin;
+    builder.metadata_mut().projection = projection;
+    builder.finish().unwrap().validate().unwrap()
+}
+
+/// The built network carries the map's geo-reference, and it is the right one: SUMO,
+/// undoing the network's `<location>` itself, puts every junction at the latitude and
+/// longitude the IR puts it at — the ones the Lanelet2 export writes — while the
+/// network's coordinates stay the IR's own metres.
+///
+/// Through each of the map's projections, and on both sides of the equator, because
+/// a UTM network south of it is the one with a false northing to get right.
+#[test]
+fn the_built_network_is_where_the_map_is_on_the_globe() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let tokyo = GeoOrigin::new(35.68, 139.76, 0.0).unwrap();
+    let sydney = GeoOrigin::new(-33.87, 151.21, 0.0).unwrap();
+    for (origin, projection) in [
+        (tokyo, Projection::LocalCartesian),
+        (sydney, Projection::LocalCartesian),
+        (tokyo, Projection::Utm),
+        (sydney, Projection::Utm),
+        (tokyo, Projection::Mgrs),
+    ] {
+        let case = format!("{} at {origin:?}", projection.as_str());
+        let map = located(origin, projection);
+        assert_on_the_globe(&map, &case, 5);
+    }
+}
+
+/// The same, from an origin 2000 m up — where a transverse Mercator at unit scale
+/// would put the far end of a 2 km arm 0.63 m from where the Lanelet2 export's
+/// east/north/up frame does — and with the far ends of three of the arms above or
+/// below the origin's plane, which a 2D `<location>` cannot say.
+#[test]
+fn a_high_origin_and_raised_junctions_are_where_the_map_is_on_the_globe() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let reach = 2_000.0;
+    for projection in [
+        Projection::LocalCartesian,
+        Projection::Mgrs,
+        Projection::Utm,
+    ] {
+        let mut builder = MapBuilder::new(scenarios::metadata("located"));
+        builder.metadata_mut().origin = GeoOrigin::new(35.68, 139.76, 2_000.0).unwrap();
+        builder.metadata_mut().projection = projection;
+        // Each arm climbs or falls from its far end to the level centre. The west one
+        // stays on the plane, so there the scale alone is under test.
+        let arms = [
+            (
+                "north",
+                Point3::new(0.0, reach, 60.0),
+                Point3::new(0.0, 14.0, 0.0),
+            ),
+            (
+                "east",
+                Point3::new(reach, 0.0, -40.0),
+                Point3::new(14.0, 0.0, 0.0),
+            ),
+            (
+                "south",
+                Point3::new(0.0, -reach, 100.0),
+                Point3::new(0.0, -14.0, 0.0),
+            ),
+            (
+                "west",
+                Point3::new(-reach, 0.0, 0.0),
+                Point3::new(-14.0, 0.0, 0.0),
+            ),
+        ];
+        let roads: Vec<_> = arms
+            .into_iter()
+            .map(|(name, start, end)| {
+                builder
+                    .add_road(
+                        RoadSpec::line(start, end, scenarios::two_way())
+                            .unwrap()
+                            .with_name(name),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let junction = builder.add_junction(Some("x"));
+        for (index, from) in roads.iter().enumerate() {
+            for to in roads.iter().skip(index + 1) {
+                builder
+                    .connect_ends(from, RoadEnd::End, to, RoadEnd::End, Some(&junction))
+                    .unwrap();
+            }
+        }
+        let map = builder.finish().unwrap().validate().unwrap();
+        let case = format!("{} 2000 m up with raised arms", projection.as_str());
+        let raised = assert_on_the_globe(&map, &case, 5);
+        // The raised ends are where SUMO lands off the IR by more than its own
+        // centimetre, so the bound is what the test leant on.
+        if projection != Projection::Utm {
+            assert!(raised > 0.01, "{case}: worst height error only {raised}");
+        }
+    }
+}
+
+/// Builds `map` with netconvert and checks its `<location>` against the map: what the
+/// network states, and where SUMO, undoing it, puts each of the `junctions`
+/// non-internal junctions. Returns the largest error from height allowed for.
+fn assert_on_the_globe(map: &ValidatedMap, case: &str, junctions: usize) -> f64 {
+    let projection = map.metadata.projection;
+    let (directory, network) = sumo_build::build(map);
+    let location = &network.location;
+
+    // What the export asked for is what the network says.
+    let reference = roadgen_sumo::geo_reference(map).unwrap();
+    assert_eq!(location.proj_parameter, reference.proj_parameter, "{case}");
+    // netconvert writes the offset to the centimetre, as it does every length.
+    assert!(
+        (location.net_offset.0 - reference.net_offset.0).abs() <= 0.005
+            && (location.net_offset.1 - reference.net_offset.1).abs() <= 0.005,
+        "{case}: the network's offset is {:?}, not {:?}",
+        location.net_offset,
+        reference.net_offset
+    );
+    if projection != Projection::Utm {
+        assert_eq!(location.net_offset, (0.0, 0.0), "{case}");
+        // A local map at sea level is in the frame the OpenDRIVE export describes,
+        // in the same words. Above it SUMO's transverse Mercator is scaled to the
+        // origin's plane and OpenDRIVE's is not, so the two differ by the `+k`.
+        let opendrive = roadgen_opendrive::origin_proj_string(map);
+        if map.metadata.origin.altitude() == 0.0 {
+            assert_eq!(location.proj_parameter, opendrive, "{case}");
+        } else {
+            assert_ne!(location.proj_parameter, opendrive, "{case}");
+            assert!(opendrive.contains("+k=1 "), "{opendrive}");
+        }
+    }
+
+    // The coordinates are still the IR's: the junction is at the origin.
+    let centre = network.junction("j_x").position;
+    assert!(centre.x.abs() < 0.02 && centre.y.abs() < 0.02, "{case}");
+
+    // And SUMO's own reading of every junction's position is the IR's.
+    let projector = roadgen_lanelet2::projector_for(map).unwrap();
+    let on_the_globe =
+        sumo_build::junctions_on_the_globe(&directory.path().join("located.net.xml"));
+    let [west, south, east, north] = location.orig_boundary;
+    let mut checked = 0;
+    let mut worst_height = 0.0f64;
+    for junction in network.junctions.iter().filter(|j| j.kind != "internal") {
+        let (lon, lat) = on_the_globe[&junction.id];
+        let p = junction.position;
+        let wanted = projector.reverse([p.x, p.y, p.z]).unwrap();
+        // Degrees to metres, near enough for a tolerance.
+        let metres_north = (lat - wanted.lat) * 111_320.0;
+        let metres_east = (lon - wanted.lon) * 111_320.0 * wanted.lat.to_radians().cos();
+        let error = metres_north.hypot(metres_east);
+        // The centimetre is netconvert's rounding of the offset and of the
+        // positions. Then 2 mm for a scaled transverse Mercator standing in for the
+        // east/north/up plane 2 km out from an origin 2000 m up (1.5 mm measured:
+        // one scale cannot match both radii of curvature), and the height a 2D
+        // `<location>` cannot carry, which the export states as a bound.
+        let height = roadgen_sumo::height_error(map, &p);
+        worst_height = worst_height.max(height);
+        let tolerance = 0.01 + 0.002 + height;
+        assert!(
+            error < tolerance,
+            "{case}: SUMO puts {} at ({lat:.9}, {lon:.9}), {error:.4} m from the \
+             IR's ({:.9}, {:.9}), more than {tolerance:.4} m",
+            junction.id,
+            wanted.lat,
+            wanted.lon
+        );
+        // And the boundary the network states holds it — to the millionth of a
+        // degree netconvert rounds a boundary to, since the far end of an arm is
+        // where the boundary is.
+        let slack = 1e-6;
+        assert!(
+            (west - slack..=east + slack).contains(&lon)
+                && (south - slack..=north + slack).contains(&lat),
+            "{case}: {} at ({lat}, {lon}) is outside the origBoundary {:?}",
+            junction.id,
+            location.orig_boundary
+        );
+        checked += 1;
+    }
+    // The centre and the far end of each arm.
+    assert_eq!(checked, junctions, "{case}");
+    worst_height
+}
+
+/// A movement across a junction follows the path the IR drew for it. The connector
+/// lane is not an edge, but its centreline is written as the connection's shape, and
+/// netconvert lays the internal lane along that — splitting it in two where a turn
+/// must wait inside the junction — instead of inventing a curve of its own that the
+/// OpenDRIVE and the Lanelet2 map written from the same IR would not share.
+#[test]
+fn a_movement_across_a_junction_follows_the_connector_the_ir_drew() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::crossroads();
+    let sampling = map.metadata.sampling;
+    let written = roadgen_sumo::to_plain_xml(&map).unwrap().lanes;
+    let (_directory, network) = sumo_build::build(&map);
+    let internal_shape = |id: &str| -> Vec<Point3> {
+        let (edge, index) = id.rsplit_once('_').expect("an edge and an index");
+        network
+            .edges
+            .iter()
+            .find(|candidate| candidate.id == edge)
+            .unwrap_or_else(|| panic!("no internal edge {edge}"))
+            .lane(index.parse().unwrap())
+            .shape
+            .clone()
+    };
+
+    let mut turns = 0;
+    for connector in map.lanes.iter() {
+        let Some(road) = map.road(&connector.road) else {
+            continue;
+        };
+        if road.junction.is_none() {
+            continue;
+        }
+        // The lanes the connector joins, as the network names them.
+        let into = map
+            .connections
+            .iter()
+            .find(|connection| connection.to.lane == connector.id)
+            .and_then(|connection| written.get(&connection.from.lane))
+            .expect("a connector is entered from a written lane");
+        let out = map
+            .connections
+            .iter()
+            .find(|connection| connection.from.lane == connector.id)
+            .and_then(|connection| written.get(&connection.to.lane))
+            .expect("a connector leads to a written lane");
+        let (from, from_lane) = into.rsplit_once('_').unwrap();
+        let (to, to_lane) = out.rsplit_once('_').unwrap();
+        let entry = network
+            .connections
+            .iter()
+            .find(|connection| {
+                connection.from == from
+                    && connection.to == to
+                    && connection.from_lane.to_string() == from_lane
+                    && connection.to_lane.to_string() == to_lane
+            })
+            .unwrap_or_else(|| panic!("no movement {into} > {out}"));
+        if entry.direction.as_deref() == Some("s") {
+            continue;
+        }
+        turns += 1;
+
+        // The internal lanes of the movement, in order: the first is the entry's
+        // `via`, and each after it is the `via` of the connection leaving the last.
+        let mut built: Vec<Point3> = Vec::new();
+        let mut lane = entry.via.clone().expect("a turn crosses the junction");
+        loop {
+            for point in internal_shape(&lane) {
+                if built
+                    .last()
+                    .is_none_or(|last| last.distance_to(point) > 0.02)
+                {
+                    built.push(point);
+                }
+            }
+            let next = network
+                .connections
+                .iter()
+                .find(|connection| format!("{}_{}", connection.from, connection.from_lane) == lane);
+            match next.and_then(|connection| connection.via.clone()) {
+                Some(via) => lane = via,
+                None => break,
+            }
+        }
+
+        let drawn = connector
+            .travel_geometry(sampling)
+            .unwrap()
+            .centerline
+            .to_polyline(sampling)
+            .unwrap();
+        // Every point netconvert put the internal lanes through lies on the
+        // connector's centreline, to the centimetre it writes its output to.
+        for point in &built {
+            let off = distance_to_polyline(*point, drawn.points());
+            assert!(
+                off < 0.05,
+                "{into} > {out}: the internal lane passes {off:.3} m off the connector at {point:?}"
+            );
+        }
+        // And they run the whole of it, end to end.
+        let length = |points: &[Point3]| -> f64 {
+            points
+                .windows(2)
+                .map(|pair| pair[0].distance_to(pair[1]))
+                .sum()
+        };
+        let (built_length, drawn_length) = (length(&built), length(drawn.points()));
+        assert!(
+            (built_length - drawn_length).abs() < 0.05,
+            "{into} > {out}: the internal lanes are {built_length:.3} m long, the connector \
+             {drawn_length:.3} m"
+        );
+    }
+    // A left and a right turn from each of the four arms.
+    assert_eq!(turns, 8);
+}
+
+/// How far `point` is from the nearest segment of `line`.
+fn distance_to_polyline(point: Point3, line: &[Point3]) -> f64 {
+    line.windows(2)
+        .map(|pair| {
+            let (a, b) = (pair[0], pair[1]);
+            let (dx, dy, dz) = (b.x - a.x, b.y - a.y, b.z - a.z);
+            let squared = dx * dx + dy * dy + dz * dz;
+            let t = if squared == 0.0 {
+                0.0
+            } else {
+                (((point.x - a.x) * dx + (point.y - a.y) * dy + (point.z - a.z) * dz) / squared)
+                    .clamp(0.0, 1.0)
+            };
+            point.distance_to(Point3::new(a.x + t * dx, a.y + t * dy, a.z + t * dz))
+        })
+        .fold(f64::INFINITY, f64::min)
 }

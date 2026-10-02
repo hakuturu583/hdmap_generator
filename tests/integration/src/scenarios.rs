@@ -459,6 +459,62 @@ pub fn lane_drop() -> ValidatedMap {
     finish(builder)
 }
 
+/// A two-way road whose forward driving lane becomes a cycle lane halfway along,
+/// while the backward lane stays a driving lane all the way.
+///
+/// The forward lane does not carry on: a cycle lane is not more of the same lane, so
+/// the IR has no connection across the boundary on that side — and nothing at all
+/// from the first section's forward carriageway.
+pub fn lane_type_change() -> ValidatedMap {
+    let mut builder = MapBuilder::new(metadata("lane-type-change"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(200.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("r")
+            .with_cross_section(
+                100.0,
+                vec![
+                    lane(3.5, Direction::Forward).with_type(LaneType::Biking),
+                    lane(3.5, Direction::Backward),
+                ],
+            ),
+        )
+        .unwrap();
+    finish(builder)
+}
+
+/// A two-way road whose backward carriageway loses a lane: two lanes run backward
+/// past station 100 and one before it, so traffic running backward — from the far
+/// end — finds its outer lane ending at the boundary.
+pub fn backward_lane_drop() -> ValidatedMap {
+    let mut builder = MapBuilder::new(metadata("backward-lane-drop"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(200.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("r")
+            .with_cross_section(
+                100.0,
+                vec![
+                    lane(3.5, Direction::Forward),
+                    lane(3.5, Direction::Backward),
+                    lane(3.5, Direction::Backward),
+                ],
+            ),
+        )
+        .unwrap();
+    finish(builder)
+}
+
 /// A carriageway that widens out into a lay-by and narrows back again, without ever
 /// changing how many lanes it has.
 pub fn widening_road() -> ValidatedMap {
@@ -547,5 +603,68 @@ pub fn controlled_crossroads() -> ValidatedMap {
     );
     builder.add_right_of_way(vec![east_approach], vec![north_approach], Some(stop_line));
     builder.add_crosswalk(&roads[0], 0.8, 4.0).unwrap();
+    finish(builder)
+}
+
+/// A four-way crossroads of streets with a pavement down each side, so the
+/// generator lays a pavement round every corner of the junction.
+///
+/// The arms are not all drawn towards the centre: west and south end at the
+/// junction, east and north start there. Which end of a road meets the junction
+/// decides which of its pavements faces which corner, and so whether the pavement
+/// round a corner runs from a sidewalk *arriving* at the junction or from one
+/// *leaving* it — which a format whose lanes are one way has to get right.
+///
+/// `handedness` is the side traffic keeps to. It moves every lane to the other side
+/// of the reference line, and every pavement with it, so the same street makes the
+/// corners join the opposite sidewalks.
+pub fn sidewalk_crossroads(handedness: TrafficHandedness) -> ValidatedMap {
+    let name = match handedness {
+        TrafficHandedness::RightHand => "sidewalks",
+        TrafficHandedness::LeftHand => "sidewalks_lht",
+    };
+    let mut builder = MapBuilder::new(MapMetadata {
+        handedness,
+        ..metadata(name)
+    });
+    let street = || {
+        vec![
+            lane(3.5, Direction::Backward),
+            lane(2.0, Direction::Backward).with_type(LaneType::Sidewalk),
+            lane(3.5, Direction::Forward),
+            lane(2.0, Direction::Forward).with_type(LaneType::Sidewalk),
+        ]
+    };
+    let junction = builder.add_junction(Some("x"));
+    let mut arm = |name: &str, from: (f64, f64), to: (f64, f64)| {
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(from.0, from.1, 0.0),
+                    Point3::new(to.0, to.1, 0.0),
+                    street(),
+                )
+                .unwrap()
+                .with_name(name),
+            )
+            .unwrap()
+    };
+    let west = arm("west", (-70.0, 0.0), (-14.0, 0.0));
+    let east = arm("east", (14.0, 0.0), (70.0, 0.0));
+    let north = arm("north", (0.0, 14.0), (0.0, 70.0));
+    let south = arm("south", (0.0, -70.0), (0.0, -14.0));
+    let arms = [
+        (&west, RoadEnd::End),
+        (&east, RoadEnd::Start),
+        (&north, RoadEnd::Start),
+        (&south, RoadEnd::End),
+    ];
+    for (index, (from, from_end)) in arms.iter().enumerate() {
+        for (to, to_end) in arms.iter().skip(index + 1) {
+            builder
+                .connect_ends(from, *from_end, to, *to_end, Some(&junction))
+                .unwrap();
+        }
+    }
     finish(builder)
 }

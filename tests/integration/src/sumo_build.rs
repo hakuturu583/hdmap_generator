@@ -10,7 +10,7 @@
 //! helpers say so and the test skips, unless `ROADGEN_REQUIRE_SUMO` is set — which CI
 //! does set, so the checks that matter never silently stop running.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,7 +24,7 @@ use roadgen_core::validation::ValidatedMap;
 ///
 /// A package manager puts them on `PATH`; a source or pip install puts them in
 /// `$SUMO_HOME/bin` and may not.
-fn tool(name: &str) -> Option<PathBuf> {
+pub fn tool(name: &str) -> Option<PathBuf> {
     if let Ok(home) = std::env::var("SUMO_HOME") {
         let candidate = Path::new(&home).join("bin").join(name);
         if candidate.is_file() {
@@ -65,15 +65,19 @@ pub fn sumo_available() -> bool {
 /// Whether a line SUMO printed is about something other than the file it was given.
 ///
 /// Two kinds are not the export's business. One is about the machine: SUMO says so
-/// when `SUMO_HOME` is unset and it cannot find its schemas. The other is about the
+/// when `SUMO_HOME` is unset and it cannot find its schemas, and the PROJ it links
+/// says so when it cannot find its database — which a pip-installed SUMO's bundled
+/// PROJ never can, and which none of the definitions the export writes needs, since
+/// they name the ellipsoid and the projection outright. The other is about the
 /// *map*: where two roads meet at an angle, SUMO works out the turning radius of the
 /// link between them and lowers the speed a vehicle may take it at. That is SUMO
 /// reading the geometry correctly and saying what it found — a scenario like
 /// `two_roads_joined`, which bends by 26 degrees at the joint, should produce it.
 ///
 /// Everything else counts as a complaint and fails the test.
-fn is_about_the_machine_or_the_map(line: &str) -> bool {
+pub fn is_about_the_machine_or_the_map(line: &str) -> bool {
     line.contains("SUMO_HOME")
+        || line.contains("Cannot find proj.db")
         || (line.contains("Speed of") && line.contains("due to turning radius"))
 }
 
@@ -91,10 +95,33 @@ pub fn build(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork) {
     (directory, SumoNetwork::read(&path))
 }
 
+/// [`build`], for a map netconvert is *right* to warn about: what it said comes back
+/// alongside the network instead of failing the test, so the test can check that it
+/// warned about exactly what the map holds and nothing else.
+pub fn build_with_warnings(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork, Vec<String>) {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let prefix = roadgen_sumo::write(map, directory.path()).expect("the map should export as SUMO");
+
+    let (path, warnings) = run_netconvert(directory.path(), &prefix);
+    (directory, SumoNetwork::read(&path), warnings)
+}
+
 /// Runs `netconvert` on the SUMO export in `directory` whose files are named after
 /// `prefix`, checks that it built the network without complaint, and returns the
 /// path of the `.net.xml` it wrote.
 pub fn netconvert(directory: &Path, prefix: &str) -> PathBuf {
+    let (path, complaints) = run_netconvert(directory, prefix);
+    assert!(
+        complaints.is_empty(),
+        "netconvert accepted the export but complained about it:\n{}",
+        complaints.join("\n")
+    );
+    path
+}
+
+/// Runs `netconvert` as [`netconvert`] does and checks that it built the network,
+/// returning the `.net.xml` it wrote and every line it complained with.
+fn run_netconvert(directory: &Path, prefix: &str) -> (PathBuf, Vec<String>) {
     // Through the generated configuration, which is how a user runs it: if the
     // `.netccfg` names the wrong files or asks for the wrong processing, that is a
     // fault in the export and the test should see it.
@@ -116,13 +143,55 @@ pub fn netconvert(directory: &Path, prefix: &str) -> PathBuf {
         output.status.success(),
         "netconvert rejected the export:\n{stderr}"
     );
+
+    (directory.join(format!("{prefix}.net.xml")), complaints)
+}
+
+/// Every junction of the built network at `path`, as a longitude and latitude — worked
+/// out by SUMO.
+///
+/// netconvert is asked to read the network back and write it out as plain XML with
+/// geographic coordinates, which it does by undoing the network's `<location>` with
+/// its own PROJ: the offset taken off, the projection inverted. That is the same
+/// computation `sumolib`'s `convertXY2LonLat` makes, done by the program that owns the
+/// format, and to nine decimals of a degree — a tenth of a millimetre — rather than
+/// the six it writes by default.
+pub fn junctions_on_the_globe(path: &Path) -> HashMap<String, (f64, f64)> {
+    let directory = path.parent().expect("a network inside a directory");
+    let prefix = "on_the_globe";
+    let output = Command::new(tool("netconvert").expect("netconvert"))
+        .arg("-s")
+        .arg(path)
+        .args(["--plain-output-prefix", prefix])
+        .args(["--proj.plain-geo", "true"])
+        .args(["--precision.geo", "9"])
+        .current_dir(directory)
+        .output()
+        .expect("netconvert should run");
     assert!(
-        complaints.is_empty(),
-        "netconvert accepted the export but complained about it:\n{}",
-        complaints.join("\n")
+        output.status.success(),
+        "netconvert could not read the network back:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
-    directory.join(format!("{prefix}.net.xml"))
+    let xml = std::fs::read_to_string(directory.join(format!("{prefix}.nod.xml")))
+        .expect("netconvert should have written the nodes");
+    let mut reader = Reader::from_str(&xml);
+    let mut nodes = HashMap::new();
+    loop {
+        match reader.read_event().expect("valid node XML") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element) if element.name().as_ref() == b"node" => {
+                let attributes = attributes(&element);
+                nodes.insert(
+                    attributes["id"].clone(),
+                    (number(&attributes, "x"), number(&attributes, "y")),
+                );
+            }
+            _ => {}
+        }
+    }
+    nodes
 }
 
 /// Loads a built network into the simulator itself.
@@ -156,15 +225,85 @@ pub fn simulate(directory: &Path, prefix: &str) {
     );
 }
 
+/// Drives one passenger car down `edge` of a built network, from `depart_lane` to
+/// `arrival_lane`, and returns every lane it was on — so whether the lane change was
+/// allowed is what the simulator did, not what the attributes are taken to mean.
+pub fn lanes_driven(
+    directory: &Path,
+    prefix: &str,
+    edge: &str,
+    depart_lane: usize,
+    arrival_lane: usize,
+) -> BTreeSet<String> {
+    let routes = directory.join("drive.rou.xml");
+    std::fs::write(
+        &routes,
+        format!(
+            r#"<routes><vehicle id="car" depart="0" departLane="{depart_lane}" arrivalLane="{arrival_lane}" departSpeed="10"><route edges="{edge}"/></vehicle></routes>"#
+        ),
+    )
+    .expect("the route file");
+    let output = Command::new(tool("sumo").expect("sumo"))
+        .args(["-n", &format!("{prefix}.net.xml")])
+        .args(["-r", "drive.rou.xml"])
+        .args(["--fcd-output", "drive.fcd.xml"])
+        .args(["--no-step-log", "true"])
+        .args(["--no-warnings", "true"])
+        .current_dir(directory)
+        .output()
+        .expect("sumo should run");
+    assert!(
+        output.status.success(),
+        "sumo could not drive the network:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fcd = std::fs::read_to_string(directory.join("drive.fcd.xml")).expect("the fcd output");
+    let mut lanes = BTreeSet::new();
+    let mut reader = Reader::from_str(&fcd);
+    loop {
+        match reader.read_event().expect("well-formed fcd output") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element)
+                if element.name().as_ref() == b"vehicle" =>
+            {
+                if let Some(lane) = attributes(&element).remove("lane") {
+                    lanes.insert(lane);
+                }
+            }
+            _ => {}
+        }
+    }
+    lanes
+}
+
 // --------------------------------------------------------------------------- //
 // The network netconvert produced
 // --------------------------------------------------------------------------- //
 
 #[derive(Debug, Clone)]
 pub struct SumoNetwork {
+    /// The `<location>`: how the network is tied to the globe.
+    pub location: SumoLocation,
+    /// Whether netconvert built the network for left-hand traffic, as it records on
+    /// the `<net>` element. SUMO reads handedness from here and not from the
+    /// geometry, so this is what the simulator will drive by.
+    pub lefthand: bool,
     pub edges: Vec<SumoEdge>,
     pub junctions: Vec<SumoJunction>,
     pub connections: Vec<SumoConnection>,
+}
+
+/// A network's `<location>`, read as SUMO states it: a network position is the
+/// position `proj_parameter` projects a longitude and latitude to, plus `net_offset`.
+#[derive(Debug, Clone, Default)]
+pub struct SumoLocation {
+    pub net_offset: (f64, f64),
+    /// `xmin, ymin, xmax, ymax` in the network's metres.
+    pub conv_boundary: [f64; 4],
+    /// `lonmin, latmin, lonmax, latmax`.
+    pub orig_boundary: [f64; 4],
+    /// The PROJ definition, or `!` for a network with none.
+    pub proj_parameter: String,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +328,10 @@ pub struct SumoLane {
     pub length: f64,
     pub allow: Option<String>,
     pub disallow: Option<String>,
+    /// The vehicle classes that may change to the lane on the left and on the
+    /// right; absent where SUMO leaves the change open to everyone.
+    pub change_left: Option<String>,
+    pub change_right: Option<String>,
     pub shape: Vec<Point3>,
 }
 
@@ -228,6 +371,8 @@ impl SumoNetwork {
     fn parse(xml: &str) -> SumoNetwork {
         let mut reader = Reader::from_str(xml);
         let mut network = SumoNetwork {
+            location: SumoLocation::default(),
+            lefthand: false,
             edges: Vec::new(),
             junctions: Vec::new(),
             connections: Vec::new(),
@@ -241,6 +386,34 @@ impl SumoNetwork {
                     let name = String::from_utf8_lossy(element.name().as_ref()).into_owned();
                     let attributes = attributes(element);
                     match name.as_str() {
+                        "location" => {
+                            let list = |key: &str| -> Vec<f64> {
+                                attributes
+                                    .get(key)
+                                    .map(|value| {
+                                        value
+                                            .split(',')
+                                            .map(|part| part.parse().expect("a number"))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            let offset = list("netOffset");
+                            network.location = SumoLocation {
+                                net_offset: (offset[0], offset[1]),
+                                conv_boundary: list("convBoundary")
+                                    .try_into()
+                                    .expect("four numbers"),
+                                orig_boundary: list("origBoundary")
+                                    .try_into()
+                                    .expect("four numbers"),
+                                proj_parameter: attributes["projParameter"].clone(),
+                            };
+                        }
+                        "net" => {
+                            network.lefthand =
+                                attributes.get("lefthand").map(String::as_str) == Some("true");
+                        }
                         "edge" => network.edges.push(SumoEdge {
                             id: attributes["id"].clone(),
                             function: attributes.get("function").cloned(),
@@ -265,6 +438,8 @@ impl SumoNetwork {
                                 length: number(&attributes, "length"),
                                 allow: attributes.get("allow").cloned(),
                                 disallow: attributes.get("disallow").cloned(),
+                                change_left: attributes.get("changeLeft").cloned(),
+                                change_right: attributes.get("changeRight").cloned(),
                                 shape: points(attributes.get("shape").map(String::as_str)),
                             };
                             network
