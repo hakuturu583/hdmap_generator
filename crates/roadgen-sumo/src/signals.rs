@@ -23,9 +23,11 @@
 //! the program a traffic engineer would sketch on the back of an envelope for a
 //! junction they know nothing about:
 //!
-//! - The approaches are grouped by their **axis** — the heading traffic arrives on,
-//!   taken modulo 180° — so that an approach and the one facing it across the
-//!   junction fall into one group, within [`AXIS_TOLERANCE_DEGREES`] of each other.
+//! - The approaches are grouped by their **axis**, so that an approach and the one
+//!   facing it across the junction fall into one group: they share a phase only if
+//!   they arrive on headings opposite to within [`AXIS_TOLERANCE_DEGREES`]. Arms that
+//!   merely lie near one axis without facing each other — those of two roads crossing
+//!   at an acute angle — are kept apart, since their straight movements cross.
 //! - Each group gets a green phase, followed by a yellow and an all-red: the two
 //!   approaches of one road run together, and the crossing road waits.
 //! - A green is [`GREEN_FEW_SECONDS`] long where there are at most two groups — the
@@ -55,7 +57,8 @@ use roadgen_core::TrafficHandedness;
 /// netconvert calls its own, which a loaded program of the same id replaces.
 pub(crate) const PROGRAM_ID: &str = "0";
 
-/// How far apart the axes of two approaches may be for them to run in one phase.
+/// How far from exactly opposite the headings of two approaches may be for them to
+/// run in one phase.
 pub const AXIS_TOLERANCE_DEGREES: f64 = 35.0;
 
 /// How far a movement must swing from the heading it arrived on to count as a turn
@@ -100,28 +103,37 @@ pub(crate) struct Phase {
 /// The approaches of a junction, grouped by axis, in the order each group's first
 /// approach appears among `links`.
 ///
-/// Each approach joins the first group whose *first* approach lies within the
-/// tolerance of it, rather than any member: chaining through members would let a
-/// sequence of slightly skewed arms gather the whole junction into one phase.
+/// An approach joins the first group every member of which it *faces*: arrives on a
+/// heading within the tolerance of opposite to theirs. Sharing an axis is not enough.
+/// Two roads crossing at an acute angle have arms whose axes lie within the tolerance
+/// of each other, but an arm and the arm of the other road beside it do not face each
+/// other — they cross — and releasing them together would give two crossing straight
+/// movements one green. Requiring every member rather than any also keeps a sequence
+/// of slightly skewed arms from chaining the whole junction into one phase.
 pub(crate) fn groups(links: &[Link]) -> Vec<Vec<usize>> {
-    let mut groups: Vec<(f64, Vec<usize>)> = Vec::new();
+    let mut groups: Vec<Vec<(usize, f64)>> = Vec::new();
     for link in links {
-        if groups
-            .iter()
-            .any(|(_, members)| members.contains(&link.approach))
-        {
+        if groups.iter().any(|members| {
+            members
+                .iter()
+                .any(|(approach, _)| *approach == link.approach)
+        }) {
             continue;
         }
-        let axis = axis_of(link.heading);
-        match groups
-            .iter_mut()
-            .find(|(first, _)| axis_distance(*first, axis) <= AXIS_TOLERANCE_DEGREES.to_radians())
-        {
-            Some((_, members)) => members.push(link.approach),
-            None => groups.push((axis, vec![link.approach])),
+        let member = (link.approach, link.heading);
+        match groups.iter_mut().find(|members| {
+            members
+                .iter()
+                .all(|(_, heading)| facing(*heading, link.heading))
+        }) {
+            Some(members) => members.push(member),
+            None => groups.push(vec![member]),
         }
     }
-    groups.into_iter().map(|(_, members)| members).collect()
+    groups
+        .into_iter()
+        .map(|members| members.into_iter().map(|(approach, _)| approach).collect())
+        .collect()
 }
 
 /// The program for one junction whose controlled movements are `links`, in the order
@@ -206,15 +218,11 @@ pub(crate) fn swing(from: f64, to: f64) -> f64 {
     angle
 }
 
-/// A heading folded onto [0, π): the line it runs along, whichever way.
-fn axis_of(heading: f64) -> f64 {
-    heading.rem_euclid(PI)
-}
-
-/// How far apart two axes are, going whichever way round is shorter.
-fn axis_distance(a: f64, b: f64) -> f64 {
-    let difference = (a - b).rem_euclid(PI);
-    difference.min(PI - difference)
+/// Whether two approaches arriving on headings `a` and `b` face each other across
+/// the junction: their headings are opposite, within the tolerance — the same axis,
+/// travelled the other way.
+fn facing(a: f64, b: f64) -> bool {
+    PI - swing(a, b).abs() <= AXIS_TOLERANCE_DEGREES.to_radians()
 }
 
 #[cfg(test)]
@@ -263,6 +271,48 @@ mod tests {
             link.heading = degrees(90.0 + 40.0);
         }
         assert_eq!(groups(&links).len(), 3);
+    }
+
+    #[test]
+    fn the_arms_of_roads_crossing_at_an_acute_angle_do_not_share_a_green() {
+        // Two straight roads crossing at 30°: one runs along 0°/180°, the other along
+        // 30°/210°. Every axis lies within the tolerance of every other, but only the
+        // two arms of one road face each other.
+        let headings = [0.0, 30.0, 180.0, 210.0];
+        let links: Vec<Link> = headings
+            .into_iter()
+            .enumerate()
+            .map(|(approach, heading)| Link {
+                approach,
+                heading: degrees(heading),
+                turn: 0.0,
+                target: (approach, 0),
+            })
+            .collect();
+        assert_eq!(groups(&links), vec![vec![0, 2], vec![1, 3]]);
+        let phases = program(&links, TrafficHandedness::RightHand);
+        let greens: Vec<&str> = phases
+            .iter()
+            .step_by(3)
+            .map(|phase| phase.state.as_str())
+            .collect();
+        assert_eq!(greens, ["GrGr", "rGrG"]);
+    }
+
+    #[test]
+    fn approaches_arriving_the_same_way_do_not_share_a_green() {
+        // Two arms arriving side by side, 20° apart, neither facing the other.
+        let links: Vec<Link> = [0.0, 20.0]
+            .into_iter()
+            .enumerate()
+            .map(|(approach, heading)| Link {
+                approach,
+                heading: degrees(heading),
+                turn: 0.0,
+                target: (approach, 0),
+            })
+            .collect();
+        assert_eq!(groups(&links), vec![vec![0], vec![1]]);
     }
 
     #[test]
