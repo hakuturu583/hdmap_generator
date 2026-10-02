@@ -149,6 +149,21 @@ fn a_crossroads_with_sidewalks_builds_and_loads_whichever_side_traffic_keeps_to(
             8,
             "{handedness:?}: one sidewalk per side of each of four arms: {footways:?}"
         );
+        // netconvert built the network for the side traffic keeps to, and each
+        // sidewalk is its edge's kerb lane: lane 0, which SUMO counts from the
+        // outside of the carriageway — the right where traffic keeps right, the left
+        // where it keeps left.
+        assert_eq!(
+            network.lefthand,
+            handedness == TrafficHandedness::LeftHand,
+            "{handedness:?}"
+        );
+        for footway in &footways {
+            assert!(
+                footway.ends_with("_0"),
+                "{handedness:?}: {footway} is not its edge's kerb lane"
+            );
+        }
         for (from, from_lane, to, to_lane) in network.movements() {
             let (from, to) = (format!("{from}_{from_lane}"), format!("{to}_{to_lane}"));
             assert!(
