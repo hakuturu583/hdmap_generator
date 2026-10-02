@@ -37,8 +37,8 @@
 //! A road whose cross-section changes becomes one edge per cross-section, joined at
 //! an internal node: a SUMO edge has one lane count from end to end. Which lane
 //! carries on across that node is the IR's connections, written as the movements
-//! through it; an edge the IR carries nothing on from is listed as connecting to
-//! nothing, so netconvert does not guess a movement for it.
+//! through it; for an edge the IR carries nothing on from, its movements onto the
+//! edges beyond are listed as deleted, so netconvert guesses none.
 //!
 //! Every lane is written with its own shape, so the geometry the generator computed
 //! is the geometry SUMO gets — not a centreline with a width, which is what a
@@ -1131,25 +1131,40 @@ impl<'a> Exporter<'a> {
         // An edge none of whose lanes the IR carries on from, leading anywhere but a
         // dead end. With nothing listed for it netconvert would take its movements
         // as unspecified and guess some — a lane dropped where the type changes, say
-        // driving into cycling, would be carried on into the cycle lane — so it is
-        // listed with no target, which is plain XML for "this edge connects to
-        // nothing". netconvert warns that the edge goes nowhere, and that is what the
-        // IR says.
+        // driving into cycling, would be carried on into the cycle lane — so the
+        // edge's movements onto each edge leaving the node it runs into are listed
+        // as deleted. A `<connection>` with no target says the same thing to newer
+        // versions, but netconvert 1.18 still guesses past it; a `<delete>` is
+        // honoured by both, and deleting movements netconvert would not have built
+        // (the turnaround, which `no-turnarounds` already rules out) is silent.
+        // netconvert warns that the edge goes nowhere, and that is what the IR says.
         for unconnected in self.unconnected_edges() {
-            document.leaf(
-                "connection",
-                &[("from", self.edges[unconnected].id.clone())],
-            );
+            let edge = &self.edges[unconnected];
+            for next in self.edges.iter().filter(|next| next.from == edge.to) {
+                document.leaf(
+                    "delete",
+                    &[("from", edge.id.clone()), ("to", next.id.clone())],
+                );
+            }
         }
         document.finish()
     }
 
     /// The edges that run into a node something could continue from, but from which
     /// the IR states no movement at all.
+    ///
+    /// A footway is not one of them: pedestrians do not follow connections but cross
+    /// a node on its walking area, so there is no movement for netconvert to guess.
     fn unconnected_edges(&self) -> Vec<usize> {
         let connected: BTreeSet<usize> = self.movements.keys().map(|key| key.0).collect();
+        let footway = |edge: &Edge| {
+            edge.lanes
+                .iter()
+                .all(|lane| lane.permission == Some(Permission::Allow("pedestrian")))
+        };
         (0..self.edges.len())
             .filter(|edge| !connected.contains(edge))
+            .filter(|&edge| !footway(&self.edges[edge]))
             .filter(|&edge| {
                 self.nodes
                     .get(&self.edges[edge].to)
@@ -1433,9 +1448,11 @@ mod tests {
                     b"lane" => {
                         found.insert(format!("lane:{edge}_{}", attributes["index"]));
                     }
-                    b"connection" if !attributes.contains_key("to") => {
-                        // An edge listed with no target: it connects to nothing.
-                        found.insert(format!("nowhere:{}", attributes["from"]));
+                    b"delete" => {
+                        found.insert(format!(
+                            "delete:{}>{}",
+                            attributes["from"], attributes["to"]
+                        ));
                     }
                     b"connection" => {
                         found.insert(format!(
@@ -1556,17 +1573,18 @@ mod tests {
             .any(|link| link.local == "connection:north.fwd_0>west.bwd_0"));
     }
 
-    /// Where no lane of an edge carries on into the next cross-section, the edge is
-    /// listed as connecting to nothing; left out, netconvert would guess a movement
-    /// the IR does not have.
+    /// Where no lane of an edge carries on into the next cross-section, every movement
+    /// netconvert could guess from the edge is deleted; left out, netconvert would
+    /// guess a movement the IR does not have.
     #[test]
     fn an_edge_the_map_carries_nothing_on_from_connects_to_nothing() {
         let map = type_change();
         let network = to_plain_xml(&map).unwrap();
         let written = written(&network);
 
-        // The driving lane ends where the cycle lane begins: nothing joins them.
-        assert!(written.contains("nowhere:r.0.fwd"), "{written:?}");
+        // The driving lane ends where the cycle lane begins: nothing joins them, and
+        // nothing turns it back either.
+        assert!(written.contains("delete:r.0.fwd>r.1.fwd"), "{written:?}");
         assert!(
             !written
                 .iter()
@@ -1578,11 +1596,45 @@ mod tests {
             written.contains("connection:r.1.bwd_0>r.0.bwd_0"),
             "{written:?}"
         );
-        assert!(!written.contains("nowhere:r.1.bwd"), "{written:?}");
-        // Nor is the far end of either carriageway listed: nothing continues from a
-        // dead end for netconvert to guess.
-        assert!(!written.contains("nowhere:r.1.fwd"), "{written:?}");
-        assert!(!written.contains("nowhere:r.0.bwd"), "{written:?}");
+        // Only the edge that goes nowhere has anything deleted: the far end of either
+        // carriageway is a dead end, where nothing continues for netconvert to guess.
+        assert!(
+            written
+                .iter()
+                .filter(|element| element.starts_with("delete:"))
+                .all(|element| element.starts_with("delete:r.0.fwd>")),
+            "{written:?}"
+        );
+    }
+
+    /// A footway the IR carries nothing on from is left alone: pedestrians cross a
+    /// node on its walking area, not along connections, so there is nothing for
+    /// netconvert to guess and nothing to delete.
+    #[test]
+    fn a_footway_the_map_carries_nothing_on_from_has_nothing_deleted() {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("footway-ends"));
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(200.0, 0.0, 0.0),
+                    vec![LaneSpec::new(width, Direction::Forward).with_type(LaneType::Sidewalk)],
+                )
+                .unwrap()
+                .with_name("r")
+                .with_cross_section(100.0, vec![LaneSpec::new(width, Direction::Forward)]),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+        let written = written(&network);
+
+        assert!(written.contains("edge:r.0.fwd"), "{written:?}");
+        assert!(
+            !written.iter().any(|element| element.starts_with("delete:")),
+            "{written:?}"
+        );
     }
 
     #[test]

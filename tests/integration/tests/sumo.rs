@@ -500,9 +500,10 @@ fn across(
 
 /// Where no lane of an edge carries on across a cross-section boundary — here a
 /// driving lane that becomes a cycle lane — the IR states no movement from it, and
-/// the built network has none: netconvert is told the edge connects to nothing
-/// rather than left to guess, which would carry the driving lane on into the cycle
-/// lane. That it warns the edge goes nowhere is what the map says, and all it warns.
+/// the built network has none: every movement netconvert could guess from the edge
+/// is deleted rather than left to it, which would carry the driving lane on into the
+/// cycle lane. That it warns the edge goes nowhere is what the map says, and all it
+/// warns — in the same words from SUMO 1.18, which CI installs, to 1.26.
 #[test]
 fn a_lane_that_ends_where_its_type_changes_is_not_carried_on() {
     if !sumo_build::sumo_available() {
