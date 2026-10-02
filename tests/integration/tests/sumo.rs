@@ -79,9 +79,10 @@ fn a_two_way_road_is_an_edge_in_each_direction() {
     );
 }
 
-/// SUMO numbers an edge's lanes from the right of the direction of travel. The IR
-/// counts outwards from the reference line, which for the opposing carriageway is the
-/// other way round, so getting this wrong mirrors one side of every road.
+/// SUMO numbers an edge's lanes from the outside, which on a right-hand map is the
+/// right of the direction of travel. The IR counts outwards from the reference line,
+/// which for the opposing carriageway is the other way round, so getting this wrong
+/// mirrors one side of every road.
 #[test]
 fn lanes_are_numbered_from_the_right_of_travel() {
     if !sumo_build::sumo_available() {
@@ -124,6 +125,118 @@ fn lanes_are_numbered_from_the_right_of_travel() {
     // Whichever carriageway, lane 0 is the outside of the road.
     assert!(forward.lane(0).shape[0].y < -3.5);
     assert!(backward.lane(0).shape[0].y > 3.5);
+}
+
+/// The same road, driving on the left. SUMO still numbers from the outside of the
+/// carriageway, and the outside is now the driver's left — which is what netconvert
+/// itself lays out when it spreads an edge's lanes with `lefthand` set. Numbered from
+/// the right instead, the kerb lane would be SUMO's overtaking lane.
+#[test]
+fn lanes_of_a_left_hand_map_are_numbered_from_the_left_of_travel() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let mut builder = MapBuilder::new(scenarios::metadata("numbering"));
+    builder.metadata_mut().handedness = TrafficHandedness::LeftHand;
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(200.0, 0.0, 0.0),
+                vec![
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Backward),
+                    scenarios::lane(3.5, Direction::Backward),
+                ],
+            )
+            .unwrap()
+            .with_name("dual"),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let (_directory, network) = sumo_build::build(&map);
+    assert!(
+        network.lefthand,
+        "netconvert should know the map drives on the left"
+    );
+
+    // Travelling along +x on the left of the road, the driver's left is +y, so lane 0
+    // is the one with the largest offset.
+    let forward = network.edge("dual.fwd");
+    assert!(
+        forward.lane(0).shape[0].y > forward.lane(1).shape[0].y,
+        "lane 0 of the forward carriageway should be its leftmost"
+    );
+    let backward = network.edge("dual.bwd");
+    assert!(
+        backward.lane(0).shape[0].y < backward.lane(1).shape[0].y,
+        "lane 0 of the backward carriageway should be its leftmost"
+    );
+    // Whichever carriageway, lane 0 is still the outside of the road — on the other
+    // side of it from where a right-hand map puts it.
+    assert!(forward.lane(0).shape[0].y > 3.5);
+    assert!(backward.lane(0).shape[0].y < -3.5);
+}
+
+/// netconvert assumes right-hand traffic unless it is told otherwise, and what it
+/// assumes decides who gives way. Driving on the left, the turn that crosses the
+/// oncoming carriageway is the *right* turn, so on a major approach that is the one
+/// that must yield, and the left turn — which stays on the kerb side — keeps right of
+/// way. A left-hand map built as a right-hand network gets exactly the opposite.
+#[test]
+fn a_left_hand_map_is_built_as_a_left_hand_network() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let (_directory, right) = sumo_build::build(&scenarios::crossroads());
+    assert!(!right.lefthand, "a right-hand map is netconvert's default");
+
+    let mut builder = scenarios::crossroads_builder("left-crossroads", 70.0);
+    builder.metadata_mut().handedness = TrafficHandedness::LeftHand;
+    let map = builder.finish().unwrap().validate().unwrap();
+    let prefix = roadgen_sumo::network_name(&map);
+    let (directory, left) = sumo_build::build(&map);
+    assert!(
+        left.lefthand,
+        "netconvert should know the map drives on the left"
+    );
+    sumo_build::simulate(directory.path(), &prefix);
+
+    // Which pair of arms netconvert makes the major road is its own call, so the
+    // check is made on whichever approaches it gave the straight-on movement to.
+    let state = |network: &SumoNetwork, from: &str, direction: &str| {
+        network
+            .connections
+            .iter()
+            .find(|connection| {
+                connection.from == from && connection.direction.as_deref() == Some(direction)
+            })
+            .and_then(|connection| connection.state.clone())
+            .unwrap_or_else(|| panic!("no {direction:?} movement from {from}"))
+    };
+    for (network, crossing, kerbside) in [(&right, "l", "r"), (&left, "r", "l")] {
+        let major: Vec<&str> = ["north.fwd", "east.fwd", "south.fwd", "west.fwd"]
+            .into_iter()
+            .filter(|from| state(network, from, "s") == "M")
+            .collect();
+        assert_eq!(major.len(), 2, "netconvert should pick one major road");
+        for from in major {
+            assert_eq!(
+                state(network, from, crossing),
+                "m",
+                "{from}: the turn across the oncoming carriageway should give way \
+                 (lefthand {})",
+                network.lefthand
+            );
+            assert_eq!(
+                state(network, from, kerbside),
+                "M",
+                "{from}: the kerb-side turn should keep right of way (lefthand {})",
+                network.lefthand
+            );
+        }
+    }
 }
 
 /// Every lane is written with its own shape, so what SUMO has is the geometry the
@@ -555,6 +668,8 @@ fn the_export_is_a_netconvert_run_ready_to_go() {
         config.contains(r#"<no-turnarounds value="true"/>"#),
         "{config}"
     );
+    // A right-hand map is netconvert's default, so nothing is said about handedness.
+    assert!(!config.contains("lefthand"), "{config}");
 }
 
 /// The trace names each connection by its two lanes as the built network names them,
