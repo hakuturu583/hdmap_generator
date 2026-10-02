@@ -2297,7 +2297,13 @@ mod tests {
 
     #[test]
     fn everything_the_trace_names_is_in_the_files() {
-        for map in [crossroads(), in_line(), colliding(), ruled_street(), type_change()] {
+        for map in [
+            crossroads(),
+            in_line(),
+            colliding(),
+            ruled_street(),
+            type_change(),
+        ] {
             let network = to_plain_xml(&map).unwrap();
             let written = written(&network);
             assert_eq!(network.trace.format, "sumo");
