@@ -9,6 +9,8 @@
 //! When SUMO is not installed these skip, saying so; CI sets `ROADGEN_REQUIRE_SUMO`,
 //! which turns the skip into a failure.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use roadgen_core::prelude::*;
 use roadgen_integration_tests::scenarios;
 use roadgen_integration_tests::sumo_build::{self, SumoNetwork};
@@ -529,8 +531,9 @@ fn what_the_format_cannot_carry_is_reported() {
     assert!(crossroads.contains("crosswalk"), "{crossroads}");
 }
 
-/// The four files are named after the map and refer to each other, so that building
-/// the network is one command over one configuration.
+/// The four network files are named after the map and refer to each other, so that
+/// building the network is one command over one configuration; the three
+/// `randomTrips.py` weight files sit beside them under the same name.
 #[test]
 fn the_export_is_a_netconvert_run_ready_to_go() {
     let map = scenarios::crossroads();
@@ -538,7 +541,15 @@ fn the_export_is_a_netconvert_run_ready_to_go() {
     let prefix = roadgen_sumo::write(&map, directory.path()).unwrap();
     assert_eq!(prefix, "crossroads");
 
-    for suffix in [".nod.xml", ".edg.xml", ".con.xml", ".netccfg"] {
+    for suffix in [
+        ".nod.xml",
+        ".edg.xml",
+        ".con.xml",
+        ".netccfg",
+        ".safe.src.xml",
+        ".safe.dst.xml",
+        ".safe.via.xml",
+    ] {
         let path = directory.path().join(format!("{prefix}{suffix}"));
         assert!(path.is_file(), "{} was not written", path.display());
     }
@@ -606,4 +617,160 @@ fn every_movement_netconvert_built_is_in_the_trace() {
     }
     // Every pair of the four arms, both ways.
     assert_eq!(matched, 12);
+}
+
+/// One of the `randomTrips.py` weight files the export wrote: each edge it names, and
+/// its weight.
+fn trip_weights(path: &std::path::Path) -> BTreeMap<String, f64> {
+    use quick_xml::events::Event;
+    let xml = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{} was not written: {error}", path.display()));
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut weights = BTreeMap::new();
+    loop {
+        match reader.read_event().expect("valid edgedata XML") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element) if element.name().as_ref() == b"edge" => {
+                let mut id = None;
+                let mut value = None;
+                for attribute in element.attributes().map(Result::unwrap) {
+                    let text = String::from_utf8_lossy(&attribute.value).into_owned();
+                    match attribute.key.as_ref() {
+                        b"id" => id = Some(text),
+                        b"value" => value = Some(text.parse::<f64>().expect("a number")),
+                        _ => {}
+                    }
+                }
+                weights.insert(id.expect("an edge id"), value.expect("a value"));
+            }
+            _ => {}
+        }
+    }
+    weights
+}
+
+/// The edges a weight file gives a weight to.
+fn weighted(weights: &BTreeMap<String, f64>) -> BTreeSet<String> {
+    weights
+        .iter()
+        .filter(|(_, value)| **value > 0.0)
+        .map(|(edge, _)| edge.clone())
+        .collect()
+}
+
+/// The `randomTrips.py` weights hold up against the network netconvert actually
+/// built: they name its edges and no others, every edge a trip may depart from can be
+/// left and leads somewhere a trip may arrive, every edge a trip may arrive on can be
+/// reached from somewhere a trip may depart, and none of it is anywhere a passenger
+/// car may not drive.
+///
+/// The check is made on the built `.net.xml`, read independently, and not on what the
+/// exporter thinks it wrote — including across a change of cross-section, where the
+/// continuation is netconvert's lane matching and not a written connection.
+#[test]
+fn the_trip_weights_agree_with_the_network_netconvert_built() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    // Not a lone road: with nothing at either end it has no edge a car can leave, so
+    // every weight is 0 — as `randomTrips.py`'s own fringe rule would have it too.
+    let scenarios: Vec<(&str, ValidatedMap)> = vec![
+        ("in-line", scenarios::two_roads_in_line()),
+        ("split", scenarios::split()),
+        ("merge", scenarios::merge()),
+        ("crossroads", scenarios::crossroads()),
+        ("controlled", scenarios::controlled_crossroads()),
+        ("lane drop", scenarios::lane_drop()),
+    ];
+
+    for (name, map) in scenarios {
+        let prefix = roadgen_sumo::network_name(&map);
+        let (directory, network) = sumo_build::build(&map);
+        let read = |suffix: &str| {
+            trip_weights(&directory.path().join(format!("{prefix}.safe.{suffix}.xml")))
+        };
+        let (src, dst, via) = (read("src"), read("dst"), read("via"));
+
+        let roads: BTreeSet<&str> = network
+            .roads()
+            .iter()
+            .map(|edge| edge.id.as_str())
+            .collect();
+        for weights in [&src, &dst, &via] {
+            let named: BTreeSet<&str> = weights.keys().map(String::as_str).collect();
+            assert_eq!(named, roads, "{name}: the weights should name every edge");
+        }
+
+        // The edges a passenger car may drive on, and where the built network lets it
+        // go from each — through a junction or straight on — leaving out turnarounds.
+        let admits = |classes: &str| classes.split_whitespace().any(|class| class == "passenger");
+        let drivable: BTreeSet<&str> = network
+            .roads()
+            .iter()
+            .filter(|edge| {
+                edge.lanes
+                    .iter()
+                    .any(|lane| match (&lane.allow, &lane.disallow) {
+                        (Some(allow), _) => admits(allow),
+                        (None, Some(disallow)) => !admits(disallow),
+                        (None, None) => true,
+                    })
+            })
+            .map(|edge| edge.id.as_str())
+            .collect();
+        let mut next: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for connection in &network.connections {
+            if connection.from.starts_with(':')
+                || connection.to.starts_with(':')
+                || connection.direction.as_deref() == Some("t")
+            {
+                continue;
+            }
+            next.entry(connection.from.as_str())
+                .or_default()
+                .insert(connection.to.as_str());
+        }
+        let reachable = |from: &str| {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            let mut pending: Vec<&str> = next.get(from).into_iter().flatten().copied().collect();
+            while let Some(edge) = pending.pop() {
+                if seen.insert(edge) {
+                    pending.extend(next.get(edge).into_iter().flatten().copied());
+                }
+            }
+            seen
+        };
+
+        let (departures, arrivals, way_points) = (weighted(&src), weighted(&dst), weighted(&via));
+        assert!(!departures.is_empty(), "{name}: nowhere to depart from");
+        assert!(!arrivals.is_empty(), "{name}: nowhere to arrive");
+        for edge in departures.iter().chain(&arrivals) {
+            assert!(
+                drivable.contains(edge.as_str()),
+                "{name}: {edge} is weighted, but no passenger car may drive on it"
+            );
+        }
+        for edge in &departures {
+            assert!(
+                reachable(edge)
+                    .iter()
+                    .any(|other| arrivals.contains(*other)),
+                "{name}: a trip departing on {edge} can reach no edge it may arrive on"
+            );
+        }
+        for edge in &arrivals {
+            assert!(
+                departures
+                    .iter()
+                    .any(|other| reachable(other).contains(edge.as_str())),
+                "{name}: no edge a trip may depart on leads to {edge}"
+            );
+        }
+        for edge in &way_points {
+            assert!(
+                departures.contains(edge) && arrivals.contains(edge),
+                "{name}: {edge} is a way point with no way in or no way out"
+            );
+        }
+    }
 }
