@@ -10,7 +10,7 @@
 //! helpers say so and the test skips, unless `ROADGEN_REQUIRE_SUMO` is set — which CI
 //! does set, so the checks that matter never silently stop running.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -156,12 +156,67 @@ pub fn simulate(directory: &Path, prefix: &str) {
     );
 }
 
+/// Drives one passenger car down `edge` of a built network, from `depart_lane` to
+/// `arrival_lane`, and returns every lane it was on — so whether the lane change was
+/// allowed is what the simulator did, not what the attributes are taken to mean.
+pub fn lanes_driven(
+    directory: &Path,
+    prefix: &str,
+    edge: &str,
+    depart_lane: usize,
+    arrival_lane: usize,
+) -> BTreeSet<String> {
+    let routes = directory.join("drive.rou.xml");
+    std::fs::write(
+        &routes,
+        format!(
+            r#"<routes><vehicle id="car" depart="0" departLane="{depart_lane}" arrivalLane="{arrival_lane}" departSpeed="10"><route edges="{edge}"/></vehicle></routes>"#
+        ),
+    )
+    .expect("the route file");
+    let output = Command::new(tool("sumo").expect("sumo"))
+        .args(["-n", &format!("{prefix}.net.xml")])
+        .args(["-r", "drive.rou.xml"])
+        .args(["--fcd-output", "drive.fcd.xml"])
+        .args(["--no-step-log", "true"])
+        .args(["--no-warnings", "true"])
+        .current_dir(directory)
+        .output()
+        .expect("sumo should run");
+    assert!(
+        output.status.success(),
+        "sumo could not drive the network:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fcd = std::fs::read_to_string(directory.join("drive.fcd.xml")).expect("the fcd output");
+    let mut lanes = BTreeSet::new();
+    let mut reader = Reader::from_str(&fcd);
+    loop {
+        match reader.read_event().expect("well-formed fcd output") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element)
+                if element.name().as_ref() == b"vehicle" =>
+            {
+                if let Some(lane) = attributes(&element).remove("lane") {
+                    lanes.insert(lane);
+                }
+            }
+            _ => {}
+        }
+    }
+    lanes
+}
+
 // --------------------------------------------------------------------------- //
 // The network netconvert produced
 // --------------------------------------------------------------------------- //
 
 #[derive(Debug, Clone)]
 pub struct SumoNetwork {
+    /// Whether netconvert built the network for left-hand traffic, as it records on
+    /// the `<net>` element. SUMO reads handedness from here and not from the
+    /// geometry, so this is what the simulator will drive by.
+    pub lefthand: bool,
     pub edges: Vec<SumoEdge>,
     pub junctions: Vec<SumoJunction>,
     pub connections: Vec<SumoConnection>,
@@ -232,6 +287,7 @@ impl SumoNetwork {
     fn parse(xml: &str) -> SumoNetwork {
         let mut reader = Reader::from_str(xml);
         let mut network = SumoNetwork {
+            lefthand: false,
             edges: Vec::new(),
             junctions: Vec::new(),
             connections: Vec::new(),
@@ -245,6 +301,10 @@ impl SumoNetwork {
                     let name = String::from_utf8_lossy(element.name().as_ref()).into_owned();
                     let attributes = attributes(element);
                     match name.as_str() {
+                        "net" => {
+                            network.lefthand =
+                                attributes.get("lefthand").map(String::as_str) == Some("true");
+                        }
                         "edge" => network.edges.push(SumoEdge {
                             id: attributes["id"].clone(),
                             function: attributes.get("function").cloned(),

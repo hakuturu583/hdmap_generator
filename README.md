@@ -909,7 +909,7 @@ A SUMO edge is a one-way bundle of lanes, so a road carrying traffic both ways i
 of them pointing at each other:
 
 ```xml
-<edge id="north.fwd" from="n_north_start" to="j_x" priority="4" numLanes="1"
+<edge id="north.fwd" from="n_north_start" to="j_x" priority="5" numLanes="1"
       speed="13.890" spreadType="center" name="north"
       shape="-1.750,70.000,0.000 -1.750,14.000,0.000">
   <lane index="0" width="3.500" disallow="pedestrian"
@@ -923,14 +923,38 @@ network imported from OpenStreetMap has to make do with. The heights go with it:
 SUMO shape is `x,y,z`, so the relief that plain OSM could only put in `ele` tags is
 part of the geometry here.
 
-Lanes are numbered from the **right in the direction of travel**, index 0 outwards.
-The IR counts outwards from the reference line instead, which for the opposing
-carriageway is the other way round — so the same physical lane has different numbers
-in the two directions. `sumo_lane_ids()` is the way back:
+Lanes are numbered from the **outside of the carriageway**, index 0 being the kerb
+lane: the rightmost in the direction of travel where traffic drives on the right, the
+leftmost where it drives on the left. The IR counts outwards from the reference line
+instead, which for the opposing carriageway is the other way round — so the same
+physical lane has different numbers in the two directions. `sumo_lane_ids()` is the
+way back:
 
 ```python
 dict(m.sumo_lane_ids())["lane/north/1"]     # 'north.bwd_0'
 ```
+
+### Left-hand traffic
+
+netconvert does not read handedness off the geometry: it builds a right-hand network
+unless it is told otherwise. A map made with `handedness="lht"` therefore gets
+`lefthand` in its `.netccfg`, and netconvert records it on the `<net>` it writes:
+
+```xml
+<processing>
+    <offset.disable-normalization value="true"/>
+    <no-turnarounds value="true"/>
+    <lefthand value="true"/>
+</processing>
+```
+
+That is more than bookkeeping. Left-hand traffic decides which turn crosses the
+oncoming carriageway — the right one — and so which movement on a major approach has
+to give way, which side of a junction the internal lanes are laid out on, and which
+lane is the slow one. Without it a left-hand map would be simulated as a right-hand
+one drawn on the wrong side of the road: right turns would cut across oncoming
+traffic with priority, and the kerb lane would be SUMO's overtaking lane. A right-hand
+map writes nothing, since that is netconvert's default.
 
 `speed` is the road's limit in m/s, or SUMO's own default for the OSM `highway` value
 the road type maps to. What may use a lane is the whole of what SUMO knows about lane
@@ -969,6 +993,12 @@ line, so a lane running against it has its `left_marking` on its right in travel
 the exporter accounts for that, and for handedness, by working from where the lanes
 are.
 
+`changeLeft` and `changeRight` are the driver's left and right in travel under either
+handedness. A left-hand network numbers its lanes from the kerb on the left, so there
+the next lane up is on the driver's **right**: with a solid line between two lanes
+driving on the left, lane 0 is written with `changeRight` and lane 1 with
+`changeLeft` — the mirror of the example above.
+
 Two things open a change the paint would close. A lane that leads nowhere while the
 rest of its edge carries on — a lane drop — can only be left sideways, and
 netconvert refuses a prohibition that would trap a vehicle in it, so none is written.
@@ -985,7 +1015,8 @@ changed between a `broken` line on the side they share.
 SUMO's right of way is a **matrix over pairs of movements** — which stream gives way
 to which other stream — and a plain XML file has no way to state one: `<request>` is
 something netconvert computes and writes into the `.net.xml`. What the format does
-have is the edge `priority` ladder, the same one the OpenStreetMap export climbs.
+have is the edge `priority` ladder, the same one the OpenStreetMap export climbs —
+lifted one rung, so that even a footway has a rung below it to yield on.
 
 So a `RightOfWay` rule moves the **approach edges it names** one rung apart, and the
 junction is marked `rightOfWay="edgePriority"`:
@@ -1019,15 +1050,25 @@ as a **node**: the arms stop at its edge, and netconvert generates an internal l
 for every connection across it. The two models agree about the thing that matters —
 the movements are enumerated, not guessed — so the connectors are not written as
 edges. Each becomes the `<connection>` saying its approach lane may be left for its
-exit lane:
+exit lane, and the connector's **centreline is written as the connection's shape**:
 
 ```xml
-<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"/>
+<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"
+            shape="-1.750,14.000,0.000 -1.748,13.200,0.000 … -14.000,1.750,0.000"/>
 ```
 
+netconvert takes a connection's shape as the shape of the internal lane it draws for
+it, so the path across the junction in SUMO is the curve the IR drew — the same one
+the OpenDRIVE connecting road and the Lanelet2 lanelet carry — and not one netconvert
+invented. A turn that must wait inside the junction for oncoming traffic is still
+split into two internal lanes at the point where it waits, but both lie along the
+connector. A movement through a chain of connectors gets their centrelines end to end,
+in the order it crosses them.
+
 This is why the arms are left exactly where the IR puts them, 14 m short of the
-centre: **the gap is the junction**, and netconvert fills it. Nothing here moves
-geometry, which is the one thing the OpenStreetMap export has to do.
+centre: **the gap is the junction**, and netconvert fills it along the IR's
+connectors. Nothing here moves geometry, which is the one thing the OpenStreetMap
+export has to do.
 
 A junction with a traffic light on an approach becomes a `traffic_light` node.
 netconvert generates the phases, because the IR holds no signal timing to write.
@@ -1919,7 +1960,7 @@ their boundary points the *same* points rather than merely nearby ones.
 
 Every format numbers its output its own way. OpenDRIVE numbers roads in the IR's
 order; Lanelet2 and OpenStreetMap count; SUMO names edges after roads and counts lanes
-from the right; ClipGT and GPUDrive have nothing but the row. None of those numbers
+from the kerb; ClipGT and GPUDrive have nothing but the row. None of those numbers
 flow back into the IR, so "which lanelet is OpenDRIVE road 4, lane -1?" has no answer
 in the files themselves.
 

@@ -174,4 +174,53 @@ mod tests {
             assert!(default_speed(road_type) > 0.0);
         }
     }
+
+    /// The two lane types with a class of their own rather than the open road's: a
+    /// cycle lane is for bicycles and nothing else, and a hard shoulder is for the
+    /// emergency services. Both are `allow`, never `disallow`, because what they
+    /// admit is the short list.
+    #[test]
+    fn a_cycle_lane_admits_bicycles_and_a_shoulder_the_emergency_services() {
+        assert_eq!(
+            permission(LaneType::Biking),
+            Some(Permission::Allow("bicycle"))
+        );
+        assert_eq!(
+            permission(LaneType::Shoulder),
+            Some(Permission::Allow("emergency"))
+        );
+        assert_eq!(
+            Permission::Allow("bicycle").attribute(),
+            ("allow", "bicycle")
+        );
+        assert_eq!(
+            Permission::Disallow("pedestrian").attribute(),
+            ("disallow", "pedestrian")
+        );
+    }
+
+    /// Every lane type with no movement along it is dropped — not just the border and
+    /// the strip beyond it, but a parking bay and a restricted lane too.
+    #[test]
+    fn a_parking_bay_and_a_restricted_lane_are_not_sumo_lanes() {
+        assert_eq!(permission(LaneType::Parking), None);
+        assert_eq!(permission(LaneType::Restricted), None);
+    }
+
+    /// The fallback speeds fall down the same ladder the priorities do: a road that
+    /// outranks another at a junction is also the faster of the two when neither
+    /// states a limit.
+    #[test]
+    fn the_fallback_speeds_fall_from_a_motorway_to_a_footway() {
+        let ladder = [
+            RoadType::Motorway,
+            RoadType::Rural,
+            RoadType::Town,
+            RoadType::LowSpeed,
+            RoadType::Pedestrian,
+        ];
+        for pair in ladder.windows(2) {
+            assert!(default_speed(pair[0]) > default_speed(pair[1]), "{pair:?}");
+        }
+    }
 }
