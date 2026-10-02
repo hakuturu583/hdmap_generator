@@ -909,7 +909,7 @@ A SUMO edge is a one-way bundle of lanes, so a road carrying traffic both ways i
 of them pointing at each other:
 
 ```xml
-<edge id="north.fwd" from="n_north_start" to="j_x" priority="4" numLanes="1"
+<edge id="north.fwd" from="n_north_start" to="j_x" priority="5" numLanes="1"
       speed="13.890" spreadType="center" name="north"
       shape="-1.750,70.000,0.000 -1.750,14.000,0.000">
   <lane index="0" width="3.500" disallow="pedestrian"
@@ -967,7 +967,8 @@ vehicles.
 SUMO's right of way is a **matrix over pairs of movements** — which stream gives way
 to which other stream — and a plain XML file has no way to state one: `<request>` is
 something netconvert computes and writes into the `.net.xml`. What the format does
-have is the edge `priority` ladder, the same one the OpenStreetMap export climbs.
+have is the edge `priority` ladder, the same one the OpenStreetMap export climbs —
+lifted one rung, so that even a footway has a rung below it to yield on.
 
 So a `RightOfWay` rule moves the **approach edges it names** one rung apart, and the
 junction is marked `rightOfWay="edgePriority"`:
@@ -1001,15 +1002,25 @@ as a **node**: the arms stop at its edge, and netconvert generates an internal l
 for every connection across it. The two models agree about the thing that matters —
 the movements are enumerated, not guessed — so the connectors are not written as
 edges. Each becomes the `<connection>` saying its approach lane may be left for its
-exit lane:
+exit lane, and the connector's **centreline is written as the connection's shape**:
 
 ```xml
-<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"/>
+<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"
+            shape="-1.750,14.000,0.000 -1.748,13.200,0.000 … -14.000,1.750,0.000"/>
 ```
 
+netconvert takes a connection's shape as the shape of the internal lane it draws for
+it, so the path across the junction in SUMO is the curve the IR drew — the same one
+the OpenDRIVE connecting road and the Lanelet2 lanelet carry — and not one netconvert
+invented. A turn that must wait inside the junction for oncoming traffic is still
+split into two internal lanes at the point where it waits, but both lie along the
+connector. A movement through a chain of connectors gets their centrelines end to end,
+in the order it crosses them.
+
 This is why the arms are left exactly where the IR puts them, 14 m short of the
-centre: **the gap is the junction**, and netconvert fills it. Nothing here moves
-geometry, which is the one thing the OpenStreetMap export has to do.
+centre: **the gap is the junction**, and netconvert fills it along the IR's
+connectors. Nothing here moves geometry, which is the one thing the OpenStreetMap
+export has to do.
 
 A junction with a traffic light on an approach becomes a `traffic_light` node.
 netconvert generates the phases, because the IR holds no signal timing to write.

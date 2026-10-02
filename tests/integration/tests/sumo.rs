@@ -722,3 +722,141 @@ fn every_movement_netconvert_built_is_in_the_trace() {
     // Every pair of the four arms, both ways.
     assert_eq!(matched, 12);
 }
+
+/// A movement across a junction follows the path the IR drew for it. The connector
+/// lane is not an edge, but its centreline is written as the connection's shape, and
+/// netconvert lays the internal lane along that — splitting it in two where a turn
+/// must wait inside the junction — instead of inventing a curve of its own that the
+/// OpenDRIVE and the Lanelet2 map written from the same IR would not share.
+#[test]
+fn a_movement_across_a_junction_follows_the_connector_the_ir_drew() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::crossroads();
+    let sampling = map.metadata.sampling;
+    let written = roadgen_sumo::to_plain_xml(&map).unwrap().lanes;
+    let (_directory, network) = sumo_build::build(&map);
+    let internal_shape = |id: &str| -> Vec<Point3> {
+        let (edge, index) = id.rsplit_once('_').expect("an edge and an index");
+        network
+            .edges
+            .iter()
+            .find(|candidate| candidate.id == edge)
+            .unwrap_or_else(|| panic!("no internal edge {edge}"))
+            .lane(index.parse().unwrap())
+            .shape
+            .clone()
+    };
+
+    let mut turns = 0;
+    for connector in map.lanes.iter() {
+        let Some(road) = map.road(&connector.road) else {
+            continue;
+        };
+        if road.junction.is_none() {
+            continue;
+        }
+        // The lanes the connector joins, as the network names them.
+        let into = map
+            .connections
+            .iter()
+            .find(|connection| connection.to.lane == connector.id)
+            .and_then(|connection| written.get(&connection.from.lane))
+            .expect("a connector is entered from a written lane");
+        let out = map
+            .connections
+            .iter()
+            .find(|connection| connection.from.lane == connector.id)
+            .and_then(|connection| written.get(&connection.to.lane))
+            .expect("a connector leads to a written lane");
+        let (from, from_lane) = into.rsplit_once('_').unwrap();
+        let (to, to_lane) = out.rsplit_once('_').unwrap();
+        let entry = network
+            .connections
+            .iter()
+            .find(|connection| {
+                connection.from == from
+                    && connection.to == to
+                    && connection.from_lane.to_string() == from_lane
+                    && connection.to_lane.to_string() == to_lane
+            })
+            .unwrap_or_else(|| panic!("no movement {into} > {out}"));
+        if entry.direction.as_deref() == Some("s") {
+            continue;
+        }
+        turns += 1;
+
+        // The internal lanes of the movement, in order: the first is the entry's
+        // `via`, and each after it is the `via` of the connection leaving the last.
+        let mut built: Vec<Point3> = Vec::new();
+        let mut lane = entry.via.clone().expect("a turn crosses the junction");
+        loop {
+            for point in internal_shape(&lane) {
+                if built
+                    .last()
+                    .is_none_or(|last| last.distance_to(point) > 0.02)
+                {
+                    built.push(point);
+                }
+            }
+            let next = network
+                .connections
+                .iter()
+                .find(|connection| format!("{}_{}", connection.from, connection.from_lane) == lane);
+            match next.and_then(|connection| connection.via.clone()) {
+                Some(via) => lane = via,
+                None => break,
+            }
+        }
+
+        let drawn = connector
+            .travel_geometry(sampling)
+            .unwrap()
+            .centerline
+            .to_polyline(sampling)
+            .unwrap();
+        // Every point netconvert put the internal lanes through lies on the
+        // connector's centreline, to the centimetre it writes its output to.
+        for point in &built {
+            let off = distance_to_polyline(*point, drawn.points());
+            assert!(
+                off < 0.05,
+                "{into} > {out}: the internal lane passes {off:.3} m off the connector at {point:?}"
+            );
+        }
+        // And they run the whole of it, end to end.
+        let length = |points: &[Point3]| -> f64 {
+            points
+                .windows(2)
+                .map(|pair| pair[0].distance_to(pair[1]))
+                .sum()
+        };
+        let (built_length, drawn_length) = (length(&built), length(drawn.points()));
+        assert!(
+            (built_length - drawn_length).abs() < 0.05,
+            "{into} > {out}: the internal lanes are {built_length:.3} m long, the connector \
+             {drawn_length:.3} m"
+        );
+    }
+    // A left and a right turn from each of the four arms.
+    assert_eq!(turns, 8);
+}
+
+/// How far `point` is from the nearest segment of `line`.
+fn distance_to_polyline(point: Point3, line: &[Point3]) -> f64 {
+    line.windows(2)
+        .map(|pair| {
+            let (a, b) = (pair[0], pair[1]);
+            let (dx, dy, dz) = (b.x - a.x, b.y - a.y, b.z - a.z);
+            let squared = dx * dx + dy * dy + dz * dz;
+            let t = if squared == 0.0 {
+                0.0
+            } else {
+                (((point.x - a.x) * dx + (point.y - a.y) * dy + (point.z - a.z) * dz) / squared)
+                    .clamp(0.0, 1.0)
+            };
+            point.distance_to(Point3::new(a.x + t * dx, a.y + t * dy, a.z + t * dz))
+        })
+        .fold(f64::INFINITY, f64::min)
+}
