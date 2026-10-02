@@ -339,32 +339,6 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             unshaped.join(", ")
         ));
     }
-
-    problems.push(
-        "the network is in the map's own metres about its origin; SUMO carries no \
-         geo-reference for it"
-            .to_owned(),
-    );
-    problems
-}
-
-/// Pairs of written lanes the IR joins by more than one way through connectors, as
-/// `from > to`. The exporter writes one connection per pair, and a connection carries
-/// one shape, so every way but the first goes unwritten; `check()` names them.
-///
-/// The walk is the one `build_connections` makes: out of a lane SUMO has a place for,
-/// through any number of connector lanes, to the next lane SUMO has a place for. Ways
-/// are counted rather than lanes reached, so two connectors side by side between the
-/// same lanes count twice where one connector reached twice does not.
-fn parallel_connectors(map: &ValidatedMap) -> Vec<String> {
-    let mut successors: BTreeMap<&LaneId, Vec<&LaneId>> = BTreeMap::new();
-    for connection in map.connections.iter() {
-        successors
-            .entry(&connection.from.lane)
-            .or_default()
-            .push(&connection.to.lane);
-    }
-
     problems.extend(Ids::new(map).renamed);
 
     problems.push(
