@@ -1538,4 +1538,410 @@ mod tests {
         assert_eq!(trace.links, to_plain_xml(&map).unwrap().trace.links);
         std::fs::remove_dir_all(&directory).unwrap();
     }
+
+    // ----------------------------------------------------------------------- //
+    // What the edges file says about each lane
+    // ----------------------------------------------------------------------- //
+
+    /// One `<edge>` of the edges file as it was written: its own attributes, and
+    /// each of its `<lane>`s' in document order.
+    struct WrittenEdge {
+        attributes: HashMap<String, String>,
+        lanes: Vec<HashMap<String, String>>,
+    }
+
+    impl WrittenEdge {
+        fn number(&self, key: &str) -> f64 {
+            self.attributes[key].parse().unwrap()
+        }
+    }
+
+    /// The edges file, read back from the XML rather than from the exporter's state,
+    /// so that what is checked is what netconvert would be handed.
+    fn edges_file(network: &PlainNetwork) -> BTreeMap<String, WrittenEdge> {
+        let mut edges = BTreeMap::new();
+        let mut current: Option<String> = None;
+        let mut reader = quick_xml::Reader::from_str(&network.edges);
+        loop {
+            let event = reader.read_event().unwrap();
+            let element = match &event {
+                Event::Eof => break,
+                Event::Start(element) | Event::Empty(element) => element,
+                _ => continue,
+            };
+            let attributes: HashMap<String, String> = element
+                .attributes()
+                .map(|attribute| {
+                    let attribute = attribute.unwrap();
+                    (
+                        String::from_utf8_lossy(attribute.key.as_ref()).into_owned(),
+                        quick_xml::escape::unescape(&String::from_utf8_lossy(&attribute.value))
+                            .unwrap()
+                            .into_owned(),
+                    )
+                })
+                .collect();
+            match element.name().as_ref() {
+                b"edge" => {
+                    let id = attributes["id"].clone();
+                    edges.insert(
+                        id.clone(),
+                        WrittenEdge {
+                            attributes,
+                            lanes: Vec::new(),
+                        },
+                    );
+                    current = Some(id);
+                }
+                b"lane" => {
+                    let edge = current.as_ref().expect("a lane inside an edge");
+                    edges.get_mut(edge).unwrap().lanes.push(attributes);
+                }
+                _ => {}
+            }
+        }
+        edges
+    }
+
+    fn one_road(spec: RoadSpec) -> ValidatedMap {
+        let mut builder = MapBuilder::new(metadata("one-road"));
+        builder.add_road(spec).unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    fn lane(width: f64) -> LaneSpec {
+        LaneSpec::new(PositiveWidth::new(width).unwrap(), Direction::Forward)
+    }
+
+    /// A cycle lane and a hard shoulder each carry the one class they exist for, as
+    /// an `allow` on the lane — the lowering [`classes::permission`] states, checked
+    /// here where it lands, in the file.
+    #[test]
+    fn a_cycle_lane_and_a_shoulder_are_written_with_their_own_class() {
+        let map = one_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(120.0, 0.0, 0.0),
+                vec![
+                    lane(3.5),
+                    lane(1.5).with_type(LaneType::Biking),
+                    lane(2.5).with_type(LaneType::Shoulder),
+                ],
+            )
+            .unwrap()
+            .with_name("street"),
+        );
+        let network = to_plain_xml(&map).unwrap();
+        let edges = edges_file(&network);
+        let street = &edges["street.fwd"];
+        assert_eq!(street.attributes["numLanes"], "3");
+
+        // Outermost first: the shoulder is the kerbside lane 0, the cycle lane
+        // inside it and the driving lane innermost.
+        let class = |index: usize| {
+            let lane = &street.lanes[index];
+            (
+                lane.get("allow").map(String::as_str),
+                lane.get("disallow").map(String::as_str),
+            )
+        };
+        assert_eq!(class(0), (Some("emergency"), None));
+        assert_eq!(class(1), (Some("bicycle"), None));
+        assert_eq!(class(2), (None, Some("pedestrian")));
+    }
+
+    /// A lane SUMO has no place for leaves no hole behind it. The edge's lane count
+    /// is the lanes actually written, they are numbered 0, 1, 2 … with nothing
+    /// skipped, and the dropped lanes are nowhere in the files or in the lane map —
+    /// even when they sit *between* lanes that are written, which is where a
+    /// numbering taken from the IR's lane index would leave a gap.
+    #[test]
+    fn a_dropped_lane_leaves_no_gap_in_the_numbering() {
+        let map = one_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(120.0, 0.0, 0.0),
+                vec![
+                    lane(3.5),
+                    lane(2.5).with_type(LaneType::Restricted),
+                    lane(3.5),
+                    lane(2.5).with_type(LaneType::Parking),
+                    lane(0.5).with_type(LaneType::Border),
+                    lane(2.0).with_type(LaneType::Sidewalk),
+                ],
+            )
+            .unwrap()
+            .with_name("street"),
+        );
+        let network = to_plain_xml(&map).unwrap();
+        let edges = edges_file(&network);
+        assert_eq!(edges.len(), 1, "every lane runs forward, so one edge");
+        let street = &edges["street.fwd"];
+
+        assert_eq!(street.attributes["numLanes"], "3");
+        let indices: Vec<&str> = street
+            .lanes
+            .iter()
+            .map(|lane| lane["index"].as_str())
+            .collect();
+        assert_eq!(indices, ["0", "1", "2"]);
+        // The sidewalk outermost, the two driving lanes inside it.
+        assert_eq!(
+            street.lanes[0].get("allow").map(String::as_str),
+            Some("pedestrian")
+        );
+        for driving in &street.lanes[1..] {
+            assert_eq!(
+                driving.get("disallow").map(String::as_str),
+                Some("pedestrian")
+            );
+        }
+
+        // The lane map and the trace know only the written lanes, and name them by
+        // the contiguous indices.
+        let written: BTreeSet<&str> = network.lanes.values().map(String::as_str).collect();
+        assert_eq!(
+            written,
+            BTreeSet::from(["street.fwd_0", "street.fwd_1", "street.fwd_2"])
+        );
+        for dropped in map.lanes.iter().filter(|lane| {
+            matches!(
+                lane.lane_type,
+                LaneType::Restricted | LaneType::Parking | LaneType::Border
+            )
+        }) {
+            assert!(!network.lanes.contains_key(&dropped.id), "{}", dropped.id);
+            assert!(
+                network
+                    .trace
+                    .links_of(&IrRef::Lane(dropped.id.clone()))
+                    .next()
+                    .is_none(),
+                "{} was dropped but is traced",
+                dropped.id
+            );
+        }
+    }
+
+    /// A lane on a road 260 m long that runs at 2 m, widens to 5 m between 60 m and
+    /// 100 m, holds 5 m to 160 m and narrows back to 2 m by 200 m.
+    fn lay_by(taper: Taper) -> ValidatedMap {
+        let width = |metres: f64| PositiveWidth::new(metres).unwrap();
+        let profile = WidthProfile::new(
+            [
+                (60.0, width(2.0)),
+                (100.0, width(5.0)),
+                (160.0, width(5.0)),
+                (200.0, width(2.0)),
+            ],
+            taper,
+        )
+        .unwrap();
+        one_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(260.0, 0.0, 0.0),
+                vec![lane(3.5), lane(2.0).with_width_profile(profile)],
+            )
+            .unwrap()
+            .with_name("layby"),
+        )
+    }
+
+    /// The width written for a tapering lane is its mean along — the area of the lane
+    /// over its length — and not the width at either end or halfway along.
+    ///
+    /// The lay-by's area is a sum of trapezoids that can be done by hand: 2 m over
+    /// the 120 m outside the bay, 5 m over the 60 m of it, and each 40 m ramp
+    /// averaging 3.5 m, so 820 m² over 260 m. A smooth taper eases in and out
+    /// symmetrically, `3t² − 2t³` having a mean of exactly ½ over the ramp, so it
+    /// covers the same ground as the straight one and has the same mean; it is
+    /// measured from samples along the curve rather than exactly, so it is held to
+    /// the centimetre rather than to the millimetre the file is written to.
+    #[test]
+    fn a_tapering_lane_is_written_at_its_mean_width_along() {
+        let analytic = (2.0 * 120.0 + 5.0 * 60.0 + 3.5 * 80.0) / 260.0;
+        for (taper, tolerance) in [(Taper::Linear, 0.0006), (Taper::Smooth, 0.01)] {
+            let map = lay_by(taper);
+            let network = to_plain_xml(&map).unwrap();
+            let edges = edges_file(&network);
+            let layby = &edges["layby.fwd"];
+            // The bay is the outer lane, so the kerbside lane 0.
+            let written: f64 = layby.lanes[0]["width"].parse().unwrap();
+            assert!(
+                (written - analytic).abs() < tolerance,
+                "{taper:?}: written at {written} m, but the mean along is {analytic} m"
+            );
+            // Not any of the widths the lane actually has at a landmark.
+            for landmark in [2.0, 3.5, 5.0] {
+                assert!((written - landmark).abs() > 0.1, "{taper:?}: {written}");
+            }
+            // And the lane that does not taper is written at its own width.
+            assert_eq!(layby.lanes[1]["width"], "3.500");
+        }
+    }
+
+    /// A lane with a limit of its own carries it as the lane's `speed`, which in
+    /// SUMO overrides the edge's — here the road's own limit. (A lane on a
+    /// road that states no limit at all writes no `speed`, and runs at its road
+    /// type's fallback: see the test after this one.)
+    #[test]
+    fn a_lane_speed_limit_is_written_on_the_lane() {
+        let map = one_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(120.0, 0.0, 0.0),
+                vec![
+                    lane(3.5).with_speed_limit(SpeedLimit::from_kph(30.0).unwrap()),
+                    lane(3.5),
+                ],
+            )
+            .unwrap()
+            .with_name("street")
+            .with_speed_limit(SpeedLimit::from_kph(50.0).unwrap()),
+        );
+        let network = to_plain_xml(&map).unwrap();
+        let edges = edges_file(&network);
+        let street = &edges["street.fwd"];
+        assert_eq!(street.attributes["speed"], metres(50.0 / 3.6));
+
+        let limited = map
+            .lanes
+            .iter()
+            .find(|lane| lane.speed_limit.is_some())
+            .unwrap();
+        let (_, index) = network.lanes[&limited.id].rsplit_once('_').unwrap();
+        let index: usize = index.parse().unwrap();
+        assert_eq!(
+            street.lanes[index].get("speed").map(String::as_str),
+            Some(metres(30.0 / 3.6).as_str())
+        );
+        // The builder hands the road's limit down to a lane that states none, so the
+        // other lane carries the road's 50 km/h as a limit of its own.
+        assert_eq!(
+            street.lanes[1 - index].get("speed").map(String::as_str),
+            Some(metres(50.0 / 3.6).as_str())
+        );
+    }
+
+    const LADDER: [RoadType; 5] = [
+        RoadType::Motorway,
+        RoadType::Rural,
+        RoadType::Town,
+        RoadType::LowSpeed,
+        RoadType::Pedestrian,
+    ];
+
+    /// One unconnected road of each type, named after it.
+    fn one_road_of_each_type() -> ValidatedMap {
+        let mut builder = MapBuilder::new(metadata("ladder"));
+        for (row, road_type) in LADDER.into_iter().enumerate() {
+            let y = 50.0 * row as f64;
+            builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(0.0, y, 0.0),
+                        Point3::new(120.0, y, 0.0),
+                        vec![lane(3.5)],
+                    )
+                    .unwrap()
+                    .with_name(road_type.as_str())
+                    .with_type(road_type),
+                )
+                .unwrap();
+        }
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// A road that states no limit runs at its type's fallback speed, and the edges
+    /// of a map rank by type the way [`classes::priority`] ladders them. Only the
+    /// order is checked, not the numbers: it is the order netconvert reads to decide
+    /// who yields, and the numbers are free to move as long as it holds.
+    #[test]
+    fn a_road_type_sets_the_edge_speed_and_its_place_in_the_priority_order() {
+        let map = one_road_of_each_type();
+        let network = to_plain_xml(&map).unwrap();
+        let edges = edges_file(&network);
+        let edge = |road_type: RoadType| &edges[&format!("{}.fwd", road_type.as_str())];
+
+        for road_type in LADDER {
+            assert_eq!(
+                edge(road_type).attributes["speed"],
+                metres(classes::default_speed(road_type)),
+                "{road_type:?}"
+            );
+            // No lane states a limit, so none writes a speed of its own.
+            assert!(!edge(road_type).lanes[0].contains_key("speed"));
+        }
+        for pair in LADDER.windows(2) {
+            assert!(
+                edge(pair[0]).number("priority") > edge(pair[1]).number("priority"),
+                "a {:?} road should outrank a {:?} one",
+                pair[0],
+                pair[1]
+            );
+            assert!(
+                edge(pair[0]).number("speed") > edge(pair[1]).number("speed"),
+                "a {:?} road should be faster than a {:?} one",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// What [`identifier`] does to each character SUMO cannot take in a name it did
+    /// not generate: whitespace of every kind and every colon, wherever it is, become
+    /// an underscore. Everything else is passed through as it is — including `#`,
+    /// which SUMO's own OpenStreetMap import writes into the edges it splits
+    /// (`123#0`, `123#1`) and so takes in an id, and `.`, `-` and `/`, which it
+    /// takes as well.
+    #[test]
+    fn an_identifier_replaces_every_whitespace_and_colon_and_keeps_the_rest() {
+        assert_eq!(identifier("a\tb\nc\r d"), "a_b_c__d");
+        assert_eq!(identifier(":internal"), "_internal");
+        assert_eq!(identifier("a::b:"), "a__b_");
+        assert_eq!(identifier("a\u{a0}b"), "a_b");
+        assert_eq!(identifier("route#2"), "route#2");
+        assert_eq!(identifier("a.b-c/d"), "a.b-c/d");
+        assert_eq!(identifier("Ginza-dōri"), "Ginza-dōri");
+        assert_eq!(identifier(""), "");
+    }
+
+    /// The identifier is what every written id is made of, so a road named with a
+    /// space and a colon is written without either — in its edges, its nodes and the
+    /// lane map — while its `name` keeps what the map called it.
+    #[test]
+    fn a_road_name_sumo_cannot_hold_is_made_into_one_it_can() {
+        let map = one_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(120.0, 0.0, 0.0),
+                vec![
+                    LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+                    LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+                ],
+            )
+            .unwrap()
+            .with_name("north arm:2"),
+        );
+        let network = to_plain_xml(&map).unwrap();
+        let edges = edges_file(&network);
+        assert_eq!(
+            edges.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["north_arm_2.bwd", "north_arm_2.fwd"]
+        );
+        let forward = &edges["north_arm_2.fwd"];
+        assert_eq!(forward.attributes["name"], "north arm:2");
+        assert_eq!(forward.attributes["from"], "n_north_arm_2_start");
+        assert_eq!(forward.attributes["to"], "n_north_arm_2_end");
+        for id in network.lanes.values() {
+            assert!(id.starts_with("north_arm_2."), "{id}");
+        }
+        for local in written(&network) {
+            assert!(
+                !local.contains(' ') && !local.contains("arm:"),
+                "{local} still holds a character SUMO cannot"
+            );
+        }
+    }
 }
