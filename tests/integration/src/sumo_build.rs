@@ -215,6 +215,10 @@ pub fn simulate(directory: &Path, prefix: &str) {
 pub struct SumoNetwork {
     /// The `<location>`: how the network is tied to the globe.
     pub location: SumoLocation,
+    /// Whether netconvert built the network for left-hand traffic, as it records on
+    /// the `<net>` element. SUMO reads handedness from here and not from the
+    /// geometry, so this is what the simulator will drive by.
+    pub lefthand: bool,
     pub edges: Vec<SumoEdge>,
     pub junctions: Vec<SumoJunction>,
     pub connections: Vec<SumoConnection>,
@@ -295,6 +299,7 @@ impl SumoNetwork {
         let mut reader = Reader::from_str(xml);
         let mut network = SumoNetwork {
             location: SumoLocation::default(),
+            lefthand: false,
             edges: Vec::new(),
             junctions: Vec::new(),
             connections: Vec::new(),
@@ -331,6 +336,10 @@ impl SumoNetwork {
                                     .expect("four numbers"),
                                 proj_parameter: attributes["projParameter"].clone(),
                             };
+                        }
+                        "net" => {
+                            network.lefthand =
+                                attributes.get("lefthand").map(String::as_str) == Some("true");
                         }
                         "edge" => network.edges.push(SumoEdge {
                             id: attributes["id"].clone(),
