@@ -9,6 +9,8 @@
 //! When SUMO is not installed these skip, saying so; CI sets `ROADGEN_REQUIRE_SUMO`,
 //! which turns the skip into a failure.
 
+use std::collections::BTreeSet;
+
 use roadgen_core::prelude::*;
 use roadgen_integration_tests::scenarios;
 use roadgen_integration_tests::sumo_build::{self, SumoNetwork};
@@ -451,6 +453,33 @@ fn a_changing_cross_section_becomes_a_chain_of_edges() {
             .any(|(from, _, to, _)| *from == "wide.0.fwd" && *to == "wide.1.fwd"),
         "traffic should be able to get from one section to the next"
     );
+
+    // And which lane carries on into which is the IR's, not netconvert's: the
+    // connections the core makes across the boundary are written as the movements
+    // through the node, and the built network has exactly those.
+    let lanes = roadgen_sumo::to_plain_xml(&map).unwrap().lanes;
+    let sumo = |lane: &LaneId| {
+        let (edge, index) = lanes.get(lane)?.rsplit_once('_')?;
+        Some((edge.to_owned(), index.parse::<usize>().ok()?))
+    };
+    let stated: BTreeSet<(String, usize, String, usize)> = map
+        .connections
+        .iter()
+        .filter_map(|connection| {
+            let (from, from_lane) = sumo(&connection.from.lane)?;
+            let (to, to_lane) = sumo(&connection.to.lane)?;
+            Some((from, from_lane, to, to_lane))
+        })
+        .filter(|(from, _, to, _)| from == "wide.0.fwd" && to == "wide.1.fwd")
+        .collect();
+    let built: BTreeSet<(String, usize, String, usize)> = network
+        .movements()
+        .into_iter()
+        .filter(|(from, _, to, _)| *from == "wide.0.fwd" && *to == "wide.1.fwd")
+        .map(|(from, from_lane, to, to_lane)| (from.to_owned(), from_lane, to.to_owned(), to_lane))
+        .collect();
+    assert_eq!(stated.len(), 2, "the two lanes that carry on: {stated:?}");
+    assert_eq!(built, stated);
 }
 
 /// What may use a lane is the whole of what SUMO knows about lane type, so it is what
@@ -527,6 +556,13 @@ fn what_the_format_cannot_carry_is_reported() {
         "{crossroads}"
     );
     assert!(crossroads.contains("crosswalk"), "{crossroads}");
+
+    // A changing cross-section is a chain of edges, but the movements across each
+    // node are the IR's own connections, so nothing about them is left to
+    // netconvert.
+    let sectioned = roadgen_sumo::check(&scenarios::lane_drop()).join("\n");
+    assert!(sectioned.contains("chain of edges"), "{sectioned}");
+    assert!(!sectioned.contains("lane-matching"), "{sectioned}");
 }
 
 /// The four files are named after the map and refer to each other, so that building

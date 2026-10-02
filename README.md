@@ -968,7 +968,10 @@ movement of the priority arm must still give way to an oncoming one is netconver
 decision, and `sumo_warnings()` says so.
 
 A road whose **cross-section changes** becomes a chain of edges with a node between
-them, because an edge has one lane count from end to end.
+them, because an edge has one lane count from end to end. Which lane carries on into
+which is still the IR's: the connections it holds across the boundary are written as
+`<connection>`s through that node, so netconvert has no lane-matching of its own to do
+there, and a lane that ends at the boundary simply ends.
 
 ### Junctions, which SUMO models the same way round as the IR
 
