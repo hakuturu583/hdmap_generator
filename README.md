@@ -1124,12 +1124,16 @@ away.
 
 A line carries no direction, so which carriageway it belongs to is judged only where
 it is in doubt: for a line that crosses lanes running both ways, as one drawn across
-the whole road does. That is decided on the IR road, before anything about SUMO
-edges or nodes: the crossing with each lane is projected onto the road's reference
-line, and the line belongs to a lane if it is nearer the end of the road the lane runs
-to than the end it begins at, measured over the whole road, every cross-section of it.
-A lane for which it is nearer the start is "at the start" of it, however the road is
-cut into edges and whatever the nodes at their ends are; exactly halfway, a lane a rule
+the whole road does. That is decided on the IR, before anything about SUMO edges or
+nodes: the crossing with each lane is projected onto the road's reference line, and
+the line belongs to a lane if it is nearer the junction the lane runs into than the
+junction it leaves, each measured along the road — every cross-section of it — and on
+through the roads joined to it end to end by plain joints, up to the first junction
+that way; a dead end has no junction beyond it. So a road joined to the next by a
+plain joint at one end and running into a junction at the other, or a stub with a dead
+end, is judged by the one junction it has, not by its own two ends. A lane for which
+the line is nearer the junction behind it is "at the start" of it, however the roads
+are cut into edges; exactly halfway, or with no junction either way, a lane a rule
 naming the line governs is preferred, and the others are at the start. Only the lanes
 the line belongs to are then placed as above — on the edge that reaches the junction,
 or reported as on an earlier edge, or as running into no junction. A line whose lanes
