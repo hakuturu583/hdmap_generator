@@ -41,6 +41,17 @@
 //! is the geometry SUMO gets — not a centreline with a width, which is what a
 //! network imported from OpenStreetMap has to make do with.
 //!
+//! # Lane changes
+//!
+//! SUMO has no paint, but it has the thing paint between two lanes is *for*: whether
+//! a vehicle may change across it. Each lane says so with `changeLeft` and
+//! `changeRight`, and the exporter reads both off the IR's marking on the boundary
+//! the lane shares with its neighbour in the edge. A solid line, a double solid line
+//! or a kerb leaves the change to `emergency` vehicles; a broken line or no paint at
+//! all says nothing, which SUMO reads as open to everyone. A line that is solid on
+//! one side and broken on the other binds each vehicle by the half nearer it. See
+//! [`lane_change`].
+//!
 //! # Junctions
 //!
 //! The IR draws a junction as a set of connector roads, one per movement. SUMO draws
@@ -84,7 +95,7 @@ use std::path::Path;
 use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
 use roadgen_core::map::{Lane, Road};
 use roadgen_core::semantics::{MapObjectKind, TrafficRule};
-use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
+use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd, RoadLinkTarget};
 use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, ValidatedMap};
 
@@ -202,7 +213,8 @@ pub fn write_traced(
 pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = vec![
         "SUMO has no lane markings: which line is painted between two lanes, and in \
-         what colour, is not written"
+         what colour, is not written — only whether it may be crossed, which becomes \
+         each lane's `changeLeft` and `changeRight`"
             .to_owned(),
     ];
 
@@ -390,6 +402,11 @@ struct EdgeLane {
     width: f64,
     speed: Option<f64>,
     permission: Option<Permission>,
+    /// Whether the boundary on each side of the direction of travel is one only
+    /// emergency vehicles may change across. Never set on the outer side of the
+    /// outermost lanes: there is no lane there to change into.
+    restricted_left: bool,
+    restricted_right: bool,
     shape: Polyline3,
 }
 
@@ -519,7 +536,39 @@ impl<'a> Exporter<'a> {
             }
         }
         self.build_connections();
+        self.open_dead_ends();
         Ok(())
+    }
+
+    /// Lifts the paint's restriction from every lane that leads nowhere while the
+    /// rest of its edge carries on: a lane that drops, say, past the end of a taper.
+    ///
+    /// The only way out of such a lane is sideways, so the topology of the IR says a
+    /// vehicle in it must change lanes whatever is painted beside it — and the
+    /// builder's default marking is a solid line, so a lane drop drawn without
+    /// thought for its paint has one. netconvert agrees: it refuses a prohibition
+    /// that would trap a vehicle in a dead-end lane, discards it and complains. So
+    /// it is not written, and the change out of the lane is left open to everyone.
+    /// An edge none of whose lanes lead anywhere is the end of the road rather than
+    /// a lane drop, and its paint is written as it is.
+    fn open_dead_ends(&mut self) {
+        let leaving: HashSet<(usize, usize)> = self
+            .movements
+            .keys()
+            .map(|&(edge, lane, _, _)| (edge, lane))
+            .collect();
+        for (index, edge) in self.edges.iter_mut().enumerate() {
+            let continues = |position: usize| leaving.contains(&(index, position));
+            if !(0..edge.lanes.len()).any(continues) {
+                continue;
+            }
+            for (position, lane) in edge.lanes.iter_mut().enumerate() {
+                if !continues(position) {
+                    lane.restricted_left = false;
+                    lane.restricted_right = false;
+                }
+            }
+        }
     }
 
     // ----------------------------------------------------------------------- //
@@ -688,11 +737,18 @@ impl<'a> Exporter<'a> {
         let mut written = Vec::with_capacity(lanes.len());
         for (position, lane) in lanes.iter().enumerate() {
             let travel = lane.travel_geometry(self.sampling)?;
+            // SUMO counts from the right, so the next lane up is the one to the left.
+            let to_left = lanes.get(position + 1);
+            let to_right = position.checked_sub(1).and_then(|below| lanes.get(below));
             written.push(EdgeLane {
                 lane: lane.id.clone(),
                 width: self.mean_width(lane)?,
                 speed: lane.speed_limit.map(|limit| limit.mps()),
                 permission: classes::permission(lane.lane_type),
+                restricted_left: to_left
+                    .is_some_and(|other| !lane_change(lane, other, LateralSide::Left)),
+                restricted_right: to_right
+                    .is_some_and(|other| !lane_change(lane, other, LateralSide::Right)),
                 shape: travel.centerline.to_polyline(self.sampling)?,
             });
             self.slots.insert(
@@ -1099,6 +1155,14 @@ impl<'a> Exporter<'a> {
                     let (key, value) = permission.attribute();
                     attributes.push((key, value.to_owned()));
                 }
+                // Left out where the paint allows it: SUMO's default is that anyone
+                // may change.
+                if lane.restricted_left {
+                    attributes.push(("changeLeft", classes::CHANGE_ACROSS_SOLID.to_owned()));
+                }
+                if lane.restricted_right {
+                    attributes.push(("changeRight", classes::CHANGE_ACROSS_SOLID.to_owned()));
+                }
                 document.leaf("lane", &attributes);
             }
             document.close("edge");
@@ -1122,6 +1186,41 @@ impl<'a> Exporter<'a> {
         }
         document.finish()
     }
+}
+
+/// Whether the paint lets a vehicle in `lane` change into `neighbour`, the lane
+/// beside it in the same edge on the `towards` side of its direction of travel.
+///
+/// The IR keeps a lane's markings by the side of the *reference line* they are on,
+/// and which side that is depends on which way the lane runs: a backward lane's
+/// left in travel is the reference line's right. Only the direction matters here,
+/// not the map's handedness — [`Exporter::carriageway`] orders an edge's lanes by
+/// where they physically are, so the neighbour on the driver's left is always the
+/// next lane further left in travel, whichever side of the road the carriageway is
+/// on.
+///
+/// The marking read is `lane`'s own on that side. Two lanes sharing a boundary
+/// normally agree about it — the OpenDRIVE reader gives each the same one, and a
+/// caller describing a road should too — and where they do not, each vehicle obeys
+/// the paint its own lane describes. A vehicle sits on the opposite side of the
+/// boundary from where the boundary sits relative to its lane, and that is the side
+/// [`classes::may_cross`] wants: it picks the nearer half of a line like
+/// `solid broken`.
+///
+/// Two lanes that are neighbours in SUMO but do not share a boundary in the IR have
+/// something between them SUMO has no lane for — a painted island, a border, a
+/// lane the other way — and crossing it is no lane change the map offers, so it is
+/// restricted like a solid line.
+fn lane_change(lane: &Lane, neighbour: &Lane, towards: LateralSide) -> bool {
+    let across = match lane.direction {
+        Direction::Forward => towards,
+        Direction::Backward => towards.opposite(),
+    };
+    let (marking, own, theirs) = match across {
+        LateralSide::Left => (lane.left_marking, lane.left_edge, neighbour.right_edge),
+        LateralSide::Right => (lane.right_marking, lane.right_edge, neighbour.left_edge),
+    };
+    own == theirs && classes::may_cross(marking.marking, across.opposite())
 }
 
 /// The netconvert run that builds the `.net.xml`.
@@ -1515,6 +1614,166 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(to_plain_xml(&map).unwrap().trace, first.trace);
         }
+    }
+
+    // ----------------------------------------------------------------------- //
+    // Lane changes
+    // ----------------------------------------------------------------------- //
+
+    /// A straight road whose lanes, listed from the reference line outwards, all run
+    /// `direction` and all carry `separator` on both sides — so the line between
+    /// every pair of them is `separator`, whichever lane it is read off.
+    fn separated(direction: Direction, separator: RoadMarking) -> ValidatedMap {
+        separated_in(TrafficHandedness::RightHand, direction, separator)
+    }
+
+    fn separated_in(
+        handedness: TrafficHandedness,
+        direction: Direction,
+        separator: RoadMarking,
+    ) -> ValidatedMap {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let marking = BoundaryMarking::new(separator, MarkingColor::White);
+        let lanes = (0..2)
+            .map(|_| LaneSpec::new(width, direction).with_markings(marking, marking))
+            .collect();
+        let mut builder = MapBuilder::new(MapMetadata {
+            handedness,
+            ..metadata("separated")
+        });
+        builder
+            .add_road(
+                RoadSpec::line(Point3::ORIGIN, Point3::new(100.0, 0.0, 0.0), lanes)
+                    .unwrap()
+                    .with_name("road"),
+            )
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// Each written lane's `changeLeft` and `changeRight`, by `<edge>_<index>`, read
+    /// back from the `.edg.xml`.
+    fn lane_changes(network: &PlainNetwork) -> BTreeMap<String, (Option<String>, Option<String>)> {
+        let mut found = BTreeMap::new();
+        let mut edge = String::new();
+        let mut reader = quick_xml::Reader::from_str(&network.edges);
+        loop {
+            let event = reader.read_event().unwrap();
+            let element = match &event {
+                Event::Eof => break,
+                Event::Start(element) | Event::Empty(element) => element,
+                _ => continue,
+            };
+            let attributes: HashMap<String, String> = element
+                .attributes()
+                .map(|attribute| {
+                    let attribute = attribute.unwrap();
+                    (
+                        String::from_utf8_lossy(attribute.key.as_ref()).into_owned(),
+                        String::from_utf8_lossy(&attribute.value).into_owned(),
+                    )
+                })
+                .collect();
+            match element.name().as_ref() {
+                b"edge" => edge = attributes["id"].clone(),
+                b"lane" => {
+                    found.insert(
+                        format!("{edge}_{}", attributes["index"]),
+                        (
+                            attributes.get("changeLeft").cloned(),
+                            attributes.get("changeRight").cloned(),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    fn emergency() -> Option<String> {
+        Some("emergency".to_owned())
+    }
+
+    #[test]
+    fn a_solid_line_between_two_lanes_keeps_all_but_emergency_vehicles_from_crossing() {
+        let network = to_plain_xml(&separated(Direction::Forward, RoadMarking::Solid)).unwrap();
+        let changes = lane_changes(&network);
+        // Lane 0 is the right-hand lane, so its neighbour is on its left and lane 1's
+        // is on its right. The outer sides have no neighbour and say nothing.
+        assert_eq!(changes["road.fwd_0"], (emergency(), None));
+        assert_eq!(changes["road.fwd_1"], (None, emergency()));
+    }
+
+    #[test]
+    fn a_broken_line_or_none_lets_anyone_change() {
+        for separator in [RoadMarking::Broken, RoadMarking::None] {
+            let network = to_plain_xml(&separated(Direction::Forward, separator)).unwrap();
+            for (lane, change) in lane_changes(&network) {
+                assert_eq!(change, (None, None), "{lane} across {separator:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_line_no_one_may_cross_restricts_the_change() {
+        for separator in [
+            RoadMarking::Solid,
+            RoadMarking::SolidSolid,
+            RoadMarking::Curbstone,
+        ] {
+            let network = to_plain_xml(&separated(Direction::Forward, separator)).unwrap();
+            let changes = lane_changes(&network);
+            assert_eq!(changes["road.fwd_0"].0, emergency(), "{separator:?}");
+            assert_eq!(changes["road.fwd_1"].1, emergency(), "{separator:?}");
+        }
+    }
+
+    #[test]
+    fn half_of_a_solid_broken_line_binds_the_vehicle_on_its_side() {
+        // Forward lanes on the right of the reference line, looking along it: lane 1
+        // is the inner one, on the left of the line between them, and so faces the
+        // solid half of `solid broken`; lane 0 faces the broken half.
+        let network =
+            to_plain_xml(&separated(Direction::Forward, RoadMarking::SolidBroken)).unwrap();
+        let changes = lane_changes(&network);
+        assert_eq!(changes["road.fwd_0"], (None, None));
+        assert_eq!(changes["road.fwd_1"], (None, emergency()));
+
+        let network =
+            to_plain_xml(&separated(Direction::Forward, RoadMarking::BrokenSolid)).unwrap();
+        let changes = lane_changes(&network);
+        assert_eq!(changes["road.fwd_0"], (emergency(), None));
+        assert_eq!(changes["road.fwd_1"], (None, None));
+    }
+
+    #[test]
+    fn a_backward_lane_reads_its_markings_the_other_way_round() {
+        // Backward lanes sit left of the reference line and run against it. Lane 0
+        // is the outer one, which is on the left of the line between the two looking
+        // along the reference line — so it faces the solid half of `solid broken`,
+        // and that half is on its left in travel.
+        let network =
+            to_plain_xml(&separated(Direction::Backward, RoadMarking::SolidBroken)).unwrap();
+        let changes = lane_changes(&network);
+        assert_eq!(changes["road.bwd_0"], (emergency(), None));
+        assert_eq!(changes["road.bwd_1"], (None, None));
+    }
+
+    #[test]
+    fn handedness_moves_the_lanes_but_not_which_half_of_the_line_binds_whom() {
+        // Under left-hand traffic the forward lanes sit left of the reference line,
+        // so lane 0 — the right-hand lane in travel — is now the inner one. It is
+        // still on the right of the line between the two looking along the
+        // reference line, so it still faces the broken half.
+        let map = separated_in(
+            TrafficHandedness::LeftHand,
+            Direction::Forward,
+            RoadMarking::SolidBroken,
+        );
+        let changes = lane_changes(&to_plain_xml(&map).unwrap());
+        assert_eq!(changes["road.fwd_0"], (None, None));
+        assert_eq!(changes["road.fwd_1"], (None, emergency()));
     }
 
     #[test]

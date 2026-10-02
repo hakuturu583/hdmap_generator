@@ -189,6 +189,10 @@ pub struct SumoLane {
     pub length: f64,
     pub allow: Option<String>,
     pub disallow: Option<String>,
+    /// The vehicle classes that may change to the lane on the left and on the
+    /// right; absent where SUMO leaves the change open to everyone.
+    pub change_left: Option<String>,
+    pub change_right: Option<String>,
     pub shape: Vec<Point3>,
 }
 
@@ -265,6 +269,8 @@ impl SumoNetwork {
                                 length: number(&attributes, "length"),
                                 allow: attributes.get("allow").cloned(),
                                 disallow: attributes.get("disallow").cloned(),
+                                change_left: attributes.get("changeLeft").cloned(),
+                                change_right: attributes.get("changeRight").cloned(),
                                 shape: points(attributes.get("shape").map(String::as_str)),
                             };
                             network

@@ -486,6 +486,93 @@ fn a_footway_admits_pedestrians_and_a_driving_lane_keeps_them_out() {
     assert_eq!(street.lane(1).disallow.as_deref(), Some("pedestrian"));
 }
 
+/// Two lanes the same way with `separator` painted between them, read off both of
+/// them.
+fn two_lanes_separated_by(separator: RoadMarking) -> ValidatedMap {
+    let marking = BoundaryMarking::new(separator, MarkingColor::White);
+    let mut builder = MapBuilder::new(scenarios::metadata("separated"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(150.0, 0.0, 0.0),
+                (0..2)
+                    .map(|_| {
+                        scenarios::lane(3.5, Direction::Forward).with_markings(marking, marking)
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .with_name("road"),
+        )
+        .unwrap();
+    builder.finish().unwrap().validate().unwrap()
+}
+
+/// SUMO has no paint, but it has what a solid line between two lanes is for: the
+/// change across it is closed to everyone but emergency vehicles, in the plain XML
+/// that goes in and — which is what a simulation runs on — in the network netconvert
+/// builds from it.
+#[test]
+fn a_solid_line_between_lanes_closes_the_lane_change_and_a_broken_one_does_not() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+
+    let map = two_lanes_separated_by(RoadMarking::Solid);
+    let (directory, network) = sumo_build::build(&map);
+    let plain =
+        std::fs::read_to_string(directory.path().join("separated.edg.xml")).expect("the edge file");
+    assert_eq!(
+        plain.matches("changeLeft=\"emergency\"").count(),
+        1,
+        "{plain}"
+    );
+    assert_eq!(
+        plain.matches("changeRight=\"emergency\"").count(),
+        1,
+        "{plain}"
+    );
+
+    let road = network.edge("road.fwd");
+    assert_eq!(road.lanes.len(), 2);
+    // Lane 0 is on the right: its neighbour is to its left, and lane 1's to its right.
+    assert_eq!(road.lane(0).change_left.as_deref(), Some("emergency"));
+    assert_eq!(road.lane(1).change_right.as_deref(), Some("emergency"));
+    // The outer sides have no lane to change into and say nothing.
+    assert_eq!(road.lane(0).change_right, None);
+    assert_eq!(road.lane(1).change_left, None);
+    sumo_build::simulate(directory.path(), "separated");
+
+    let map = two_lanes_separated_by(RoadMarking::Broken);
+    let (directory, network) = sumo_build::build(&map);
+    let plain =
+        std::fs::read_to_string(directory.path().join("separated.edg.xml")).expect("the edge file");
+    assert!(!plain.contains("changeLeft"), "{plain}");
+    assert!(!plain.contains("changeRight"), "{plain}");
+    for lane in &network.edge("road.fwd").lanes {
+        assert_eq!(lane.change_left, None, "{}", lane.id);
+        assert_eq!(lane.change_right, None, "{}", lane.id);
+    }
+}
+
+/// A lane that drops has no way out but sideways, so the solid line the builder
+/// paints beside it by default does not close the change out of it — netconvert
+/// would refuse that prohibition, and `build` fails on its complaint — while the
+/// lanes that carry on keep theirs.
+#[test]
+fn a_lane_that_drops_may_always_be_left() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let (_directory, network) = sumo_build::build(&scenarios::lane_drop());
+    let before = network.edge("wide.0.fwd");
+    assert_eq!(before.lanes.len(), 3);
+    assert_eq!(before.lane(0).change_left, None);
+    assert_eq!(before.lane(1).change_right.as_deref(), Some("emergency"));
+    assert_eq!(before.lane(1).change_left.as_deref(), Some("emergency"));
+}
+
 /// The heights the generator computed reach SUMO, which is the one thing plain
 /// OpenStreetMap could not carry.
 #[test]
