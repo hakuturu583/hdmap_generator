@@ -486,6 +486,63 @@ fn a_footway_admits_pedestrians_and_a_driving_lane_keeps_them_out() {
     assert_eq!(street.lane(1).disallow.as_deref(), Some("pedestrian"));
 }
 
+/// A `SpeedLimit` rule is the speed of the lanes it names, in the network netconvert
+/// builds — not only in the file handed to it — and the lanes it does not name keep
+/// their road's.
+#[test]
+fn a_speed_limit_rule_sets_the_speed_of_the_lanes_it_names() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let mut builder = MapBuilder::new(scenarios::metadata("limited"));
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(150.0, 0.0, 0.0),
+                vec![
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Forward),
+                    scenarios::lane(3.5, Direction::Backward),
+                ],
+            )
+            .unwrap()
+            .with_name("street")
+            .with_speed_limit(SpeedLimit::from_kph(60.0).unwrap()),
+        )
+        .unwrap();
+    builder.add_speed_limit_rule(
+        SpeedLimit::from_kph(30.0).unwrap(),
+        vec![LaneRef::new(road.clone(), 0)],
+    );
+    let map = builder.finish().unwrap().validate().unwrap();
+
+    let plain = roadgen_sumo::to_plain_xml(&map).unwrap();
+    let limited = plain.lanes[&map.lanes.iter().find(|lane| lane.index == 0).unwrap().id].clone();
+    assert!(
+        plain.edges.contains("speed=\"8.333\""),
+        "the rule should be in the .edg.xml:\n{}",
+        plain.edges
+    );
+
+    let (_directory, network) = sumo_build::build(&map);
+    let lanes: Vec<_> = network
+        .roads()
+        .into_iter()
+        .flat_map(|edge| edge.lanes.iter())
+        .collect();
+    assert_eq!(lanes.len(), 3);
+    for lane in lanes {
+        let expected = if lane.id == limited { 30.0 } else { 60.0 } / 3.6;
+        assert!(
+            (lane.speed - expected).abs() < 0.01,
+            "{} runs at {} m/s, not {expected}",
+            lane.id,
+            lane.speed
+        );
+    }
+}
+
 /// The heights the generator computed reach SUMO, which is the one thing plain
 /// OpenStreetMap could not carry.
 #[test]
