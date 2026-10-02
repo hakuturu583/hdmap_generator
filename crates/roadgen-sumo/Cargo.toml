@@ -10,4 +10,5 @@ description = "Lowers the roadgen canonical IR onto a SUMO plain-XML network"
 
 [dependencies]
 roadgen-core.workspace = true
+ll2-projection.workspace = true
 quick-xml.workspace = true
