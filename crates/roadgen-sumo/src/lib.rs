@@ -75,6 +75,13 @@
 //! This is why the arms are left exactly where the IR puts them, short of the
 //! junction: the gap is the junction, and netconvert fills it along the connectors.
 //!
+//! Footways are the exception. SUMO's pedestrians do not walk along connections:
+//! they cross a node on a *walking area* that netconvert builds there, joining every
+//! footway that meets at the node, walked either way. So the pavement the IR lays
+//! round a junction corner — a connector between two sidewalks — is not written as a
+//! connection, and neither is any other movement from one footway to another; the
+//! configuration asks netconvert for walking areas instead.
+//!
 //! # The trace
 //!
 //! [`PlainNetwork::trace`] records where each element of the IR went, naming the
@@ -90,6 +97,7 @@
 //! | `lane:<edge>_<index>` | a speed-limit rule naming the lane, role `speed` | merged |
 //! | `connection:<from edge>_<from lane>><to edge>_<to lane>` | a lane connection | exact, or merged |
 //! | the same connection | a connector lane it runs over | collapsed |
+//! | `node:<id>`, role `walkingarea` | a connection between two footways, and a pavement lane round a corner | collapsed |
 //!
 //! A connection is named by its two lanes as the built network names them, so the
 //! `.net.xml` `<connection from fromLane to toLane via>` that netconvert writes for it
@@ -118,8 +126,10 @@ use std::path::Path;
 
 use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
 use roadgen_core::map::{Lane, Projection, Road, TrafficHandedness};
-use roadgen_core::semantics::{MapObjectKind, TrafficRule};
-use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
+use roadgen_core::semantics::{LaneType, MapObjectKind, TrafficRule};
+use roadgen_core::topology::{
+    Direction, LaneConnection, LaneEnd, LaneEndpoint, RoadEnd, RoadLinkTarget,
+};
 use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, ValidatedMap};
 
@@ -334,6 +344,25 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
              an oncoming one is netconvert's"
                 .to_owned(),
         );
+    }
+
+    let footway = |lane: &LaneId| {
+        map.lane(lane)
+            .is_some_and(|lane| lane.lane_type == LaneType::Sidewalk)
+    };
+    let walks = map
+        .connections
+        .iter()
+        .filter(|connection| footway(&connection.from.lane) && footway(&connection.to.lane))
+        .count();
+    if walks > 0 {
+        problems.push(format!(
+            "SUMO's pedestrians cross a node on the walking area netconvert builds \
+             there, not along connections, so the {walks} connections between \
+             footways — the pavements round junction corners among them — are not \
+             written: at each node, a pedestrian may walk between any of the footways \
+             that meet there, in either direction"
+        ));
     }
 
     problems.extend(speed_limit_problems(map));
@@ -627,6 +656,11 @@ struct Exporter<'a> {
     /// connectors between one pair of lanes would otherwise write the same movement
     /// twice.
     movements: BTreeMap<(usize, usize, usize, usize), Movement>,
+    /// What the IR says about walking from one footway to another, by the node it
+    /// happens at. None of it is written as a connection: netconvert builds a
+    /// walking area at every node footways meet at, and that is how SUMO's
+    /// pedestrians get from one to the next. See [`Exporter::connect`].
+    walking: BTreeMap<String, Movement>,
     slots: HashMap<LaneId, Slot>,
     /// Junctions a traffic light controls an approach to.
     /// The signalised junctions, each with the lights that govern it.
@@ -655,6 +689,7 @@ impl<'a> Exporter<'a> {
             nodes: BTreeMap::new(),
             edges: Vec::new(),
             movements: BTreeMap::new(),
+            walking: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: BTreeMap::new(),
             right_of_way: HashSet::new(),
@@ -1299,13 +1334,50 @@ impl<'a> Exporter<'a> {
             .is_some_and(Road::is_connector)
     }
 
-    fn connect(&mut self, from: &LaneId, to: &LaneId, movement: Movement) {
-        let (Some(from), Some(to)) = (self.slots.get(from), self.slots.get(to)) else {
+    /// Records one movement between two written lanes — as a connection, unless both
+    /// are footways.
+    ///
+    /// SUMO does not walk its pedestrians along connections. Where footways meet,
+    /// netconvert builds a *walking area* — a patch of pavement joining every
+    /// footway that ends or starts at the node, walked in any direction — and a
+    /// pedestrian crosses the node on it. That is the model every SUMO network with
+    /// pedestrians uses, and it is the one asked for here: the configuration sets
+    /// `walkingareas` (see [`render_config`]).
+    ///
+    /// The IR's model is not that. A pavement round a junction corner is a connector
+    /// road from one arm's sidewalk to the next arm's, and it is joined to them by a
+    /// connection at each end, read in whatever direction the two sidewalks happen
+    /// to run. Which sidewalk faces a corner depends on which end of each arm meets
+    /// the junction and on the side traffic keeps to, so the pavement can run *from*
+    /// a sidewalk that leaves the junction *to* one that arrives at it. Written as a
+    /// SUMO connection, that is a connection from an edge that starts at the node to
+    /// one that ends there, and netconvert refuses the network: "could not insert
+    /// connection … after build". Even where the directions happen to line up, the
+    /// connection would only say a pedestrian may walk round the corner one way, and
+    /// it would draw an internal lane across the walking area that netconvert builds
+    /// anyway.
+    ///
+    /// So a movement from footway to footway is not written. Where it happens — the
+    /// node it crosses, see [`Exporter::walking_nodes`] — is kept instead, and the
+    /// trace says that the IR's connections and pavement lanes became part of that
+    /// node's walking area. A joint between two roads is treated the same way, for
+    /// the same reason: the walking area netconvert builds there is what joins the
+    /// two footways, in both directions.
+    fn connect(&mut self, source: &LaneId, target: &LaneId, movement: Movement) {
+        let (Some(&from), Some(&to)) = (self.slots.get(source), self.slots.get(target)) else {
             return;
         };
         if from.edge == to.edge {
             // Two lanes of one edge; SUMO says that with a lane change, not a
             // connection.
+            return;
+        }
+        if self.is_footway(from) && self.is_footway(to) {
+            for (node, part) in self.walking_nodes(source, target, movement) {
+                let walked = self.walking.entry(node).or_default();
+                walked.connections.extend(part.connections);
+                walked.connectors.extend(part.connectors);
+            }
             return;
         }
         let key = (from.edge, from.index, to.edge, to.index);
@@ -1314,6 +1386,134 @@ impl<'a> Exporter<'a> {
         merged.connectors.extend(movement.connectors);
         if merged.shape.is_none() {
             merged.shape = movement.shape;
+        }
+    }
+
+    /// Whether a written lane is one only pedestrians may use.
+    fn is_footway(&self, slot: Slot) -> bool {
+        self.edges[slot.edge].lanes[slot.index].permission
+            == classes::permission(LaneType::Sidewalk)
+    }
+
+    /// The nodes a walk from footway `source` to footway `target` crosses, each with
+    /// the part of `movement` that crosses it.
+    ///
+    /// Read from the ends the IR's connections name, not from the edges: the two
+    /// sidewalks of one road are carried by its two edges, which share *both* their
+    /// nodes, so the edges alone cannot say which end of the road a pavement joining
+    /// them turns at. A connection out of the source names the end of the source it
+    /// leaves by, and one into the target the end of the target it arrives at; each
+    /// is a node of that lane's edge. A pavement lane between them — and the
+    /// connections on from it — crosses the node of the connection it was reached
+    /// by. The walk may cross more than one node, when the two sidewalks are joined
+    /// round both ends of a road. Anything no connection places falls back to the
+    /// node the two edges share (see [`Exporter::shared_node`]).
+    fn walking_nodes(
+        &self,
+        source: &LaneId,
+        target: &LaneId,
+        movement: Movement,
+    ) -> BTreeMap<String, Movement> {
+        let connections: Vec<&LaneConnection> = movement
+            .connections
+            .iter()
+            .filter_map(|id| self.map.connections.get(id))
+            .collect();
+        let mut connection_node: HashMap<&ConnectionId, String> = HashMap::new();
+        let mut lane_node: HashMap<&LaneId, String> = HashMap::new();
+        for connection in &connections {
+            let placed = if &connection.from.lane == source {
+                self.node_at(&connection.from)
+                    .map(|node| (node, &connection.to.lane))
+            } else if &connection.to.lane == target {
+                self.node_at(&connection.to)
+                    .map(|node| (node, &connection.from.lane))
+            } else {
+                None
+            };
+            if let Some((node, other)) = placed {
+                lane_node.entry(other).or_insert_with(|| node.clone());
+                connection_node.insert(&connection.id, node);
+            }
+        }
+        // Carry each node on through the pavement lanes it was reached by.
+        loop {
+            let mut changed = false;
+            for connection in &connections {
+                if connection_node.contains_key(&connection.id) {
+                    continue;
+                }
+                let Some(node) = lane_node
+                    .get(&connection.from.lane)
+                    .or_else(|| lane_node.get(&connection.to.lane))
+                    .cloned()
+                else {
+                    continue;
+                };
+                for lane in [&connection.from.lane, &connection.to.lane] {
+                    lane_node.entry(lane).or_insert_with(|| node.clone());
+                }
+                connection_node.insert(&connection.id, node);
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let fallback = || self.shared_node(self.slots[source].edge, self.slots[target].edge);
+        let mut parts: BTreeMap<String, Movement> = BTreeMap::new();
+        for connection in movement.connections {
+            let node = connection_node
+                .get(&connection)
+                .cloned()
+                .unwrap_or_else(fallback);
+            parts
+                .entry(node)
+                .or_default()
+                .connections
+                .insert(connection);
+        }
+        for connector in movement.connectors {
+            let node = lane_node.get(&connector).cloned().unwrap_or_else(fallback);
+            parts.entry(node).or_default().connectors.insert(connector);
+        }
+        parts
+    }
+
+    /// The node at one end of a written lane: the end of its edge that the lane's
+    /// end, counted along the reference line, lies on.
+    fn node_at(&self, endpoint: &LaneEndpoint) -> Option<String> {
+        let slot = self.slots.get(&endpoint.lane)?;
+        let direction = self.map.lane(&endpoint.lane)?.direction;
+        let edge = &self.edges[slot.edge];
+        // A forward edge runs from the section's start to its end; a backward edge
+        // the other way.
+        Some(match (direction, endpoint.end) {
+            (Direction::Forward, LaneEnd::Start) | (Direction::Backward, LaneEnd::End) => {
+                edge.from.clone()
+            }
+            (Direction::Forward, LaneEnd::End) | (Direction::Backward, LaneEnd::Start) => {
+                edge.to.clone()
+            }
+        })
+    }
+
+    /// The node two edges meet at, for a walk no connection places.
+    ///
+    /// Read from the edges' own ends rather than from the direction of travel,
+    /// because a movement between two footways need not follow it: the pavement
+    /// round a corner can start on a sidewalk that leaves the junction. Where the
+    /// first edge's far end is one of the second's ends, that is the node; otherwise
+    /// it is the first edge's near end. Two edges that share both their nodes — the
+    /// two directions of one road — make this a guess, which is why
+    /// [`Exporter::walking_nodes`] asks the connections first.
+    fn shared_node(&self, from: usize, to: usize) -> String {
+        let (from, to) = (&self.edges[from], &self.edges[to]);
+        if from.to == to.from || from.to == to.to {
+            from.to.clone()
+        } else {
+            from.from.clone()
         }
     }
 
@@ -1450,6 +1650,29 @@ impl<'a> Exporter<'a> {
             }
             for connector in &movement.connectors {
                 trace.link(connector.clone(), local.clone(), Relation::Collapsed);
+            }
+        }
+
+        // A walk from one footway to another is the walking area netconvert builds
+        // at the node, which the export cannot name — so it is traced to the node,
+        // as part of what that node became.
+        for (node, walked) in &self.walking {
+            let local = format!("node:{node}");
+            for connection in &walked.connections {
+                trace.link_as(
+                    connection.clone(),
+                    local.clone(),
+                    Relation::Collapsed,
+                    "walkingarea",
+                );
+            }
+            for connector in &walked.connectors {
+                trace.link_as(
+                    connector.clone(),
+                    local.clone(),
+                    Relation::Collapsed,
+                    "walkingarea",
+                );
             }
         }
         trace
@@ -1597,6 +1820,13 @@ impl<'a> Exporter<'a> {
 /// the lane simply ends; and the internal lane it draws for one would be the only
 /// lane in the network the trace could not follow back to the map.
 ///
+/// Walking areas are turned on because they are how SUMO's pedestrians cross a node,
+/// and the export relies on them: no connection is written between two footways (see
+/// [`Exporter::connect`]). Left to itself netconvert builds walking areas only at a
+/// node that also has a pedestrian crossing, which the export never writes, so a
+/// sidewalk would end at every junction. A network with no footways gets none, and
+/// nothing else about it changes.
+///
 /// Left-hand traffic is stated when the map drives on the left, because netconvert
 /// cannot infer it and assumes the right. Left unsaid, a left-hand map is built as a
 /// right-hand one drawn on the wrong side of the road: the turn that crosses oncoming
@@ -1628,6 +1858,9 @@ fn render_config(prefix: &str, handedness: TrafficHandedness) -> String {
         document.leaf("lefthand", &[("value", "true".into())]);
     }
     document.close("processing");
+    document.open("pedestrian", &[]);
+    document.leaf("walkingareas", &[("value", "true".into())]);
+    document.close("pedestrian");
     document.finish()
 }
 
@@ -2492,6 +2725,110 @@ mod tests {
         for link in connections {
             assert_eq!(link.relation, Relation::Exact, "{}", link.local);
             assert!(matches!(link.ir, IrRef::Connection(_)));
+        }
+    }
+
+    /// A road whose two sidewalks — one on each of its two edges, which share both
+    /// their nodes — are joined by a pavement turning back round each end, through a
+    /// junction there of its own: `start` and `end`. Both walks are read from the
+    /// forward sidewalk to the backward one, so the exporter follows them as one
+    /// movement.
+    ///
+    /// The builder lays a footway the way traffic would run, which round the start is
+    /// from the backward sidewalk to the forward one; that walk is reversed by hand
+    /// afterwards. A corner pavement is read in whatever direction its two sidewalks
+    /// happen to run, and a footway connection may leave by either end.
+    fn turn_back() -> ValidatedMap {
+        let width = |metres| PositiveWidth::new(metres).unwrap();
+        let street = vec![
+            LaneSpec::new(width(3.5), Direction::Backward),
+            LaneSpec::new(width(2.0), Direction::Backward).with_type(LaneType::Sidewalk),
+            LaneSpec::new(width(3.5), Direction::Forward),
+            LaneSpec::new(width(2.0), Direction::Forward).with_type(LaneType::Sidewalk),
+        ];
+        let mut builder = MapBuilder::new(metadata("turn-back"));
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    street,
+                )
+                .unwrap()
+                .with_name("street"),
+            )
+            .unwrap();
+        let (backward, forward) = (LaneRef::new(road.clone(), 1), LaneRef::new(road, 3));
+        // The backward sidewalk leaves by the road's start and the forward one by its
+        // end, so these are pavements round the start and round the end.
+        let start = builder.add_junction(Some("start"));
+        builder
+            .connect_lanes(&backward, &forward, Some(&start))
+            .unwrap();
+        let end = builder.add_junction(Some("end"));
+        builder
+            .connect_lanes(&forward, &backward, Some(&end))
+            .unwrap();
+        let mut map = builder.finish().unwrap().validate().unwrap().into_map();
+        for connection in map.connections.iter_mut() {
+            if connection.junction.as_ref() == Some(&start) {
+                std::mem::swap(&mut connection.from, &mut connection.to);
+            }
+        }
+        UnvalidatedMap::from_map(map).validate().unwrap()
+    }
+
+    #[test]
+    fn a_walk_between_the_two_edges_of_a_road_is_traced_to_the_end_it_happens_at() {
+        let map = turn_back();
+        let street = map
+            .roads
+            .iter()
+            .find(|road| road.name.as_deref() == Some("street"))
+            .unwrap();
+        let forward = map
+            .lanes
+            .iter()
+            .find(|lane| {
+                lane.road == street.id
+                    && lane.lane_type == LaneType::Sidewalk
+                    && lane.direction == Direction::Forward
+            })
+            .unwrap();
+        // Both walks leave the forward sidewalk: one by its start, the other by its
+        // end. The forward edge's far end is a node the backward edge starts at, so
+        // the edges alone would put both at the road's end.
+        let leaving: Vec<LaneEnd> = map
+            .connections
+            .iter()
+            .filter(|connection| connection.from.lane == forward.id)
+            .map(|connection| connection.from.end)
+            .collect();
+        assert!(leaving.contains(&LaneEnd::Start) && leaving.contains(&LaneEnd::End));
+
+        let network = to_plain_xml(&map).unwrap();
+        let trace = &network.trace;
+        let written = written(&network);
+        assert_eq!(map.connections.len(), 4);
+        for connection in map.connections.iter() {
+            let junction = connection.junction.as_ref().unwrap();
+            let node = format!("node:j_{}", junction.local_name());
+            assert!(written.contains(&node), "{node}");
+            let links: Vec<_> = trace
+                .links_of(&IrRef::Connection(connection.id.clone()))
+                .collect();
+            assert_eq!(links.len(), 1, "{}", connection.id);
+            assert_eq!(links[0].local, node, "{}", connection.id);
+            assert_eq!(links[0].role.as_deref(), Some("walkingarea"));
+        }
+        for pavement in map.roads.iter().filter(|road| road.is_connector()) {
+            let junction = pavement.junction.as_ref().unwrap();
+            let node = format!("node:j_{}", junction.local_name());
+            for lane in map.lanes.iter().filter(|lane| lane.road == pavement.id) {
+                let links: Vec<_> = trace.links_of(&IrRef::Lane(lane.id.clone())).collect();
+                assert_eq!(links.len(), 1, "{}", lane.id);
+                assert_eq!(links[0].local, node, "{}", lane.id);
+            }
         }
     }
 
