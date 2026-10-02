@@ -403,6 +403,9 @@ fn stop_line_problems(map: &ValidatedMap) -> Vec<String> {
             Unplaced::NoJunctionAhead => {
                 "the edge does not end at a junction, where a stop offset stops nothing"
             }
+            Unplaced::AtLaneStart => {
+                "it is at the lane's start, not before the junction it runs into"
+            }
             Unplaced::NotAcross => "it does not cross the lane's centreline",
             Unplaced::BeyondLane => {
                 "it is further back from the junction than the edge is long, which \
@@ -550,6 +553,10 @@ enum Unplaced {
     /// Its lane does not run into a junction, so there is nothing at its end to wait
     /// for.
     NoJunctionAhead,
+    /// It crosses the lane nearer where the lane starts than where it runs into its
+    /// junction: a line across both carriageways, seen from the one leaving the
+    /// junction it stands before.
+    AtLaneStart,
     /// It does not cross the centreline of the lane it names.
     NotAcross,
     /// It is further back from the junction than its edge is long, which netconvert
@@ -1161,6 +1168,23 @@ impl<'a> Exporter<'a> {
                     self.unplace(Unplaced::NoJunctionAhead, &object.id, Some(lane));
                     continue;
                 }
+                // Nothing says which way a line runs, and one drawn across the whole
+                // road names the lane leaving a junction as well as the one entering
+                // it. It stands before the junction ahead only where it is in the
+                // half of the lane that leads into it, nearer its end than its start,
+                // and nearer the edge's own mouth at that end than at the other (the
+                // nodes themselves will not do: a junction's sits at its middle).
+                let from_start = shape.length() - distance;
+                let start_nearer = match edge.shape.points() {
+                    [first, .., last] => {
+                        distance_to_line(*first, &line) < distance_to_line(*last, &line)
+                    }
+                    _ => false,
+                };
+                if distance >= from_start || start_nearer {
+                    self.unplace(Unplaced::AtLaneStart, &object.id, Some(lane));
+                    continue;
+                }
                 // netconvert measures the limit against the edge, whose line is the
                 // middle of the carriageway; the lane's own length is the other bound
                 // that matters, on the inside of a bend.
@@ -1520,6 +1544,25 @@ fn crossing_from_end(path: &Polyline3, line: &Polyline3) -> Option<f64> {
         travelled += length;
     }
     best
+}
+
+/// How far `point` is from the nearest piece of `line`, in plan.
+fn distance_to_line(point: Point3, line: &Polyline3) -> f64 {
+    line.points()
+        .windows(2)
+        .map(|piece| {
+            let (c, d) = (piece[0], piece[1]);
+            let across = (d.x - c.x, d.y - c.y);
+            let squared = across.0 * across.0 + across.1 * across.1;
+            let t = if squared > 0.0 {
+                (((point.x - c.x) * across.0 + (point.y - c.y) * across.1) / squared)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (point.x - c.x - t * across.0).hypot(point.y - c.y - t * across.1)
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// A name reduced to something a SUMO identifier can hold.
@@ -2044,6 +2087,79 @@ mod tests {
         assert!(
             !about[0].contains("on lanes ")
                 && !about[0].contains(&format!("lane {}", approach.local_name())),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_line_across_a_road_between_junctions_stops_only_the_lane_approaching_it() {
+        // A road from one junction to another, with a line eight metres short of the
+        // second drawn across both carriageways, as an imported line with no
+        // orientation is: its lane leaving the first junction must not take an
+        // offset of nearly the whole road.
+        let mut builder = MapBuilder::new(metadata("between"));
+        let road = |builder: &mut MapBuilder, name: &str, from: f64, to: f64| {
+            builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(from, 0.0, 0.0),
+                        Point3::new(to, 0.0, 0.0),
+                        two_way(),
+                    )
+                    .unwrap()
+                    .with_name(name),
+                )
+                .unwrap()
+        };
+        let west = road(&mut builder, "west", -100.0, -10.0);
+        let mid = road(&mut builder, "mid", 0.0, 100.0);
+        let east = road(&mut builder, "east", 110.0, 200.0);
+        let ja = builder.add_junction(Some("ja"));
+        let jb = builder.add_junction(Some("jb"));
+        builder
+            .connect_ends(&west, RoadEnd::End, &mid, RoadEnd::Start, Some(&ja))
+            .unwrap();
+        builder
+            .connect_ends(&mid, RoadEnd::End, &east, RoadEnd::Start, Some(&jb))
+            .unwrap();
+        let line = builder
+            .add_stop_line_at(&LaneRef::new(mid.clone(), 0), LaneEnd::End, 8.0)
+            .unwrap();
+        let mut map =
+            UnvalidatedMap::from_map(builder.finish().unwrap().validate().unwrap().into_map());
+        let approaching = LaneId::of_road(&mid, 0);
+        let leaving = LaneId::of_road(&mid, 1);
+        let object = map
+            .as_map_mut()
+            .objects
+            .get_mut(&line)
+            .expect("the stop line");
+        object.geometry = ObjectGeometry::Line(
+            Curve3::line(Point3::new(92.0, -7.0, 0.0), Point3::new(92.0, 7.0, 0.0)).unwrap(),
+        );
+        object.lanes = vec![approaching.clone(), leaving.clone()];
+        let map = map.validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+
+        let offsets = stop_offsets(&network);
+        let written = network.lanes[&approaching].clone();
+        assert_eq!(
+            offsets.keys().collect::<Vec<_>>(),
+            [&written],
+            "{offsets:?}"
+        );
+        assert!((offsets[&written] - 8.0).abs() < 1e-3, "{offsets:?}");
+
+        let report = check(&map);
+        let about: Vec<&String> = report
+            .iter()
+            .filter(|line_| line_.contains(line.as_str()) && line_.contains("is not written"))
+            .collect();
+        assert_eq!(about.len(), 1, "{report:#?}");
+        assert!(
+            about[0].contains(&format!("is not written on lane {}:", leaving.local_name()))
+                && about[0]
+                    .contains("it is at the lane's start, not before the junction it runs into"),
             "{report:#?}"
         );
     }

@@ -521,7 +521,12 @@ fn what_the_format_cannot_carry_is_reported() {
     assert!(report.contains("markings"), "{report}");
     assert!(report.contains("mean width along"), "{report}");
 
-    let crossroads = roadgen_sumo::check(&scenarios::controlled_crossroads()).join("\n");
+    let crossroads = roadgen_sumo::check(&scenarios::controlled_crossroads());
+    let lost: Vec<&String> = crossroads
+        .iter()
+        .filter(|line| line.contains("stop line") && line.contains("is not written"))
+        .collect();
+    let crossroads = crossroads.join("\n");
     assert!(
         crossroads.contains("netconvert generates the phases"),
         "{crossroads}"
@@ -530,10 +535,7 @@ fn what_the_format_cannot_carry_is_reported() {
     // Its stop line is right at the junction's mouth, so the stop offset it becomes
     // is no offset at all, and nothing is lost.
     assert!(crossroads.contains("stopOffset"), "{crossroads}");
-    assert!(
-        !crossroads.contains("not written: object/stopline"),
-        "{crossroads}"
-    );
+    assert!(lost.is_empty(), "{crossroads}");
 }
 
 /// The four files are named after the map and refer to each other, so that building
