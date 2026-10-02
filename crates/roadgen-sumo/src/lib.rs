@@ -48,10 +48,13 @@
 //! lane for every connection across it. The two models agree about what matters —
 //! the enumerated movements — so the connectors are not written as edges. Each one
 //! becomes the `<connection>` that says its approach lane may be left for its exit
-//! lane, and netconvert draws the path.
+//! lane, and the connector's centreline goes with it as the connection's `shape`.
+//! netconvert lays the internal lane along that shape, so the path across the
+//! junction is the IR's — the same curve the OpenDRIVE and Lanelet2 exports carry —
+//! even though the lane that follows it is netconvert's.
 //!
 //! This is why the arms are left exactly where the IR puts them, short of the
-//! junction: the gap is the junction, and netconvert fills it.
+//! junction: the gap is the junction, and netconvert fills it along the connectors.
 //!
 //! # The trace
 //!
@@ -319,8 +322,10 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
     if !map.junctions.is_empty() {
         problems.push(format!(
             "the connector roads of the {} junctions are not written as edges: SUMO \
-             builds an internal lane per movement from the connections instead, so \
-             the path across a junction is netconvert's and not the IR's",
+             builds an internal lane per movement from the connections instead. Each \
+             connection carries its connectors' centreline as its shape, so the path \
+             across a junction is the IR's, but the junction's outline and where a \
+             turn waits inside it are netconvert's",
             map.junctions.len()
         ));
     }
@@ -406,6 +411,16 @@ struct Slot {
 struct Movement {
     connections: BTreeSet<ConnectionId>,
     connectors: BTreeSet<LaneId>,
+    /// The path across the junction, as the IR drew it: the centrelines of the
+    /// connector lanes one way through, in travel order and joined end to end. Absent
+    /// for a movement that crosses no connector — two roads that meet head on — where
+    /// there is no drawing of the IR's to pass on and netconvert's own short internal
+    /// lane is the right one.
+    ///
+    /// Only one way through is drawn, even where a junction holds several connectors
+    /// between the same pair of lanes: a connection has one shape. The first one the
+    /// walk found is kept.
+    shape: Option<Polyline3>,
 }
 
 struct Exporter<'a> {
@@ -511,14 +526,15 @@ impl<'a> Exporter<'a> {
         for road in self.map.roads.iter() {
             if road.is_connector() {
                 // A connector is the IR's drawing of one movement through a junction.
-                // SUMO draws that itself, from the connection, as an internal lane.
+                // SUMO draws that itself, from the connection, as an internal lane —
+                // along the connector's centreline, which the connection carries.
                 continue;
             }
             for section in 0..road.sections.len() {
                 self.section_edges(road, section)?;
             }
         }
-        self.build_connections();
+        self.build_connections()?;
         Ok(())
     }
 
@@ -834,7 +850,15 @@ impl<'a> Exporter<'a> {
     /// Every IR connection walked along the way is kept with the connection it
     /// became, as is every connector lane crossed, so the trace can say what each
     /// written connection stands for.
-    fn build_connections(&mut self) {
+    ///
+    /// The connectors are not lost on the way, though: their centrelines, in the order
+    /// the movement crosses them, become the connection's `shape`. netconvert takes a
+    /// connection's shape as the shape of the internal lane it draws for it — clipped
+    /// or stretched only to meet the junction's border, which here is where the arms
+    /// stop and the connector starts anyway — so the path across the junction in SUMO
+    /// is the one the IR drew, and the one the OpenDRIVE and the Lanelet2 map written
+    /// from the same IR carry.
+    fn build_connections(&mut self) -> Result<(), ExportError> {
         let mut successors: BTreeMap<LaneId, Vec<(ConnectionId, LaneId)>> = BTreeMap::new();
         for connection in self.map.connections.iter() {
             successors
@@ -858,12 +882,16 @@ impl<'a> Exporter<'a> {
             let mut seen: HashSet<LaneId> = HashSet::from([source.clone()]);
             // Every connection followed, whether or not it led anywhere new.
             let mut walked: Vec<(LaneId, ConnectionId, LaneId)> = Vec::new();
+            // The lane each lane was first reached from, which is one way back from
+            // anywhere the walk got to: the path a connection's shape is drawn along.
+            let mut reached_from: HashMap<LaneId, LaneId> = HashMap::new();
             let mut frontier = step(&source);
             while let Some((from, connection, next)) = frontier.pop() {
-                walked.push((from, connection, next.clone()));
+                walked.push((from.clone(), connection, next.clone()));
                 if !seen.insert(next.clone()) {
                     continue;
                 }
+                reached_from.insert(next.clone(), from);
                 if self.slots.contains_key(&next) {
                     reached.push(next);
                 } else if self.on_connector(&next) {
@@ -875,10 +903,66 @@ impl<'a> Exporter<'a> {
                 }
             }
             for target in reached {
-                let movement = self.movement_between(&source, &target, &walked);
+                let mut movement = self.movement_between(&source, &target, &walked);
+                movement.shape = self.path_across(&source, &target, &reached_from)?;
                 self.connect(&source, &target, movement);
             }
         }
+        Ok(())
+    }
+
+    /// The connector centrelines between `source` and `target`, one after the other in
+    /// travel order: the shape of the connection between the two.
+    ///
+    /// The way back is read from `reached_from`, so it is the path the walk first
+    /// found. Where one connector runs into the next, the first one's last point and
+    /// the second one's first are the same joint, and only one of them is kept — a
+    /// repeated point is a zero-length segment, which netconvert would have to make a
+    /// direction out of.
+    fn path_across(
+        &self,
+        source: &LaneId,
+        target: &LaneId,
+        reached_from: &HashMap<LaneId, LaneId>,
+    ) -> Result<Option<Polyline3>, ExportError> {
+        let mut connectors: Vec<&LaneId> = Vec::new();
+        let mut lane = target;
+        while let Some(previous) = reached_from.get(lane) {
+            if previous == source {
+                break;
+            }
+            connectors.push(previous);
+            lane = previous;
+        }
+        connectors.reverse();
+
+        let mut points: Vec<Point3> = Vec::new();
+        for connector in connectors {
+            let lane = self
+                .map
+                .lane(connector)
+                .ok_or_else(|| ExportError::Unknown(format!("connector lane {connector}")))?;
+            let centreline = lane
+                .travel_geometry(self.sampling)?
+                .centerline
+                .to_polyline(self.sampling)?;
+            for &point in centreline.points() {
+                // The joint between two connectors, or a sample on top of its
+                // neighbour: a point within a millimetre of the last is the same point
+                // once written.
+                if points
+                    .last()
+                    .is_some_and(|last| last.distance_to(point) < 1e-3)
+                {
+                    continue;
+                }
+                points.push(point);
+            }
+        }
+        if points.len() < 2 {
+            return Ok(None);
+        }
+        Ok(Some(Polyline3::new(points)?))
     }
 
     /// The part of what was walked from `source` that lies on a way to `target`: the
@@ -925,6 +1009,9 @@ impl<'a> Exporter<'a> {
         let merged = self.movements.entry(key).or_default();
         merged.connections.extend(movement.connections);
         merged.connectors.extend(movement.connectors);
+        if merged.shape.is_none() {
+            merged.shape = movement.shape;
+        }
     }
 
     // ----------------------------------------------------------------------- //
@@ -1109,16 +1196,19 @@ impl<'a> Exporter<'a> {
     fn render_connections(&self) -> String {
         let mut document =
             xml::Document::new("connections", "http://sumo.dlr.de/xsd/connections_file.xsd");
-        for (from_edge, from_lane, to_edge, to_lane) in self.movements.keys() {
-            document.leaf(
-                "connection",
-                &[
-                    ("from", self.edges[*from_edge].id.clone()),
-                    ("to", self.edges[*to_edge].id.clone()),
-                    ("fromLane", from_lane.to_string()),
-                    ("toLane", to_lane.to_string()),
-                ],
-            );
+        for ((from_edge, from_lane, to_edge, to_lane), movement) in &self.movements {
+            let mut attributes = vec![
+                ("from", self.edges[*from_edge].id.clone()),
+                ("to", self.edges[*to_edge].id.clone()),
+                ("fromLane", from_lane.to_string()),
+                ("toLane", to_lane.to_string()),
+            ];
+            if let Some(path) = &movement.shape {
+                // What becomes the internal lane: the IR's own path across the
+                // junction rather than one netconvert would invent.
+                attributes.push(("shape", shape(path)));
+            }
+            document.leaf("connection", &attributes);
         }
         document.finish()
     }
