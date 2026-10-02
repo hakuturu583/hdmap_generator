@@ -970,6 +970,46 @@ decision, and `sumo_warnings()` says so.
 A road whose **cross-section changes** becomes a chain of edges with a node between
 them, because an edge has one lane count from end to end.
 
+### Stop lines
+
+SUMO has no stop line as a thing of its own. What it has is a lane's **stop offset**:
+how far short of the end of the lane a vehicle waiting at the junction ahead comes to
+a halt. Without one it halts at the very end of the lane — for an arm that stops where
+the IR's junction begins, the junction's mouth rather than the line painted before
+it.
+
+So each stop line is measured along every written lane it crosses, from where it
+crosses the lane's centreline to the lane's end in the direction of travel, and the
+distance becomes that lane's `<stopOffset>`:
+
+```xml
+<lane index="0" width="3.500" shape="-1.750,40.000,0.000 -1.750,14.000,0.000" disallow="pedestrian">
+    <stopOffset value="8.000"/>
+</lane>
+```
+
+It carries no `vClasses`: a stop line binds everything that drives up to it, which is
+SUMO's default of `all`. netconvert keeps a lane's custom shape as it was given rather
+than cutting it back to the junction, so the end it is measured from is the end the
+built network has, and the tests read the offset back out of the `.net.xml` and check
+that the point it puts the stop at is the painted line, to within a few centimetres.
+
+The lanes measured are the ones the stop line names, and those that a rule naming it
+governs — a right-of-way rule's yielding lanes, a traffic-light rule's lanes — where
+the line actually crosses them. An offset is only meaningful where the lane runs into
+a junction, so on an approach split over several edges by a change of cross-section
+it goes on the edge that reaches the junction and nowhere else. A line within 10 cm of
+the end of its lane is written as nothing, since that is where SUMO stops a vehicle
+anyway; and where two stop lines cross one lane, the one nearer the junction holds its
+one offset. The trace records each as `merged` into the lane, with the role
+`stopOffset`.
+
+A stop line that cannot become an offset is named by `sumo_warnings()` with the
+reason: one on a lane no SUMO lane is written for (a junction's connector), one short
+of the end of an edge that does not meet a junction, one that does not cross the
+centreline of a lane it names, or one further back than its edge is long — which
+netconvert would refuse.
+
 ### Junctions, which SUMO models the same way round as the IR
 
 The IR draws a junction as a set of connector roads, one per movement. SUMO draws it
@@ -1008,6 +1048,8 @@ IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
   additional file, not part of the network.
 - **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
   right of way and no more.
+- **The stop line's paint.** Where it is survives as a stop offset, as above; a stop
+  line with nowhere to go is named.
 - **The geo-reference.** The network is in the map's own metres about its origin, and
   the generated configuration turns off netconvert's offset normalisation so that it
   stays that way — the same coordinates as the other four exports.
