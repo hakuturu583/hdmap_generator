@@ -31,6 +31,20 @@ impl Permission {
             Permission::Disallow(classes) => ("disallow", classes),
         }
     }
+
+    /// Whether a vehicle of SUMO class `class` — `passenger`, `pedestrian` — may use
+    /// a lane with this permission.
+    ///
+    /// Read off the same space-separated list the attribute is written with, so the
+    /// answer is SUMO's for the file as written and cannot drift from it.
+    pub fn admits(self, class: &str) -> bool {
+        match self {
+            Permission::Allow(classes) => classes.split_whitespace().any(|named| named == class),
+            Permission::Disallow(classes) => {
+                !classes.split_whitespace().any(|named| named == class)
+            }
+        }
+    }
 }
 
 /// Who may use a lane of this type, or `None` for a lane SUMO has no place for.
@@ -136,6 +150,16 @@ mod tests {
         );
         assert_eq!(permission(LaneType::Border), None);
         assert_eq!(permission(LaneType::None), None);
+    }
+
+    #[test]
+    fn only_a_driving_lane_admits_a_passenger_car() {
+        let admits = |lane_type| permission(lane_type).unwrap().admits("passenger");
+        assert!(admits(LaneType::Driving));
+        assert!(!admits(LaneType::Sidewalk));
+        assert!(!admits(LaneType::Biking));
+        assert!(!admits(LaneType::Shoulder));
+        assert!(permission(LaneType::Sidewalk).unwrap().admits("pedestrian"));
     }
 
     #[test]
