@@ -957,7 +957,21 @@ traffic with priority, and the kerb lane would be SUMO's overtaking lane. A righ
 map writes nothing, since that is netconvert's default.
 
 `speed` is the road's limit in m/s, or SUMO's own default for the OSM `highway` value
-the road type maps to. What may use a lane is the whole of what SUMO knows about lane
+the road type maps to. A lane with a limit of its own carries it as the lane's `speed`,
+and so does a lane a **`SpeedLimit` rule** names — the rule *is* that lane's limit and
+replaces any it had, as it overwrites the lanelet's `speed_limit` tag in the Lanelet2
+export:
+
+```xml
+<lane index="0" width="3.500" shape="..." speed="8.333" disallow="pedestrian"/>
+```
+
+An IR lane runs the whole of one cross-section, which is exactly one lane of one edge,
+so the rule covers the SUMO lane from end to end. Where two rules name one lane, the
+lower is written. The trace records the rule as `merged` into each `lane:` it set,
+with role `speed`, the way a right-of-way rule is merged into an edge's `priority`.
+
+What may use a lane is the whole of what SUMO knows about lane
 type: a driving lane is written as one pedestrians are kept out of, a footway as one
 that admits only them, a bike lane only bicycles and a hard shoulder only emergency
 vehicles.
@@ -1098,6 +1112,10 @@ for the map whenever it reaches a centimetre.
   additional file, not part of the network.
 - **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
   right of way and no more.
+- **A speed-limit rule on a lane that is not written.** The connector lanes inside a
+  junction become internal lanes whose speed netconvert sets for the turn, and a lane
+  of a type SUMO has no place for is dropped with its rule. Where rules disagree about
+  a lane, the higher ones are dropped. `sumo_warnings()` names the lanes in each case.
 - **Heights in the geo-reference.** A `<location>` is horizontal only; the heights
   are the map's own `z`, as in every other export. The origin's altitude goes into a
   local map's projection scale rather than being lost, but each point's own height

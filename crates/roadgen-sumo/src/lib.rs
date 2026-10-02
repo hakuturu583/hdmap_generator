@@ -89,7 +89,9 @@
 //! | `node:<id>` | a junction | exact |
 //! | `node:<id>` | a traffic light, role `traffic_light` | merged |
 //! | `edge:<id>` | a road — one edge per direction and cross-section | part |
+//! | `edge:<id>` | a right-of-way rule naming its lanes, role `priority` | merged |
 //! | `lane:<edge>_<index>` | a lane | exact |
+//! | `lane:<edge>_<index>` | a speed-limit rule naming the lane, role `speed` | merged |
 //! | `connection:<from edge>_<from lane>><to edge>_<to lane>` | a lane connection | exact, or merged |
 //! | the same connection | a connector lane it runs over | collapsed |
 //! | `node:<id>`, role `walkingarea` | a connection between two footways, and a pavement lane round a corner | collapsed |
@@ -377,6 +379,8 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         ));
     }
 
+    problems.extend(speed_limit_problems(map));
+
     if !map.junctions.is_empty() {
         problems.push(format!(
             "the connector roads of the {} junctions are not written as edges: SUMO \
@@ -433,6 +437,76 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
              above or below the origin's plane as if it were on it: up to {worst:.3} m \
              from the latitude and longitude the Lanelet2 export gives it (the point's \
              distance from the origin times its height, over the earth's radius)"
+        ));
+    }
+    problems
+}
+
+/// What of the map's `SpeedLimit` rules does not reach a lane `speed`.
+///
+/// A rule names lanes, and an IR lane runs the whole length of one cross-section of
+/// its road — which is exactly what one lane of one edge is — so wherever the lane it
+/// names is written, the rule is written exactly. What is lost is the rest:
+///
+/// - a lane on a **connector road**, because the connectors are not written as edges
+///   and the internal lane netconvert builds in their place takes the speed
+///   netconvert works out for the turn;
+/// - a lane of a type SUMO has **no lane for**, because nothing is written for it to
+///   go on;
+/// - the **higher** of two rules naming the same lane, because a lane has one speed
+///   and the lower of them is the one a driver has to keep to.
+fn speed_limit_problems(map: &ValidatedMap) -> Vec<String> {
+    let mut on_connectors = BTreeSet::new();
+    let mut on_unwritten = BTreeSet::new();
+    let mut limits: BTreeMap<&LaneId, BTreeSet<u64>> = BTreeMap::new();
+    for rule in &map.rules {
+        let TrafficRule::SpeedLimit { limit, lanes } = rule else {
+            continue;
+        };
+        for id in lanes {
+            let Some(lane) = map.lane(id) else {
+                continue;
+            };
+            if map.road(&lane.road).is_some_and(Road::is_connector) {
+                on_connectors.insert(id.as_str());
+            } else if classes::permission(lane.lane_type).is_none() {
+                on_unwritten.insert(id.as_str());
+            } else {
+                // Compared as bit patterns so a set can hold them; two limits that
+                // are the same number are the same rule as far as the lane goes.
+                limits.entry(id).or_default().insert(limit.mps().to_bits());
+            }
+        }
+    }
+    let contested: Vec<&str> = limits
+        .into_iter()
+        .filter(|(_, limits)| limits.len() > 1)
+        .map(|(lane, _)| lane.as_str())
+        .collect();
+
+    let mut problems = Vec::new();
+    if !on_connectors.is_empty() {
+        problems.push(format!(
+            "the connector roads are not written as edges, so a speed-limit rule on \
+             the {} connector lanes it names is not written: netconvert sets the speed \
+             of the internal lane it builds for each movement: {}",
+            on_connectors.len(),
+            on_connectors.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !on_unwritten.is_empty() {
+        problems.push(format!(
+            "a speed-limit rule on the {} lanes SUMO has no lane for is dropped with \
+             them: {}",
+            on_unwritten.len(),
+            on_unwritten.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !contested.is_empty() {
+        problems.push(format!(
+            "a SUMO lane has one speed, so where speed-limit rules disagree about a \
+             lane the lowest of them is written and the others are dropped: {}",
+            contested.join(", ")
         ));
     }
     problems
@@ -612,6 +686,9 @@ struct Exporter<'a> {
     yielding: HashSet<LaneId>,
     /// Junctions a right-of-way rule speaks about.
     ruled: HashSet<JunctionId>,
+    /// The speed each lane named by a `SpeedLimit` rule is held to, in m/s, and the
+    /// rules that hold it there. See [`Exporter::lane_speed`].
+    rule_speeds: HashMap<LaneId, (f64, Vec<usize>)>,
     /// The attributes of the node file's `<location>`, worked out once everything
     /// it has to bound has been built.
     location: Vec<(&'static str, String)>,
@@ -632,14 +709,16 @@ impl<'a> Exporter<'a> {
             right_of_way: HashSet::new(),
             yielding: HashSet::new(),
             ruled: HashSet::new(),
+            rule_speeds: HashMap::new(),
             location: Vec::new(),
         };
         exporter.read_rules();
         exporter
     }
 
-    /// The two things about a map that are decided before any edge is written: which
-    /// junctions are signalised, and which arms hold right of way over which.
+    /// The things about a map that are decided before any edge is written: which
+    /// junctions are signalised, which arms hold right of way over which, and which
+    /// lanes a speed-limit rule holds to a speed.
     fn read_rules(&mut self) {
         for object in self.map.objects.iter() {
             if !object.kind.is_traffic_light() {
@@ -671,6 +750,45 @@ impl<'a> Exporter<'a> {
             }
             self.right_of_way.extend(right_of_way.iter().cloned());
             self.yielding.extend(yielding.iter().cloned());
+        }
+
+        for (index, rule) in self.map.rules.iter().enumerate() {
+            let TrafficRule::SpeedLimit { limit, lanes } = rule else {
+                continue;
+            };
+            let limit = limit.mps();
+            for lane in lanes {
+                let held = self
+                    .rule_speeds
+                    .entry(lane.clone())
+                    .or_insert((limit, Vec::new()));
+                if limit < held.0 {
+                    *held = (limit, Vec::new());
+                }
+                // A rule that names one lane twice is still one rule over it.
+                if limit == held.0 && held.1.last() != Some(&index) {
+                    held.1.push(index);
+                }
+            }
+        }
+    }
+
+    /// The speed a lane is written with, in m/s, or `None` to leave it the edge's.
+    ///
+    /// A `SpeedLimit` rule is the IR saying how fast the lanes it names may be driven,
+    /// and where one names this lane it *is* the lane's limit: it replaces whatever
+    /// limit the lane carried of its own, as it does in the Lanelet2 export, where the
+    /// rule overwrites the lanelet's `speed_limit` tag. Where several rules name the
+    /// same lane the lowest of them is the one a driver has to keep to, so that is the
+    /// one written, and [`crate::check`] names the lane.
+    ///
+    /// Nothing is lost along the lane: an IR lane runs the whole of one cross-section
+    /// of its road, and one cross-section is one edge, so the rule covers the SUMO
+    /// lane from end to end exactly as it covers the IR lane.
+    fn lane_speed(&self, lane: &Lane) -> Option<f64> {
+        match self.rule_speeds.get(&lane.id) {
+            Some((limit, _)) => Some(*limit),
+            None => lane.speed_limit.map(|limit| limit.mps()),
         }
     }
 
@@ -926,7 +1044,7 @@ impl<'a> Exporter<'a> {
             written.push(EdgeLane {
                 lane: lane.id.clone(),
                 width: self.mean_width(lane)?,
-                speed: lane.speed_limit.map(|limit| limit.mps()),
+                speed: self.lane_speed(lane),
                 permission: classes::permission(lane.lane_type),
                 shape: travel.centerline.to_polyline(self.sampling)?,
             });
@@ -1491,6 +1609,26 @@ impl<'a> Exporter<'a> {
                     Relation::Merged,
                     "priority",
                 );
+            }
+        }
+
+        // A speed-limit rule is the `speed` of each lane it names — merged into a lane
+        // that is otherwise the IR lane's, as the right-of-way rule is merged into an
+        // edge's priority. Only the rules whose limit was the one written are linked:
+        // a higher rule over the same lane left nothing in the file.
+        for edge in &self.edges {
+            for (index, lane) in edge.lanes.iter().enumerate() {
+                let Some((_, rules)) = self.rule_speeds.get(&lane.lane) else {
+                    continue;
+                };
+                for rule in rules {
+                    trace.link_as(
+                        IrRef::Rule(*rule),
+                        format!("lane:{}_{index}", edge.id),
+                        Relation::Merged,
+                        "speed",
+                    );
+                }
             }
         }
 
@@ -2332,7 +2470,7 @@ mod tests {
 
     #[test]
     fn everything_the_trace_names_is_in_the_files() {
-        for map in [crossroads(), in_line(), colliding()] {
+        for map in [crossroads(), in_line(), colliding(), ruled_street()] {
             let network = to_plain_xml(&map).unwrap();
             let written = written(&network);
             assert_eq!(network.trace.format, "sumo");
@@ -2688,6 +2826,138 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(to_plain_xml(&map).unwrap().trace, first.trace);
         }
+    }
+
+    // ----------------------------------------------------------------------- //
+    // Speed-limit rules
+    // ----------------------------------------------------------------------- //
+
+    /// One road with three rules over its lanes: one that overrides a lane's own
+    /// limit and also names a lane SUMO has no place for, and two that disagree about
+    /// the same lane.
+    fn ruled_street() -> ValidatedMap {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("ruled"));
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::ORIGIN,
+                    Point3::new(120.0, 0.0, 0.0),
+                    vec![
+                        LaneSpec::new(width, Direction::Forward)
+                            .with_speed_limit(SpeedLimit::from_kph(60.0).unwrap()),
+                        LaneSpec::new(width, Direction::Forward),
+                        LaneSpec::new(width, Direction::Backward),
+                        LaneSpec::new(width, Direction::Forward).with_type(LaneType::Border),
+                    ],
+                )
+                .unwrap()
+                .with_name("main"),
+            )
+            .unwrap();
+        let lane = |index| LaneRef::new(road.clone(), index);
+        let kph = |value| SpeedLimit::from_kph(value).unwrap();
+        builder.add_speed_limit_rule(kph(30.0), vec![lane(0), lane(3)]);
+        builder.add_speed_limit_rule(kph(40.0), vec![lane(1)]);
+        builder.add_speed_limit_rule(kph(50.0), vec![lane(1)]);
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// The IR lane at `index` in the road's cross-section.
+    fn lane_at(map: &ValidatedMap, index: usize) -> &Lane {
+        map.lanes.iter().find(|lane| lane.index == index).unwrap()
+    }
+
+    /// Each written lane's `speed` attribute, by `<edge>_<index>`, read back from the
+    /// `.edg.xml` rather than from the exporter's state.
+    fn lane_speeds(network: &PlainNetwork) -> HashMap<String, Option<String>> {
+        let mut speeds = HashMap::new();
+        let mut edge = String::new();
+        let mut reader = quick_xml::Reader::from_str(&network.edges);
+        loop {
+            let event = reader.read_event().unwrap();
+            let element = match &event {
+                Event::Eof => break,
+                Event::Start(element) | Event::Empty(element) => element,
+                _ => continue,
+            };
+            let attribute = |name: &str| {
+                element
+                    .attributes()
+                    .map(Result::unwrap)
+                    .find(|attribute| attribute.key.as_ref() == name.as_bytes())
+                    .map(|attribute| String::from_utf8_lossy(&attribute.value).into_owned())
+            };
+            match element.name().as_ref() {
+                b"edge" => edge = attribute("id").unwrap(),
+                b"lane" => {
+                    speeds.insert(
+                        format!("{edge}_{}", attribute("index").unwrap()),
+                        attribute("speed"),
+                    );
+                }
+                _ => {}
+            }
+        }
+        speeds
+    }
+
+    #[test]
+    fn a_speed_limit_rule_is_the_speed_of_the_lanes_it_names() {
+        let map = ruled_street();
+        let network = to_plain_xml(&map).unwrap();
+        let speeds = lane_speeds(&network);
+        let written = |index| &network.lanes[&lane_at(&map, index).id];
+
+        // The rule replaces the lane's own 60 km/h, as it does in Lanelet2.
+        assert_eq!(speeds[written(0)].as_deref(), Some("8.333"));
+        // Of two rules over one lane, the lower is the one written.
+        assert_eq!(speeds[written(1)].as_deref(), Some("11.111"));
+        // A lane no rule names, with no limit of its own, keeps the edge's speed.
+        assert_eq!(speeds[written(2)], None);
+        // And the border lane the first rule also names is not written at all.
+        assert!(!network.lanes.contains_key(&lane_at(&map, 3).id));
+    }
+
+    #[test]
+    fn a_speed_limit_rule_is_merged_into_the_lanes_it_set() {
+        let map = ruled_street();
+        let network = to_plain_xml(&map).unwrap();
+        let rule_links = |rule: usize| -> Vec<&TraceLink> {
+            network.trace.links_of(&IrRef::Rule(rule)).collect()
+        };
+
+        for (rule, index) in [(0, 0), (1, 1)] {
+            let links = rule_links(rule);
+            assert_eq!(links.len(), 1, "rule {rule}");
+            assert_eq!(
+                links[0].local,
+                format!("lane:{}", network.lanes[&lane_at(&map, index).id])
+            );
+            assert_eq!(links[0].relation, Relation::Merged);
+            assert_eq!(links[0].role.as_deref(), Some("speed"));
+        }
+        // The 50 km/h rule lost to the 40 km/h one and left nothing in the file.
+        assert!(rule_links(2).is_empty());
+    }
+
+    #[test]
+    fn what_a_speed_limit_rule_cannot_reach_is_reported() {
+        let map = ruled_street();
+        let report = check(&map).join("\n");
+        assert!(
+            report.contains(&format!(
+                "no lane for is dropped with them: {}",
+                lane_at(&map, 3).id
+            )),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("the others are dropped: {}", lane_at(&map, 1).id)),
+            "{report}"
+        );
+        // A map with no such rules says nothing about them.
+        assert!(!check(&in_line()).join("\n").contains("speed-limit"));
     }
 
     // ----------------------------------------------------------------------- //
