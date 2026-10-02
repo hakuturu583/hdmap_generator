@@ -100,16 +100,27 @@
 //! internal lane (`via`) netconvert generated in place of the connector. A movement
 //! through a junction is two IR connections and one connector lane, all of them
 //! written as the one connection, so each is `merged` or `collapsed` into it.
+//!
+//! # Where on the globe
+//!
+//! The node file opens with a `<location>`: the PROJ definition of the frame the
+//! map's metres are read against, and the offset that takes a projected position to
+//! the network's own. netconvert carries it into the `.net.xml` unchanged, so the
+//! built network is georeferenced — `sumolib`'s `convertXY2LonLat` turns a junction
+//! back into the latitude and longitude the IR puts it at — while its coordinates
+//! stay the IR's metres, the same as every other export of the map. See
+//! [`location`] for which projection each of the map's projections becomes.
 
 pub mod classes;
 pub mod error;
+pub mod location;
 mod xml;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
-use roadgen_core::map::{Lane, Road, TrafficHandedness};
+use roadgen_core::map::{Lane, Projection, Road, TrafficHandedness};
 use roadgen_core::semantics::{LaneType, MapObjectKind, TrafficRule};
 use roadgen_core::topology::{
     Direction, LaneConnection, LaneEnd, LaneEndpoint, RoadEnd, RoadLinkTarget,
@@ -119,6 +130,7 @@ use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, Validated
 
 pub use classes::Permission;
 pub use error::ExportError;
+pub use location::{geo_reference, height_error, GeoReference};
 
 /// The name a map with none of its own is written under.
 const DEFAULT_NAME: &str = "network";
@@ -387,11 +399,42 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
     }
     problems.extend(Ids::new(map).renamed);
 
-    problems.push(
-        "the network is in the map's own metres about its origin; SUMO carries no \
-         geo-reference for it"
-            .to_owned(),
-    );
+    let altitude = map.metadata.origin.altitude();
+    if altitude != 0.0 {
+        problems.push(match map.metadata.projection {
+            Projection::LocalCartesian | Projection::Mgrs => format!(
+                "a SUMO `<location>` ties the network to the globe horizontally only: \
+                 the heights are the map's own z, and the origin's altitude of \
+                 {altitude} m is not written as a height — it is in the transverse \
+                 Mercator's scale, which keeps the horizontal positions those of the \
+                 east/north/up frame at that altitude"
+            ),
+            Projection::Utm => format!(
+                "a SUMO `<location>` ties the network to the globe horizontally only: \
+                 the heights are the map's own z, and the origin's altitude of \
+                 {altitude} m is not written"
+            ),
+        });
+    }
+
+    // What a 2D `<location>` cannot carry: each point's own height above the
+    // origin's plane. Measured along the reference lines, which is where the heights
+    // are; a lane's edge is never more than a few metres from its road's.
+    let worst = map
+        .roads
+        .iter()
+        .filter_map(|road| road.reference_line.samples(map.metadata.sampling).ok())
+        .flatten()
+        .map(|sample| height_error(map, &sample.point))
+        .fold(0.0, f64::max);
+    if worst >= 0.01 {
+        problems.push(format!(
+            "a SUMO `<location>` has no height, so `convertXY2LonLat` places a point \
+             above or below the origin's plane as if it were on it: up to {worst:.3} m \
+             from the latitude and longitude the Lanelet2 export gives it (the point's \
+             distance from the origin times its height, over the earth's radius)"
+        ));
+    }
     problems
 }
 
@@ -569,6 +612,9 @@ struct Exporter<'a> {
     yielding: HashSet<LaneId>,
     /// Junctions a right-of-way rule speaks about.
     ruled: HashSet<JunctionId>,
+    /// The attributes of the node file's `<location>`, worked out once everything
+    /// it has to bound has been built.
+    location: Vec<(&'static str, String)>,
 }
 
 impl<'a> Exporter<'a> {
@@ -586,6 +632,7 @@ impl<'a> Exporter<'a> {
             right_of_way: HashSet::new(),
             yielding: HashSet::new(),
             ruled: HashSet::new(),
+            location: Vec::new(),
         };
         exporter.read_rules();
         exporter
@@ -662,6 +709,24 @@ impl<'a> Exporter<'a> {
             }
         }
         self.build_connections()?;
+        let points = self
+            .nodes
+            .values()
+            .map(|node| &node.point)
+            .chain(self.edges.iter().flat_map(|edge| {
+                edge.shape.points().iter().chain(
+                    edge.lanes
+                        .iter()
+                        .flat_map(|lane| lane.shape.points().iter()),
+                )
+            }))
+            .chain(
+                self.movements
+                    .values()
+                    .filter_map(|movement| movement.shape.as_ref())
+                    .flat_map(|shape| shape.points().iter()),
+            );
+        self.location = location::location(self.map, points)?;
         Ok(())
     }
 
@@ -1491,6 +1556,9 @@ impl<'a> Exporter<'a> {
 
     fn render_nodes(&self) -> String {
         let mut document = xml::Document::new("nodes", "http://sumo.dlr.de/xsd/nodes_file.xsd");
+        // First, as the schema requires: netconvert takes the nodes that follow as
+        // positions in the frame it describes, and writes it into the network.
+        document.leaf("location", &self.location);
         for (id, node) in &self.nodes {
             let mut attributes = vec![
                 ("id", id.clone()),
@@ -1576,7 +1644,9 @@ impl<'a> Exporter<'a> {
 /// Normalising the offset is turned off because the map's metres are about its own
 /// geographic origin: a network shifted so that its lowest corner is at zero would no
 /// longer line up with the OpenDRIVE, the Lanelet2 map or the clip written from the
-/// same IR.
+/// same IR. The geo-reference does not need it either way — netconvert would fold the
+/// shift into the `netOffset` of the `<location>` the node file carries — but the
+/// coordinates would no longer be the IR's.
 ///
 /// Turnarounds are turned off because the IR has none. Left to itself netconvert adds
 /// a U-turn at every dead end — the far end of each arm — so a vehicle in SUMO could

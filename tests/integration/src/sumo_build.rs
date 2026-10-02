@@ -65,15 +65,19 @@ pub fn sumo_available() -> bool {
 /// Whether a line SUMO printed is about something other than the file it was given.
 ///
 /// Two kinds are not the export's business. One is about the machine: SUMO says so
-/// when `SUMO_HOME` is unset and it cannot find its schemas. The other is about the
+/// when `SUMO_HOME` is unset and it cannot find its schemas, and the PROJ it links
+/// says so when it cannot find its database — which a pip-installed SUMO's bundled
+/// PROJ never can, and which none of the definitions the export writes needs, since
+/// they name the ellipsoid and the projection outright. The other is about the
 /// *map*: where two roads meet at an angle, SUMO works out the turning radius of the
 /// link between them and lowers the speed a vehicle may take it at. That is SUMO
 /// reading the geometry correctly and saying what it found — a scenario like
 /// `two_roads_joined`, which bends by 26 degrees at the joint, should produce it.
 ///
 /// Everything else counts as a complaint and fails the test.
-fn is_about_the_machine_or_the_map(line: &str) -> bool {
+pub fn is_about_the_machine_or_the_map(line: &str) -> bool {
     line.contains("SUMO_HOME")
+        || line.contains("Cannot find proj.db")
         || (line.contains("Speed of") && line.contains("due to turning radius"))
 }
 
@@ -125,6 +129,53 @@ pub fn netconvert(directory: &Path, prefix: &str) -> PathBuf {
     directory.join(format!("{prefix}.net.xml"))
 }
 
+/// Every junction of the built network at `path`, as a longitude and latitude — worked
+/// out by SUMO.
+///
+/// netconvert is asked to read the network back and write it out as plain XML with
+/// geographic coordinates, which it does by undoing the network's `<location>` with
+/// its own PROJ: the offset taken off, the projection inverted. That is the same
+/// computation `sumolib`'s `convertXY2LonLat` makes, done by the program that owns the
+/// format, and to nine decimals of a degree — a tenth of a millimetre — rather than
+/// the six it writes by default.
+pub fn junctions_on_the_globe(path: &Path) -> HashMap<String, (f64, f64)> {
+    let directory = path.parent().expect("a network inside a directory");
+    let prefix = "on_the_globe";
+    let output = Command::new(tool("netconvert").expect("netconvert"))
+        .arg("-s")
+        .arg(path)
+        .args(["--plain-output-prefix", prefix])
+        .args(["--proj.plain-geo", "true"])
+        .args(["--precision.geo", "9"])
+        .current_dir(directory)
+        .output()
+        .expect("netconvert should run");
+    assert!(
+        output.status.success(),
+        "netconvert could not read the network back:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let xml = std::fs::read_to_string(directory.join(format!("{prefix}.nod.xml")))
+        .expect("netconvert should have written the nodes");
+    let mut reader = Reader::from_str(&xml);
+    let mut nodes = HashMap::new();
+    loop {
+        match reader.read_event().expect("valid node XML") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element) if element.name().as_ref() == b"node" => {
+                let attributes = attributes(&element);
+                nodes.insert(
+                    attributes["id"].clone(),
+                    (number(&attributes, "x"), number(&attributes, "y")),
+                );
+            }
+            _ => {}
+        }
+    }
+    nodes
+}
+
 /// Loads a built network into the simulator itself.
 ///
 /// netconvert accepting the plain XML says the *input* was well formed. This says the
@@ -162,6 +213,8 @@ pub fn simulate(directory: &Path, prefix: &str) {
 
 #[derive(Debug, Clone)]
 pub struct SumoNetwork {
+    /// The `<location>`: how the network is tied to the globe.
+    pub location: SumoLocation,
     /// Whether netconvert built the network for left-hand traffic, as it records on
     /// the `<net>` element. SUMO reads handedness from here and not from the
     /// geometry, so this is what the simulator will drive by.
@@ -169,6 +222,19 @@ pub struct SumoNetwork {
     pub edges: Vec<SumoEdge>,
     pub junctions: Vec<SumoJunction>,
     pub connections: Vec<SumoConnection>,
+}
+
+/// A network's `<location>`, read as SUMO states it: a network position is the
+/// position `proj_parameter` projects a longitude and latitude to, plus `net_offset`.
+#[derive(Debug, Clone, Default)]
+pub struct SumoLocation {
+    pub net_offset: (f64, f64),
+    /// `xmin, ymin, xmax, ymax` in the network's metres.
+    pub conv_boundary: [f64; 4],
+    /// `lonmin, latmin, lonmax, latmax`.
+    pub orig_boundary: [f64; 4],
+    /// The PROJ definition, or `!` for a network with none.
+    pub proj_parameter: String,
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +298,7 @@ impl SumoNetwork {
     fn parse(xml: &str) -> SumoNetwork {
         let mut reader = Reader::from_str(xml);
         let mut network = SumoNetwork {
+            location: SumoLocation::default(),
             lefthand: false,
             edges: Vec::new(),
             junctions: Vec::new(),
@@ -246,6 +313,30 @@ impl SumoNetwork {
                     let name = String::from_utf8_lossy(element.name().as_ref()).into_owned();
                     let attributes = attributes(element);
                     match name.as_str() {
+                        "location" => {
+                            let list = |key: &str| -> Vec<f64> {
+                                attributes
+                                    .get(key)
+                                    .map(|value| {
+                                        value
+                                            .split(',')
+                                            .map(|part| part.parse().expect("a number"))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            let offset = list("netOffset");
+                            network.location = SumoLocation {
+                                net_offset: (offset[0], offset[1]),
+                                conv_boundary: list("convBoundary")
+                                    .try_into()
+                                    .expect("four numbers"),
+                                orig_boundary: list("origBoundary")
+                                    .try_into()
+                                    .expect("four numbers"),
+                                proj_parameter: attributes["projParameter"].clone(),
+                            };
+                        }
                         "net" => {
                             network.lefthand =
                                 attributes.get("lefthand").map(String::as_str) == Some("true");

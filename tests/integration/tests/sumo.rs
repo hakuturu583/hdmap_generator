@@ -723,6 +723,201 @@ fn every_movement_netconvert_built_is_in_the_trace() {
     assert_eq!(matched, 12);
 }
 
+/// A crossroads with arms 2 km long, tied to the globe at `origin` through
+/// `projection`.
+fn located(origin: GeoOrigin, projection: Projection) -> ValidatedMap {
+    let mut builder = scenarios::crossroads_builder("located", 2_000.0);
+    builder.metadata_mut().origin = origin;
+    builder.metadata_mut().projection = projection;
+    builder.finish().unwrap().validate().unwrap()
+}
+
+/// The built network carries the map's geo-reference, and it is the right one: SUMO,
+/// undoing the network's `<location>` itself, puts every junction at the latitude and
+/// longitude the IR puts it at — the ones the Lanelet2 export writes — while the
+/// network's coordinates stay the IR's own metres.
+///
+/// Through each of the map's projections, and on both sides of the equator, because
+/// a UTM network south of it is the one with a false northing to get right.
+#[test]
+fn the_built_network_is_where_the_map_is_on_the_globe() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let tokyo = GeoOrigin::new(35.68, 139.76, 0.0).unwrap();
+    let sydney = GeoOrigin::new(-33.87, 151.21, 0.0).unwrap();
+    for (origin, projection) in [
+        (tokyo, Projection::LocalCartesian),
+        (sydney, Projection::LocalCartesian),
+        (tokyo, Projection::Utm),
+        (sydney, Projection::Utm),
+        (tokyo, Projection::Mgrs),
+    ] {
+        let case = format!("{} at {origin:?}", projection.as_str());
+        let map = located(origin, projection);
+        assert_on_the_globe(&map, &case, 5);
+    }
+}
+
+/// The same, from an origin 2000 m up — where a transverse Mercator at unit scale
+/// would put the far end of a 2 km arm 0.63 m from where the Lanelet2 export's
+/// east/north/up frame does — and with the far ends of three of the arms above or
+/// below the origin's plane, which a 2D `<location>` cannot say.
+#[test]
+fn a_high_origin_and_raised_junctions_are_where_the_map_is_on_the_globe() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let reach = 2_000.0;
+    for projection in [
+        Projection::LocalCartesian,
+        Projection::Mgrs,
+        Projection::Utm,
+    ] {
+        let mut builder = MapBuilder::new(scenarios::metadata("located"));
+        builder.metadata_mut().origin = GeoOrigin::new(35.68, 139.76, 2_000.0).unwrap();
+        builder.metadata_mut().projection = projection;
+        // Each arm climbs or falls from its far end to the level centre. The west one
+        // stays on the plane, so there the scale alone is under test.
+        let arms = [
+            (
+                "north",
+                Point3::new(0.0, reach, 60.0),
+                Point3::new(0.0, 14.0, 0.0),
+            ),
+            (
+                "east",
+                Point3::new(reach, 0.0, -40.0),
+                Point3::new(14.0, 0.0, 0.0),
+            ),
+            (
+                "south",
+                Point3::new(0.0, -reach, 100.0),
+                Point3::new(0.0, -14.0, 0.0),
+            ),
+            (
+                "west",
+                Point3::new(-reach, 0.0, 0.0),
+                Point3::new(-14.0, 0.0, 0.0),
+            ),
+        ];
+        let roads: Vec<_> = arms
+            .into_iter()
+            .map(|(name, start, end)| {
+                builder
+                    .add_road(
+                        RoadSpec::line(start, end, scenarios::two_way())
+                            .unwrap()
+                            .with_name(name),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let junction = builder.add_junction(Some("x"));
+        for (index, from) in roads.iter().enumerate() {
+            for to in roads.iter().skip(index + 1) {
+                builder
+                    .connect_ends(from, RoadEnd::End, to, RoadEnd::End, Some(&junction))
+                    .unwrap();
+            }
+        }
+        let map = builder.finish().unwrap().validate().unwrap();
+        let case = format!("{} 2000 m up with raised arms", projection.as_str());
+        let raised = assert_on_the_globe(&map, &case, 5);
+        // The raised ends are where SUMO lands off the IR by more than its own
+        // centimetre, so the bound is what the test leant on.
+        if projection != Projection::Utm {
+            assert!(raised > 0.01, "{case}: worst height error only {raised}");
+        }
+    }
+}
+
+/// Builds `map` with netconvert and checks its `<location>` against the map: what the
+/// network states, and where SUMO, undoing it, puts each of the `junctions`
+/// non-internal junctions. Returns the largest error from height allowed for.
+fn assert_on_the_globe(map: &ValidatedMap, case: &str, junctions: usize) -> f64 {
+    let projection = map.metadata.projection;
+    let (directory, network) = sumo_build::build(map);
+    let location = &network.location;
+
+    // What the export asked for is what the network says.
+    let reference = roadgen_sumo::geo_reference(map).unwrap();
+    assert_eq!(location.proj_parameter, reference.proj_parameter, "{case}");
+    // netconvert writes the offset to the centimetre, as it does every length.
+    assert!(
+        (location.net_offset.0 - reference.net_offset.0).abs() <= 0.005
+            && (location.net_offset.1 - reference.net_offset.1).abs() <= 0.005,
+        "{case}: the network's offset is {:?}, not {:?}",
+        location.net_offset,
+        reference.net_offset
+    );
+    if projection != Projection::Utm {
+        assert_eq!(location.net_offset, (0.0, 0.0), "{case}");
+        // A local map at sea level is in the frame the OpenDRIVE export describes,
+        // in the same words. Above it SUMO's transverse Mercator is scaled to the
+        // origin's plane and OpenDRIVE's is not, so the two differ by the `+k`.
+        let opendrive = roadgen_opendrive::origin_proj_string(map);
+        if map.metadata.origin.altitude() == 0.0 {
+            assert_eq!(location.proj_parameter, opendrive, "{case}");
+        } else {
+            assert_ne!(location.proj_parameter, opendrive, "{case}");
+            assert!(opendrive.contains("+k=1 "), "{opendrive}");
+        }
+    }
+
+    // The coordinates are still the IR's: the junction is at the origin.
+    let centre = network.junction("j_x").position;
+    assert!(centre.x.abs() < 0.02 && centre.y.abs() < 0.02, "{case}");
+
+    // And SUMO's own reading of every junction's position is the IR's.
+    let projector = roadgen_lanelet2::projector_for(map).unwrap();
+    let on_the_globe =
+        sumo_build::junctions_on_the_globe(&directory.path().join("located.net.xml"));
+    let [west, south, east, north] = location.orig_boundary;
+    let mut checked = 0;
+    let mut worst_height = 0.0f64;
+    for junction in network.junctions.iter().filter(|j| j.kind != "internal") {
+        let (lon, lat) = on_the_globe[&junction.id];
+        let p = junction.position;
+        let wanted = projector.reverse([p.x, p.y, p.z]).unwrap();
+        // Degrees to metres, near enough for a tolerance.
+        let metres_north = (lat - wanted.lat) * 111_320.0;
+        let metres_east = (lon - wanted.lon) * 111_320.0 * wanted.lat.to_radians().cos();
+        let error = metres_north.hypot(metres_east);
+        // The centimetre is netconvert's rounding of the offset and of the
+        // positions. Then 2 mm for a scaled transverse Mercator standing in for the
+        // east/north/up plane 2 km out from an origin 2000 m up (1.5 mm measured:
+        // one scale cannot match both radii of curvature), and the height a 2D
+        // `<location>` cannot carry, which the export states as a bound.
+        let height = roadgen_sumo::height_error(map, &p);
+        worst_height = worst_height.max(height);
+        let tolerance = 0.01 + 0.002 + height;
+        assert!(
+            error < tolerance,
+            "{case}: SUMO puts {} at ({lat:.9}, {lon:.9}), {error:.4} m from the \
+             IR's ({:.9}, {:.9}), more than {tolerance:.4} m",
+            junction.id,
+            wanted.lat,
+            wanted.lon
+        );
+        // And the boundary the network states holds it — to the millionth of a
+        // degree netconvert rounds a boundary to, since the far end of an arm is
+        // where the boundary is.
+        let slack = 1e-6;
+        assert!(
+            (west - slack..=east + slack).contains(&lon)
+                && (south - slack..=north + slack).contains(&lat),
+            "{case}: {} at ({lat}, {lon}) is outside the origBoundary {:?}",
+            junction.id,
+            location.orig_boundary
+        );
+        checked += 1;
+    }
+    // The centre and the far end of each arm.
+    assert_eq!(checked, junctions, "{case}");
+    worst_height
+}
+
 /// A movement across a junction follows the path the IR drew for it. The connector
 /// lane is not an edge, but its centreline is written as the connection's shape, and
 /// netconvert lays the internal lane along that — splitting it in two where a turn

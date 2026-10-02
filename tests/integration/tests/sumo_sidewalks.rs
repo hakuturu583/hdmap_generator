@@ -316,7 +316,8 @@ fn walk(directory: &Path, prefix: &str) -> BTreeMap<String, f64> {
     assert!(output.status.success(), "sumo failed:\n{stderr}");
     let complaints: Vec<&str> = stderr
         .lines()
-        .filter(|line| !line.trim().is_empty() && !line.contains("SUMO_HOME"))
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !sumo_build::is_about_the_machine_or_the_map(line))
         .collect();
     assert!(
         complaints.is_empty(),
