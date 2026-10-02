@@ -51,7 +51,10 @@
 //! `lefthand` set, and what a vehicle keeping to its side drives in.
 //!
 //! A road whose cross-section changes becomes one edge per cross-section, joined at
-//! an internal node: a SUMO edge has one lane count from end to end.
+//! an internal node: a SUMO edge has one lane count from end to end. Which lane
+//! carries on across that node is the IR's connections, written as the movements
+//! through it; for an edge the IR carries nothing on from, its movements onto the
+//! edges beyond are listed as deleted, so netconvert guesses none.
 //!
 //! Every lane is written with its own shape, so the geometry the generator computed
 //! is the geometry SUMO gets — not a centreline with a width, which is what a
@@ -83,6 +86,13 @@
 //! This is why the arms are left exactly where the IR puts them, short of the
 //! junction: the gap is the junction, and netconvert fills it along the connectors.
 //!
+//! Footways are the exception. SUMO's pedestrians do not walk along connections:
+//! they cross a node on a *walking area* that netconvert builds there, joining every
+//! footway that meets at the node, walked either way. So the pavement the IR lays
+//! round a junction corner — a connector between two sidewalks — is not written as a
+//! connection, and neither is any other movement from one footway to another; the
+//! configuration asks netconvert for walking areas instead.
+//!
 //! # The trace
 //!
 //! [`PlainNetwork::trace`] records where each element of the IR went, naming the
@@ -93,9 +103,12 @@
 //! | `node:<id>` | a junction | exact |
 //! | `node:<id>` | a traffic light, role `traffic_light` | merged |
 //! | `edge:<id>` | a road — one edge per direction and cross-section | part |
+//! | `edge:<id>` | a right-of-way rule naming its lanes, role `priority` | merged |
 //! | `lane:<edge>_<index>` | a lane | exact |
+//! | `lane:<edge>_<index>` | a speed-limit rule naming the lane, role `speed` | merged |
 //! | `connection:<from edge>_<from lane>><to edge>_<to lane>` | a lane connection | exact, or merged |
 //! | the same connection | a connector lane it runs over | collapsed |
+//! | `node:<id>`, role `walkingarea` | a connection between two footways, and a pavement lane round a corner | collapsed |
 //!
 //! A connection is named by its two lanes as the built network names them, so the
 //! `.net.xml` `<connection from fromLane to toLane via>` that netconvert writes for it
@@ -103,23 +116,37 @@
 //! internal lane (`via`) netconvert generated in place of the connector. A movement
 //! through a junction is two IR connections and one connector lane, all of them
 //! written as the one connection, so each is `merged` or `collapsed` into it.
+//!
+//! # Where on the globe
+//!
+//! The node file opens with a `<location>`: the PROJ definition of the frame the
+//! map's metres are read against, and the offset that takes a projected position to
+//! the network's own. netconvert carries it into the `.net.xml` unchanged, so the
+//! built network is georeferenced — `sumolib`'s `convertXY2LonLat` turns a junction
+//! back into the latitude and longitude the IR puts it at — while its coordinates
+//! stay the IR's metres, the same as every other export of the map. See
+//! [`location`] for which projection each of the map's projections becomes.
 
 pub mod classes;
 pub mod error;
+pub mod location;
 mod xml;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
-use roadgen_core::map::{Lane, Road, TrafficHandedness};
-use roadgen_core::semantics::{MapObjectKind, TrafficRule};
-use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd, RoadLinkTarget};
+use roadgen_core::map::{Lane, Projection, Road, TrafficHandedness};
+use roadgen_core::semantics::{LaneType, MapObjectKind, TrafficRule};
+use roadgen_core::topology::{
+    Direction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadLinkTarget,
+};
 use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, ValidatedMap};
 
 pub use classes::Permission;
 pub use error::ExportError;
+pub use location::{geo_reference, height_error, GeoReference};
 
 /// The name a map with none of its own is written under.
 const DEFAULT_NAME: &str = "network";
@@ -284,23 +311,6 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         );
     }
 
-    let sectioned: Vec<&str> = map
-        .roads
-        .iter()
-        .filter(|road| !road.is_connector() && road.sections.len() > 1)
-        .map(|road| road.id.as_str())
-        .collect();
-    if !sectioned.is_empty() {
-        problems.push(format!(
-            "an edge has one lane count, so the changing cross-section of {} becomes \
-             a chain of edges with a node between them, and which lane continues into \
-             which across that node is netconvert's lane-matching — the IR states no \
-             movement there: {}",
-            sectioned.len(),
-            sectioned.join(", ")
-        ));
-    }
-
     let signals = map
         .objects
         .iter()
@@ -348,6 +358,27 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         );
     }
 
+    let footway = |lane: &LaneId| {
+        map.lane(lane)
+            .is_some_and(|lane| lane.lane_type == LaneType::Sidewalk)
+    };
+    let walks = map
+        .connections
+        .iter()
+        .filter(|connection| footway(&connection.from.lane) && footway(&connection.to.lane))
+        .count();
+    if walks > 0 {
+        problems.push(format!(
+            "SUMO's pedestrians cross a node on the walking area netconvert builds \
+             there, not along connections, so the {walks} connections between \
+             footways — the pavements round junction corners among them — are not \
+             written: at each node, a pedestrian may walk between any of the footways \
+             that meet there, in either direction"
+        ));
+    }
+
+    problems.extend(speed_limit_problems(map));
+
     if !map.junctions.is_empty() {
         problems.push(format!(
             "the connector roads of the {} junctions are not written as edges: SUMO \
@@ -370,11 +401,112 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
     }
     problems.extend(Ids::new(map).renamed);
 
-    problems.push(
-        "the network is in the map's own metres about its origin; SUMO carries no \
-         geo-reference for it"
-            .to_owned(),
-    );
+    let altitude = map.metadata.origin.altitude();
+    if altitude != 0.0 {
+        problems.push(match map.metadata.projection {
+            Projection::LocalCartesian | Projection::Mgrs => format!(
+                "a SUMO `<location>` ties the network to the globe horizontally only: \
+                 the heights are the map's own z, and the origin's altitude of \
+                 {altitude} m is not written as a height — it is in the transverse \
+                 Mercator's scale, which keeps the horizontal positions those of the \
+                 east/north/up frame at that altitude"
+            ),
+            Projection::Utm => format!(
+                "a SUMO `<location>` ties the network to the globe horizontally only: \
+                 the heights are the map's own z, and the origin's altitude of \
+                 {altitude} m is not written"
+            ),
+        });
+    }
+
+    // What a 2D `<location>` cannot carry: each point's own height above the
+    // origin's plane. Measured along the reference lines, which is where the heights
+    // are; a lane's edge is never more than a few metres from its road's.
+    let worst = map
+        .roads
+        .iter()
+        .filter_map(|road| road.reference_line.samples(map.metadata.sampling).ok())
+        .flatten()
+        .map(|sample| height_error(map, &sample.point))
+        .fold(0.0, f64::max);
+    if worst >= 0.01 {
+        problems.push(format!(
+            "a SUMO `<location>` has no height, so `convertXY2LonLat` places a point \
+             above or below the origin's plane as if it were on it: up to {worst:.3} m \
+             from the latitude and longitude the Lanelet2 export gives it (the point's \
+             distance from the origin times its height, over the earth's radius)"
+        ));
+    }
+    problems
+}
+
+/// What of the map's `SpeedLimit` rules does not reach a lane `speed`.
+///
+/// A rule names lanes, and an IR lane runs the whole length of one cross-section of
+/// its road — which is exactly what one lane of one edge is — so wherever the lane it
+/// names is written, the rule is written exactly. What is lost is the rest:
+///
+/// - a lane on a **connector road**, because the connectors are not written as edges
+///   and the internal lane netconvert builds in their place takes the speed
+///   netconvert works out for the turn;
+/// - a lane of a type SUMO has **no lane for**, because nothing is written for it to
+///   go on;
+/// - the **higher** of two rules naming the same lane, because a lane has one speed
+///   and the lower of them is the one a driver has to keep to.
+fn speed_limit_problems(map: &ValidatedMap) -> Vec<String> {
+    let mut on_connectors = BTreeSet::new();
+    let mut on_unwritten = BTreeSet::new();
+    let mut limits: BTreeMap<&LaneId, BTreeSet<u64>> = BTreeMap::new();
+    for rule in &map.rules {
+        let TrafficRule::SpeedLimit { limit, lanes } = rule else {
+            continue;
+        };
+        for id in lanes {
+            let Some(lane) = map.lane(id) else {
+                continue;
+            };
+            if map.road(&lane.road).is_some_and(Road::is_connector) {
+                on_connectors.insert(id.as_str());
+            } else if classes::permission(lane.lane_type).is_none() {
+                on_unwritten.insert(id.as_str());
+            } else {
+                // Compared as bit patterns so a set can hold them; two limits that
+                // are the same number are the same rule as far as the lane goes.
+                limits.entry(id).or_default().insert(limit.mps().to_bits());
+            }
+        }
+    }
+    let contested: Vec<&str> = limits
+        .into_iter()
+        .filter(|(_, limits)| limits.len() > 1)
+        .map(|(lane, _)| lane.as_str())
+        .collect();
+
+    let mut problems = Vec::new();
+    if !on_connectors.is_empty() {
+        problems.push(format!(
+            "the connector roads are not written as edges, so a speed-limit rule on \
+             the {} connector lanes it names is not written: netconvert sets the speed \
+             of the internal lane it builds for each movement: {}",
+            on_connectors.len(),
+            on_connectors.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !on_unwritten.is_empty() {
+        problems.push(format!(
+            "a speed-limit rule on the {} lanes SUMO has no lane for is dropped with \
+             them: {}",
+            on_unwritten.len(),
+            on_unwritten.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !contested.is_empty() {
+        problems.push(format!(
+            "a SUMO lane has one speed, so where speed-limit rules disagree about a \
+             lane the lowest of them is written and the others are dropped: {}",
+            contested.join(", ")
+        ));
+    }
     problems
 }
 
@@ -541,6 +673,11 @@ struct Exporter<'a> {
     /// connectors between one pair of lanes would otherwise write the same movement
     /// twice.
     movements: BTreeMap<(usize, usize, usize, usize), Movement>,
+    /// What the IR says about walking from one footway to another, by the node it
+    /// happens at. None of it is written as a connection: netconvert builds a
+    /// walking area at every node footways meet at, and that is how SUMO's
+    /// pedestrians get from one to the next. See [`Exporter::connect`].
+    walking: BTreeMap<String, Movement>,
     slots: HashMap<LaneId, Slot>,
     /// Junctions a traffic light controls an approach to.
     /// The signalised junctions, each with the lights that govern it.
@@ -552,6 +689,12 @@ struct Exporter<'a> {
     yielding: HashSet<LaneId>,
     /// Junctions a right-of-way rule speaks about.
     ruled: HashSet<JunctionId>,
+    /// The speed each lane named by a `SpeedLimit` rule is held to, in m/s, and the
+    /// rules that hold it there. See [`Exporter::lane_speed`].
+    rule_speeds: HashMap<LaneId, (f64, Vec<usize>)>,
+    /// The attributes of the node file's `<location>`, worked out once everything
+    /// it has to bound has been built.
+    location: Vec<(&'static str, String)>,
 }
 
 impl<'a> Exporter<'a> {
@@ -563,18 +706,22 @@ impl<'a> Exporter<'a> {
             nodes: BTreeMap::new(),
             edges: Vec::new(),
             movements: BTreeMap::new(),
+            walking: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: BTreeMap::new(),
             right_of_way: HashSet::new(),
             yielding: HashSet::new(),
             ruled: HashSet::new(),
+            rule_speeds: HashMap::new(),
+            location: Vec::new(),
         };
         exporter.read_rules();
         exporter
     }
 
-    /// The two things about a map that are decided before any edge is written: which
-    /// junctions are signalised, and which arms hold right of way over which.
+    /// The things about a map that are decided before any edge is written: which
+    /// junctions are signalised, which arms hold right of way over which, and which
+    /// lanes a speed-limit rule holds to a speed.
     fn read_rules(&mut self) {
         for object in self.map.objects.iter() {
             if !object.kind.is_traffic_light() {
@@ -606,6 +753,45 @@ impl<'a> Exporter<'a> {
             }
             self.right_of_way.extend(right_of_way.iter().cloned());
             self.yielding.extend(yielding.iter().cloned());
+        }
+
+        for (index, rule) in self.map.rules.iter().enumerate() {
+            let TrafficRule::SpeedLimit { limit, lanes } = rule else {
+                continue;
+            };
+            let limit = limit.mps();
+            for lane in lanes {
+                let held = self
+                    .rule_speeds
+                    .entry(lane.clone())
+                    .or_insert((limit, Vec::new()));
+                if limit < held.0 {
+                    *held = (limit, Vec::new());
+                }
+                // A rule that names one lane twice is still one rule over it.
+                if limit == held.0 && held.1.last() != Some(&index) {
+                    held.1.push(index);
+                }
+            }
+        }
+    }
+
+    /// The speed a lane is written with, in m/s, or `None` to leave it the edge's.
+    ///
+    /// A `SpeedLimit` rule is the IR saying how fast the lanes it names may be driven,
+    /// and where one names this lane it *is* the lane's limit: it replaces whatever
+    /// limit the lane carried of its own, as it does in the Lanelet2 export, where the
+    /// rule overwrites the lanelet's `speed_limit` tag. Where several rules name the
+    /// same lane the lowest of them is the one a driver has to keep to, so that is the
+    /// one written, and [`crate::check`] names the lane.
+    ///
+    /// Nothing is lost along the lane: an IR lane runs the whole of one cross-section
+    /// of its road, and one cross-section is one edge, so the rule covers the SUMO
+    /// lane from end to end exactly as it covers the IR lane.
+    fn lane_speed(&self, lane: &Lane) -> Option<f64> {
+        match self.rule_speeds.get(&lane.id) {
+            Some((limit, _)) => Some(*limit),
+            None => lane.speed_limit.map(|limit| limit.mps()),
         }
     }
 
@@ -645,6 +831,24 @@ impl<'a> Exporter<'a> {
         }
         self.build_connections()?;
         self.open_dead_ends();
+        let points = self
+            .nodes
+            .values()
+            .map(|node| &node.point)
+            .chain(self.edges.iter().flat_map(|edge| {
+                edge.shape.points().iter().chain(
+                    edge.lanes
+                        .iter()
+                        .flat_map(|lane| lane.shape.points().iter()),
+                )
+            }))
+            .chain(
+                self.movements
+                    .values()
+                    .filter_map(|movement| movement.shape.as_ref())
+                    .flat_map(|shape| shape.points().iter()),
+            );
+        self.location = location::location(self.map, points)?;
         Ok(())
     }
 
@@ -885,7 +1089,7 @@ impl<'a> Exporter<'a> {
             written.push(EdgeLane {
                 lane: lane.id.clone(),
                 width: self.mean_width(lane)?,
-                speed: lane.speed_limit.map(|limit| limit.mps()),
+                speed: self.lane_speed(lane),
                 permission: classes::permission(lane.lane_type),
                 restricted_left: to_left
                     .is_some_and(|other| !lane_change(lane, other, LateralSide::Left)),
@@ -1193,13 +1397,50 @@ impl<'a> Exporter<'a> {
             .is_some_and(Road::is_connector)
     }
 
-    fn connect(&mut self, from: &LaneId, to: &LaneId, movement: Movement) {
-        let (Some(from), Some(to)) = (self.slots.get(from), self.slots.get(to)) else {
+    /// Records one movement between two written lanes — as a connection, unless both
+    /// are footways.
+    ///
+    /// SUMO does not walk its pedestrians along connections. Where footways meet,
+    /// netconvert builds a *walking area* — a patch of pavement joining every
+    /// footway that ends or starts at the node, walked in any direction — and a
+    /// pedestrian crosses the node on it. That is the model every SUMO network with
+    /// pedestrians uses, and it is the one asked for here: the configuration sets
+    /// `walkingareas` (see [`render_config`]).
+    ///
+    /// The IR's model is not that. A pavement round a junction corner is a connector
+    /// road from one arm's sidewalk to the next arm's, and it is joined to them by a
+    /// connection at each end, read in whatever direction the two sidewalks happen
+    /// to run. Which sidewalk faces a corner depends on which end of each arm meets
+    /// the junction and on the side traffic keeps to, so the pavement can run *from*
+    /// a sidewalk that leaves the junction *to* one that arrives at it. Written as a
+    /// SUMO connection, that is a connection from an edge that starts at the node to
+    /// one that ends there, and netconvert refuses the network: "could not insert
+    /// connection … after build". Even where the directions happen to line up, the
+    /// connection would only say a pedestrian may walk round the corner one way, and
+    /// it would draw an internal lane across the walking area that netconvert builds
+    /// anyway.
+    ///
+    /// So a movement from footway to footway is not written. Where it happens — the
+    /// node it crosses, see [`Exporter::walking_nodes`] — is kept instead, and the
+    /// trace says that the IR's connections and pavement lanes became part of that
+    /// node's walking area. A joint between two roads is treated the same way, for
+    /// the same reason: the walking area netconvert builds there is what joins the
+    /// two footways, in both directions.
+    fn connect(&mut self, source: &LaneId, target: &LaneId, movement: Movement) {
+        let (Some(&from), Some(&to)) = (self.slots.get(source), self.slots.get(target)) else {
             return;
         };
         if from.edge == to.edge {
             // Two lanes of one edge; SUMO says that with a lane change, not a
             // connection.
+            return;
+        }
+        if self.is_footway(from) && self.is_footway(to) {
+            for (node, part) in self.walking_nodes(source, target, movement) {
+                let walked = self.walking.entry(node).or_default();
+                walked.connections.extend(part.connections);
+                walked.connectors.extend(part.connectors);
+            }
             return;
         }
         let key = (from.edge, from.index, to.edge, to.index);
@@ -1208,6 +1449,134 @@ impl<'a> Exporter<'a> {
         merged.connectors.extend(movement.connectors);
         if merged.shape.is_none() {
             merged.shape = movement.shape;
+        }
+    }
+
+    /// Whether a written lane is one only pedestrians may use.
+    fn is_footway(&self, slot: Slot) -> bool {
+        self.edges[slot.edge].lanes[slot.index].permission
+            == classes::permission(LaneType::Sidewalk)
+    }
+
+    /// The nodes a walk from footway `source` to footway `target` crosses, each with
+    /// the part of `movement` that crosses it.
+    ///
+    /// Read from the ends the IR's connections name, not from the edges: the two
+    /// sidewalks of one road are carried by its two edges, which share *both* their
+    /// nodes, so the edges alone cannot say which end of the road a pavement joining
+    /// them turns at. A connection out of the source names the end of the source it
+    /// leaves by, and one into the target the end of the target it arrives at; each
+    /// is a node of that lane's edge. A pavement lane between them — and the
+    /// connections on from it — crosses the node of the connection it was reached
+    /// by. The walk may cross more than one node, when the two sidewalks are joined
+    /// round both ends of a road. Anything no connection places falls back to the
+    /// node the two edges share (see [`Exporter::shared_node`]).
+    fn walking_nodes(
+        &self,
+        source: &LaneId,
+        target: &LaneId,
+        movement: Movement,
+    ) -> BTreeMap<String, Movement> {
+        let connections: Vec<&LaneConnection> = movement
+            .connections
+            .iter()
+            .filter_map(|id| self.map.connections.get(id))
+            .collect();
+        let mut connection_node: HashMap<&ConnectionId, String> = HashMap::new();
+        let mut lane_node: HashMap<&LaneId, String> = HashMap::new();
+        for connection in &connections {
+            let placed = if &connection.from.lane == source {
+                self.node_at(&connection.from)
+                    .map(|node| (node, &connection.to.lane))
+            } else if &connection.to.lane == target {
+                self.node_at(&connection.to)
+                    .map(|node| (node, &connection.from.lane))
+            } else {
+                None
+            };
+            if let Some((node, other)) = placed {
+                lane_node.entry(other).or_insert_with(|| node.clone());
+                connection_node.insert(&connection.id, node);
+            }
+        }
+        // Carry each node on through the pavement lanes it was reached by.
+        loop {
+            let mut changed = false;
+            for connection in &connections {
+                if connection_node.contains_key(&connection.id) {
+                    continue;
+                }
+                let Some(node) = lane_node
+                    .get(&connection.from.lane)
+                    .or_else(|| lane_node.get(&connection.to.lane))
+                    .cloned()
+                else {
+                    continue;
+                };
+                for lane in [&connection.from.lane, &connection.to.lane] {
+                    lane_node.entry(lane).or_insert_with(|| node.clone());
+                }
+                connection_node.insert(&connection.id, node);
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let fallback = || self.shared_node(self.slots[source].edge, self.slots[target].edge);
+        let mut parts: BTreeMap<String, Movement> = BTreeMap::new();
+        for connection in movement.connections {
+            let node = connection_node
+                .get(&connection)
+                .cloned()
+                .unwrap_or_else(fallback);
+            parts
+                .entry(node)
+                .or_default()
+                .connections
+                .insert(connection);
+        }
+        for connector in movement.connectors {
+            let node = lane_node.get(&connector).cloned().unwrap_or_else(fallback);
+            parts.entry(node).or_default().connectors.insert(connector);
+        }
+        parts
+    }
+
+    /// The node at one end of a written lane: the end of its edge that the lane's
+    /// end, counted along the reference line, lies on.
+    fn node_at(&self, endpoint: &LaneEndpoint) -> Option<String> {
+        let slot = self.slots.get(&endpoint.lane)?;
+        let direction = self.map.lane(&endpoint.lane)?.direction;
+        let edge = &self.edges[slot.edge];
+        // A forward edge runs from the section's start to its end; a backward edge
+        // the other way.
+        Some(match (direction, endpoint.end) {
+            (Direction::Forward, LaneEnd::Start) | (Direction::Backward, LaneEnd::End) => {
+                edge.from.clone()
+            }
+            (Direction::Forward, LaneEnd::End) | (Direction::Backward, LaneEnd::Start) => {
+                edge.to.clone()
+            }
+        })
+    }
+
+    /// The node two edges meet at, for a walk no connection places.
+    ///
+    /// Read from the edges' own ends rather than from the direction of travel,
+    /// because a movement between two footways need not follow it: the pavement
+    /// round a corner can start on a sidewalk that leaves the junction. Where the
+    /// first edge's far end is one of the second's ends, that is the node; otherwise
+    /// it is the first edge's near end. Two edges that share both their nodes — the
+    /// two directions of one road — make this a guess, which is why
+    /// [`Exporter::walking_nodes`] asks the connections first.
+    fn shared_node(&self, from: usize, to: usize) -> String {
+        let (from, to) = (&self.edges[from], &self.edges[to]);
+        if from.to == to.from || from.to == to.to {
+            from.to.clone()
+        } else {
+            from.from.clone()
         }
     }
 
@@ -1292,6 +1661,26 @@ impl<'a> Exporter<'a> {
             }
         }
 
+        // A speed-limit rule is the `speed` of each lane it names — merged into a lane
+        // that is otherwise the IR lane's, as the right-of-way rule is merged into an
+        // edge's priority. Only the rules whose limit was the one written are linked:
+        // a higher rule over the same lane left nothing in the file.
+        for edge in &self.edges {
+            for (index, lane) in edge.lanes.iter().enumerate() {
+                let Some((_, rules)) = self.rule_speeds.get(&lane.lane) else {
+                    continue;
+                };
+                for rule in rules {
+                    trace.link_as(
+                        IrRef::Rule(*rule),
+                        format!("lane:{}_{index}", edge.id),
+                        Relation::Merged,
+                        "speed",
+                    );
+                }
+            }
+        }
+
         for edge in &self.edges {
             trace.link(
                 edge.road.clone(),
@@ -1326,11 +1715,37 @@ impl<'a> Exporter<'a> {
                 trace.link(connector.clone(), local.clone(), Relation::Collapsed);
             }
         }
+
+        // A walk from one footway to another is the walking area netconvert builds
+        // at the node, which the export cannot name — so it is traced to the node,
+        // as part of what that node became.
+        for (node, walked) in &self.walking {
+            let local = format!("node:{node}");
+            for connection in &walked.connections {
+                trace.link_as(
+                    connection.clone(),
+                    local.clone(),
+                    Relation::Collapsed,
+                    "walkingarea",
+                );
+            }
+            for connector in &walked.connectors {
+                trace.link_as(
+                    connector.clone(),
+                    local.clone(),
+                    Relation::Collapsed,
+                    "walkingarea",
+                );
+            }
+        }
         trace
     }
 
     fn render_nodes(&self) -> String {
         let mut document = xml::Document::new("nodes", "http://sumo.dlr.de/xsd/nodes_file.xsd");
+        // First, as the schema requires: netconvert takes the nodes that follow as
+        // positions in the frame it describes, and writes it into the network.
+        document.leaf("location", &self.location);
         for (id, node) in &self.nodes {
             let mut attributes = vec![
                 ("id", id.clone()),
@@ -1415,7 +1830,49 @@ impl<'a> Exporter<'a> {
             }
             document.leaf("connection", &attributes);
         }
+        // An edge none of whose lanes the IR carries on from, leading anywhere but a
+        // dead end. With nothing listed for it netconvert would take its movements
+        // as unspecified and guess some — a lane dropped where the type changes, say
+        // driving into cycling, would be carried on into the cycle lane — so the
+        // edge's movements onto each edge leaving the node it runs into are listed
+        // as deleted. A `<connection>` with no target says the same thing to newer
+        // versions, but netconvert 1.18 still guesses past it; a `<delete>` is
+        // honoured by both, and deleting movements netconvert would not have built
+        // (the turnaround, which `no-turnarounds` already rules out) is silent.
+        // netconvert warns that the edge goes nowhere, and that is what the IR says.
+        for unconnected in self.unconnected_edges() {
+            let edge = &self.edges[unconnected];
+            for next in self.edges.iter().filter(|next| next.from == edge.to) {
+                document.leaf(
+                    "delete",
+                    &[("from", edge.id.clone()), ("to", next.id.clone())],
+                );
+            }
+        }
         document.finish()
+    }
+
+    /// The edges that run into a node something could continue from, but from which
+    /// the IR states no movement at all.
+    ///
+    /// A footway is not one of them: pedestrians do not follow connections but cross
+    /// a node on its walking area, so there is no movement for netconvert to guess.
+    fn unconnected_edges(&self) -> Vec<usize> {
+        let connected: BTreeSet<usize> = self.movements.keys().map(|key| key.0).collect();
+        let footway = |edge: &Edge| {
+            edge.lanes
+                .iter()
+                .all(|lane| lane.permission == Some(Permission::Allow("pedestrian")))
+        };
+        (0..self.edges.len())
+            .filter(|edge| !connected.contains(edge))
+            .filter(|&edge| !footway(&self.edges[edge]))
+            .filter(|&edge| {
+                self.nodes
+                    .get(&self.edges[edge].to)
+                    .is_some_and(|node| node.kind != NodeKind::DeadEnd)
+            })
+            .collect()
     }
 }
 
@@ -1460,13 +1917,22 @@ fn lane_change(lane: &Lane, neighbour: &Lane, towards: LateralSide) -> bool {
 /// Normalising the offset is turned off because the map's metres are about its own
 /// geographic origin: a network shifted so that its lowest corner is at zero would no
 /// longer line up with the OpenDRIVE, the Lanelet2 map or the clip written from the
-/// same IR.
+/// same IR. The geo-reference does not need it either way — netconvert would fold the
+/// shift into the `netOffset` of the `<location>` the node file carries — but the
+/// coordinates would no longer be the IR's.
 ///
 /// Turnarounds are turned off because the IR has none. Left to itself netconvert adds
 /// a U-turn at every dead end — the far end of each arm — so a vehicle in SUMO could
 /// turn back where, in the OpenDRIVE and the Lanelet2 map written from the same IR,
 /// the lane simply ends; and the internal lane it draws for one would be the only
 /// lane in the network the trace could not follow back to the map.
+///
+/// Walking areas are turned on because they are how SUMO's pedestrians cross a node,
+/// and the export relies on them: no connection is written between two footways (see
+/// [`Exporter::connect`]). Left to itself netconvert builds walking areas only at a
+/// node that also has a pedestrian crossing, which the export never writes, so a
+/// sidewalk would end at every junction. A network with no footways gets none, and
+/// nothing else about it changes.
 ///
 /// Left-hand traffic is stated when the map drives on the left, because netconvert
 /// cannot infer it and assumes the right. Left unsaid, a left-hand map is built as a
@@ -1499,6 +1965,9 @@ fn render_config(prefix: &str, handedness: TrafficHandedness) -> String {
         document.leaf("lefthand", &[("value", "true".into())]);
     }
     document.close("processing");
+    document.open("pedestrian", &[]);
+    document.leaf("walkingareas", &[("value", "true".into())]);
+    document.close("pedestrian");
     document.finish()
 }
 
@@ -1906,6 +2375,32 @@ mod tests {
         builder.finish().unwrap().validate().unwrap()
     }
 
+    /// A two-way road whose forward lane becomes a cycle lane halfway along, while the
+    /// backward lane stays a driving lane throughout.
+    fn type_change() -> ValidatedMap {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("type-change"));
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(200.0, 0.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("r")
+                .with_cross_section(
+                    100.0,
+                    vec![
+                        LaneSpec::new(width, Direction::Forward).with_type(LaneType::Biking),
+                        LaneSpec::new(width, Direction::Backward),
+                    ],
+                ),
+            )
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
     /// A map whose names collide once SUMO's refused characters are replaced: a chain
     /// of roads called `A;B`, `A_B`, `A B` and `A_B~1`, two junctions called `J;1` and
     /// `J 1` with three arms each, and a road `c` with two cross-sections next to a
@@ -2118,6 +2613,12 @@ mod tests {
                     b"lane" => {
                         found.insert(format!("lane:{edge}_{}", attributes["index"]));
                     }
+                    b"delete" => {
+                        found.insert(format!(
+                            "delete:{}>{}",
+                            attributes["from"], attributes["to"]
+                        ));
+                    }
                     b"connection" => {
                         found.insert(format!(
                             "connection:{}_{}>{}_{}",
@@ -2136,7 +2637,13 @@ mod tests {
 
     #[test]
     fn everything_the_trace_names_is_in_the_files() {
-        for map in [crossroads(), in_line(), colliding()] {
+        for map in [
+            crossroads(),
+            in_line(),
+            colliding(),
+            ruled_street(),
+            type_change(),
+        ] {
             let network = to_plain_xml(&map).unwrap();
             let written = written(&network);
             assert_eq!(network.trace.format, "sumo");
@@ -2164,7 +2671,7 @@ mod tests {
 
     #[test]
     fn every_written_lane_has_one_exact_link_matching_its_id() {
-        for map in [crossroads(), in_line(), colliding()] {
+        for map in [crossroads(), in_line(), colliding(), type_change()] {
             let network = to_plain_xml(&map).unwrap();
             assert!(!network.lanes.is_empty());
             for (lane, id) in &network.lanes {
@@ -2247,6 +2754,70 @@ mod tests {
             .any(|link| link.local == "connection:north.fwd_0>west.bwd_0"));
     }
 
+    /// Where no lane of an edge carries on into the next cross-section, every movement
+    /// netconvert could guess from the edge is deleted; left out, netconvert would
+    /// guess a movement the IR does not have.
+    #[test]
+    fn an_edge_the_map_carries_nothing_on_from_connects_to_nothing() {
+        let map = type_change();
+        let network = to_plain_xml(&map).unwrap();
+        let written = written(&network);
+
+        // The driving lane ends where the cycle lane begins: nothing joins them, and
+        // nothing turns it back either.
+        assert!(written.contains("delete:r.0.fwd>r.1.fwd"), "{written:?}");
+        assert!(
+            !written
+                .iter()
+                .any(|element| element.starts_with("connection:r.0.fwd_")),
+            "{written:?}"
+        );
+        // The other carriageway carries on, so it is written as the movement it is.
+        assert!(
+            written.contains("connection:r.1.bwd_0>r.0.bwd_0"),
+            "{written:?}"
+        );
+        // Only the edge that goes nowhere has anything deleted: the far end of either
+        // carriageway is a dead end, where nothing continues for netconvert to guess.
+        assert!(
+            written
+                .iter()
+                .filter(|element| element.starts_with("delete:"))
+                .all(|element| element.starts_with("delete:r.0.fwd>")),
+            "{written:?}"
+        );
+    }
+
+    /// A footway the IR carries nothing on from is left alone: pedestrians cross a
+    /// node on its walking area, not along connections, so there is nothing for
+    /// netconvert to guess and nothing to delete.
+    #[test]
+    fn a_footway_the_map_carries_nothing_on_from_has_nothing_deleted() {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("footway-ends"));
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(200.0, 0.0, 0.0),
+                    vec![LaneSpec::new(width, Direction::Forward).with_type(LaneType::Sidewalk)],
+                )
+                .unwrap()
+                .with_name("r")
+                .with_cross_section(100.0, vec![LaneSpec::new(width, Direction::Forward)]),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+        let written = written(&network);
+
+        assert!(written.contains("edge:r.0.fwd"), "{written:?}");
+        assert!(
+            !written.iter().any(|element| element.starts_with("delete:")),
+            "{written:?}"
+        );
+    }
+
     #[test]
     fn a_connection_between_two_roads_is_exact() {
         let map = in_line();
@@ -2261,6 +2832,110 @@ mod tests {
         for link in connections {
             assert_eq!(link.relation, Relation::Exact, "{}", link.local);
             assert!(matches!(link.ir, IrRef::Connection(_)));
+        }
+    }
+
+    /// A road whose two sidewalks — one on each of its two edges, which share both
+    /// their nodes — are joined by a pavement turning back round each end, through a
+    /// junction there of its own: `start` and `end`. Both walks are read from the
+    /// forward sidewalk to the backward one, so the exporter follows them as one
+    /// movement.
+    ///
+    /// The builder lays a footway the way traffic would run, which round the start is
+    /// from the backward sidewalk to the forward one; that walk is reversed by hand
+    /// afterwards. A corner pavement is read in whatever direction its two sidewalks
+    /// happen to run, and a footway connection may leave by either end.
+    fn turn_back() -> ValidatedMap {
+        let width = |metres| PositiveWidth::new(metres).unwrap();
+        let street = vec![
+            LaneSpec::new(width(3.5), Direction::Backward),
+            LaneSpec::new(width(2.0), Direction::Backward).with_type(LaneType::Sidewalk),
+            LaneSpec::new(width(3.5), Direction::Forward),
+            LaneSpec::new(width(2.0), Direction::Forward).with_type(LaneType::Sidewalk),
+        ];
+        let mut builder = MapBuilder::new(metadata("turn-back"));
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    street,
+                )
+                .unwrap()
+                .with_name("street"),
+            )
+            .unwrap();
+        let (backward, forward) = (LaneRef::new(road.clone(), 1), LaneRef::new(road, 3));
+        // The backward sidewalk leaves by the road's start and the forward one by its
+        // end, so these are pavements round the start and round the end.
+        let start = builder.add_junction(Some("start"));
+        builder
+            .connect_lanes(&backward, &forward, Some(&start))
+            .unwrap();
+        let end = builder.add_junction(Some("end"));
+        builder
+            .connect_lanes(&forward, &backward, Some(&end))
+            .unwrap();
+        let mut map = builder.finish().unwrap().validate().unwrap().into_map();
+        for connection in map.connections.iter_mut() {
+            if connection.junction.as_ref() == Some(&start) {
+                std::mem::swap(&mut connection.from, &mut connection.to);
+            }
+        }
+        UnvalidatedMap::from_map(map).validate().unwrap()
+    }
+
+    #[test]
+    fn a_walk_between_the_two_edges_of_a_road_is_traced_to_the_end_it_happens_at() {
+        let map = turn_back();
+        let street = map
+            .roads
+            .iter()
+            .find(|road| road.name.as_deref() == Some("street"))
+            .unwrap();
+        let forward = map
+            .lanes
+            .iter()
+            .find(|lane| {
+                lane.road == street.id
+                    && lane.lane_type == LaneType::Sidewalk
+                    && lane.direction == Direction::Forward
+            })
+            .unwrap();
+        // Both walks leave the forward sidewalk: one by its start, the other by its
+        // end. The forward edge's far end is a node the backward edge starts at, so
+        // the edges alone would put both at the road's end.
+        let leaving: Vec<LaneEnd> = map
+            .connections
+            .iter()
+            .filter(|connection| connection.from.lane == forward.id)
+            .map(|connection| connection.from.end)
+            .collect();
+        assert!(leaving.contains(&LaneEnd::Start) && leaving.contains(&LaneEnd::End));
+
+        let network = to_plain_xml(&map).unwrap();
+        let trace = &network.trace;
+        let written = written(&network);
+        assert_eq!(map.connections.len(), 4);
+        for connection in map.connections.iter() {
+            let junction = connection.junction.as_ref().unwrap();
+            let node = format!("node:j_{}", junction.local_name());
+            assert!(written.contains(&node), "{node}");
+            let links: Vec<_> = trace
+                .links_of(&IrRef::Connection(connection.id.clone()))
+                .collect();
+            assert_eq!(links.len(), 1, "{}", connection.id);
+            assert_eq!(links[0].local, node, "{}", connection.id);
+            assert_eq!(links[0].role.as_deref(), Some("walkingarea"));
+        }
+        for pavement in map.roads.iter().filter(|road| road.is_connector()) {
+            let junction = pavement.junction.as_ref().unwrap();
+            let node = format!("node:j_{}", junction.local_name());
+            for lane in map.lanes.iter().filter(|lane| lane.road == pavement.id) {
+                let links: Vec<_> = trace.links_of(&IrRef::Lane(lane.id.clone())).collect();
+                assert_eq!(links.len(), 1, "{}", lane.id);
+                assert_eq!(links[0].local, node, "{}", lane.id);
+            }
         }
     }
 
@@ -2568,6 +3243,138 @@ mod tests {
             assert_eq!(changes[&format!("{edge}_0")], (None, emergency()), "{edge}");
             assert_eq!(changes[&format!("{edge}_1")], (emergency(), None), "{edge}");
         }
+    }
+
+    // ----------------------------------------------------------------------- //
+    // Speed-limit rules
+    // ----------------------------------------------------------------------- //
+
+    /// One road with three rules over its lanes: one that overrides a lane's own
+    /// limit and also names a lane SUMO has no place for, and two that disagree about
+    /// the same lane.
+    fn ruled_street() -> ValidatedMap {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("ruled"));
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::ORIGIN,
+                    Point3::new(120.0, 0.0, 0.0),
+                    vec![
+                        LaneSpec::new(width, Direction::Forward)
+                            .with_speed_limit(SpeedLimit::from_kph(60.0).unwrap()),
+                        LaneSpec::new(width, Direction::Forward),
+                        LaneSpec::new(width, Direction::Backward),
+                        LaneSpec::new(width, Direction::Forward).with_type(LaneType::Border),
+                    ],
+                )
+                .unwrap()
+                .with_name("main"),
+            )
+            .unwrap();
+        let lane = |index| LaneRef::new(road.clone(), index);
+        let kph = |value| SpeedLimit::from_kph(value).unwrap();
+        builder.add_speed_limit_rule(kph(30.0), vec![lane(0), lane(3)]);
+        builder.add_speed_limit_rule(kph(40.0), vec![lane(1)]);
+        builder.add_speed_limit_rule(kph(50.0), vec![lane(1)]);
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// The IR lane at `index` in the road's cross-section.
+    fn lane_at(map: &ValidatedMap, index: usize) -> &Lane {
+        map.lanes.iter().find(|lane| lane.index == index).unwrap()
+    }
+
+    /// Each written lane's `speed` attribute, by `<edge>_<index>`, read back from the
+    /// `.edg.xml` rather than from the exporter's state.
+    fn lane_speeds(network: &PlainNetwork) -> HashMap<String, Option<String>> {
+        let mut speeds = HashMap::new();
+        let mut edge = String::new();
+        let mut reader = quick_xml::Reader::from_str(&network.edges);
+        loop {
+            let event = reader.read_event().unwrap();
+            let element = match &event {
+                Event::Eof => break,
+                Event::Start(element) | Event::Empty(element) => element,
+                _ => continue,
+            };
+            let attribute = |name: &str| {
+                element
+                    .attributes()
+                    .map(Result::unwrap)
+                    .find(|attribute| attribute.key.as_ref() == name.as_bytes())
+                    .map(|attribute| String::from_utf8_lossy(&attribute.value).into_owned())
+            };
+            match element.name().as_ref() {
+                b"edge" => edge = attribute("id").unwrap(),
+                b"lane" => {
+                    speeds.insert(
+                        format!("{edge}_{}", attribute("index").unwrap()),
+                        attribute("speed"),
+                    );
+                }
+                _ => {}
+            }
+        }
+        speeds
+    }
+
+    #[test]
+    fn a_speed_limit_rule_is_the_speed_of_the_lanes_it_names() {
+        let map = ruled_street();
+        let network = to_plain_xml(&map).unwrap();
+        let speeds = lane_speeds(&network);
+        let written = |index| &network.lanes[&lane_at(&map, index).id];
+
+        // The rule replaces the lane's own 60 km/h, as it does in Lanelet2.
+        assert_eq!(speeds[written(0)].as_deref(), Some("8.333"));
+        // Of two rules over one lane, the lower is the one written.
+        assert_eq!(speeds[written(1)].as_deref(), Some("11.111"));
+        // A lane no rule names, with no limit of its own, keeps the edge's speed.
+        assert_eq!(speeds[written(2)], None);
+        // And the border lane the first rule also names is not written at all.
+        assert!(!network.lanes.contains_key(&lane_at(&map, 3).id));
+    }
+
+    #[test]
+    fn a_speed_limit_rule_is_merged_into_the_lanes_it_set() {
+        let map = ruled_street();
+        let network = to_plain_xml(&map).unwrap();
+        let rule_links = |rule: usize| -> Vec<&TraceLink> {
+            network.trace.links_of(&IrRef::Rule(rule)).collect()
+        };
+
+        for (rule, index) in [(0, 0), (1, 1)] {
+            let links = rule_links(rule);
+            assert_eq!(links.len(), 1, "rule {rule}");
+            assert_eq!(
+                links[0].local,
+                format!("lane:{}", network.lanes[&lane_at(&map, index).id])
+            );
+            assert_eq!(links[0].relation, Relation::Merged);
+            assert_eq!(links[0].role.as_deref(), Some("speed"));
+        }
+        // The 50 km/h rule lost to the 40 km/h one and left nothing in the file.
+        assert!(rule_links(2).is_empty());
+    }
+
+    #[test]
+    fn what_a_speed_limit_rule_cannot_reach_is_reported() {
+        let map = ruled_street();
+        let report = check(&map).join("\n");
+        assert!(
+            report.contains(&format!(
+                "no lane for is dropped with them: {}",
+                lane_at(&map, 3).id
+            )),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("the others are dropped: {}", lane_at(&map, 1).id)),
+            "{report}"
+        );
+        // A map with no such rules says nothing about them.
+        assert!(!check(&in_line()).join("\n").contains("speed-limit"));
     }
 
     // ----------------------------------------------------------------------- //
