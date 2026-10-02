@@ -1044,6 +1044,45 @@ turn back at the far end of an arm where the OpenDRIVE and Lanelet2 maps of the 
 IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
 `no-turnarounds`, and the network has the movements the map has and no others.
 
+### Where on the globe
+
+The network is in the map's own metres about its origin — the generated configuration
+turns off netconvert's offset normalisation so that it stays that way, in the same
+coordinates as the other exports — and it is **georeferenced** all the same. The node
+file opens with a `<location>`, which netconvert carries into the `.net.xml` without
+moving a node:
+
+```xml
+<location netOffset="0.000,0.000" convBoundary="-2000.000,-2000.000,2000.000,2000.000"
+          origBoundary="139.737907026,35.661974335,139.782092974,35.698025610"
+          projParameter="+proj=tmerc +lat_0=35.68 +lon_0=139.76 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"/>
+```
+
+SUMO reads a network position as the projected position plus `netOffset`, so
+`sumolib`'s `net.convertXY2LonLat(x, y)` hands back the latitude and longitude the IR
+puts a point at — the ones the Lanelet2 export writes. For a UTM map netconvert
+writes the offset to the centimetre, which leaves them less than a centimetre apart.
+
+| map projection | `projParameter` | `netOffset` |
+| --- | --- | --- |
+| `local_cartesian`, `mgrs` | transverse Mercator about the origin, `+k=1+h/R` for an origin `h` m up (`R` the ellipsoid's mean radius of curvature there) — at `h = 0` the OpenDRIVE `<geoReference>` string, word for word | `0,0` |
+| `utm` | `+proj=utm +zone=<zone>` (`+south` below the equator) | minus the origin's easting and northing |
+
+An MGRS map's metres are local Cartesian about its origin like any other — MGRS only
+changes the grid position the Lanelet2 export reports beside them — so it is written
+the same way as a local one.
+
+A local map's metres are an east/north/up frame: a plane tangent to the ellipsoid at
+the origin's *altitude*, which the Lanelet2 export projects through. A metre on that
+plane is longer, measured on the ellipsoid beneath it, by `1 + h/R`, so the transverse
+Mercator is scaled by that much — at unit scale, 2 km out from an origin 2000 m up, it
+would be 0.63 m off; scaled, it is 1.5 mm off. (The OpenDRIVE `<geoReference>` is
+not scaled, so above sea level the two strings differ by the `+k`.) What a 2D
+`<location>` cannot carry at all is a point's own height above that plane: a point
+`z` above it and `d` from the origin is placed `d·|z|/R` from where the Lanelet2
+export puts it — 1.6 cm for 50 m at 2 km — and `sumo_warnings()` states that bound
+for the map whenever it reaches a centimetre.
+
 ### What it cannot carry
 
 - **Lane markings.** Which line is painted between two lanes, and in what colour, has
@@ -1061,9 +1100,10 @@ IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
   junction become internal lanes whose speed netconvert sets for the turn, and a lane
   of a type SUMO has no place for is dropped with its rule. Where rules disagree about
   a lane, the higher ones are dropped. `sumo_warnings()` names the lanes in each case.
-- **The geo-reference.** The network is in the map's own metres about its origin, and
-  the generated configuration turns off netconvert's offset normalisation so that it
-  stays that way — the same coordinates as the other four exports.
+- **Heights in the geo-reference.** A `<location>` is horizontal only; the heights
+  are the map's own `z`, as in every other export. The origin's altitude goes into a
+  local map's projection scale rather than being lost, but each point's own height
+  above the origin's plane cannot be, which `sumo_warnings()` bounds as above.
 
 ## CARLA
 
