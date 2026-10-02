@@ -607,3 +607,106 @@ fn every_movement_netconvert_built_is_in_the_trace() {
     // Every pair of the four arms, both ways.
     assert_eq!(matched, 12);
 }
+
+/// A crossroads with arms 2 km long, tied to the globe at `origin` through
+/// `projection`.
+fn located(origin: GeoOrigin, projection: Projection) -> ValidatedMap {
+    let mut builder = scenarios::crossroads_builder("located", 2_000.0);
+    builder.metadata_mut().origin = origin;
+    builder.metadata_mut().projection = projection;
+    builder.finish().unwrap().validate().unwrap()
+}
+
+/// The built network carries the map's geo-reference, and it is the right one: SUMO,
+/// undoing the network's `<location>` itself, puts every junction at the latitude and
+/// longitude the IR puts it at — the ones the Lanelet2 export writes — while the
+/// network's coordinates stay the IR's own metres.
+///
+/// Through each of the map's projections, and on both sides of the equator, because
+/// a UTM network south of it is the one with a false northing to get right.
+#[test]
+fn the_built_network_is_where_the_map_is_on_the_globe() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let tokyo = GeoOrigin::new(35.68, 139.76, 0.0).unwrap();
+    let sydney = GeoOrigin::new(-33.87, 151.21, 0.0).unwrap();
+    for (origin, projection) in [
+        (tokyo, Projection::LocalCartesian),
+        (sydney, Projection::LocalCartesian),
+        (tokyo, Projection::Utm),
+        (sydney, Projection::Utm),
+        (tokyo, Projection::Mgrs),
+    ] {
+        let case = format!("{} at {origin:?}", projection.as_str());
+        let map = located(origin, projection);
+        let (directory, network) = sumo_build::build(&map);
+        let location = &network.location;
+
+        // What the export asked for is what the network says.
+        let reference = roadgen_sumo::geo_reference(&map).unwrap();
+        assert_eq!(location.proj_parameter, reference.proj_parameter, "{case}");
+        // netconvert writes the offset to the centimetre, as it does every length.
+        assert!(
+            (location.net_offset.0 - reference.net_offset.0).abs() <= 0.005
+                && (location.net_offset.1 - reference.net_offset.1).abs() <= 0.005,
+            "{case}: the network's offset is {:?}, not {:?}",
+            location.net_offset,
+            reference.net_offset
+        );
+        if projection != Projection::Utm {
+            // A local map's frame is the one the OpenDRIVE export describes, in the
+            // same words.
+            assert_eq!(
+                location.proj_parameter,
+                roadgen_opendrive::origin_proj_string(&map),
+                "{case}"
+            );
+            assert_eq!(location.net_offset, (0.0, 0.0), "{case}");
+        }
+
+        // The coordinates are still the IR's: the junction is at the origin.
+        let centre = network.junction("j_x").position;
+        assert!(centre.x.abs() < 0.02 && centre.y.abs() < 0.02, "{case}");
+
+        // And SUMO's own reading of every junction's position is the IR's.
+        let projector = roadgen_lanelet2::projector_for(&map).unwrap();
+        let on_the_globe =
+            sumo_build::junctions_on_the_globe(&directory.path().join("located.net.xml"));
+        let [west, south, east, north] = location.orig_boundary;
+        let mut checked = 0;
+        for junction in network.junctions.iter().filter(|j| j.kind != "internal") {
+            let (lon, lat) = on_the_globe[&junction.id];
+            let p = junction.position;
+            let wanted = projector.reverse([p.x, p.y, p.z]).unwrap();
+            // Degrees to metres, near enough for a tolerance.
+            let metres_north = (lat - wanted.lat) * 111_320.0;
+            let metres_east = (lon - wanted.lon) * 111_320.0 * wanted.lat.to_radians().cos();
+            let error = metres_north.hypot(metres_east);
+            // The centimetre is netconvert's rounding of the offset; the projections
+            // themselves agree to well under a millimetre.
+            assert!(
+                error < 0.01,
+                "{case}: SUMO puts {} at ({lat:.9}, {lon:.9}), {error:.4} m from the \
+                 IR's ({:.9}, {:.9})",
+                junction.id,
+                wanted.lat,
+                wanted.lon
+            );
+            // And the boundary the network states holds it — to the millionth of a
+            // degree netconvert rounds a boundary to, since the far end of an arm is
+            // where the boundary is.
+            let slack = 1e-6;
+            assert!(
+                (west - slack..=east + slack).contains(&lon)
+                    && (south - slack..=north + slack).contains(&lat),
+                "{case}: {} at ({lat}, {lon}) is outside the origBoundary {:?}",
+                junction.id,
+                location.orig_boundary
+            );
+            checked += 1;
+        }
+        // The centre and the far end of each arm.
+        assert_eq!(checked, 5, "{case}");
+    }
+}

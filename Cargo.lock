@@ -1441,6 +1441,7 @@ dependencies = [
 name = "roadgen-sumo"
 version = "0.5.0"
 dependencies = [
+ "ll2-projection",
  "quick-xml",
  "roadgen-core",
 ]

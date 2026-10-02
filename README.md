@@ -995,6 +995,35 @@ turn back at the far end of an arm where the OpenDRIVE and Lanelet2 maps of the 
 IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
 `no-turnarounds`, and the network has the movements the map has and no others.
 
+### Where on the globe
+
+The network is in the map's own metres about its origin — the generated configuration
+turns off netconvert's offset normalisation so that it stays that way, in the same
+coordinates as the other exports — and it is **georeferenced** all the same. The node
+file opens with a `<location>`, which netconvert carries into the `.net.xml` without
+moving a node:
+
+```xml
+<location netOffset="0.000,0.000" convBoundary="-2000.000,-2000.000,2000.000,2000.000"
+          origBoundary="139.737907026,35.661974335,139.782092974,35.698025610"
+          projParameter="+proj=tmerc +lat_0=35.68 +lon_0=139.76 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"/>
+```
+
+SUMO reads a network position as the projected position plus `netOffset`, so
+`sumolib`'s `net.convertXY2LonLat(x, y)` hands back the latitude and longitude the IR
+puts a point at — the ones the Lanelet2 export writes. For a local map the two agree
+to well under a millimetre; for a UTM map netconvert writes the offset to the
+centimetre, which leaves them less than a centimetre apart.
+
+| map projection | `projParameter` | `netOffset` |
+| --- | --- | --- |
+| `local_cartesian`, `mgrs` | transverse Mercator about the origin at unit scale — the OpenDRIVE `<geoReference>` string, word for word | `0,0` |
+| `utm` | `+proj=utm +zone=<zone>` (`+south` below the equator) | minus the origin's easting and northing |
+
+An MGRS map's metres are local Cartesian about its origin like any other — MGRS only
+changes the grid position the Lanelet2 export reports beside them — so it is written
+the same way as a local one.
+
 ### What it cannot carry
 
 - **Lane markings.** Which line is painted between two lanes, and in what colour, has
@@ -1008,9 +1037,9 @@ IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
   additional file, not part of the network.
 - **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
   right of way and no more.
-- **The geo-reference.** The network is in the map's own metres about its origin, and
-  the generated configuration turns off netconvert's offset normalisation so that it
-  stays that way — the same coordinates as the other four exports.
+- **The origin's altitude.** A `<location>` is horizontal only; the heights are the
+  map's own `z`, as in every other export, and `sumo_warnings()` says so when the
+  origin has an altitude.
 
 ## CARLA
 
