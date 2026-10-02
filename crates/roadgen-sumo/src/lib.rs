@@ -704,7 +704,25 @@ impl<'a> Exporter<'a> {
     // ----------------------------------------------------------------------- //
 
     /// The one or two edges of one cross-section: one per direction traffic runs in.
+    ///
+    /// A cross-section none of whose lanes SUMO has a place for — all of them
+    /// borders, parking or the like — writes no edge, and then it writes no node
+    /// either. The nodes at its two ends exist only for edges to run between, and a
+    /// node no edge reaches is not a dead end or a joint but a stray point netconvert
+    /// has to throw away. So the carriageways are read first, and the ends are made
+    /// only once there is something to hang on them. A node another road does reach
+    /// is still written, by that road.
     fn section_edges(&mut self, road: &Road, section: usize) -> Result<(), ExportError> {
+        let carriageways: Vec<(Direction, Vec<&'a Lane>)> =
+            [Direction::Forward, Direction::Backward]
+                .into_iter()
+                .map(|direction| (direction, self.carriageway(road, section, direction)))
+                .filter(|(_, lanes)| !lanes.is_empty())
+                .collect();
+        if carriageways.is_empty() {
+            return Ok(());
+        }
+
         let at_start = if section == 0 {
             self.road_end_node(road, RoadEnd::Start)
         } else {
@@ -716,11 +734,7 @@ impl<'a> Exporter<'a> {
             self.section_node(road, section + 1)?
         };
 
-        for direction in [Direction::Forward, Direction::Backward] {
-            let lanes = self.carriageway(road, section, direction);
-            if lanes.is_empty() {
-                continue;
-            }
+        for (direction, lanes) in carriageways {
             let (from, to) = match direction {
                 Direction::Forward => (at_start.clone(), at_end.clone()),
                 Direction::Backward => (at_end.clone(), at_start.clone()),
@@ -895,12 +909,20 @@ impl<'a> Exporter<'a> {
     /// IR's statement then survives as far as the format allows: which approach holds
     /// right of way. Which of its movements must still give way to an oncoming one is
     /// netconvert's, and [`crate::check`] says so.
+    ///
+    /// The whole ladder is lifted one rung before a rule moves anything. The bottom
+    /// of [`classes::priority`] is 1, a footway's, and one rung below it is 0. This
+    /// export used to clamp that back up to 1, which put a yielding footway level
+    /// with the footway it yields to, and the rule was gone without a word. Lifted,
+    /// the lowest a yielding edge can land is still 1, and every edge keeps its
+    /// place relative to every other; since only the *order* of the numbers decides
+    /// anything, the shift changes nothing else.
     fn priority_of(&self, road: &Road, lanes: &[&Lane]) -> i32 {
-        let base = classes::priority(road.road_type);
+        let base = classes::priority(road.road_type) + 1;
         let carries = |named: &HashSet<LaneId>| lanes.iter().any(|lane| named.contains(&lane.id));
         let raise = i32::from(carries(&self.right_of_way));
         let lower = i32::from(carries(&self.yielding));
-        (base + raise - lower).max(1)
+        base + raise - lower
     }
 
     // ----------------------------------------------------------------------- //
@@ -1803,6 +1825,123 @@ mod tests {
             assert_eq!(link.relation, Relation::Exact, "{}", link.local);
             assert!(matches!(link.ir, IrRef::Connection(_)));
         }
+    }
+
+    /// A road none of whose lanes SUMO can carry leaves nothing behind: no edge, and
+    /// no node for an edge that was never written to run between.
+    #[test]
+    fn a_road_with_no_sumo_lanes_writes_no_nodes() {
+        let mut builder = MapBuilder::new(metadata("verge"));
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("street"),
+            )
+            .unwrap();
+        let width = PositiveWidth::new(2.0).unwrap();
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 50.0, 0.0),
+                    Point3::new(100.0, 50.0, 0.0),
+                    vec![
+                        LaneSpec::new(width, Direction::Forward).with_type(LaneType::Border),
+                        LaneSpec::new(width, Direction::Backward).with_type(LaneType::Parking),
+                    ],
+                )
+                .unwrap()
+                .with_name("verge"),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+
+        let mut exporter = Exporter::new(&map);
+        exporter.build().unwrap();
+        assert!(exporter
+            .edges
+            .iter()
+            .all(|edge| edge.id.starts_with("street")));
+        let reached: BTreeSet<&str> = exporter
+            .edges
+            .iter()
+            .flat_map(|edge| [edge.from.as_str(), edge.to.as_str()])
+            .collect();
+        let nodes: BTreeSet<&str> = exporter.nodes.keys().map(String::as_str).collect();
+        assert_eq!(nodes, reached, "every node written should be an edge's end");
+    }
+
+    /// A right-of-way rule between footways must still move their edges apart.
+    ///
+    /// A footway is the bottom of the priority ladder, so its yielding approach is the
+    /// one edge that could fall off it. It has to land below the approach it yields
+    /// to, and below the carriageways the rule leaves alone, or the rule is lost.
+    #[test]
+    fn a_yielding_footway_still_ranks_below_the_one_it_yields_to() {
+        let mut builder = MapBuilder::new(metadata("footways"));
+        let arms: Vec<RoadId> = [
+            (
+                "north",
+                Point3::new(0.0, 70.0, 0.0),
+                Point3::new(0.0, 14.0, 0.0),
+            ),
+            (
+                "east",
+                Point3::new(70.0, 0.0, 0.0),
+                Point3::new(14.0, 0.0, 0.0),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, start, end)| {
+            builder
+                .add_road(
+                    RoadSpec::line(start, end, two_way())
+                        .unwrap()
+                        .with_name(name)
+                        .with_type(RoadType::Pedestrian),
+                )
+                .unwrap()
+        })
+        .collect();
+        let junction = builder.add_junction(Some("x"));
+        builder
+            .connect_ends(
+                &arms[0],
+                RoadEnd::End,
+                &arms[1],
+                RoadEnd::End,
+                Some(&junction),
+            )
+            .unwrap();
+        builder.add_right_of_way(
+            vec![LaneRef::new(arms[0].clone(), 0)],
+            vec![LaneRef::new(arms[1].clone(), 0)],
+            None,
+        );
+        let map = builder.finish().unwrap().validate().unwrap();
+
+        let mut exporter = Exporter::new(&map);
+        exporter.build().unwrap();
+        let priority = |id: &str| {
+            exporter
+                .edges
+                .iter()
+                .find(|edge| edge.id == id)
+                .unwrap_or_else(|| panic!("no edge {id}"))
+                .priority
+        };
+        let untouched = priority("north.bwd");
+        assert_eq!(priority("east.bwd"), untouched);
+        assert!(priority("north.fwd") > untouched);
+        assert!(
+            priority("east.fwd") < untouched,
+            "the footway that yields should rank below the ones the rule left alone"
+        );
+        assert!(priority("east.fwd") >= 1);
     }
 
     #[test]
