@@ -1006,20 +1006,32 @@ the program a light of the map controls. So the export decides the program itsel
 writes it to `<name>.tll.xml`: the phases, and the link index of every movement into
 the node, which fixes the position of each movement in every state string.
 
+For the four-arm crossroads of the exporter's tests, one lane each way, the program
+written is exactly this (links 0–2 leave the north arm for east, south and west, and
+so on round, 3–5 from the east, 6–8 from the south, 9–11 from the west):
+
 ```xml
 <tlLogic id="j_x" type="static" programID="0" offset="0">
     <phase duration="35" state="gGgrrrGggrrr"/>
-    <phase duration="3"  state="yyyrrryyyrrr"/>
-    <phase duration="2"  state="rrrrrrrrrrrr"/>
-    ...
+    <phase duration="3" state="yyyrrryyyrrr"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
+    <phase duration="35" state="rrrggGrrrgGg"/>
+    <phase duration="3" state="rrryyyrrryyy"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
 </tlLogic>
 <connection from="north.fwd" to="east.bwd" fromLane="0" toLane="0" tl="j_x" linkIndex="0"/>
+...
 ```
+
+North and south go together, then east and west. The straights are protected; each
+left turn gives way to the oncoming traffic, and with one lane per exit a right turn
+gives way too, since it runs into the same lane as the left turn from opposite.
 
 The program is a static heuristic — the one Autoware's `lanelet2_to_sumo` writes:
 
-- Approaches are grouped by **axis**, the heading they arrive on modulo 180°, within
-  35° — so an approach and the one facing it run together and the crossing road waits.
+- Approaches are grouped by **axis**: two share a phase only if they arrive on
+  headings opposite to within 35° — so an approach and the one facing it run together
+  and the crossing road waits, however acute the angle the roads cross at.
 - Each group gets a **green** of 35 s (25 s when a junction has more than two groups),
   then 3 s of **yellow** and 2 s of **all-red**.
 - In a green, a movement is **permissive** (`g`) if it turns across the oncoming
