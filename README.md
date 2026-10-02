@@ -1011,18 +1011,28 @@ moving a node:
 
 SUMO reads a network position as the projected position plus `netOffset`, so
 `sumolib`'s `net.convertXY2LonLat(x, y)` hands back the latitude and longitude the IR
-puts a point at — the ones the Lanelet2 export writes. For a local map the two agree
-to well under a millimetre; for a UTM map netconvert writes the offset to the
-centimetre, which leaves them less than a centimetre apart.
+puts a point at — the ones the Lanelet2 export writes. For a UTM map netconvert
+writes the offset to the centimetre, which leaves them less than a centimetre apart.
 
 | map projection | `projParameter` | `netOffset` |
 | --- | --- | --- |
-| `local_cartesian`, `mgrs` | transverse Mercator about the origin at unit scale — the OpenDRIVE `<geoReference>` string, word for word | `0,0` |
+| `local_cartesian`, `mgrs` | transverse Mercator about the origin, `+k=1+h/R` for an origin `h` m up (`R` the ellipsoid's mean radius of curvature there) — at `h = 0` the OpenDRIVE `<geoReference>` string, word for word | `0,0` |
 | `utm` | `+proj=utm +zone=<zone>` (`+south` below the equator) | minus the origin's easting and northing |
 
 An MGRS map's metres are local Cartesian about its origin like any other — MGRS only
 changes the grid position the Lanelet2 export reports beside them — so it is written
 the same way as a local one.
+
+A local map's metres are an east/north/up frame: a plane tangent to the ellipsoid at
+the origin's *altitude*, which the Lanelet2 export projects through. A metre on that
+plane is longer, measured on the ellipsoid beneath it, by `1 + h/R`, so the transverse
+Mercator is scaled by that much — at unit scale, 2 km out from an origin 2000 m up, it
+would be 0.63 m off; scaled, it is 1.5 mm off. (The OpenDRIVE `<geoReference>` is
+not scaled, so above sea level the two strings differ by the `+k`.) What a 2D
+`<location>` cannot carry at all is a point's own height above that plane: a point
+`z` above it and `d` from the origin is placed `d·|z|/R` from where the Lanelet2
+export puts it — 1.6 cm for 50 m at 2 km — and `sumo_warnings()` states that bound
+for the map whenever it reaches a centimetre.
 
 ### What it cannot carry
 
@@ -1037,9 +1047,10 @@ the same way as a local one.
   additional file, not part of the network.
 - **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
   right of way and no more.
-- **The origin's altitude.** A `<location>` is horizontal only; the heights are the
-  map's own `z`, as in every other export, and `sumo_warnings()` says so when the
-  origin has an altitude.
+- **Heights in the geo-reference.** A `<location>` is horizontal only; the heights
+  are the map's own `z`, as in every other export. The origin's altitude goes into a
+  local map's projection scale rather than being lost, but each point's own height
+  above the origin's plane cannot be, which `sumo_warnings()` bounds as above.
 
 ## CARLA
 

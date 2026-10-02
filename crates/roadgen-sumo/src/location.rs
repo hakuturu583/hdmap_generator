@@ -36,11 +36,23 @@
 //!
 //! * **local Cartesian** (and **MGRS**, whose metres are local Cartesian too — MGRS
 //!   only changes the grid position the Lanelet2 export reports beside them) is the
-//!   transverse Mercator centred on the origin at unit scale, with a zero offset.
-//!   That is the very string the OpenDRIVE export writes in its `<geoReference>`,
-//!   and it agrees with the east/north/up frame the Lanelet2 export projects through
-//!   to well under a millimetre over the size of a generated map. PROJ has no exact
-//!   east/north/up projection to name instead.
+//!   transverse Mercator centred on the origin, with a zero offset. PROJ has no
+//!   east/north/up projection to name instead, and SUMO's `<location>` is 2D, so a
+//!   map projection has to stand in for the east/north/up frame the Lanelet2 export
+//!   projects through — a plane tangent to the ellipsoid *at the origin's altitude*.
+//!   A metre on that plane is longer, measured on the ellipsoid beneath it, by
+//!   `1 + h/R`: at unit scale a point 2 km out from an origin 2000 m up would come
+//!   back 0.63 m short. So the scale is `+k=1+h/R`, with `R` the ellipsoid's mean
+//!   radius of curvature `√(MN)` at the origin, which takes that to 1.5 mm (the rest
+//!   is the difference between the north–south and east–west radii, which a single
+//!   scale cannot take up). At altitude zero the scale is exactly 1 and the string is
+//!   character for character the one the OpenDRIVE export writes in its
+//!   `<geoReference>`; above it the two differ, because that one has no scale.
+//!
+//!   What a 2D definition cannot carry is each point's own height above the plane:
+//!   a point `z` above it, `d` from the origin, is placed `d·|z|/R` from where the
+//!   east/north/up frame puts it — 1.6 cm for 50 m at 2 km. [`height_error`] is that
+//!   bound, and `check()` reports it when it reaches a centimetre.
 //! * **UTM** is the zone's own `+proj=utm`, the form SUMO itself writes for a network
 //!   it imported from OpenStreetMap, with the origin's easting and northing as the
 //!   (negated) offset: the map's metres are UTM eastings and northings less the
@@ -93,15 +105,51 @@ pub fn geo_reference(map: &ValidatedMap) -> Result<GeoReference, ExportError> {
     })
 }
 
-/// The transverse Mercator about `origin` at unit scale — character for character the
-/// string the OpenDRIVE export writes for the same origin, so the two files can be
-/// seen to agree.
+/// The transverse Mercator about `origin`, scaled by [`scale_at`] — at altitude zero
+/// character for character the string the OpenDRIVE export writes for the same
+/// origin, so the two files can be seen to agree.
 fn tmerc_about(origin: GeoOrigin) -> String {
     format!(
-        "+proj=tmerc +lat_0={} +lon_0={} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
+        "+proj=tmerc +lat_0={} +lon_0={} +k={} +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
         origin.latitude(),
-        origin.longitude()
+        origin.longitude(),
+        scale_at(origin)
     )
+}
+
+/// The ellipsoid's mean radius of curvature at `latitude` degrees: `√(MN)`, the
+/// geometric mean of the meridian's radius and the prime vertical's.
+fn mean_radius(latitude: f64) -> f64 {
+    use ll2_projection::wgs84::{A, F};
+    let e2 = F * (2.0 - F);
+    let w2 = 1.0 - e2 * latitude.to_radians().sin().powi(2);
+    let prime_vertical = A / w2.sqrt();
+    let meridian = A * (1.0 - e2) / w2.powf(1.5);
+    (prime_vertical * meridian).sqrt()
+}
+
+/// The transverse Mercator's scale for a local map about `origin`: a metre of the
+/// east/north/up plane at the origin's altitude, measured on the ellipsoid beneath
+/// it. Exactly 1 at altitude zero.
+///
+/// Written with `{}`, which round-trips, so the definition SUMO reads and the
+/// projector `origBoundary` is worked out with have the very same scale.
+fn scale_at(origin: GeoOrigin) -> f64 {
+    1.0 + origin.altitude() / mean_radius(origin.latitude())
+}
+
+/// How far from where the map's own projection puts it SUMO's `<location>` places a
+/// point at `point`, through the height the 2D definition cannot carry: the point's
+/// distance from the origin times its height above the origin's plane, over the
+/// earth's radius. Zero for a UTM map, whose projection is horizontal only in every
+/// export.
+pub fn height_error(map: &ValidatedMap, point: &Point3) -> f64 {
+    match map.metadata.projection {
+        Projection::LocalCartesian | Projection::Mgrs => {
+            point.x.hypot(point.y) * point.z.abs() / mean_radius(map.metadata.origin.latitude())
+        }
+        Projection::Utm => 0.0,
+    }
 }
 
 /// The projector that takes the network's metres back to latitude and longitude:
@@ -119,10 +167,10 @@ fn projector(map: &ValidatedMap) -> Result<Box<dyn Projector>, ExportError> {
     ));
     Ok(match map.metadata.projection {
         // A transverse Mercator whose central meridian is the origin's and whose
-        // northing is rebased on it — `+lat_0 +lon_0 +k=1 +x_0=0 +y_0=0` exactly.
-        Projection::LocalCartesian | Projection::Mgrs => {
-            Box::new(TransverseMercatorProjector::new(origin, 1.0))
-        }
+        // northing is rebased on it — `+lat_0 +lon_0 +k +x_0=0 +y_0=0` exactly.
+        Projection::LocalCartesian | Projection::Mgrs => Box::new(
+            TransverseMercatorProjector::new(origin, scale_at(map.metadata.origin)),
+        ),
         // The origin's easting and northing subtracted, which is the negated offset.
         Projection::Utm => Box::new(Utm::new(origin, true, false).map_err(projection)?),
     })
@@ -282,6 +330,105 @@ mod tests {
                  +datum=WGS84 +units=m +no_defs"
             );
         }
+    }
+
+    /// Above sea level the transverse Mercator is scaled, so that it reproduces the
+    /// east/north/up frame the Lanelet2 export reads the same metres in — which at
+    /// unit scale it misses by more than half a metre 2 km out from an origin 2000 m
+    /// up.
+    #[test]
+    fn a_high_origin_scales_the_transverse_mercator_to_its_own_plane() {
+        use ll2_projection::LocalCartesian;
+
+        let high = GeoOrigin::new(35.68, 139.76, 2000.0).unwrap();
+        let location = written(&map(high, Projection::LocalCartesian));
+        let scale = scale_at(high);
+        assert!((scale - 1.000_314).abs() < 1e-6, "{scale}");
+        assert_eq!(
+            location["projParameter"],
+            format!(
+                "+proj=tmerc +lat_0=35.68 +lon_0=139.76 +k={scale} +x_0=0 +y_0=0 \
+                 +datum=WGS84 +units=m +no_defs"
+            )
+        );
+        // The string round-trips the scale exactly.
+        let written_scale: f64 = location["projParameter"]
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("+k="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(written_scale, scale);
+
+        let gps = |lat, lon| GpsPoint::new(lat, lon, 0.0);
+        let enu = LocalCartesian::new(Origin::new(GpsPoint::new(35.68, 139.76, 2000.0)));
+        let scaled = TransverseMercatorProjector::new(enu.origin(), scale);
+        let unit = TransverseMercatorProjector::new(enu.origin(), 1.0);
+        // Metres between two positions near the origin, near enough.
+        let apart = |a: GpsPoint, b: GpsPoint| {
+            let north = (a.lat - b.lat) * 111_000.0;
+            let east = (a.lon - b.lon) * 111_000.0 * 35.68f64.to_radians().cos();
+            north.hypot(east)
+        };
+        let (mut worst_scaled, mut worst_unit) = (0.0f64, 0.0f64);
+        for step in 0..16 {
+            let angle = f64::from(step) * std::f64::consts::PI / 8.0;
+            let point = [2000.0 * angle.cos(), 2000.0 * angle.sin(), 0.0];
+            let wanted = enu.reverse(point).unwrap();
+            let wanted = gps(wanted.lat, wanted.lon);
+            let at = |projector: &TransverseMercatorProjector| {
+                let p = projector.reverse(point).unwrap();
+                apart(gps(p.lat, p.lon), wanted)
+            };
+            worst_scaled = worst_scaled.max(at(&scaled));
+            worst_unit = worst_unit.max(at(&unit));
+        }
+        assert!(worst_unit > 0.6, "{worst_unit}");
+        assert!(worst_scaled < 0.002, "{worst_scaled}");
+    }
+
+    #[test]
+    fn the_height_a_location_cannot_carry_is_reported() {
+        let flat = map(tokyo(), Projection::LocalCartesian);
+        assert!(!crate::check(&flat)
+            .iter()
+            .any(|line| line.contains("no height")));
+
+        // A road climbing 100 m over 2 km: its far end is 3 cm from where the
+        // east/north/up frame puts it.
+        let climbing = |projection| {
+            let mut builder = MapBuilder::new(MapMetadata {
+                origin: GeoOrigin::new(35.68, 139.76, 2000.0).unwrap(),
+                projection,
+                ..MapMetadata::default()
+            });
+            let width = PositiveWidth::new(3.5).unwrap();
+            builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(0.0, 0.0, 0.0),
+                        Point3::new(2000.0, 0.0, 100.0),
+                        vec![LaneSpec::new(width, Direction::Forward)],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            builder.finish().unwrap().validate().unwrap()
+        };
+        let far_end = Point3::new(2000.0, 0.0, 100.0);
+        let local = climbing(Projection::LocalCartesian);
+        let error = height_error(&local, &far_end);
+        assert!((error - 0.0314).abs() < 0.0002, "{error}");
+        let report = crate::check(&local).join("\n");
+        assert!(report.contains("up to 0.031 m"), "{report}");
+        assert!(report.contains("transverse Mercator's scale"), "{report}");
+
+        // UTM is horizontal in every export, so there is nothing to lose.
+        let utm = climbing(Projection::Utm);
+        assert_eq!(height_error(&utm, &far_end), 0.0);
+        assert!(!crate::check(&utm)
+            .iter()
+            .any(|line| line.contains("no height")));
     }
 
     #[test]

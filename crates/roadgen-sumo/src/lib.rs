@@ -93,7 +93,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
-use roadgen_core::map::{Lane, Road};
+use roadgen_core::map::{Lane, Projection, Road};
 use roadgen_core::semantics::{MapObjectKind, TrafficRule};
 use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
 use roadgen_core::trace::{IrRef, Relation, Trace};
@@ -101,7 +101,7 @@ use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, Validated
 
 pub use classes::Permission;
 pub use error::ExportError;
-pub use location::{geo_reference, GeoReference};
+pub use location::{geo_reference, height_error, GeoReference};
 
 /// The name a map with none of its own is written under.
 const DEFAULT_NAME: &str = "network";
@@ -339,10 +339,38 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
 
     let altitude = map.metadata.origin.altitude();
     if altitude != 0.0 {
+        problems.push(match map.metadata.projection {
+            Projection::LocalCartesian | Projection::Mgrs => format!(
+                "a SUMO `<location>` ties the network to the globe horizontally only: \
+                 the heights are the map's own z, and the origin's altitude of \
+                 {altitude} m is not written as a height — it is in the transverse \
+                 Mercator's scale, which keeps the horizontal positions those of the \
+                 east/north/up frame at that altitude"
+            ),
+            Projection::Utm => format!(
+                "a SUMO `<location>` ties the network to the globe horizontally only: \
+                 the heights are the map's own z, and the origin's altitude of \
+                 {altitude} m is not written"
+            ),
+        });
+    }
+
+    // What a 2D `<location>` cannot carry: each point's own height above the
+    // origin's plane. Measured along the reference lines, which is where the heights
+    // are; a lane's edge is never more than a few metres from its road's.
+    let worst = map
+        .roads
+        .iter()
+        .filter_map(|road| road.reference_line.samples(map.metadata.sampling).ok())
+        .flatten()
+        .map(|sample| height_error(map, &sample.point))
+        .fold(0.0, f64::max);
+    if worst >= 0.01 {
         problems.push(format!(
-            "a SUMO `<location>` ties the network to the globe horizontally only: the \
-             heights are the map's own z, and the origin's altitude of {altitude} m is \
-             not written"
+            "a SUMO `<location>` has no height, so `convertXY2LonLat` places a point \
+             above or below the origin's plane as if it were on it: up to {worst:.3} m \
+             from the latitude and longitude the Lanelet2 export gives it (the point's \
+             distance from the origin times its height, over the earth's radius)"
         ));
     }
     problems
