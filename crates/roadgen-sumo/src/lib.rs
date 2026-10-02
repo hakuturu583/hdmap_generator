@@ -1179,10 +1179,29 @@ fn edge_id(road: &Road, section: usize, direction: Direction) -> String {
 /// SUMO splits lists of ids on whitespace and reserves a leading colon for the
 /// internal edges it generates itself, so neither can survive in a name the caller
 /// chose.
+///
+/// Beyond those, SUMO refuses an id outright if it holds any of
+/// [`FORBIDDEN_IN_IDS`]: the set its own validity check
+/// (`SUMOXMLDefinitions::isValidNetID`) rejects, and which netconvert enforces on
+/// every node and edge it reads, stopping with "Invalid edge id". They are the
+/// characters that would be ambiguous in SUMO's own lists and route strings (`;`,
+/// `,`, `|`) or awkward to carry through XML and the shells its tools are driven
+/// from (the quotes, `&`, the angle brackets, the backslash). A road called "Smith's
+/// Lane" or "A; B" is an ordinary name, so each of them becomes an underscore here
+/// rather than failing the build. Everything else — `#`, `.`, `/`, letters in any
+/// script — SUMO accepts, and it is kept, so an id stays as close to the caller's
+/// name as it can.
+///
+/// Every id the export writes — edges, nodes, and the prefix the files are named
+/// after — is built from names that pass through here, so none of them can hold a
+/// character netconvert would refuse.
 fn identifier(name: &str) -> String {
     name.chars()
         .map(|character| {
-            if character.is_whitespace() || character == ':' {
+            if character.is_whitespace()
+                || character == ':'
+                || FORBIDDEN_IN_IDS.contains(&character)
+            {
                 '_'
             } else {
                 character
@@ -1190,6 +1209,12 @@ fn identifier(name: &str) -> String {
         })
         .collect()
 }
+
+/// The characters SUMO will not accept anywhere in a network id, besides whitespace.
+///
+/// Mirrors the set in `SUMOXMLDefinitions::isValidNetID`, and checked against
+/// netconvert 1.26, which rejects a node or an edge id holding any one of them.
+const FORBIDDEN_IN_IDS: [char; 9] = [';', ',', '|', '\'', '"', '&', '<', '>', '\\'];
 
 /// A length, written to the millimetre.
 ///
@@ -1224,6 +1249,17 @@ mod tests {
         assert_eq!(identifier("north arm"), "north_arm");
         assert_eq!(identifier("a:b"), "a_b");
         assert_eq!(identifier("plain"), "plain");
+    }
+
+    #[test]
+    fn an_identifier_loses_what_netconvert_refuses_and_keeps_the_rest() {
+        assert_eq!(identifier("A; B"), "A__B");
+        assert_eq!(identifier("Smith's Lane"), "Smith_s_Lane");
+        assert_eq!(identifier("x|y,z"), "x_y_z");
+        assert_eq!(identifier(r#"a"b&c<d>e\f"#), "a_b_c_d_e_f");
+        // What SUMO is happy with stays as the caller wrote it.
+        assert_eq!(identifier("route#7/a.b-c"), "route#7/a.b-c");
+        assert_eq!(identifier("銀座通り"), "銀座通り");
     }
 
     #[test]
