@@ -567,6 +567,40 @@ pub fn sidewalk_crossroads(handedness: TrafficHandedness) -> ValidatedMap {
         TrafficHandedness::RightHand => "sidewalks",
         TrafficHandedness::LeftHand => "sidewalks_lht",
     };
+    let (builder, _) = sidewalk_crossroads_builder(handedness, name);
+    finish(builder)
+}
+
+/// The sidewalk crossroads of [`sidewalk_crossroads`] with a crosswalk across every
+/// arm at the mouth of the junction, and one more half way along the west arm.
+///
+/// Each crosswalk at the junction is 4 m wide and stands a little under 3 m back
+/// from the mouth, as one does to leave a turning car room to wait; at 95 % of the
+/// way along an arm that ends at the junction, and 5 % of the way along one that
+/// starts there. The one half way along the west arm is a mid-block crossing, which
+/// a format that puts crossings at junctions has to do something about.
+///
+/// The arms are returned west, east, north, south.
+pub fn crosswalk_crossroads(handedness: TrafficHandedness) -> (ValidatedMap, [RoadId; 4]) {
+    let name = match handedness {
+        TrafficHandedness::RightHand => "crosswalks",
+        TrafficHandedness::LeftHand => "crosswalks_lht",
+    };
+    let (mut builder, arms) = sidewalk_crossroads_builder(handedness, name);
+    let [west, east, north, south] = &arms;
+    for (arm, fraction) in [(west, 0.95), (east, 0.05), (north, 0.05), (south, 0.95)] {
+        builder.add_crosswalk(arm, fraction, 4.0).unwrap();
+    }
+    builder.add_crosswalk(west, 0.5, 4.0).unwrap();
+    (finish(builder), arms)
+}
+
+/// The builder of [`sidewalk_crossroads`], with its four arms — west, east, north,
+/// south — so that more can be put on them.
+fn sidewalk_crossroads_builder(
+    handedness: TrafficHandedness,
+    name: &str,
+) -> (MapBuilder, [RoadId; 4]) {
     let mut builder = MapBuilder::new(MapMetadata {
         handedness,
         ..metadata(name)
@@ -610,5 +644,5 @@ pub fn sidewalk_crossroads(handedness: TrafficHandedness) -> ValidatedMap {
                 .unwrap();
         }
     }
-    finish(builder)
+    (builder, [west, east, north, south])
 }

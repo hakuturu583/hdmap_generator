@@ -46,6 +46,8 @@ pub struct Translation {
 pub struct SumoNetReport {
     /// Internal lanes traced back to the IR.
     pub internal_lanes: usize,
+    /// Pedestrian crossings traced back to the crosswalks they were written for.
+    pub crossings: usize,
     /// Connections netconvert made that the export did not ask for, and that
     /// therefore have no IR counterpart. None for a network built with the export's
     /// own configuration; a U-turn at every dead end for one built without it, since
@@ -376,7 +378,7 @@ impl TraceIndex {
     }
 
     /// Reads the network netconvert built from a SUMO export, and traces the internal
-    /// lanes it made.
+    /// lanes and the pedestrian crossings it made.
     ///
     /// The export cannot name them: an internal lane is netconvert's, drawn across a
     /// junction when the network is built. But the built network says which
@@ -393,6 +395,14 @@ impl TraceIndex {
     /// `north.fwd`, `j_x` — so the check is on what the two must agree on: the same
     /// edges and lanes, every connection the export wrote, and every node of the
     /// export's `.nod.xml` where the network put its junction.
+    ///
+    /// A crossing is netconvert's too: the export writes a `<crossing node edges>`,
+    /// which has no id, and netconvert builds it as an edge `:<node>_c<n>` numbered in
+    /// its own order. The built edge records the edges it crosses (`crossingEdges`),
+    /// so the node and those edges find the crossing the export wrote, and the
+    /// crossing's lane is linked to the crosswalk behind it with the role
+    /// `crossing`. A crossing the export wrote that the network does not have —
+    /// netconvert discards one it cannot build — makes the network not the export's.
     pub fn load_sumo_net(&mut self, path: impl AsRef<Path>) -> Result<SumoNetReport, TraceError> {
         let path = path.as_ref();
         let text = crate::file::read_text(path)?;
@@ -407,6 +417,7 @@ impl TraceIndex {
             reason,
         })?;
         let connections = net.connections;
+        let crossings = net.crossings;
 
         let mut report = SumoNetReport::default();
         // The IR elements each internal lane carries, filled from the connections that
@@ -447,6 +458,22 @@ impl TraceIndex {
                     relation: Relation::Part,
                     role: Some("internal".to_owned()),
                 });
+            }
+        }
+        for crossing in &crossings {
+            let links: Vec<Link> = sumo.with_local(&crossing.key()).cloned().collect();
+            if !links.is_empty() {
+                report.crossings += 1;
+            }
+            for lane in &crossing.lanes {
+                for link in &links {
+                    sumo.push(Link {
+                        ir: link.ir.clone(),
+                        local: format!("lane:{lane}"),
+                        relation: link.relation,
+                        role: Some("crossing".to_owned()),
+                    });
+                }
             }
         }
         Ok(report)
@@ -583,6 +610,15 @@ fn built_from(sumo: &FormatLinks, net: &Net) -> Result<(), String> {
             "it has no connection {missing}, which the export wrote"
         ));
     }
+    let crossings: BTreeSet<String> = net.crossings.iter().map(NetCrossing::key).collect();
+    if let Some(missing) = written("crossing:")
+        .into_iter()
+        .find(|crossing| !crossings.contains(&format!("crossing:{crossing}")))
+    {
+        return Err(format!(
+            "it has no crossing {missing}, which the export wrote"
+        ));
+    }
     let nodes = sumo
         .files
         .iter()
@@ -616,6 +652,8 @@ const NODE_TOLERANCE: f64 = 0.02;
 #[derive(Default)]
 struct Net {
     connections: Vec<NetConnection>,
+    /// The pedestrian crossings netconvert built.
+    crossings: Vec<NetCrossing>,
     /// The edges that are not internal: the export's.
     edges: BTreeSet<String>,
     /// Their lanes.
@@ -641,6 +679,25 @@ impl NetConnection {
             "connection:{}_{}>{}_{}",
             self.from, self.from_lane, self.to, self.to_lane
         )
+    }
+}
+
+/// A pedestrian crossing of a built network: the node it is at, the edges it
+/// crosses, and its lanes.
+struct NetCrossing {
+    node: String,
+    edges: Vec<String>,
+    lanes: Vec<String>,
+}
+
+impl NetCrossing {
+    /// The crossing as a trace names it, `crossing:<node>/<edge>+<edge>` with the
+    /// edges sorted: the form the SUMO exporter writes, where netconvert lists the
+    /// same edges in an order of its own.
+    fn key(&self) -> String {
+        let mut edges = self.edges.clone();
+        edges.sort();
+        format!("crossing:{}/{}", self.node, edges.join("+"))
     }
 }
 
@@ -674,12 +731,16 @@ fn parse_net(text: &str) -> Result<Net, String> {
     let mut net = Net::default();
     // The edge whose lanes are being read, when it is one of the export's.
     let mut edge: Option<String> = None;
+    // Whether the edge being read is a crossing, whose lanes go to the last of
+    // `net.crossings`.
+    let mut crossing = false;
     loop {
         let (element, empty) = match reader.read_event().map_err(|error| error.to_string())? {
             Event::Eof => break,
             Event::End(end) => {
                 if end.name().as_ref() == b"edge" {
                     edge = None;
+                    crossing = false;
                 }
                 continue;
             }
@@ -706,6 +767,24 @@ fn parse_net(text: &str) -> Result<Net, String> {
                 // edges are the ones without.
                 let generated = attributes.contains_key(b"function".as_slice());
                 let id = attributes.remove(b"id".as_slice()).unwrap_or_default();
+                if attributes.get(b"function".as_slice()).map(String::as_str) == Some("crossing") {
+                    // netconvert names a crossing `:<node>_c<n>`.
+                    let node = id
+                        .strip_prefix(':')
+                        .and_then(|rest| rest.rsplit_once("_c"))
+                        .map(|(node, _)| node.to_owned())
+                        .unwrap_or_default();
+                    let edges = attributes
+                        .get(b"crossingEdges".as_slice())
+                        .map(|edges| edges.split_whitespace().map(str::to_owned).collect())
+                        .unwrap_or_default();
+                    net.crossings.push(NetCrossing {
+                        node,
+                        edges,
+                        lanes: Vec::new(),
+                    });
+                    crossing = !empty;
+                }
                 if !generated {
                     net.edges.insert(id.clone());
                     if !empty {
@@ -716,6 +795,14 @@ fn parse_net(text: &str) -> Result<Net, String> {
             b"lane" if edge.is_some() => {
                 if let Some(id) = attributes.remove(b"id".as_slice()) {
                     net.lanes.insert(id);
+                }
+            }
+            b"lane" if crossing => {
+                if let (Some(id), Some(last)) = (
+                    attributes.remove(b"id".as_slice()),
+                    net.crossings.last_mut(),
+                ) {
+                    last.lanes.push(id);
                 }
             }
             b"junction" => {

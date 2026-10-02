@@ -60,6 +60,13 @@
 //! connection, and neither is any other movement from one footway to another; the
 //! configuration asks netconvert for walking areas instead.
 //!
+//! A crosswalk becomes a pedestrian `<crossing>` in the connections file. SUMO puts a
+//! crossing at a node, across the mouth of the edges it names, between the walking
+//! areas either side of them; so a crosswalk near the end of a road — where the IR
+//! puts one at a junction — is written at that end's node, across the road's edges
+//! there. A crosswalk further along the road, or across one without a footway at
+//! both kerbs, has nothing to be in SUMO and is reported by [`check`] instead.
+//!
 //! # The trace
 //!
 //! [`PlainNetwork::trace`] records where each element of the IR went, naming the
@@ -74,6 +81,7 @@
 //! | `connection:<from edge>_<from lane>><to edge>_<to lane>` | a lane connection | exact, or merged |
 //! | the same connection | a connector lane it runs over | collapsed |
 //! | `node:<id>`, role `walkingarea` | a connection between two footways, and a pavement lane round a corner | collapsed |
+//! | `crossing:<node>/<edge>+<edge>` | a crosswalk | exact, or merged |
 //!
 //! A connection is named by its two lanes as the built network names them, so the
 //! `.net.xml` `<connection from fromLane to toLane via>` that netconvert writes for it
@@ -81,6 +89,11 @@
 //! internal lane (`via`) netconvert generated in place of the connector. A movement
 //! through a junction is two IR connections and one connector lane, all of them
 //! written as the one connection, so each is `merged` or `collapsed` into it.
+//!
+//! A crossing has no id in the plain format, so it is named by its node and the
+//! edges it crosses, sorted, which is also how the built network can be matched to
+//! it: netconvert names the crossing `:<node>_c<n>` and lists the same edges as its
+//! `crossingEdges`.
 
 pub mod classes;
 pub mod error;
@@ -89,9 +102,9 @@ mod xml;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
+use roadgen_core::geometry::{Curve3, Point3, Polyline3, SamplingConfig};
 use roadgen_core::map::{Lane, Road};
-use roadgen_core::semantics::{LaneType, MapObjectKind, TrafficRule};
+use roadgen_core::semantics::{LaneType, MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
 use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
 use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, ValidatedMap};
@@ -289,24 +302,18 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         ));
     }
 
-    let unwritten: BTreeSet<&str> = map
+    if map
         .objects
         .iter()
-        .filter(|object| {
-            matches!(
-                object.kind,
-                MapObjectKind::Crosswalk | MapObjectKind::TrafficSign { .. }
-            )
-        })
-        .map(|object| object.kind.as_str())
-        .collect();
-    if !unwritten.is_empty() {
-        problems.push(format!(
-            "a SUMO crossing belongs to a node and a sign is an additional file, not \
-             part of the network, so the map's {} are not written",
-            unwritten.into_iter().collect::<Vec<_>>().join(" and ")
-        ));
+        .any(|object| matches!(object.kind, MapObjectKind::TrafficSign { .. }))
+    {
+        problems.push(
+            "a SUMO sign is an additional file, not part of the network, so the map's \
+             traffic signs are not written"
+                .to_owned(),
+        );
     }
+    problems.extend(crosswalk_problems(map));
 
     if map
         .rules
@@ -358,6 +365,207 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             .to_owned(),
     );
     problems
+}
+
+// --------------------------------------------------------------------------- //
+// Crosswalks
+// --------------------------------------------------------------------------- //
+
+/// What [`check`] says about the map's crosswalks: how far the ones written as
+/// crossings were moved to reach their node, and which were not written and why.
+fn crosswalk_problems(map: &ValidatedMap) -> Vec<String> {
+    let mut moved: Vec<f64> = Vec::new();
+    let mut mid_block: Vec<String> = Vec::new();
+    let mut no_footway: Vec<&str> = Vec::new();
+    let mut unplaced: Vec<&str> = Vec::new();
+    for object in map
+        .objects
+        .iter()
+        .filter(|object| object.kind == MapObjectKind::Crosswalk)
+    {
+        match place_crosswalk(map, object) {
+            Placement::AtEnd { offset, .. } => moved.push(offset),
+            Placement::MidBlock { offset } => {
+                mid_block.push(format!("{} ({offset:.1} m)", object.id.as_str()))
+            }
+            Placement::NoFootway => no_footway.push(object.id.as_str()),
+            Placement::Unplaced => unplaced.push(object.id.as_str()),
+        }
+    }
+
+    let mut problems = Vec::new();
+    if !moved.is_empty() {
+        let furthest = moved.iter().copied().fold(0.0_f64, f64::max);
+        problems.push(format!(
+            "a SUMO crossing belongs to a node and lies across the mouth of the edges it \
+             crosses, so the {} crosswalks near the end of their road are written as \
+             crossings at the node there, moved up to {furthest:.1} m from where the IR \
+             draws them; pedestrians have priority on each, or the signal decides at a \
+             signalised node",
+            moved.len()
+        ));
+    }
+    if !mid_block.is_empty() {
+        problems.push(format!(
+            "a SUMO crossing belongs to a node, so the {} crosswalks more than \
+             {CROSSING_REACH} m from either end of their road are not written — splitting \
+             the road with a node of its own there would be needed: {}",
+            mid_block.len(),
+            mid_block.join(", ")
+        ));
+    }
+    if !no_footway.is_empty() {
+        problems.push(format!(
+            "a SUMO crossing joins the footways either side of the road, so the {} \
+             crosswalks across a road without a footway at both kerbs are not written: \
+             {}",
+            no_footway.len(),
+            no_footway.join(", ")
+        ));
+    }
+    if !unplaced.is_empty() {
+        problems.push(format!(
+            "a SUMO crossing lies across the edges at a node, and the junction itself \
+             has none, so the {} crosswalks inside a junction are not written: {}",
+            unplaced.len(),
+            unplaced.join(", ")
+        ));
+    }
+    problems
+}
+
+/// How far from the end of its road a crosswalk may lie and still be written as a
+/// crossing at the node there, measured from the road end to the crosswalk's nearer
+/// edge.
+///
+/// A SUMO crossing has no position of its own: it belongs to a node, and netconvert
+/// lays it across the mouth of the edges it names, right where they meet the
+/// junction. The IR draws a crosswalk wherever it was put, and at a junction that is
+/// usually a little way back from the mouth — far enough for a turning vehicle to
+/// wait clear of the junction before it, a car length or two. Fifteen metres takes
+/// in that setback and no more: a crosswalk further along is a mid-block crossing,
+/// and writing it at the node would move the place pedestrians cross by half a
+/// block. [`check`] says how far each written crossing was moved.
+const CROSSING_REACH: f64 = 15.0;
+
+/// Where a crosswalk of the IR can go in a SUMO network.
+///
+/// Decided from the IR alone, so that [`check`] says exactly what the export does.
+#[derive(Debug, Clone, PartialEq)]
+enum Placement {
+    /// A crossing at the node at `end` of `road`, across that end's edges. `offset`
+    /// is how far the crosswalk's nearer edge lies from the road end — how far the
+    /// crossing moves — and `width` is the crosswalk's, along the road.
+    AtEnd {
+        road: RoadId,
+        end: RoadEnd,
+        offset: f64,
+        width: f64,
+    },
+    /// Too far from either end of its road to belong to a node; `offset` is the
+    /// distance to the nearer one.
+    MidBlock { offset: f64 },
+    /// At the end of a road with no footway on one side or the other, so the
+    /// crossing would have nowhere to land.
+    NoFootway,
+    /// Across a connector road — inside a junction, where SUMO has no edge to lay a
+    /// crossing over — or across no road at all.
+    Unplaced,
+}
+
+/// Where `object`, a crosswalk, can go: see [`Placement`].
+///
+/// The road is the one its lanes are on — the builder lists every lane of the road
+/// it crosses — and where along that road it lies is read from its outline, the two
+/// lines across the road that are its edges. Each is taken at its middle and found
+/// on the road's reference line, which gives the station of each edge; the nearer
+/// one to a road end is how far the crossing would have to move to reach that end's
+/// node, and the distance between the two is the crosswalk's width.
+///
+/// A crossing joins the footways either side of the road, so the road's cross-section
+/// at that end has to be footway at both kerbs: netconvert builds a crossing with no
+/// footway at one end of it, but nothing leads off it there, and it says so ("has no
+/// target"). Only the crossed road's own footways are looked for, not those of the
+/// arms beside it, which is what the generator lays out.
+fn place_crosswalk(map: &ValidatedMap, object: &MapObject) -> Placement {
+    let Some(road) = object
+        .lanes
+        .iter()
+        .find_map(|lane| map.lane(lane))
+        .and_then(|lane| map.road(&lane.road))
+    else {
+        return Placement::Unplaced;
+    };
+    if road.is_connector() {
+        return Placement::Unplaced;
+    }
+    let ObjectGeometry::Band { left, right } = &object.geometry else {
+        return Placement::Unplaced;
+    };
+    let middle = |edge: &Curve3| edge.start_point().lerp(edge.end_point(), 0.5);
+    let (left, right) = (middle(left), middle(right));
+    let (Some(a), Some(b), Ok(length)) = (
+        station_on(map, road, left),
+        station_on(map, road, right),
+        road.horizontal_length(),
+    ) else {
+        return Placement::Unplaced;
+    };
+    let (near, far) = (a.min(b), a.max(b));
+    let (end, offset) = if near <= length - far {
+        (RoadEnd::Start, near.max(0.0))
+    } else {
+        (RoadEnd::End, (length - far).max(0.0))
+    };
+    if offset > CROSSING_REACH {
+        return Placement::MidBlock { offset };
+    }
+    let section = match end {
+        RoadEnd::Start => 0,
+        RoadEnd::End => road.sections.len() - 1,
+    };
+    let mut kerb_to_kerb: Vec<&Lane> = map
+        .lanes_of_section(&road.id, section)
+        .into_iter()
+        .filter(|lane| classes::permission(lane.lane_type).is_some())
+        .collect();
+    kerb_to_kerb.sort_by(|a, b| a.center_offset().total_cmp(&b.center_offset()));
+    let footway = |lane: &&Lane| {
+        classes::permission(lane.lane_type) == classes::permission(LaneType::Sidewalk)
+    };
+    let kerbs = kerb_to_kerb.first().zip(kerb_to_kerb.last());
+    if !kerbs.is_some_and(|(right, left)| footway(right) && footway(left) && right.id != left.id) {
+        return Placement::NoFootway;
+    }
+    Placement::AtEnd {
+        road: road.id.clone(),
+        end,
+        offset,
+        width: left.horizontal_distance_to(right),
+    }
+}
+
+/// The station on `road`'s reference line nearest to `point`, read off the
+/// polyline through the road's vertices.
+fn station_on(map: &ValidatedMap, road: &Road, point: Point3) -> Option<f64> {
+    let samples = map.vertex_samples(&road.id).ok()?;
+    let mut best: Option<(f64, f64)> = None;
+    for pair in samples.windows(2) {
+        let (a, b) = (pair[0].point, pair[1].point);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let span = dx * dx + dy * dy;
+        let t = if span > 0.0 {
+            (((point.x - a.x) * dx + (point.y - a.y) * dy) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let distance = a.lerp(b, t).horizontal_distance_to(point);
+        let station = pair[0].station + t * (pair[1].station - pair[0].station);
+        if best.is_none_or(|(nearest, _)| distance < nearest) {
+            best = Some((distance, station));
+        }
+    }
+    best.map(|(_, station)| station)
 }
 
 // --------------------------------------------------------------------------- //
@@ -427,6 +635,14 @@ struct Slot {
     index: usize,
 }
 
+/// One written pedestrian crossing, and the crosswalks of the IR it stands for.
+#[derive(Default)]
+struct Crossing {
+    /// Its width along the road: the widest of its crosswalks.
+    width: f64,
+    crosswalks: BTreeSet<ObjectId>,
+}
+
 /// The IR behind one written connection: the lane connections it was followed along,
 /// and the connector lanes it crossed a junction on.
 #[derive(Default)]
@@ -450,6 +666,9 @@ struct Exporter<'a> {
     /// walking area at every node footways meet at, and that is how SUMO's
     /// pedestrians get from one to the next. See [`Exporter::connect`].
     walking: BTreeMap<String, Movement>,
+    /// The pedestrian crossings, by the node each is at and the edges it crosses
+    /// there, in the order they are written; see [`Exporter::build_crossings`].
+    crossings: BTreeMap<(String, Vec<String>), Crossing>,
     slots: HashMap<LaneId, Slot>,
     /// Junctions a traffic light controls an approach to.
     /// The signalised junctions, each with the lights that govern it.
@@ -472,6 +691,7 @@ impl<'a> Exporter<'a> {
             edges: Vec::new(),
             movements: BTreeMap::new(),
             walking: BTreeMap::new(),
+            crossings: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: BTreeMap::new(),
             right_of_way: HashSet::new(),
@@ -552,6 +772,7 @@ impl<'a> Exporter<'a> {
             }
         }
         self.build_connections();
+        self.build_crossings();
         Ok(())
     }
 
@@ -1019,6 +1240,79 @@ impl<'a> Exporter<'a> {
     }
 
     // ----------------------------------------------------------------------- //
+    // Crossings
+    // ----------------------------------------------------------------------- //
+
+    /// Every crosswalk that can be a SUMO crossing, as one: at the node at the end of
+    /// the road it crosses, across the edges of that end.
+    ///
+    /// A SUMO crossing is not a strip of its own with a place along the road. It is a
+    /// `<crossing node edges>` in the connections file, and netconvert lays it across
+    /// the named edges where they meet the node, joining the walking areas either
+    /// side of them. So a crosswalk near the end of a road — which is where the IR
+    /// puts one at a junction, a little short of the mouth — becomes the crossing
+    /// at that end's node, over both carriageways of the road if it has two; one
+    /// further along the road has no node to belong to and is left out (see
+    /// [`place_crosswalk`] for what decides it, and [`check`] for what is reported).
+    ///
+    /// The edges are written in a fixed order, sorted by name, because netconvert
+    /// reads them as a set — it writes them back in an order of its own — and two
+    /// crosswalks across the same end of the same road would be the same crossing.
+    /// They are merged into one, at the wider of the two widths, rather than written
+    /// twice, which netconvert would refuse.
+    fn build_crossings(&mut self) {
+        for object in self.map.objects.iter() {
+            if object.kind != MapObjectKind::Crosswalk {
+                continue;
+            }
+            let Placement::AtEnd {
+                road, end, width, ..
+            } = place_crosswalk(self.map, object)
+            else {
+                continue;
+            };
+            let Some((node, edges)) = self.edges_at(&road, end) else {
+                continue;
+            };
+            let crossing = self.crossings.entry((node, edges)).or_default();
+            crossing.width = crossing.width.max(width);
+            crossing.crosswalks.insert(object.id.clone());
+        }
+    }
+
+    /// The node at one end of a road, and the road's edges that meet it there.
+    ///
+    /// Found from the written edges rather than worked out again: the first
+    /// cross-section's edges at the start of the road, the last one's at its end, of
+    /// which a forward edge leaves the start and arrives at the end, and a backward
+    /// edge the other way round.
+    fn edges_at(&self, road: &RoadId, end: RoadEnd) -> Option<(String, Vec<String>)> {
+        let road = self.map.road(road)?;
+        let section = match end {
+            RoadEnd::Start => 0,
+            RoadEnd::End => road.sections.len() - 1,
+        };
+        let mut node = None;
+        let mut edges = Vec::new();
+        for direction in [Direction::Forward, Direction::Backward] {
+            let id = edge_id(road, section, direction);
+            let Some(edge) = self.edges.iter().find(|edge| edge.id == id) else {
+                continue;
+            };
+            let at = match (end, direction) {
+                (RoadEnd::Start, Direction::Forward) | (RoadEnd::End, Direction::Backward) => {
+                    &edge.from
+                }
+                _ => &edge.to,
+            };
+            node.get_or_insert_with(|| at.clone());
+            edges.push(id);
+        }
+        edges.sort();
+        Some((node?, edges))
+    }
+
+    // ----------------------------------------------------------------------- //
     // Rendering
     // ----------------------------------------------------------------------- //
 
@@ -1134,6 +1428,20 @@ impl<'a> Exporter<'a> {
             }
         }
 
+        // A crosswalk is the crossing written for it, and one of several where two
+        // crosswalks cross the same end of the same road.
+        for ((node, edges), crossing) in &self.crossings {
+            let local = format!("crossing:{}", crossing_name(node, edges));
+            let relation = if crossing.crosswalks.len() == 1 {
+                Relation::Exact
+            } else {
+                Relation::Merged
+            };
+            for crosswalk in &crossing.crosswalks {
+                trace.link(crosswalk.clone(), local.clone(), relation);
+            }
+        }
+
         // A walk from one footway to another is the walking area netconvert builds
         // at the node, which the export cannot name — so it is traced to the node,
         // as part of what that node became.
@@ -1234,8 +1542,38 @@ impl<'a> Exporter<'a> {
                 ],
             );
         }
+        // `priority` is written as a number because that is what SUMO's schema for
+        // the file says it is, though netconvert reads it as a yes or no: with
+        // `SUMO_HOME` set, netconvert validates the file and refuses `true`.
+        //
+        // It is always yes. A crosswalk in the IR is a painted one — it has an
+        // outline, the stripes the other exports draw — and at a marked crossing
+        // traffic gives way to pedestrians on it. At a signalised node the signal
+        // decides instead, and netconvert gives the crossing a phase of its own.
+        for ((node, edges), crossing) in &self.crossings {
+            document.leaf(
+                "crossing",
+                &[
+                    ("node", node.clone()),
+                    ("edges", edges.join(" ")),
+                    ("priority", "1".to_owned()),
+                    ("width", metres(crossing.width)),
+                ],
+            );
+        }
         document.finish()
     }
+}
+
+/// What the trace calls a crossing: the node it is at and the edges it crosses
+/// there, as `<node>/<edge>+<edge>`.
+///
+/// A `<crossing>` has no id in the plain format. netconvert names the one it builds
+/// `:<node>_c<n>`, numbered in an order of its own, and records the edges it crosses
+/// beside it (`crossingEdges`), so the node and the edges are what both ends can
+/// agree on.
+fn crossing_name(node: &str, edges: &[String]) -> String {
+    format!("{node}/{}", edges.join("+"))
 }
 
 /// The netconvert run that builds the `.net.xml`.
@@ -1254,9 +1592,9 @@ impl<'a> Exporter<'a> {
 /// Walking areas are turned on because they are how SUMO's pedestrians cross a node,
 /// and the export relies on them: no connection is written between two footways (see
 /// [`Exporter::connect`]). Left to itself netconvert builds walking areas only at a
-/// node that also has a pedestrian crossing, which the export never writes, so a
-/// sidewalk would end at every junction. A network with no footways gets none, and
-/// nothing else about it changes.
+/// node that also has a pedestrian crossing, which the export writes only where the
+/// IR has a crosswalk, so a sidewalk would end at every other junction. A network
+/// with no footways gets none, and nothing else about it changes.
 fn render_config(prefix: &str) -> String {
     let mut document = xml::Document::new(
         "configuration",
@@ -1461,6 +1799,124 @@ mod tests {
         builder.finish().unwrap().validate().unwrap()
     }
 
+    /// Two streets with crosswalks on them: `paved`, with a footway at both kerbs and
+    /// three crosswalks — two near its start, one in the middle — and `bare`, with
+    /// no footway and one crosswalk near its end.
+    fn crossing_street() -> ValidatedMap {
+        let mut builder = MapBuilder::new(metadata("crossings"));
+        let width = PositiveWidth::new(3.5).unwrap();
+        let footway = PositiveWidth::new(2.0).unwrap();
+        let paved = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    vec![
+                        LaneSpec::new(width, Direction::Backward),
+                        LaneSpec::new(footway, Direction::Backward).with_type(LaneType::Sidewalk),
+                        LaneSpec::new(width, Direction::Forward),
+                        LaneSpec::new(footway, Direction::Forward).with_type(LaneType::Sidewalk),
+                    ],
+                )
+                .unwrap()
+                .with_name("paved"),
+            )
+            .unwrap();
+        let bare = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 50.0, 0.0),
+                    Point3::new(100.0, 50.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("bare"),
+            )
+            .unwrap();
+        builder.add_crosswalk(&paved, 0.05, 4.0).unwrap();
+        builder.add_crosswalk(&paved, 0.06, 3.0).unwrap();
+        builder.add_crosswalk(&paved, 0.5, 4.0).unwrap();
+        builder.add_crosswalk(&bare, 0.95, 4.0).unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    #[test]
+    fn a_crosswalk_near_the_end_of_its_road_is_a_crossing_at_the_node_there() {
+        let map = crossing_street();
+        let network = to_plain_xml(&map).unwrap();
+        // The two near the start are one crossing, as wide as the wider; the one in
+        // the middle and the one with no footway to land on are not written.
+        let crossings: Vec<&str> = network
+            .connections
+            .lines()
+            .filter(|line| line.contains("<crossing"))
+            .collect();
+        assert_eq!(
+            crossings,
+            [
+                r#"    <crossing node="n_paved_start" edges="paved.bwd paved.fwd" priority="1" width="4.000"/>"#
+            ],
+            "{}",
+            network.connections
+        );
+
+        let local = "crossing:n_paved_start/paved.bwd+paved.fwd";
+        let near: Vec<&ObjectId> = map
+            .objects
+            .iter()
+            .filter(|object| {
+                ["object/crosswalk/paved/0.05", "object/crosswalk/paved/0.06"]
+                    .contains(&object.id.as_str())
+            })
+            .map(|object| &object.id)
+            .collect();
+        assert_eq!(near.len(), 2);
+        for id in near {
+            let links: Vec<&TraceLink> =
+                network.trace.links_of(&IrRef::Object(id.clone())).collect();
+            assert_eq!(links.len(), 1, "{id}");
+            assert_eq!(links[0].local, local);
+            assert_eq!(links[0].relation, Relation::Merged);
+        }
+        for id in ["object/crosswalk/paved/0.5", "object/crosswalk/bare/0.95"] {
+            let id = &map
+                .objects
+                .iter()
+                .find(|object| object.id.as_str() == id)
+                .unwrap()
+                .id;
+            assert!(
+                network
+                    .trace
+                    .links_of(&IrRef::Object(id.clone()))
+                    .next()
+                    .is_none(),
+                "{id} was not written, so it should not be traced"
+            );
+        }
+    }
+
+    #[test]
+    fn what_becomes_of_each_crosswalk_is_reported() {
+        let report = check(&crossing_street()).join("\n");
+        assert!(
+            report.contains("the 2 crosswalks near the end of their road are written"),
+            "{report}"
+        );
+        assert!(
+            report.contains("object/crosswalk/paved/0.5 (48.0 m)"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "without a footway at both kerbs are not written: object/crosswalk/bare/0.95"
+            ),
+            "{report}"
+        );
+        // Nothing about crosswalks for a map with none.
+        assert!(!check(&in_line()).join("\n").contains("crosswalk"));
+    }
+
     /// Every `<kind>:<local>` the rendered files actually contain, read back from the
     /// XML rather than from the exporter's state.
     fn written(network: &PlainNetwork) -> BTreeSet<String> {
@@ -1505,6 +1961,17 @@ mod tests {
                             attributes["toLane"]
                         ));
                     }
+                    b"crossing" => {
+                        let mut edges: Vec<String> = attributes["edges"]
+                            .split_whitespace()
+                            .map(str::to_owned)
+                            .collect();
+                        edges.sort();
+                        found.insert(format!(
+                            "crossing:{}",
+                            crossing_name(&attributes["node"], &edges)
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -1514,7 +1981,7 @@ mod tests {
 
     #[test]
     fn everything_the_trace_names_is_in_the_files() {
-        for map in [crossroads(), in_line()] {
+        for map in [crossroads(), in_line(), crossing_street()] {
             let network = to_plain_xml(&map).unwrap();
             let written = written(&network);
             assert_eq!(network.trace.format, "sumo");
