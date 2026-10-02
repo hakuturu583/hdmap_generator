@@ -2092,6 +2092,11 @@ impl<'a> Exporter<'a> {
     /// The edges that run into a node something could continue from, but from which
     /// the IR states no movement at all.
     ///
+    /// At a signalised node this matters twice over: a movement netconvert guessed
+    /// there would be in no program — no `tl`, state `m` — so vehicles on it would
+    /// drive through the junction ignoring the signal. Deleting them leaves every
+    /// movement into the node one the `.tll.xml` controls.
+    ///
     /// A footway is not one of them: pedestrians do not follow connections but cross
     /// a node on its walking area, so there is no movement for netconvert to guess.
     fn unconnected_edges(&self) -> Vec<usize> {

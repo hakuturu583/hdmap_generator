@@ -151,10 +151,20 @@ fn attributes(element: &quick_xml::events::BytesStart) -> HashMap<String, String
 /// the programs the export wrote, with every movement into a signalised node on the
 /// link index the export gave it. Returns what the export wrote, and the directory.
 fn build_and_compare(map: &ValidatedMap) -> (tempfile::TempDir, String, Lights) {
+    build_and_compare_warned(map, &[])
+}
+
+/// [`build_and_compare`], for a map netconvert is right to warn about: it must say
+/// exactly `expected`, one line each, and nothing else.
+fn build_and_compare_warned(
+    map: &ValidatedMap,
+    expected: &[&str],
+) -> (tempfile::TempDir, String, Lights) {
     let directory = tempfile::tempdir().unwrap();
     let prefix = roadgen_sumo::write(map, directory.path()).unwrap();
     let written = Lights::read(&directory.path().join(format!("{prefix}.tll.xml")));
-    let net_path = sumo_build::netconvert(directory.path(), &prefix);
+    let (net_path, warnings) = sumo_build::netconvert_with_warnings(directory.path(), &prefix);
+    assert_eq!(warnings, expected, "netconvert said something unexpected");
     let built = Lights::read(&net_path);
 
     assert!(!written.programs.is_empty(), "the export wrote no program");
@@ -347,6 +357,98 @@ fn signalised_crossroads() -> ValidatedMap {
         builder.add_traffic_light_rule(vec![light], Some(stop_line), vec![approach]);
     }
     builder.finish().unwrap().validate().unwrap()
+}
+
+/// The crossroads of [`signalised_crossroads`], lit and ruled on every arm, but with
+/// no connector out of the northern approach: the IR states no movement onward from
+/// `north.fwd`, while every other approach turns into the other three arms,
+/// `north.bwd` among them.
+fn crossroads_with_a_dead_approach() -> ValidatedMap {
+    let mut builder = MapBuilder::new(scenarios::metadata("dead_approach"));
+    let arms: Vec<RoadId> = [
+        ("north", (0.0, 70.0), (0.0, 14.0)),
+        ("east", (70.0, 0.0), (14.0, 0.0)),
+        ("south", (0.0, -70.0), (0.0, -14.0)),
+        ("west", (-70.0, 0.0), (-14.0, 0.0)),
+    ]
+    .into_iter()
+    .map(|(name, (x0, y0), (x1, y1))| {
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(x0, y0, 0.0),
+                    Point3::new(x1, y1, 0.0),
+                    scenarios::two_way(),
+                )
+                .unwrap()
+                .with_name(name),
+            )
+            .unwrap()
+    })
+    .collect();
+    let junction = builder.add_junction(Some("x"));
+    // Lane 0 of each arm runs into the junction, lane 1 out of it.
+    for from in arms.iter().skip(1) {
+        for to in arms.iter().filter(|to| *to != from) {
+            builder
+                .connect_lanes(
+                    &LaneRef::new(from.clone(), 0),
+                    &LaneRef::new(to.clone(), 1),
+                    Some(&junction),
+                )
+                .unwrap();
+        }
+    }
+    for arm in &arms {
+        let approach = LaneRef::new(arm.clone(), 0);
+        let stop_line = builder.add_stop_line(&approach, LaneEnd::End).unwrap();
+        let light = builder
+            .add_traffic_light(&approach, LaneEnd::End, 5.0)
+            .unwrap();
+        builder.add_traffic_light_rule(vec![light], Some(stop_line), vec![approach]);
+    }
+    builder.finish().unwrap().validate().unwrap()
+}
+
+/// An approach into a signalised junction that the IR carries nowhere is not left
+/// for netconvert to fill in. Were it, netconvert would guess movements off it that
+/// no program controls — state `m`, no `tl` — and vehicles on it would drive through
+/// the junction ignoring the signal. The export deletes every movement off it
+/// instead, so the network has none, every movement that is there is controlled, and
+/// the rest of the junction runs on the program without incident.
+#[test]
+fn an_approach_with_nowhere_to_go_enters_the_signal_not_uncontrolled() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = crossroads_with_a_dead_approach();
+    // netconvert says the edge goes nowhere, which is what the IR says.
+    let (directory, prefix, lights) = build_and_compare_warned(
+        &map,
+        &["Warning: Edge 'north.fwd' is not connected to outgoing edges at junction 'j_x'."],
+    );
+
+    let net = directory.path().join(format!("{prefix}.net.xml"));
+    let network = sumo_build::SumoNetwork::read(&net);
+    let guessed: Vec<String> = network
+        .connections
+        .iter()
+        .filter(|connection| connection.from == "north.fwd")
+        .map(|connection| format!("{} → {}", connection.from, connection.to))
+        .collect();
+    assert!(
+        guessed.is_empty(),
+        "netconvert guessed movements the IR does not state: {guessed:?}"
+    );
+
+    // The other three approaches each turn into the other three arms.
+    assert_eq!(lights.links.len(), 9);
+    assert!(lights.links.keys().all(|(from, ..)| from != "north.fwd"));
+    assert!(lights.links.keys().any(|(_, _, to, _)| to == "north.bwd"));
+    let indices: BTreeSet<usize> = lights.links.values().map(|(_, index)| *index).collect();
+    assert_eq!(indices, (0..9).collect());
+
+    drive(directory.path(), &prefix, &lights);
 }
 
 /// The scenario every format is tested with: two arms at right angles, so two groups

@@ -39,7 +39,8 @@
 //!   released is protected; everything not released is red.
 //!
 //! "Across the oncoming traffic" is a left turn where traffic keeps right and a right
-//! turn where it keeps left. It is read off the geometry here — the angle between the
+//! turn where it keeps left, and a U-turn (a swing past [`U_TURN_DEGREES`]) either
+//! way. It is read off the geometry here — the angle between the
 //! lane a movement leaves and the lane it joins, and the map's handedness — rather
 //! than off the `dir` netconvert later writes, so that the program does not depend on
 //! netconvert being told which side the map drives on. One refinement over the
@@ -64,6 +65,10 @@ pub const AXIS_TOLERANCE_DEGREES: f64 = 35.0;
 /// How far a movement must swing from the heading it arrived on to count as a turn
 /// rather than as carrying straight on through a junction drawn slightly askew.
 pub const TURN_DEGREES: f64 = 30.0;
+
+/// How far a movement must swing, either way, to count as a U-turn, which crosses
+/// the oncoming traffic whichever side the map drives on.
+pub const U_TURN_DEGREES: f64 = 150.0;
 
 /// The green of each phase where a junction has at most two groups of approaches.
 pub const GREEN_FEW_SECONDS: u32 = 35;
@@ -198,8 +203,15 @@ pub(crate) fn program(links: &[Link], handedness: TrafficHandedness) -> Vec<Phas
 
 /// Whether a movement that swings by `turn` crosses the path of the traffic coming
 /// the other way: a left turn where traffic keeps right, a right turn where it keeps
-/// left.
+/// left — and a U-turn either way.
+///
+/// A swing of more than [`U_TURN_DEGREES`] is a U-turn whatever its sign: the lane it
+/// joins runs back beside the oncoming approach, so it cuts across that traffic even
+/// where the drawn geometry has it bend a few degrees past straight back.
 pub(crate) fn crosses_oncoming(turn: f64, handedness: TrafficHandedness) -> bool {
+    if turn.abs() > U_TURN_DEGREES.to_radians() {
+        return true;
+    }
     let threshold = TURN_DEGREES.to_radians();
     match handedness {
         TrafficHandedness::RightHand => turn > threshold,
@@ -399,6 +411,23 @@ mod tests {
         let phases = program(&links, TrafficHandedness::RightHand);
         assert_eq!(phases.len(), 9);
         assert_eq!(phases[0].duration, GREEN_MANY_SECONDS);
+    }
+
+    #[test]
+    fn a_u_turn_crosses_oncoming_traffic_whichever_way_it_bends() {
+        for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+            assert!(crosses_oncoming(degrees(175.0), handedness));
+            assert!(crosses_oncoming(degrees(-175.0), handedness));
+            assert!(crosses_oncoming(PI, handedness));
+        }
+        assert!(!crosses_oncoming(
+            degrees(-90.0),
+            TrafficHandedness::RightHand
+        ));
+        assert!(!crosses_oncoming(
+            degrees(90.0),
+            TrafficHandedness::LeftHand
+        ));
     }
 
     #[test]
