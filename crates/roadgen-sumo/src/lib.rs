@@ -330,12 +330,83 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         ));
     }
 
+    let unshaped = parallel_connectors(map);
+    if !unshaped.is_empty() {
+        problems.push(format!(
+            "a SUMO connection has one shape, but the IR draws more than one way across \
+             a junction between some pairs of lanes; each is written as one connection \
+             along the first of its ways, and the rest are not drawn: {}",
+            unshaped.join(", ")
+        ));
+    }
+
     problems.push(
         "the network is in the map's own metres about its origin; SUMO carries no \
          geo-reference for it"
             .to_owned(),
     );
     problems
+}
+
+/// Pairs of written lanes the IR joins by more than one way through connectors, as
+/// `from > to`. The exporter writes one connection per pair, and a connection carries
+/// one shape, so every way but the first goes unwritten; `check()` names them.
+///
+/// The walk is the one `build_connections` makes: out of a lane SUMO has a place for,
+/// through any number of connector lanes, to the next lane SUMO has a place for. Ways
+/// are counted rather than lanes reached, so two connectors side by side between the
+/// same lanes count twice where one connector reached twice does not.
+fn parallel_connectors(map: &ValidatedMap) -> Vec<String> {
+    let mut successors: BTreeMap<&LaneId, Vec<&LaneId>> = BTreeMap::new();
+    for connection in map.connections.iter() {
+        successors
+            .entry(&connection.from.lane)
+            .or_default()
+            .push(&connection.to.lane);
+    }
+    let on_connector = |lane: &LaneId| {
+        map.lane(lane)
+            .and_then(|lane| map.road(&lane.road))
+            .is_some_and(Road::is_connector)
+    };
+    let written = |lane: &LaneId| {
+        !on_connector(lane)
+            && map
+                .lane(lane)
+                .is_some_and(|lane| classes::permission(lane.lane_type).is_some())
+    };
+
+    let mut found = Vec::new();
+    for source in map
+        .lanes
+        .iter()
+        .map(|lane| &lane.id)
+        .filter(|id| written(id))
+    {
+        // Every way out of the source, each one a stack entry with the connector
+        // lanes it has crossed so far, so a way that loops back on itself stops.
+        let mut ways: BTreeMap<&LaneId, usize> = BTreeMap::new();
+        let mut pending: Vec<(&LaneId, Vec<&LaneId>)> = vec![(source, Vec::new())];
+        while let Some((lane, crossed)) = pending.pop() {
+            for &next in successors.get(lane).into_iter().flatten() {
+                if written(next) {
+                    if !crossed.is_empty() {
+                        *ways.entry(next).or_default() += 1;
+                    }
+                } else if on_connector(next) && !crossed.contains(&next) {
+                    let mut further = crossed.clone();
+                    further.push(next);
+                    pending.push((next, further));
+                }
+            }
+        }
+        found.extend(
+            ways.into_iter()
+                .filter(|&(_, count)| count > 1)
+                .map(|(target, _)| format!("{source} > {target}")),
+        );
+    }
+    found
 }
 
 // --------------------------------------------------------------------------- //
@@ -419,7 +490,7 @@ struct Movement {
     ///
     /// Only one way through is drawn, even where a junction holds several connectors
     /// between the same pair of lanes: a connection has one shape. The first one the
-    /// walk found is kept.
+    /// walk found is kept, and `check()` names the pairs of lanes where that drops one.
     shape: Option<Polyline3>,
 }
 
@@ -1521,6 +1592,16 @@ mod tests {
                 assert_eq!(exact, vec![format!("lane:{id}")], "{lane}");
             }
         }
+    }
+
+    #[test]
+    fn one_connector_per_movement_loses_no_way_across() {
+        // The builder draws one connector per movement, so on a crossroads every pair
+        // of lanes has one way across and every connection's shape is the whole of
+        // what the IR drew: nothing to report.
+        let map = crossroads();
+        assert!(parallel_connectors(&map).is_empty());
+        assert!(!check(&map).iter().any(|line| line.contains("one shape")));
     }
 
     #[test]
