@@ -1038,15 +1038,18 @@ governs — a right-of-way rule's yielding lanes, a traffic-light rule's lanes �
 the line actually crosses them. An offset is only meaningful where the lane runs into
 a junction, so on an approach split over several edges by a change of cross-section
 it goes on the edge that reaches the junction and nowhere else. A line within 10 cm of
-the end of its lane is written as nothing, since that is where SUMO stops a vehicle
-anyway; and where two stop lines cross one lane, the one nearer the junction holds its
-one offset. The trace records each as `merged` into the lane, with the role
-`stopOffset`.
+the end of its lane needs no offset, since that is where SUMO stops a vehicle anyway,
+so it leaves neither a `<stopOffset>` nor a trace link, and `sumo_warnings()` counts
+it apart from the lines that are written; and where two stop lines cross one lane, the
+one nearer the junction holds its one offset. The trace records each offset as
+`merged` into the lane, with the role `stopOffset`.
 
 Where a stop line cannot become an offset, `sumo_warnings()` names it with the lane
 it misses and the reason: a stop line not drawn as a line across the road at all, a
 lane no SUMO lane is written for (a junction's connector), an edge that does not end at
-a junction, a lane whose centreline it does not cross, a lane where it is at the start
+a junction, a line set back further than the last edge before the junction is long
+(so on an earlier edge of the approach, named on that edge's lane), a lane whose
+centreline it does not cross, a lane where it is at the start
 rather than before the junction ahead, a lane where it is further back than its edge
 is long — which netconvert would refuse — or one whose offset a line nearer the
 junction already holds. It is named lane by lane, so a line drawn across both
@@ -1054,9 +1057,11 @@ carriageways that is written on the approach is reported only for the lane leadi
 away.
 
 A line carries no direction, so "at the start" is judged only where it is in doubt: on
-an edge that runs from one junction to another, where a line drawn across the whole
-road crosses both the lane approaching the far junction and the one leaving the near
-one. There it belongs to the lane whose end it is nearer. Anywhere else the lane
+an edge that runs from one junction to another, and only for a line that crosses lanes
+running both ways — one drawn across the whole road, crossing both the lane
+approaching the far junction and the one leaving the near one. There it belongs to the
+lane whose end it is nearer. A line whose lanes all run the same way stands before the
+junction they run into, however short the road between the two junctions. Anywhere else the lane
 leaving a junction ends at a node that is no junction and is already turned away for
 that, so an approach split by a change of cross-section close to the junction keeps
 its stop line even when the last edge is shorter than the line is set back.
