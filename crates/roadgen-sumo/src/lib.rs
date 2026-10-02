@@ -252,22 +252,6 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         );
     }
 
-    let sectioned: Vec<&str> = map
-        .roads
-        .iter()
-        .filter(|road| !road.is_connector() && road.sections.len() > 1)
-        .map(|road| road.id.as_str())
-        .collect();
-    if !sectioned.is_empty() {
-        problems.push(format!(
-            "an edge has one lane count, so the changing cross-section of {} becomes \
-             a chain of edges with a node between them; the IR's connections across \
-             each boundary are written as the movements through that node: {}",
-            sectioned.len(),
-            sectioned.join(", ")
-        ));
-    }
-
     let signals = map
         .objects
         .iter()

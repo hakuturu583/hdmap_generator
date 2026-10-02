@@ -558,11 +558,11 @@ fn what_the_format_cannot_carry_is_reported() {
     assert!(crossroads.contains("crosswalk"), "{crossroads}");
 
     // A changing cross-section is a chain of edges, but the movements across each
-    // node are the IR's own connections, so nothing about them is left to
-    // netconvert.
+    // node are the IR's own connections: nothing is lost there, so nothing about
+    // it is reported.
     let sectioned = roadgen_sumo::check(&scenarios::lane_drop()).join("\n");
-    assert!(sectioned.contains("chain of edges"), "{sectioned}");
-    assert!(!sectioned.contains("lane-matching"), "{sectioned}");
+    assert!(!sectioned.contains("cross-section"), "{sectioned}");
+    assert!(!sectioned.contains("chain of edges"), "{sectioned}");
 }
 
 /// The four files are named after the map and refer to each other, so that building
