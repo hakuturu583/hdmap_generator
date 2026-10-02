@@ -21,8 +21,6 @@
 //! which turns the skip into a failure.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-use std::process::Command;
 
 use roadgen_core::prelude::*;
 use roadgen_core::trace::Relation;
@@ -283,7 +281,7 @@ fn a_pedestrian_walks_round_every_corner_both_ways() {
         let routes = format!("<routes>\n{persons}</routes>\n");
         std::fs::write(directory.path().join("walks.rou.xml"), routes).unwrap();
 
-        let walked = walk(directory.path(), &prefix);
+        let walked = sumo_build::walk(directory.path(), &prefix);
         assert_eq!(
             walked.len(),
             walks.len(),
@@ -298,69 +296,6 @@ fn a_pedestrian_walks_round_every_corner_both_ways() {
             );
         }
     }
-}
-
-/// Runs the simulator on the built network with the persons of `walks.rou.xml`, and
-/// returns how far each one that arrived walked, by id.
-fn walk(directory: &Path, prefix: &str) -> BTreeMap<String, f64> {
-    let output = Command::new(sumo_build::tool("sumo").expect("sumo"))
-        .args(["-n", &format!("{prefix}.net.xml")])
-        .args(["-r", "walks.rou.xml"])
-        .args(["--tripinfo-output", "walks.tripinfo.xml"])
-        .args(["--no-step-log", "true"])
-        .args(["--end", "600"])
-        .current_dir(directory)
-        .output()
-        .expect("sumo should run");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "sumo failed:\n{stderr}");
-    let complaints: Vec<&str> = stderr
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter(|line| !sumo_build::is_about_the_machine_or_the_map(line))
-        .collect();
-    assert!(
-        complaints.is_empty(),
-        "sumo complained about the walks:\n{}",
-        complaints.join("\n")
-    );
-
-    let tripinfo = std::fs::read_to_string(directory.join("walks.tripinfo.xml")).unwrap();
-    let mut walked = BTreeMap::new();
-    let mut reader = quick_xml::Reader::from_str(&tripinfo);
-    let mut person = None;
-    loop {
-        match reader.read_event().expect("valid tripinfo XML") {
-            quick_xml::events::Event::Eof => break,
-            quick_xml::events::Event::Start(element) | quick_xml::events::Event::Empty(element) => {
-                let attribute = |key: &str| {
-                    element
-                        .try_get_attribute(key)
-                        .ok()
-                        .flatten()
-                        .map(|value| String::from_utf8_lossy(&value.value).into_owned())
-                };
-                match element.name().as_ref() {
-                    b"personinfo" => person = attribute("id"),
-                    b"walk" => {
-                        let arrived = attribute("arrival")
-                            .and_then(|value| value.parse::<f64>().ok())
-                            .is_some_and(|time| time >= 0.0);
-                        if let (true, Some(id), Some(length)) = (
-                            arrived,
-                            person.clone(),
-                            attribute("routeLength").and_then(|value| value.parse().ok()),
-                        ) {
-                            walked.insert(id, length);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-    walked
 }
 
 /// Nothing of the IR's pavements is lost from the trace: each pavement lane, and the

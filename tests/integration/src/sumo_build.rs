@@ -10,7 +10,7 @@
 //! helpers say so and the test skips, unless `ROADGEN_REQUIRE_SUMO` is set — which CI
 //! does set, so the checks that matter never silently stop running.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -225,6 +225,69 @@ pub fn simulate(directory: &Path, prefix: &str) {
     );
 }
 
+/// Runs the simulator on the built network with the persons of `walks.rou.xml`, and
+/// returns how far each one that arrived walked, by id.
+pub fn walk(directory: &Path, prefix: &str) -> BTreeMap<String, f64> {
+    let output = Command::new(tool("sumo").expect("sumo"))
+        .args(["-n", &format!("{prefix}.net.xml")])
+        .args(["-r", "walks.rou.xml"])
+        .args(["--tripinfo-output", "walks.tripinfo.xml"])
+        .args(["--no-step-log", "true"])
+        .args(["--end", "600"])
+        .current_dir(directory)
+        .output()
+        .expect("sumo should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "sumo failed:\n{stderr}");
+    let complaints: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !is_about_the_machine_or_the_map(line))
+        .collect();
+    assert!(
+        complaints.is_empty(),
+        "sumo complained about the walks:\n{}",
+        complaints.join("\n")
+    );
+
+    let tripinfo = std::fs::read_to_string(directory.join("walks.tripinfo.xml")).unwrap();
+    let mut walked = BTreeMap::new();
+    let mut reader = Reader::from_str(&tripinfo);
+    let mut person = None;
+    loop {
+        match reader.read_event().expect("valid tripinfo XML") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element) => {
+                let attribute = |key: &str| {
+                    element
+                        .try_get_attribute(key)
+                        .ok()
+                        .flatten()
+                        .map(|value| String::from_utf8_lossy(&value.value).into_owned())
+                };
+                match element.name().as_ref() {
+                    b"personinfo" => person = attribute("id"),
+                    b"walk" => {
+                        let arrived = attribute("arrival")
+                            .and_then(|value| value.parse::<f64>().ok())
+                            .is_some_and(|time| time >= 0.0);
+                        if let (true, Some(id), Some(length)) = (
+                            arrived,
+                            person.clone(),
+                            attribute("routeLength").and_then(|value| value.parse().ok()),
+                        ) {
+                            walked.insert(id, length);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    walked
+}
+
 /// Drives one passenger car down `edge` of a built network, from `depart_lane` to
 /// `arrival_lane`, and returns every lane it was on — so whether the lane change was
 /// allowed is what the simulator did, not what the attributes are taken to mean.
@@ -316,6 +379,8 @@ pub struct SumoEdge {
     pub to: Option<String>,
     pub name: Option<String>,
     pub priority: Option<i32>,
+    /// For a pedestrian crossing, the edges it crosses, in netconvert's order.
+    pub crossing_edges: Vec<String>,
     pub lanes: Vec<SumoLane>,
 }
 
@@ -426,6 +491,10 @@ impl SumoNetwork {
                             priority: attributes
                                 .get("priority")
                                 .and_then(|value| value.parse().ok()),
+                            crossing_edges: attributes
+                                .get("crossingEdges")
+                                .map(|value| value.split_whitespace().map(str::to_owned).collect())
+                                .unwrap_or_default(),
                             lanes: Vec::new(),
                         }),
                         "lane" => {

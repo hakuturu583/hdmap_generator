@@ -1180,6 +1180,32 @@ the side traffic keeps to, so a pavement can run from a sidewalk *leaving* the
 junction, and netconvert refuses a connection out of an edge that does not end
 there. `sumo_warnings()` counts the footway connections left to the walking areas.
 
+**A crosswalk becomes a pedestrian crossing.** SUMO's crossing is not a strip with a
+place along the road, as the IR's is: it belongs to a node, and netconvert lays it
+across the mouth of the edges it names, between the walking areas either side. So a
+crosswalk near the end of a road — where the IR puts one at a junction, a little short
+of the mouth — is written as the crossing at that end's node, across both
+carriageways of the road:
+
+```xml
+<crossing node="j_x" edges="west.bwd west.fwd" priority="1" width="4.000"/>
+```
+
+"Near" is within 15 m of the road end, measured to the crosswalk's nearer edge;
+`sumo_warnings()` says how far the furthest one moved. Pedestrians have priority on
+every crossing, because a crosswalk in the IR is a painted one, and at a signalised
+node netconvert gives the crossing a phase of its own. (`priority` is written as `1`
+rather than `true` because SUMO's schema types it as a number, and netconvert refuses
+`true` when it validates the file.) Two kinds of crosswalk are not written, and
+`sumo_warnings()` names each: one further along the road than that, a mid-block
+crossing, which SUMO could only carry by splitting the road with a node of its own
+there; and one across a road without a footway at both kerbs, which netconvert would
+build with nothing leading off one end. The trace names a crossing
+`crossing:<node>/<edge>+<edge>`, the edges sorted, since the plain format gives it no
+id; once the built network is loaded, the crosswalk also reaches the lane of the
+crossing netconvert built for it (`:j_x_c0_0`, role `crossing`), matched by the
+`crossingEdges` netconvert records on it.
+
 A junction with a traffic light on an approach becomes a `traffic_light` node.
 netconvert generates the phases, because the IR holds no signal timing to write.
 
@@ -1272,8 +1298,10 @@ for the map whenever it reaches a centimetre.
 - **Superelevation.** A SUMO lane is flat across. The heights along it survive.
 - **Lanes traffic does not run along** — borders, painted islands, parking bays — are
   dropped rather than written as something they are not.
-- **Crosswalks and signs.** A SUMO crossing belongs to a node and a sign is an
-  additional file, not part of the network.
+- **Signs.** A sign is an additional file, not part of the network.
+- **Crosswalks far from either end of their road**, and across a road without a
+  footway at both kerbs, as above: a SUMO crossing belongs to a node and joins two
+  footways.
 - **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
   right of way and no more.
 - **The stop line's paint.** Where it is survives as a stop offset, as above; a stop

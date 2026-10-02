@@ -185,7 +185,7 @@ SUMO なら `{"ir": "road/north", "ref": "edge:north.fwd", "rel": "part"}` の�
 | --- | --- | --- |
 | opendrive | `road` `junction` `lane` `signal` `object` `building` `connection` `controller` | `lane:<road>/<section index>/<lane no>`、`connection:<junction>/<connection id>` |
 | lanelet2 | `lanelet` `linestring` `point` `regulatory_element` | 整数 |
-| sumo | `edge` `lane` `node` `connection` `tls` | SUMO の ID 文字列、connection は `<fromLane>><toLane>` |
+| sumo | `edge` `lane` `node` `connection` `crossing` `tls` | SUMO の ID 文字列、connection は `<fromLane>><toLane>`、crossing は `<node>/<edge>+<edge>`（edge は名前順） |
 | osm | `node` `way` `relation` | 負の整数 |
 | carla | `mesh` `actor` + `.xodr` 分は opendrive を参照 | 名前 |
 | clipgt | レイヤ名 (`lane` `lane_line` `wait_line` …) | 行番号 |
