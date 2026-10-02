@@ -385,3 +385,30 @@ fn a_right_of_way_rule_translates_to_what_each_format_carries_it_by() {
         );
     }
 }
+
+/// A UTM map's network is offset by hundreds of kilometres — the origin's easting
+/// and northing, which is its geo-reference — and still checks out against the export
+/// node for node: that offset was declared by the node file and moved nothing, so it
+/// is not mistaken for a shift netconvert applied.
+#[test]
+fn a_utm_network_is_recognised_as_built_from_its_export() {
+    if !sumo_available() {
+        return;
+    }
+    let mut builder = scenarios::crossroads_builder("crossroads", 70.0);
+    builder.metadata_mut().projection = Projection::Utm;
+    let map = builder.finish().unwrap().validate().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let prefix = export_everything(&map, directory.path());
+    let net = netconvert(&directory.path().join("sumo"), &prefix);
+    let offset = SumoNetwork::read(&net).location.net_offset;
+    assert!(
+        offset.0 < -100_000.0 && offset.1 < -1_000_000.0,
+        "{offset:?}"
+    );
+
+    let mut index = load_everything(directory.path());
+    let report = index.load_sumo_net(&net).unwrap();
+    assert_eq!(report.internal_lanes, 14);
+    assert_eq!(report.untraced, 0);
+}
