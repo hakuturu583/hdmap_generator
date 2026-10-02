@@ -976,6 +976,54 @@ type: a driving lane is written as one pedestrians are kept out of, a footway as
 that admits only them, a bike lane only bicycles and a hard shoulder only emergency
 vehicles.
 
+### Lane changes
+
+SUMO has no paint, but it has what the paint between two lanes is *for*: whether a
+vehicle may change across it. Each lane is written with `changeLeft` and
+`changeRight` read off the IR's marking on the boundary it shares with its
+neighbour in the edge — `left_marking` and `right_marking` on a `LaneSpec`, or the
+`left_marking=` / `right_marking=` arguments of `Lane` in Python:
+
+| marking between the two lanes | lane change |
+| --- | --- |
+| `broken`, `none` | open — nothing is written, which SUMO reads as open to everyone |
+| `solid`, `solid solid`, `curb` | `emergency` only |
+| `solid broken`, `broken solid` | decided by the half nearer the vehicle |
+
+```xml
+<lane index="0" ... changeLeft="emergency"/>
+<lane index="1" ... changeRight="emergency"/>
+```
+
+SUMO's attributes name the classes **allowed** to change, so a line nobody may cross
+is written as the short list of those who may cross it anyway.
+
+A double line's two words are read looking along the road's reference line, left
+word first, as OpenDRIVE reads them: in `solid broken` the solid line is on the left.
+A vehicle obeys the line on its own side, so in a lane to the right of a
+`solid broken` line it may change across and in the lane to its left it may not — the
+asymmetry the marking exists for. The IR keeps markings by the side of the reference
+line, so a lane running against it has its `left_marking` on its right in travel;
+the exporter accounts for that, and for handedness, by working from where the lanes
+are.
+
+`changeLeft` and `changeRight` are the driver's left and right in travel under either
+handedness. A left-hand network numbers its lanes from the kerb on the left, so there
+the next lane up is on the driver's **right**: with a solid line between two lanes
+driving on the left, lane 0 is written with `changeRight` and lane 1 with
+`changeLeft` — the mirror of the example above.
+
+Two things open a change the paint would close. A lane that leads nowhere while the
+rest of its edge carries on — a lane drop — can only be left sideways, and
+netconvert refuses a prohibition that would trap a vehicle in it, so none is written.
+And two lanes that are neighbours in SUMO without sharing a boundary in the IR — a
+painted island between them that SUMO has no lane for — are kept apart as if by a
+solid line, since crossing the island is no lane change the map offers.
+
+`LaneSpec` and Python's `Lane` default to a solid line on both sides, so a road
+built without saying otherwise closes every lane change on it. Give lanes that may be
+changed between a `broken` line on the side they share.
+
 ### Right of way
 
 SUMO's right of way is a **matrix over pairs of movements** — which stream gives way
@@ -1145,7 +1193,7 @@ for the map whenever it reaches a centimetre.
 ### What it cannot carry
 
 - **Lane markings.** Which line is painted between two lanes, and in what colour, has
-  nowhere to go.
+  nowhere to go. Only whether it may be crossed survives, as above.
 - **One width per lane.** A tapering lane is written at its mean width along — the
   area of the lane divided by its length — and `sumo_warnings()` names it.
 - **Superelevation.** A SUMO lane is flat across. The heights along it survive.
