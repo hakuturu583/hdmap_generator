@@ -404,6 +404,9 @@ pub struct SumoLane {
     pub change_left: Option<String>,
     pub change_right: Option<String>,
     pub shape: Vec<Point3>,
+    /// How far short of the lane's end a vehicle waiting at the junction ahead stops,
+    /// from the lane's `<stopOffset>`; `None` when it stops at the very end.
+    pub stop_offset: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -516,6 +519,7 @@ impl SumoNetwork {
                                 change_left: attributes.get("changeLeft").cloned(),
                                 change_right: attributes.get("changeRight").cloned(),
                                 shape: points(attributes.get("shape").map(String::as_str)),
+                                stop_offset: None,
                             };
                             network
                                 .edges
@@ -523,6 +527,18 @@ impl SumoNetwork {
                                 .expect("a lane inside an edge")
                                 .lanes
                                 .push(lane);
+                        }
+                        // A lane's own stop offset is its child, so it belongs to the
+                        // lane just read. One for a whole edge would come before any
+                        // of its lanes, and the export writes none.
+                        "stopOffset" => {
+                            if let Some(lane) = network
+                                .edges
+                                .last_mut()
+                                .and_then(|edge| edge.lanes.last_mut())
+                            {
+                                lane.stop_offset = Some(number(&attributes, "value"));
+                            }
                         }
                         "junction" => network.junctions.push(SumoJunction {
                             id: attributes["id"].clone(),

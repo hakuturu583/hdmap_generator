@@ -1076,6 +1076,72 @@ holds for any edge the IR carries nothing on from, wherever it ends short of a d
 end — except a footway, since pedestrians cross a node on its walking area rather
 than along connections, so there is nothing for netconvert to guess.
 
+### Stop lines
+
+SUMO has no stop line as a thing of its own. What it has is a lane's **stop offset**:
+how far short of the end of the lane a vehicle waiting at the junction ahead comes to
+a halt. Without one it halts at the very end of the lane — for an arm that stops where
+the IR's junction begins, the junction's mouth rather than the line painted before
+it.
+
+So each stop line is measured along every written lane it crosses, from where it
+crosses the lane's centreline to the lane's end in the direction of travel, and the
+distance becomes that lane's `<stopOffset>`:
+
+```xml
+<lane index="0" width="3.500" shape="-1.750,40.000,0.000 -1.750,14.000,0.000" disallow="pedestrian">
+    <stopOffset value="8.000"/>
+</lane>
+```
+
+It carries no `vClasses`: a stop line binds everything that drives up to it, which is
+SUMO's default of `all`. netconvert keeps a lane's custom shape as it was given rather
+than cutting it back to the junction, so the end it is measured from is the end the
+built network has, and the tests read the offset back out of the `.net.xml` and check
+that the point it puts the stop at is the painted line, to within a few centimetres.
+
+The lanes measured are the ones the stop line names, and those that a rule naming it
+governs — a right-of-way rule's yielding lanes, a traffic-light rule's lanes — where
+the line actually crosses them. An offset is only meaningful where the lane runs into
+a junction, so on an approach split over several edges by a change of cross-section
+it goes on the edge that reaches the junction and nowhere else. A line within 10 cm of
+the end of its lane needs no offset, since that is where SUMO stops a vehicle anyway,
+so it leaves neither a `<stopOffset>` nor a trace link, and `sumo_warnings()` counts
+it apart from the lines that are written; and where two stop lines cross one lane, the
+one nearer the junction holds its one offset. The trace records each offset as
+`merged` into the lane, with the role `stopOffset`.
+
+Where a stop line cannot become an offset, `sumo_warnings()` names it with the lane
+it misses and the reason: a stop line not drawn as a line across the road at all, a
+lane no SUMO lane is written for (a junction's connector), an edge that does not end at
+a junction, a line set back further than the last edge before the junction is long
+(so on an earlier edge of the approach, named on that edge's lane), a lane whose
+centreline it does not cross, a lane where it is at the start — drawn across both
+carriageways, it belongs to the other one — a lane where it is further back than its
+edge is long — which netconvert would refuse — or one whose offset a line nearer the
+junction already holds. It is named lane by lane, so a line drawn across both
+carriageways that is written on the approach is reported only for the lane leading
+away.
+
+A line carries no direction, so which carriageway it belongs to is judged only where
+it is in doubt: for a line that crosses lanes running both ways, as one drawn across
+the whole road does. That is decided on the IR, before anything about SUMO edges or
+nodes: the crossing with each lane is projected onto the road's reference line, and
+the line belongs to a lane if it is nearer the junction the lane runs into than the
+junction it leaves, each measured along the road — every cross-section of it — and on
+through the roads joined to it end to end by plain joints, up to the first junction
+that way; a dead end has no junction beyond it. So a road joined to the next by a
+plain joint at one end and running into a junction at the other, or a stub with a dead
+end, is judged by the one junction it has, not by its own two ends. A lane for which
+the line is nearer the junction behind it is "at the start" of it, however the roads
+are cut into edges; exactly halfway, or with no junction either way, a lane a rule
+naming the line governs is preferred, and the others are at the start. Only the lanes
+the line belongs to are then placed as above — on the edge that reaches the junction,
+or reported as on an earlier edge, or as running into no junction. A line whose lanes
+all run the same way stands before wherever they run to, however short the road, so
+an approach split by a change of cross-section close to the junction keeps its stop
+line even when the last edge is shorter than the line is set back.
+
 ### Junctions, which SUMO models the same way round as the IR
 
 The IR draws a junction as a set of connector roads, one per movement. SUMO draws it
@@ -1310,6 +1376,8 @@ for the map whenever it reaches a centimetre.
   right of way and no more.
 - **Signal timing.** The IR has none, so a signalised junction runs on the fixed-time
   program above rather than one the map states.
+- **The stop line's paint.** Where it is survives as a stop offset, as above; a stop
+  line with nowhere to go is named.
 - **A speed-limit rule on a lane that is not written.** The connector lanes inside a
   junction become internal lanes whose speed netconvert sets for the turn, and a lane
   of a type SUMO has no place for is dropped with its rule. Where rules disagree about
