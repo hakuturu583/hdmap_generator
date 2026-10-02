@@ -51,7 +51,10 @@
 //! `lefthand` set, and what a vehicle keeping to its side drives in.
 //!
 //! A road whose cross-section changes becomes one edge per cross-section, joined at
-//! an internal node: a SUMO edge has one lane count from end to end.
+//! an internal node: a SUMO edge has one lane count from end to end. Which lane
+//! carries on across that node is the IR's connections, written as the movements
+//! through it; for an edge the IR carries nothing on from, its movements onto the
+//! edges beyond are listed as deleted, so netconvert guesses none.
 //!
 //! Every lane is written with its own shape, so the geometry the generator computed
 //! is the geometry SUMO gets — not a centreline with a width, which is what a
@@ -294,23 +297,6 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
              along it survive"
                 .to_owned(),
         );
-    }
-
-    let sectioned: Vec<&str> = map
-        .roads
-        .iter()
-        .filter(|road| !road.is_connector() && road.sections.len() > 1)
-        .map(|road| road.id.as_str())
-        .collect();
-    if !sectioned.is_empty() {
-        problems.push(format!(
-            "an edge has one lane count, so the changing cross-section of {} becomes \
-             a chain of edges with a node between them, and which lane continues into \
-             which across that node is netconvert's lane-matching — the IR states no \
-             movement there: {}",
-            sectioned.len(),
-            sectioned.join(", ")
-        ));
     }
 
     let signals = map
@@ -1773,7 +1759,49 @@ impl<'a> Exporter<'a> {
             }
             document.leaf("connection", &attributes);
         }
+        // An edge none of whose lanes the IR carries on from, leading anywhere but a
+        // dead end. With nothing listed for it netconvert would take its movements
+        // as unspecified and guess some — a lane dropped where the type changes, say
+        // driving into cycling, would be carried on into the cycle lane — so the
+        // edge's movements onto each edge leaving the node it runs into are listed
+        // as deleted. A `<connection>` with no target says the same thing to newer
+        // versions, but netconvert 1.18 still guesses past it; a `<delete>` is
+        // honoured by both, and deleting movements netconvert would not have built
+        // (the turnaround, which `no-turnarounds` already rules out) is silent.
+        // netconvert warns that the edge goes nowhere, and that is what the IR says.
+        for unconnected in self.unconnected_edges() {
+            let edge = &self.edges[unconnected];
+            for next in self.edges.iter().filter(|next| next.from == edge.to) {
+                document.leaf(
+                    "delete",
+                    &[("from", edge.id.clone()), ("to", next.id.clone())],
+                );
+            }
+        }
         document.finish()
+    }
+
+    /// The edges that run into a node something could continue from, but from which
+    /// the IR states no movement at all.
+    ///
+    /// A footway is not one of them: pedestrians do not follow connections but cross
+    /// a node on its walking area, so there is no movement for netconvert to guess.
+    fn unconnected_edges(&self) -> Vec<usize> {
+        let connected: BTreeSet<usize> = self.movements.keys().map(|key| key.0).collect();
+        let footway = |edge: &Edge| {
+            edge.lanes
+                .iter()
+                .all(|lane| lane.permission == Some(Permission::Allow("pedestrian")))
+        };
+        (0..self.edges.len())
+            .filter(|edge| !connected.contains(edge))
+            .filter(|&edge| !footway(&self.edges[edge]))
+            .filter(|&edge| {
+                self.nodes
+                    .get(&self.edges[edge].to)
+                    .is_some_and(|node| node.kind != NodeKind::DeadEnd)
+            })
+            .collect()
     }
 }
 
@@ -2240,6 +2268,32 @@ mod tests {
         builder.finish().unwrap().validate().unwrap()
     }
 
+    /// A two-way road whose forward lane becomes a cycle lane halfway along, while the
+    /// backward lane stays a driving lane throughout.
+    fn type_change() -> ValidatedMap {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("type-change"));
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(200.0, 0.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("r")
+                .with_cross_section(
+                    100.0,
+                    vec![
+                        LaneSpec::new(width, Direction::Forward).with_type(LaneType::Biking),
+                        LaneSpec::new(width, Direction::Backward),
+                    ],
+                ),
+            )
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
     /// A map whose names collide once SUMO's refused characters are replaced: a chain
     /// of roads called `A;B`, `A_B`, `A B` and `A_B~1`, two junctions called `J;1` and
     /// `J 1` with three arms each, and a road `c` with two cross-sections next to a
@@ -2452,6 +2506,12 @@ mod tests {
                     b"lane" => {
                         found.insert(format!("lane:{edge}_{}", attributes["index"]));
                     }
+                    b"delete" => {
+                        found.insert(format!(
+                            "delete:{}>{}",
+                            attributes["from"], attributes["to"]
+                        ));
+                    }
                     b"connection" => {
                         found.insert(format!(
                             "connection:{}_{}>{}_{}",
@@ -2470,7 +2530,13 @@ mod tests {
 
     #[test]
     fn everything_the_trace_names_is_in_the_files() {
-        for map in [crossroads(), in_line(), colliding(), ruled_street()] {
+        for map in [
+            crossroads(),
+            in_line(),
+            colliding(),
+            ruled_street(),
+            type_change(),
+        ] {
             let network = to_plain_xml(&map).unwrap();
             let written = written(&network);
             assert_eq!(network.trace.format, "sumo");
@@ -2498,7 +2564,7 @@ mod tests {
 
     #[test]
     fn every_written_lane_has_one_exact_link_matching_its_id() {
-        for map in [crossroads(), in_line(), colliding()] {
+        for map in [crossroads(), in_line(), colliding(), type_change()] {
             let network = to_plain_xml(&map).unwrap();
             assert!(!network.lanes.is_empty());
             for (lane, id) in &network.lanes {
@@ -2579,6 +2645,70 @@ mod tests {
             .links
             .iter()
             .any(|link| link.local == "connection:north.fwd_0>west.bwd_0"));
+    }
+
+    /// Where no lane of an edge carries on into the next cross-section, every movement
+    /// netconvert could guess from the edge is deleted; left out, netconvert would
+    /// guess a movement the IR does not have.
+    #[test]
+    fn an_edge_the_map_carries_nothing_on_from_connects_to_nothing() {
+        let map = type_change();
+        let network = to_plain_xml(&map).unwrap();
+        let written = written(&network);
+
+        // The driving lane ends where the cycle lane begins: nothing joins them, and
+        // nothing turns it back either.
+        assert!(written.contains("delete:r.0.fwd>r.1.fwd"), "{written:?}");
+        assert!(
+            !written
+                .iter()
+                .any(|element| element.starts_with("connection:r.0.fwd_")),
+            "{written:?}"
+        );
+        // The other carriageway carries on, so it is written as the movement it is.
+        assert!(
+            written.contains("connection:r.1.bwd_0>r.0.bwd_0"),
+            "{written:?}"
+        );
+        // Only the edge that goes nowhere has anything deleted: the far end of either
+        // carriageway is a dead end, where nothing continues for netconvert to guess.
+        assert!(
+            written
+                .iter()
+                .filter(|element| element.starts_with("delete:"))
+                .all(|element| element.starts_with("delete:r.0.fwd>")),
+            "{written:?}"
+        );
+    }
+
+    /// A footway the IR carries nothing on from is left alone: pedestrians cross a
+    /// node on its walking area, not along connections, so there is nothing for
+    /// netconvert to guess and nothing to delete.
+    #[test]
+    fn a_footway_the_map_carries_nothing_on_from_has_nothing_deleted() {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("footway-ends"));
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(200.0, 0.0, 0.0),
+                    vec![LaneSpec::new(width, Direction::Forward).with_type(LaneType::Sidewalk)],
+                )
+                .unwrap()
+                .with_name("r")
+                .with_cross_section(100.0, vec![LaneSpec::new(width, Direction::Forward)]),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+        let written = written(&network);
+
+        assert!(written.contains("edge:r.0.fwd"), "{written:?}");
+        assert!(
+            !written.iter().any(|element| element.starts_with("delete:")),
+            "{written:?}"
+        );
     }
 
     #[test]

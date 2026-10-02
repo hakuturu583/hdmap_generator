@@ -1007,7 +1007,24 @@ movement of the priority arm must still give way to an oncoming one is netconver
 decision, and `sumo_warnings()` says so.
 
 A road whose **cross-section changes** becomes a chain of edges with a node between
-them, because an edge has one lane count from end to end.
+them, because an edge has one lane count from end to end. Which lane carries on into
+which is still the IR's: the connections it holds across the boundary are written as
+`<connection>`s through that node, and netconvert, given an edge's connections, adds
+none of its own — a lane with no connection onward ends at the boundary.
+
+That leaves the edge with *no* connection across: every lane on that side ends, say a
+driving lane that becomes a cycle lane. netconvert reads an edge with nothing listed
+as one whose movements are unspecified, and would guess some, carrying the driving
+lane on into the cycle lane. So the movements of such an edge onto every edge
+leaving the node it runs into are listed as deleted,
+`<delete from="r.0.fwd" to="r.1.fwd"/>`, and netconvert warns that the edge goes
+nowhere — which is what the map says. (A `<connection from="r.0.fwd"/>` with no
+target means the same to recent netconvert, but SUMO 1.18 still guesses past it;
+the deletions hold on both, and deleting a movement netconvert would not have built
+is silent.) The same
+holds for any edge the IR carries nothing on from, wherever it ends short of a dead
+end — except a footway, since pedestrians cross a node on its walking area rather
+than along connections, so there is nothing for netconvert to guess.
 
 ### Junctions, which SUMO models the same way round as the IR
 
