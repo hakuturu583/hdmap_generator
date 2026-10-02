@@ -126,6 +126,7 @@
 //! | `lane:<edge>_<index>` | a speed-limit rule naming the lane, role `speed` | merged |
 //! | `connection:<from edge>_<from lane>><to edge>_<to lane>` | a lane connection | exact, or merged |
 //! | the same connection | a connector lane it runs over | collapsed |
+//! | `lane:<edge>_<index>` | a stop line, role `stopOffset` | merged |
 //! | `node:<id>`, role `walkingarea` | a connection between two footways, and a pavement lane round a corner | collapsed |
 //! | `crossing:<node>/<edge>+<edge>` | a crosswalk | exact, or merged |
 //!
@@ -140,6 +141,28 @@
 //! edges it crosses, sorted, which is also how the built network can be matched to
 //! it: netconvert names the crossing `:<node>_c<n>` and lists the same edges as its
 //! `crossingEdges`.
+//!
+//! # Stop lines
+//!
+//! SUMO has no stop line as a thing of its own. What it has is a lane's
+//! `<stopOffset>`: how far short of the end of the lane a vehicle that has to wait at
+//! the junction ahead comes to a halt. Without one it halts at the very end of the
+//! lane, which for an arm that stops where the IR's junction begins is the junction's
+//! mouth — not the line painted some metres before it.
+//!
+//! So each stop line is measured along every written lane it crosses, from where it
+//! crosses the lane's centreline to the lane's end in the direction of travel, and
+//! that distance is written as the lane's stop offset. It is only meaningful where
+//! the lane runs into a junction — the end of an edge at a cross-section boundary or
+//! at a joint with the next road is not a place anyone waits — so a lane split over
+//! several edges carries it on the edge that reaches the junction, and only there. A
+//! line drawn across lanes running both ways stops only the lanes it is nearer the
+//! junction ahead of than the junction behind, measured on the IR along the road and
+//! the roads joined to it end to end, rather than edge by edge. A
+//! stop line SUMO has no place for — on a lane that is not written, short of the end
+//! of a lane that does not meet a junction, further back than the lane is long — is
+//! named by [`check`] rather than dropped without a word, lane by lane, so a line
+//! written on some of its lanes is reported only for the ones it misses.
 //!
 //! # Where on the globe
 //!
@@ -176,6 +199,14 @@ pub use weights::TripWeights;
 
 /// The name a map with none of its own is written under.
 const DEFAULT_NAME: &str = "network";
+
+/// The shortest stop offset worth writing, metres.
+///
+/// A stop line this close to the end of its lane is, to any precision a simulation
+/// cares about, at the end of it — which is where SUMO stops a vehicle with no
+/// offset at all. It is also the margin kept below an edge's length, which
+/// netconvert refuses an offset to reach.
+const MIN_STOP_OFFSET: f64 = 0.1;
 
 /// A SUMO plain-XML network: the three input files, the netconvert run that turns
 /// them into a `.net.xml`, and the `randomTrips.py` edge weights for the network it
@@ -397,6 +428,8 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         );
     }
 
+    problems.extend(stop_line_problems(map));
+
     let footway = |lane: &LaneId| {
         map.lane(lane)
             .is_some_and(|lane| lane.lane_type == LaneType::Sidewalk)
@@ -545,6 +578,116 @@ fn speed_limit_problems(map: &ValidatedMap) -> Vec<String> {
              lane the lowest of them is written and the others are dropped: {}",
             contested.join(", ")
         ));
+    }
+    problems
+}
+
+/// What becomes of the map's stop lines: how the ones that are written are written,
+/// and which ones are not, and why.
+///
+/// Where a stop line can go depends on the network as it is laid out — which lanes
+/// are written, on which edge, ending at which node — so this lays it out, exactly as
+/// the export does, and reads the answer off that. A map that cannot be laid out at
+/// all fails the export with its own error, and there is nothing to say here about
+/// its stop lines.
+fn stop_line_problems(map: &ValidatedMap) -> Vec<String> {
+    let total = map
+        .objects
+        .iter()
+        .filter(|object| object.kind == MapObjectKind::StopLine)
+        .count();
+    if total == 0 {
+        return Vec::new();
+    }
+    let mut exporter = Exporter::new(map);
+    if exporter.build().is_err() {
+        return Vec::new();
+    }
+
+    // Only the lines that hold some lane's stop are written; the rest are named
+    // below. One at the very end of each lane it holds needs no offset, since that
+    // is where SUMO stops a vehicle anyway, and is counted apart: it leaves no
+    // `<stopOffset>` and no trace link behind.
+    let offset: BTreeSet<&ObjectId> = exporter
+        .stop_offsets
+        .values()
+        .map(|(object, _)| object)
+        .collect();
+    let mut how = match offset.len() {
+        0 => "none of the map's stop lines is written as a stopOffset".to_owned(),
+        1 => "1 stop line is written as the stopOffset of the lanes it crosses".to_owned(),
+        count => {
+            format!("{count} stop lines are written as the stopOffset of the lanes they cross")
+        }
+    };
+    match exporter
+        .stopping
+        .iter()
+        .filter(|object| !offset.contains(object))
+        .count()
+    {
+        0 => {}
+        1 => how.push_str(
+            "; 1 is at the very end of its lanes, where SUMO stops a vehicle without \
+             one, and needs none",
+        ),
+        count => how.push_str(&format!(
+            "; {count} are at the very end of their lanes, where SUMO stops a vehicle \
+             without one, and need none"
+        )),
+    }
+    let mut problems = vec![format!(
+        "a SUMO network has no stop lines, only a lane's stop offset back from the \
+         junction it runs into: {how}, and the paint itself is not"
+    )];
+    // Named lane by lane: a line drawn across both carriageways may well be written
+    // on the one that runs into the junction and not on the one that leaves it, and
+    // only what is missing is missing.
+    for (reason, objects) in &exporter.unplaced {
+        let why = match reason {
+            Unplaced::NotALine => "it is not drawn as a line across the road",
+            Unplaced::LaneNotWritten => {
+                "no SUMO lane is written there — a junction's connector, or a lane of a \
+                 type SUMO has no place for"
+            }
+            Unplaced::NoJunctionAhead => {
+                "the edge does not end at a junction, where a stop offset stops nothing"
+            }
+            Unplaced::BeyondLastEdge => {
+                "it is further back from the junction than the last edge before the \
+                 junction is long, and the edge it is on ends short of the junction, \
+                 where a stop offset stops nothing"
+            }
+            Unplaced::AtLaneStart => {
+                "it is at the lane's start: drawn across lanes running both ways, it \
+                 is nearer the junction the lane leaves than the first junction the \
+                 lane runs into (or no nearer either), and belongs to the lanes running \
+                 the other way"
+            }
+            Unplaced::NotAcross => "it does not cross the lane's centreline",
+            Unplaced::BeyondLane => {
+                "it is further back from the junction than the edge is long, which \
+                 netconvert refuses as an offset"
+            }
+            Unplaced::Superseded => {
+                "a stop line nearer the junction holds the lane's one stop offset"
+            }
+        };
+        for (object, lanes) in objects {
+            let lanes: Vec<String> = lanes.iter().map(LaneId::local_name).collect();
+            problems.push(match lanes.as_slice() {
+                [] => format!("stop line {} is not written: {why}", object.as_str()),
+                [lane] => format!(
+                    "stop line {} is not written on lane {lane}: {why}",
+                    object.as_str()
+                ),
+                _ => format!(
+                    "stop line {} is not written on lanes {}: {why}",
+                    object.as_str(),
+                    lanes.join(", ")
+                ),
+            });
+        }
     }
     problems
 }
@@ -1006,6 +1149,61 @@ struct Exporter<'a> {
     /// The attributes of the node file's `<location>`, worked out once everything
     /// it has to bound has been built.
     location: Vec<(&'static str, String)>,
+    /// The stop offset of each written lane that has one, by (edge, lane index): how
+    /// far back from the lane's end its stop line is, and which stop line that is.
+    stop_offsets: BTreeMap<(usize, usize), (ObjectId, f64)>,
+    /// The stop lines that hold some written lane's stop: as its offset, or — at the
+    /// very end of the lane, where SUMO stops a vehicle anyway — as no offset at all.
+    stopping: BTreeSet<ObjectId>,
+    /// Where stop lines could not be written as a stop offset, for [`check`] to
+    /// name: by reason, each stop line with the lanes it misses. A line that is not
+    /// a line at all misses every lane, and is held with none.
+    unplaced: BTreeMap<Unplaced, BTreeMap<ObjectId, BTreeSet<LaneId>>>,
+}
+
+/// Why a stop line did not become a lane's stop offset.
+///
+/// Ordered, so that [`check`] names the reasons in a fixed order and each once, with
+/// every stop line and lane it applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Unplaced {
+    /// The line is drawn as something other than a line across the road.
+    NotALine,
+    /// It is on a lane no SUMO lane was written for: a junction's connector, or a
+    /// lane of a type SUMO has no place for.
+    LaneNotWritten,
+    /// Its lane does not run into a junction, so there is nothing at its end to wait
+    /// for.
+    NoJunctionAhead,
+    /// It is set back further from the junction than the edge that reaches the
+    /// junction is long: on an earlier edge of the approach, which ends at a mere
+    /// change of cross-section or joint, where a stop offset stops nothing.
+    BeyondLastEdge,
+    /// A line that also crosses lanes running the other way crosses this one nearer
+    /// the junction the lane leaves than the first junction it runs into — measured
+    /// along the lane's travel through plain joints, a dead end counting as never
+    /// reaching one — or no nearer either: a line across both carriageways, seen from
+    /// the one it does not stop.
+    AtLaneStart,
+    /// It does not cross the centreline of the lane it names.
+    NotAcross,
+    /// It is further back from the junction than its edge is long, which netconvert
+    /// refuses as an offset.
+    BeyondLane,
+    /// Another stop line, nearer the junction, already holds the lane's offset.
+    Superseded,
+}
+
+/// Which junction a lane is nearer where a stop line crosses it. See
+/// [`Exporter::line_end`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEnd {
+    /// The junction the lane runs into.
+    Exit,
+    /// The junction the lane leaves.
+    Entry,
+    /// Exactly halfway.
+    Middle,
 }
 
 impl<'a> Exporter<'a> {
@@ -1024,6 +1222,9 @@ impl<'a> Exporter<'a> {
             right_of_way: HashSet::new(),
             yielding: HashSet::new(),
             ruled: HashSet::new(),
+            stop_offsets: BTreeMap::new(),
+            stopping: BTreeSet::new(),
+            unplaced: BTreeMap::new(),
             rule_speeds: HashMap::new(),
             location: Vec::new(),
         };
@@ -1144,6 +1345,7 @@ impl<'a> Exporter<'a> {
         self.build_connections()?;
         self.build_crossings();
         self.open_dead_ends();
+        self.place_stop_lines()?;
         let points = self
             .nodes
             .values()
@@ -1895,6 +2097,270 @@ impl<'a> Exporter<'a> {
     }
 
     // ----------------------------------------------------------------------- //
+    // Stop lines
+    // ----------------------------------------------------------------------- //
+
+    /// Every stop line of the map, as the stop offset of the written lanes it
+    /// crosses.
+    ///
+    /// The lanes a stop line is measured against are the ones it names, and the ones
+    /// a rule that names it governs: a right-of-way rule's yielding lanes, a traffic
+    /// light rule's lanes. The first are the stop line's own word, so a line that
+    /// does not actually cross one of them is reported. The second are the rule's,
+    /// and a rule over several lanes may well carry a stop line drawn across only
+    /// some of them — so a lane the line does not cross is simply not one it stops.
+    ///
+    /// The distance is measured along the lane's written shape, the line SUMO
+    /// measures its own offsets along, from where the stop line crosses it to its
+    /// far end. netconvert keeps a lane's custom shape as it was given rather than
+    /// cutting it back to the junction, so the end measured from here is the end the
+    /// built network has.
+    fn place_stop_lines(&mut self) -> Result<(), ExportError> {
+        let map = self.map;
+        let mut governed: HashMap<&ObjectId, BTreeSet<&LaneId>> = HashMap::new();
+        for rule in &map.rules {
+            let (stop_line, lanes) = match rule {
+                TrafficRule::RightOfWay {
+                    stop_line,
+                    yielding,
+                    ..
+                } => (stop_line, yielding),
+                TrafficRule::TrafficLight {
+                    stop_line, lanes, ..
+                } => (stop_line, lanes),
+                TrafficRule::SpeedLimit { .. } => continue,
+            };
+            if let Some(stop_line) = stop_line {
+                governed.entry(stop_line).or_default().extend(lanes);
+            }
+        }
+
+        // Every placement each lane could take, to be sorted nearest the junction
+        // first, so that the line that governs the junction is the one written.
+        let mut candidates: BTreeMap<(usize, usize), Vec<(f64, ObjectId)>> = BTreeMap::new();
+        for object in map.objects.iter() {
+            if object.kind != MapObjectKind::StopLine {
+                continue;
+            }
+            let ObjectGeometry::Line(curve) = &object.geometry else {
+                self.unplace(Unplaced::NotALine, &object.id, None);
+                continue;
+            };
+            let line = curve.to_polyline(self.sampling)?;
+            let named: BTreeSet<&LaneId> = object.lanes.iter().collect();
+            let lanes: BTreeSet<&LaneId> = named
+                .iter()
+                .copied()
+                .chain(governed.get(&object.id).into_iter().flatten().copied())
+                .collect();
+            // Where the line crosses each written lane it is measured against, before
+            // anything is decided about any of them: whether the line is in doubt
+            // about its direction depends on all of them together.
+            let mut crossed = Vec::new();
+            for lane in lanes {
+                let own = named.contains(lane);
+                let Some(&slot) = self.slots.get(lane) else {
+                    if own {
+                        self.unplace(Unplaced::LaneNotWritten, &object.id, Some(lane));
+                    }
+                    continue;
+                };
+                let shape = &self.edges[slot.edge].lanes[slot.index].shape;
+                let Some(crossing) = crossing(shape, &line) else {
+                    if own {
+                        self.unplace(Unplaced::NotAcross, &object.id, Some(lane));
+                    }
+                    continue;
+                };
+                crossed.push((lane, slot, crossing));
+            }
+            // A line across both carriageways: some lane it crosses passes over it
+            // one way and another the other way.
+            let both_ways = crossed
+                .iter()
+                .any(|(_, _, a)| crossed.iter().any(|(_, _, b)| a.sense != b.sense));
+            let ruled = governed.get(&object.id);
+            for (lane, slot, crossing) in crossed {
+                // Nothing says which way a line runs, and one drawn across the whole
+                // road names the lanes leaving a junction as well as the ones
+                // entering it. That is only in doubt where the line does cross lanes
+                // running both ways — one whose lanes all run the same way stands
+                // before wherever they run to, however short the edge. Where it is in
+                // doubt, it is settled on the IR, not on the SUMO edges the roads are
+                // cut into: the line belongs to the carriageway whose lanes it is
+                // nearer the junction ahead of than the one behind, measured along
+                // the road and the roads joined to it. See [`Exporter::line_end`].
+                if both_ways {
+                    let belongs = match self.line_end(lane, crossing.point)? {
+                        LineEnd::Exit => true,
+                        LineEnd::Entry => false,
+                        LineEnd::Middle => ruled.is_some_and(|lanes| lanes.contains(lane)),
+                    };
+                    if !belongs {
+                        self.unplace(Unplaced::AtLaneStart, &object.id, Some(lane));
+                        continue;
+                    }
+                }
+                let distance = crossing.from_end;
+                let edge = &self.edges[slot.edge];
+                let shape = &edge.lanes[slot.index].shape;
+                let at_junction = self
+                    .nodes
+                    .get(&edge.to)
+                    .is_some_and(|node| node.junction.is_some());
+                if !at_junction {
+                    // Set back further than the edge that reaches the junction is
+                    // long, the line falls on an earlier edge of the same approach;
+                    // only one exactly at that edge's end is at a mere boundary.
+                    let reason = if distance > MIN_STOP_OFFSET && self.junction_beyond(slot) {
+                        Unplaced::BeyondLastEdge
+                    } else {
+                        Unplaced::NoJunctionAhead
+                    };
+                    self.unplace(reason, &object.id, Some(lane));
+                    continue;
+                }
+                // netconvert measures the limit against the edge, whose line is the
+                // middle of the carriageway; the lane's own length is the other bound
+                // that matters, on the inside of a bend.
+                let limit = shape.length().min(edge.shape.length());
+                if distance >= limit - MIN_STOP_OFFSET {
+                    self.unplace(Unplaced::BeyondLane, &object.id, Some(lane));
+                    continue;
+                }
+                candidates
+                    .entry((slot.edge, slot.index))
+                    .or_default()
+                    .push((distance, object.id.clone()));
+            }
+        }
+
+        for (key, mut placements) in candidates {
+            placements.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let mut placements = placements.into_iter();
+            let Some((distance, object)) = placements.next() else {
+                continue;
+            };
+            for (_, other) in placements {
+                if other != object {
+                    let lane = self.edges[key.0].lanes[key.1].lane.clone();
+                    self.unplace(Unplaced::Superseded, &other, Some(&lane));
+                }
+            }
+            self.stopping.insert(object.clone());
+            // A line at the very end of the lane is where SUMO stops a vehicle
+            // anyway; writing an offset of nothing would only add noise.
+            if distance > MIN_STOP_OFFSET {
+                self.stop_offsets.insert(key, (object, distance));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the lane in `slot`, on an edge that does not end at a junction, runs
+    /// on into one: through the one written lane it continues into at each node on
+    /// the way, as across a change of cross-section or a joint between two roads.
+    fn junction_beyond(&self, slot: Slot) -> bool {
+        let (mut edge, mut index) = (slot.edge, slot.index);
+        for _ in 0..self.edges.len() {
+            let mut next = self
+                .movements
+                .range((edge, index, 0, 0)..=(edge, index, usize::MAX, usize::MAX))
+                .map(|(&(_, _, to_edge, to_lane), _)| (to_edge, to_lane));
+            let (Some(following), None) = (next.next(), next.next()) else {
+                return false;
+            };
+            (edge, index) = following;
+            let ends_at_junction = self
+                .nodes
+                .get(&self.edges[edge].to)
+                .is_some_and(|node| node.junction.is_some());
+            if ends_at_junction {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Which junction the lane `lane` is nearer at `point`, where a stop line crosses
+    /// it: the one it runs into, or the one it leaves.
+    ///
+    /// Measured on the IR, along the lane's road and on through the roads it is
+    /// joined to end to end — across a plain joint, not through a junction — to the
+    /// first junction reached each way, so the answer is the same however the roads
+    /// are cut into SUMO edges. It is the junctions that matter, not the road's own
+    /// ends: a road joined to the next by a plain joint at one end and running into
+    /// a junction at the other is approached from far beyond its start, and a stub
+    /// with a dead end has a junction only one way. A line nearer the junction ahead
+    /// is before it; one nearer the junction behind is at the start of the lane, and
+    /// belongs to the lanes running the other way. With no junction either way, or
+    /// the line exactly halfway between them, it is in the middle.
+    fn line_end(&self, lane: &LaneId, point: Point3) -> Result<LineEnd, ExportError> {
+        let Some((lane, road)) = self
+            .map
+            .lane(lane)
+            .and_then(|lane| Some((lane, self.map.road(&lane.road)?)))
+        else {
+            // A written lane is always on a road of the map.
+            return Ok(LineEnd::Exit);
+        };
+        let reference = road.reference_line.to_polyline(self.sampling)?;
+        let (station, length) = station_along(&reference, point);
+        let to_start = station + self.junction_beyond_end(road, RoadEnd::Start)?;
+        let to_end = length - station + self.junction_beyond_end(road, RoadEnd::End)?;
+        let (ahead, behind) = match lane.direction {
+            Direction::Forward => (to_end, to_start),
+            Direction::Backward => (to_start, to_end),
+        };
+        Ok(if ahead == behind || (ahead - behind).abs() <= 1e-6 {
+            LineEnd::Middle
+        } else if ahead < behind {
+            LineEnd::Exit
+        } else {
+            LineEnd::Entry
+        })
+    }
+
+    /// How far beyond the end `end` of `road` the first junction is: nothing if the
+    /// road runs into one there, the length of every road joined end to end on the
+    /// way to one otherwise, and infinitely far at a dead end — or after going round
+    /// a loop of plain joints without ever meeting one.
+    fn junction_beyond_end(&self, road: &Road, end: RoadEnd) -> Result<f64, ExportError> {
+        let mut distance = 0.0;
+        let mut seen: HashSet<&RoadId> = HashSet::from([&road.id]);
+        let mut at = road.link.at(end);
+        loop {
+            let next = match at {
+                None => return Ok(f64::INFINITY),
+                Some(RoadLinkTarget::Junction(_)) => return Ok(distance),
+                Some(RoadLinkTarget::Road(endpoint)) => endpoint,
+            };
+            let Some(joined) = self.map.road(&next.road) else {
+                return Ok(f64::INFINITY);
+            };
+            if joined.is_connector() {
+                // The road beyond is a junction's own.
+                return Ok(distance);
+            }
+            if !seen.insert(&joined.id) {
+                return Ok(f64::INFINITY);
+            }
+            distance += joined.horizontal_length()?;
+            at = joined.link.at(next.end.opposite());
+        }
+    }
+
+    fn unplace(&mut self, reason: Unplaced, object: &ObjectId, lane: Option<&LaneId>) {
+        let lanes = self
+            .unplaced
+            .entry(reason)
+            .or_default()
+            .entry(object.clone())
+            .or_default();
+        lanes.extend(lane.cloned());
+    }
+
+    // ----------------------------------------------------------------------- //
     // Crossings
     // ----------------------------------------------------------------------- //
 
@@ -2088,6 +2554,17 @@ impl<'a> Exporter<'a> {
             }
         }
 
+        // A stop line is carried by the stop offset of each lane it was measured
+        // against: one attribute of a lane that is otherwise the IR's lane.
+        for (&(edge, index), (object, _)) in &self.stop_offsets {
+            trace.link_as(
+                object.clone(),
+                format!("lane:{}_{index}", self.edges[edge].id),
+                Relation::Merged,
+                "stopOffset",
+            );
+        }
+
         for (&(from_edge, from_lane, to_edge, to_lane), movement) in &self.movements {
             let local = format!(
                 "connection:{}_{from_lane}>{}_{to_lane}",
@@ -2174,7 +2651,7 @@ impl<'a> Exporter<'a> {
 
     fn render_edges(&self) -> String {
         let mut document = xml::Document::new("edges", "http://sumo.dlr.de/xsd/edges_file.xsd");
-        for edge in &self.edges {
+        for (edge_index, edge) in self.edges.iter().enumerate() {
             let mut attributes = vec![
                 ("id", edge.id.clone()),
                 ("from", edge.from.clone()),
@@ -2212,7 +2689,16 @@ impl<'a> Exporter<'a> {
                 if lane.restricted_right {
                     attributes.push(("changeRight", classes::CHANGE_ACROSS_SOLID.to_owned()));
                 }
-                document.leaf("lane", &attributes);
+                match self.stop_offsets.get(&(edge_index, index)) {
+                    // No `vClasses`: a stop line binds everything that drives up to
+                    // it, which is SUMO's default of `all`.
+                    Some((_, distance)) => {
+                        document.open("lane", &attributes);
+                        document.leaf("stopOffset", &[("value", metres(*distance))]);
+                        document.close("lane");
+                    }
+                    None => document.leaf("lane", &attributes),
+                }
             }
             document.close("edge");
         }
@@ -2419,6 +2905,95 @@ fn edge_id(name: &str, road: &Road, section: usize, direction: Direction) -> Str
     } else {
         format!("{name}.{sense}")
     }
+}
+
+/// Where a path crosses a line: see [`crossing`].
+#[derive(Debug, Clone, Copy)]
+struct LineCrossing {
+    /// How far back from the far end of the path, measured along it.
+    from_end: f64,
+    /// Which way the path passes over the line. Two paths cross it the same way
+    /// exactly where this agrees, whichever way the line itself was drawn.
+    sense: bool,
+    /// Where on the path the line crosses it.
+    point: Point3,
+}
+
+/// How far back from the far end of `path` the line `line` crosses it, measured
+/// along `path`, and which way; `None` if the two never meet.
+///
+/// The crossing is found in plan, because a stop line is paint on the road and the
+/// lane's centreline is on the same surface: what matters is where one passes over
+/// the other, not whether two floating-point heights agree. The distance is then
+/// taken along the path in three dimensions, which is how SUMO measures a lane's
+/// length and so its offsets.
+///
+/// A line drawn exactly to the end of the path — a stop line at the very mouth of the
+/// junction — counts as crossing it there, with a little tolerance on both, so that
+/// the rounding in where the line was put does not lose it. Where the line crosses
+/// more than once, the crossing nearest the end is the one that stops a vehicle.
+fn crossing(path: &Polyline3, line: &Polyline3) -> Option<LineCrossing> {
+    const TOLERANCE: f64 = 1e-6;
+    let cross = |a: (f64, f64), b: (f64, f64)| a.0 * b.1 - a.1 * b.0;
+    let total = path.length();
+    let mut travelled = 0.0;
+    let mut best: Option<LineCrossing> = None;
+    for segment in path.points().windows(2) {
+        let (a, b) = (segment[0], segment[1]);
+        let along = (b.x - a.x, b.y - a.y);
+        let length = a.distance_to(b);
+        for piece in line.points().windows(2) {
+            let (c, d) = (piece[0], piece[1]);
+            let across = (d.x - c.x, d.y - c.y);
+            let denominator = cross(along, across);
+            if denominator.abs() < 1e-12 {
+                // Parallel: a stop line running along a lane stops nothing on it.
+                continue;
+            }
+            let offset = (c.x - a.x, c.y - a.y);
+            let t = cross(offset, across) / denominator;
+            let u = cross(offset, along) / denominator;
+            if (-TOLERANCE..=1.0 + TOLERANCE).contains(&t)
+                && (-TOLERANCE..=1.0 + TOLERANCE).contains(&u)
+            {
+                let remaining = (total - travelled - t.clamp(0.0, 1.0) * length).max(0.0);
+                if best.is_none_or(|previous| remaining < previous.from_end) {
+                    best = Some(LineCrossing {
+                        from_end: remaining,
+                        sense: denominator > 0.0,
+                        point: a.lerp(b, t.clamp(0.0, 1.0)),
+                    });
+                }
+            }
+        }
+        travelled += length;
+    }
+    best
+}
+
+/// How far along `path` the point of it nearest `point` is, in plan, and how long
+/// `path` is in plan: the station of `point` on a road whose reference line `path`
+/// samples, and the road's length measured the same way.
+fn station_along(path: &Polyline3, point: Point3) -> (f64, f64) {
+    let mut travelled = 0.0;
+    let mut best = (f64::INFINITY, 0.0);
+    for piece in path.points().windows(2) {
+        let (c, d) = (piece[0], piece[1]);
+        let along = (d.x - c.x, d.y - c.y);
+        let length = along.0.hypot(along.1);
+        let t = if length > 0.0 {
+            (((point.x - c.x) * along.0 + (point.y - c.y) * along.1) / (length * length))
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let off = (point.x - c.x - t * along.0).hypot(point.y - c.y - t * along.1);
+        if off < best.0 {
+            best = (off, travelled + t * length);
+        }
+        travelled += length;
+    }
+    (best.1, travelled)
 }
 
 /// The name each road and junction is written under: its own, reduced by
@@ -3491,6 +4066,687 @@ mod tests {
             assert_eq!(link.relation, Relation::Exact, "{}", link.local);
             assert!(matches!(link.ir, IrRef::Connection(_)));
         }
+    }
+
+    // ----------------------------------------------------------------------- //
+    // Stop lines
+    // ----------------------------------------------------------------------- //
+
+    /// A tee whose northern arm changes cross-section partway along, with a stop line
+    /// eight metres back from the junction on its approach, another at the end of
+    /// the approach's first section, and one right at the mouth of the eastern arm.
+    fn stop_lines() -> (ValidatedMap, [ObjectId; 3]) {
+        let mut builder = MapBuilder::new(metadata("stops"));
+        let north = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 70.0, 0.0),
+                    Point3::new(0.0, 14.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("north")
+                .with_cross_section(30.0, two_way()),
+            )
+            .unwrap();
+        let others: Vec<RoadId> = [
+            (
+                Point3::new(70.0, 0.0, 0.0),
+                Point3::new(14.0, 0.0, 0.0),
+                "east",
+            ),
+            (
+                Point3::new(-70.0, 0.0, 0.0),
+                Point3::new(-14.0, 0.0, 0.0),
+                "west",
+            ),
+        ]
+        .into_iter()
+        .map(|(start, end, name)| {
+            builder
+                .add_road(
+                    RoadSpec::line(start, end, two_way())
+                        .unwrap()
+                        .with_name(name),
+                )
+                .unwrap()
+        })
+        .collect();
+        let junction = builder.add_junction(Some("t"));
+        for other in &others {
+            builder
+                .connect_ends(&north, RoadEnd::End, other, RoadEnd::End, Some(&junction))
+                .unwrap();
+        }
+        // The northern road's lanes are counted across both its cross-sections: 0
+        // and 1 are the first, 2 and 3 the second, the one that meets the junction.
+        let approach = LaneRef::new(north.clone(), 2);
+        let set_back = builder
+            .add_stop_line_at(&approach, LaneEnd::End, 8.0)
+            .unwrap();
+        let mid_road = builder
+            .add_stop_line(&LaneRef::new(north.clone(), 0), LaneEnd::End)
+            .unwrap();
+        let at_mouth = builder
+            .add_stop_line(&LaneRef::new(others[0].clone(), 0), LaneEnd::End)
+            .unwrap();
+        builder.add_right_of_way(
+            vec![LaneRef::new(others[0].clone(), 0)],
+            vec![approach],
+            Some(set_back.clone()),
+        );
+        let map = builder.finish().unwrap().validate().unwrap();
+        (map, [set_back, mid_road, at_mouth])
+    }
+
+    /// Every `<stopOffset>` in the edge file, by the `<edge>_<index>` of its lane.
+    fn stop_offsets(network: &PlainNetwork) -> BTreeMap<String, f64> {
+        let mut found = BTreeMap::new();
+        let mut reader = quick_xml::Reader::from_str(&network.edges);
+        let (mut edge, mut lane) = (String::new(), String::new());
+        loop {
+            let event = reader.read_event().unwrap();
+            let element = match &event {
+                Event::Eof => break,
+                Event::Start(element) | Event::Empty(element) => element,
+                _ => continue,
+            };
+            let attribute = |key: &str| {
+                element
+                    .try_get_attribute(key)
+                    .unwrap()
+                    .map(|attribute| String::from_utf8_lossy(&attribute.value).into_owned())
+            };
+            match element.name().as_ref() {
+                b"edge" => edge = attribute("id").unwrap(),
+                b"lane" => lane = format!("{edge}_{}", attribute("index").unwrap()),
+                b"stopOffset" => {
+                    assert!(
+                        attribute("vClasses").is_none(),
+                        "a stop line binds every class"
+                    );
+                    found.insert(lane.clone(), attribute("value").unwrap().parse().unwrap());
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_stop_line_is_the_stop_offset_of_the_lane_it_crosses_into_the_junction() {
+        let (map, [set_back, mid_road, at_mouth]) = stop_lines();
+        let network = to_plain_xml(&map).unwrap();
+
+        // Only the edge that reaches the junction carries it, and only the stop line
+        // set back from the mouth says anything SUMO would not assume anyway.
+        let offsets = stop_offsets(&network);
+        assert_eq!(offsets.keys().collect::<Vec<_>>(), ["north.1.fwd_0"]);
+        assert!((offsets["north.1.fwd_0"] - 8.0).abs() < 1e-3, "{offsets:?}");
+        let approach = LaneId::of_road(&RoadId::new("north"), 2);
+        assert_eq!(network.lanes[&approach], "north.1.fwd_0");
+
+        let links: Vec<&TraceLink> = network
+            .trace
+            .links_of(&IrRef::Object(set_back.clone()))
+            .collect();
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].local, "lane:north.1.fwd_0");
+        assert_eq!(links[0].relation, Relation::Merged);
+        assert_eq!(links[0].role.as_deref(), Some("stopOffset"));
+        for object in [&mid_road, &at_mouth] {
+            assert!(network
+                .trace
+                .links_of(&IrRef::Object(object.clone()))
+                .next()
+                .is_none());
+        }
+
+        // The line at the end of the first section is short of a node that is not a
+        // junction, and is said to be lost; the one at the mouth loses nothing.
+        let report = check(&map).join("\n");
+        assert!(report.contains("written as the stopOffset"), "{report}");
+        assert!(
+            report.contains("does not end at a junction") && report.contains(mid_road.as_str()),
+            "{report}"
+        );
+        assert!(!report.contains(at_mouth.as_str()), "{report}");
+        assert!(!report.contains(set_back.as_str()), "{report}");
+    }
+
+    #[test]
+    fn a_stop_line_across_both_carriageways_is_missing_only_where_it_is_not_written() {
+        // The set-back line redrawn across the whole road, naming the approach and
+        // the lane beside it that leaves the junction, as an imported line would.
+        let (map, [set_back, ..]) = stop_lines();
+        let mut map = UnvalidatedMap::from_map(map.into_map());
+        let approach = LaneId::of_road(&RoadId::new("north"), 2);
+        let leaving = LaneId::of_road(&RoadId::new("north"), 3);
+        let object = map
+            .as_map_mut()
+            .objects
+            .get_mut(&set_back)
+            .expect("the set-back stop line");
+        object.geometry = ObjectGeometry::Line(
+            Curve3::line(Point3::new(-7.0, 22.0, 0.0), Point3::new(7.0, 22.0, 0.0)).unwrap(),
+        );
+        object.lanes = vec![approach.clone(), leaving.clone()];
+        let map = map.validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+
+        // Written where it stops traffic into the junction...
+        let offsets = stop_offsets(&network);
+        assert_eq!(offsets.keys().collect::<Vec<_>>(), ["north.1.fwd_0"]);
+        assert!((offsets["north.1.fwd_0"] - 8.0).abs() < 1e-3, "{offsets:?}");
+        assert_eq!(network.lanes[&approach], "north.1.fwd_0");
+
+        // ...and said to be missing only on the lane that leaves it.
+        let report = check(&map);
+        let about: Vec<&String> = report
+            .iter()
+            .filter(|line| line.contains(set_back.as_str()))
+            .collect();
+        assert_eq!(about.len(), 1, "{report:#?}");
+        assert!(
+            about[0].contains(&format!("is not written on lane {}:", leaving.local_name()))
+                && about[0].contains("it is at the lane's start"),
+            "{report:#?}"
+        );
+        // The line's own name carries its lane's, so look for the approach as a lane.
+        assert!(
+            !about[0].contains("on lanes ")
+                && !about[0].contains(&format!("lane {}", approach.local_name())),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_line_across_a_road_between_junctions_stops_only_the_lane_approaching_it() {
+        // A road from one junction to another, with a line eight metres short of the
+        // second drawn across both carriageways, as an imported line with no
+        // orientation is: its lane leaving the first junction must not take an
+        // offset of nearly the whole road.
+        let mut builder = MapBuilder::new(metadata("between"));
+        let road = |builder: &mut MapBuilder, name: &str, from: f64, to: f64| {
+            builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(from, 0.0, 0.0),
+                        Point3::new(to, 0.0, 0.0),
+                        two_way(),
+                    )
+                    .unwrap()
+                    .with_name(name),
+                )
+                .unwrap()
+        };
+        let west = road(&mut builder, "west", -100.0, -10.0);
+        let mid = road(&mut builder, "mid", 0.0, 100.0);
+        let east = road(&mut builder, "east", 110.0, 200.0);
+        let ja = builder.add_junction(Some("ja"));
+        let jb = builder.add_junction(Some("jb"));
+        builder
+            .connect_ends(&west, RoadEnd::End, &mid, RoadEnd::Start, Some(&ja))
+            .unwrap();
+        builder
+            .connect_ends(&mid, RoadEnd::End, &east, RoadEnd::Start, Some(&jb))
+            .unwrap();
+        let line = builder
+            .add_stop_line_at(&LaneRef::new(mid.clone(), 0), LaneEnd::End, 8.0)
+            .unwrap();
+        let mut map =
+            UnvalidatedMap::from_map(builder.finish().unwrap().validate().unwrap().into_map());
+        let approaching = LaneId::of_road(&mid, 0);
+        let leaving = LaneId::of_road(&mid, 1);
+        let object = map
+            .as_map_mut()
+            .objects
+            .get_mut(&line)
+            .expect("the stop line");
+        object.geometry = ObjectGeometry::Line(
+            Curve3::line(Point3::new(92.0, -7.0, 0.0), Point3::new(92.0, 7.0, 0.0)).unwrap(),
+        );
+        object.lanes = vec![approaching.clone(), leaving.clone()];
+        let map = map.validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+
+        let offsets = stop_offsets(&network);
+        let written = network.lanes[&approaching].clone();
+        assert_eq!(
+            offsets.keys().collect::<Vec<_>>(),
+            [&written],
+            "{offsets:?}"
+        );
+        assert!((offsets[&written] - 8.0).abs() < 1e-3, "{offsets:?}");
+
+        let report = check(&map);
+        let about: Vec<&String> = report
+            .iter()
+            .filter(|line_| line_.contains(line.as_str()) && line_.contains("is not written"))
+            .collect();
+        assert_eq!(about.len(), 1, "{report:#?}");
+        assert!(
+            about[0].contains(&format!("is not written on lane {}:", leaving.local_name()))
+                && about[0]
+                    .contains("it is at the lane's start: drawn across lanes running both ways"),
+            "{report:#?}"
+        );
+    }
+
+    /// The road between two junctions of the test above, 100 m long, its
+    /// cross-section changing at `change`, with a line at x = 92 — 8 m short of the
+    /// second junction — drawn across both carriageways and naming the lane of each
+    /// that it crosses. Returns the map, the line, and the eastbound lane approaching
+    /// the line's junction and the westbound one leaving it.
+    fn line_across_a_split_road(change: f64) -> (ValidatedMap, ObjectId, LaneId, LaneId) {
+        let mut builder = MapBuilder::new(metadata("split"));
+        let road = |builder: &mut MapBuilder, name: &str, from: f64, to: f64, change| {
+            let spec = RoadSpec::line(
+                Point3::new(from, 0.0, 0.0),
+                Point3::new(to, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name(name);
+            let spec = match change {
+                Some(station) => spec.with_cross_section(station, two_way()),
+                None => spec,
+            };
+            builder.add_road(spec).unwrap()
+        };
+        let west = road(&mut builder, "west", -100.0, -10.0, None);
+        let mid = road(&mut builder, "mid", 0.0, 100.0, Some(change));
+        let east = road(&mut builder, "east", 110.0, 200.0, None);
+        let ja = builder.add_junction(Some("ja"));
+        let jb = builder.add_junction(Some("jb"));
+        builder
+            .connect_ends(&west, RoadEnd::End, &mid, RoadEnd::Start, Some(&ja))
+            .unwrap();
+        builder
+            .connect_ends(&mid, RoadEnd::End, &east, RoadEnd::Start, Some(&jb))
+            .unwrap();
+        // Lanes 0 and 1 are the first cross-section's, 2 and 3 the second's.
+        let section = usize::from(change < 92.0) * 2;
+        let line = builder
+            .add_stop_line(&LaneRef::new(mid.clone(), section), LaneEnd::End)
+            .unwrap();
+        let mut map =
+            UnvalidatedMap::from_map(builder.finish().unwrap().validate().unwrap().into_map());
+        let approaching = LaneId::of_road(&mid, section);
+        let leaving = LaneId::of_road(&mid, section + 1);
+        let object = map
+            .as_map_mut()
+            .objects
+            .get_mut(&line)
+            .expect("the stop line");
+        object.geometry = ObjectGeometry::Line(
+            Curve3::line(Point3::new(92.0, -7.0, 0.0), Point3::new(92.0, 7.0, 0.0)).unwrap(),
+        );
+        object.lanes = vec![approaching.clone(), leaving.clone()];
+        (map.validate().unwrap(), line, approaching, leaving)
+    }
+
+    /// What `check` says `line` is not written on, one entry per line of the report.
+    fn said_about(map: &ValidatedMap, line: &ObjectId) -> Vec<String> {
+        check(map)
+            .into_iter()
+            .filter(|said| said.contains(line.as_str()) && said.contains("is not written"))
+            .collect()
+    }
+
+    #[test]
+    fn a_stop_line_across_both_carriageways_of_a_road_split_behind_it_stops_nothing_far_back() {
+        // The cross-section changes 5 m short of the second junction, behind the
+        // line: both lanes the line crosses are on the first section's edges, and
+        // neither of those edges reaches the junction ahead of the eastbound lane.
+        // The westbound lane leaves that junction, so the line is at its start — not
+        // a stop 92 m short of the first junction.
+        let (map, line, approaching, leaving) = line_across_a_split_road(95.0);
+        let network = to_plain_xml(&map).unwrap();
+        let offsets = stop_offsets(&network);
+        assert!(offsets.is_empty(), "{offsets:?}");
+
+        let said = said_about(&map, &line);
+        assert_eq!(said.len(), 2, "{said:#?}");
+        assert!(
+            said.iter().any(|line_| line_
+                .contains(&format!("is not written on lane {}:", leaving.local_name()))
+                && line_.contains("it is at the lane's start")),
+            "{said:#?}"
+        );
+        assert!(
+            said.iter().any(|line_| line_.contains(&format!(
+                "is not written on lane {}:",
+                approaching.local_name()
+            )) && line_
+                .contains("further back from the junction than the last edge")),
+            "{said:#?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_line_across_both_carriageways_of_a_road_split_midway_is_at_the_leaving_start() {
+        // The cross-section changes halfway, so the eastbound lane's last edge
+        // reaches the junction 8 m past the line and takes the offset; the westbound
+        // lane's edge there runs from that junction to the change of cross-section,
+        // and the line is at its start, not on an earlier edge of some approach.
+        let (map, line, approaching, leaving) = line_across_a_split_road(50.0);
+        let network = to_plain_xml(&map).unwrap();
+        let offsets = stop_offsets(&network);
+        let written = network.lanes[&approaching].clone();
+        assert_eq!(
+            offsets.keys().collect::<Vec<_>>(),
+            [&written],
+            "{offsets:?}"
+        );
+        assert!((offsets[&written] - 8.0).abs() < 1e-3, "{offsets:?}");
+
+        let said = said_about(&map, &line);
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert!(
+            said[0].contains(&format!("is not written on lane {}:", leaving.local_name()))
+                && said[0].contains("it is at the lane's start")
+                && !said[0].contains("further back"),
+            "{said:#?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_line_across_both_carriageways_is_judged_by_the_junctions_not_the_road_ends() {
+        // A road `b` running east into junction `jb`, with a line `setback` metres
+        // short of it drawn across both carriageways. Behind `b` is either a 200 m
+        // road `a` joined to it by a plain joint, no junction, or nothing — a dead
+        // end. Either way the only junction near the line is the one ahead of the
+        // eastbound lane, however far past the middle of `b` itself the line is.
+        for (length, setback, joined) in [(12.0, 8.0, true), (30.0, 20.0, true), (12.0, 8.0, false)]
+        {
+            let context = format!("{length} m, {setback} m back, joined: {joined}");
+            let mut builder = MapBuilder::new(metadata("joint"));
+            let road = |builder: &mut MapBuilder, name: &str, from: f64, to: f64| {
+                builder
+                    .add_road(
+                        RoadSpec::line(
+                            Point3::new(from, 0.0, 0.0),
+                            Point3::new(to, 0.0, 0.0),
+                            two_way(),
+                        )
+                        .unwrap()
+                        .with_name(name),
+                    )
+                    .unwrap()
+            };
+            let b = road(&mut builder, "b", 0.0, length);
+            let c = road(&mut builder, "c", length + 10.0, length + 100.0);
+            if joined {
+                let a = road(&mut builder, "a", -200.0, 0.0);
+                builder
+                    .connect_ends(&a, RoadEnd::End, &b, RoadEnd::Start, None)
+                    .unwrap();
+            }
+            let jb = builder.add_junction(Some("jb"));
+            builder
+                .connect_ends(&b, RoadEnd::End, &c, RoadEnd::Start, Some(&jb))
+                .unwrap();
+            let line = builder
+                .add_stop_line_at(&LaneRef::new(b.clone(), 0), LaneEnd::End, setback)
+                .unwrap();
+            let mut map =
+                UnvalidatedMap::from_map(builder.finish().unwrap().validate().unwrap().into_map());
+            let approaching = LaneId::of_road(&b, 0);
+            let leaving = LaneId::of_road(&b, 1);
+            let x = length - setback;
+            let object = map
+                .as_map_mut()
+                .objects
+                .get_mut(&line)
+                .expect("the stop line");
+            object.geometry = ObjectGeometry::Line(
+                Curve3::line(Point3::new(x, -7.0, 0.0), Point3::new(x, 7.0, 0.0)).unwrap(),
+            );
+            object.lanes = vec![approaching.clone(), leaving.clone()];
+            let map = map.validate().unwrap();
+            let network = to_plain_xml(&map).unwrap();
+
+            let offsets = stop_offsets(&network);
+            let written = network.lanes[&approaching].clone();
+            assert_eq!(
+                offsets.keys().collect::<Vec<_>>(),
+                [&written],
+                "{context}: {offsets:?}"
+            );
+            assert!(
+                (offsets[&written] - setback).abs() < 1e-3,
+                "{context}: {offsets:?}"
+            );
+
+            let said = said_about(&map, &line);
+            assert_eq!(said.len(), 1, "{context}: {said:#?}");
+            assert!(
+                said[0].contains(&format!("is not written on lane {}:", leaving.local_name()))
+                    && said[0].contains("it is at the lane's start")
+                    && said[0].contains("nearer the junction the lane leaves")
+                    && !said[0].contains("does not end at a junction"),
+                "{context}: {said:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_line_on_one_lane_of_a_short_road_between_junctions_is_before_its_junction() {
+        // The same three roads with the middle one only 12 m long, and a line on
+        // each of its lanes 7 m back from the junction that lane runs into: past the
+        // middle of the road, but each line names only the lane it stands on, so
+        // there is no doubt which junction it stands before.
+        for (length, setback) in [(12.0, 7.0), (16.0, 9.0), (100.0, 8.0)] {
+            let mut builder = MapBuilder::new(metadata("short_link"));
+            let road = |builder: &mut MapBuilder, name: &str, from: f64, to: f64| {
+                builder
+                    .add_road(
+                        RoadSpec::line(
+                            Point3::new(from, 0.0, 0.0),
+                            Point3::new(to, 0.0, 0.0),
+                            two_way(),
+                        )
+                        .unwrap()
+                        .with_name(name),
+                    )
+                    .unwrap()
+            };
+            let west = road(&mut builder, "west", -100.0, -10.0);
+            let mid = road(&mut builder, "mid", 0.0, length);
+            let east = road(&mut builder, "east", length + 10.0, length + 100.0);
+            let ja = builder.add_junction(Some("ja"));
+            let jb = builder.add_junction(Some("jb"));
+            builder
+                .connect_ends(&west, RoadEnd::End, &mid, RoadEnd::Start, Some(&ja))
+                .unwrap();
+            builder
+                .connect_ends(&mid, RoadEnd::End, &east, RoadEnd::Start, Some(&jb))
+                .unwrap();
+            let eastbound = builder
+                .add_stop_line_at(&LaneRef::new(mid.clone(), 0), LaneEnd::End, setback)
+                .unwrap();
+            let westbound = builder
+                .add_stop_line_at(&LaneRef::new(mid.clone(), 1), LaneEnd::Start, setback)
+                .unwrap();
+            let map = builder.finish().unwrap().validate().unwrap();
+            let network = to_plain_xml(&map).unwrap();
+
+            let offsets = stop_offsets(&network);
+            for lane in [0, 1] {
+                let written = &network.lanes[&LaneId::of_road(&mid, lane)];
+                assert!(
+                    offsets
+                        .get(written)
+                        .is_some_and(|offset| (offset - setback).abs() < 1e-3),
+                    "{length} m, {setback} m: {offsets:?}"
+                );
+            }
+            let report = check(&map);
+            for line in [&eastbound, &westbound] {
+                assert!(
+                    !report.iter().any(|line_| line_.contains(line.as_str())),
+                    "{length} m, {setback} m: {report:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stop_line_further_back_than_the_last_section_is_beyond_the_last_edge() {
+        // The tee's approach, named on its first section's lane 30 m back from the
+        // junction: further back than the 26 m section that reaches it.
+        let mut builder = MapBuilder::new(metadata("beyond"));
+        let north = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 70.0, 0.0),
+                    Point3::new(0.0, 14.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("north")
+                .with_cross_section(30.0, two_way()),
+            )
+            .unwrap();
+        let junction = builder.add_junction(Some("t"));
+        for (x, name) in [(70.0, "east"), (-70.0, "west")] {
+            let other = builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(x, 0.0, 0.0),
+                        Point3::new(x / 5.0, 0.0, 0.0),
+                        two_way(),
+                    )
+                    .unwrap()
+                    .with_name(name),
+                )
+                .unwrap();
+            builder
+                .connect_ends(&north, RoadEnd::End, &other, RoadEnd::End, Some(&junction))
+                .unwrap();
+        }
+        let line = builder
+            .add_stop_line_at(&LaneRef::new(north.clone(), 0), LaneEnd::End, 4.0)
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        assert!(stop_offsets(&to_plain_xml(&map).unwrap()).is_empty());
+
+        let report = check(&map);
+        let about: Vec<&String> = report
+            .iter()
+            .filter(|line_| line_.contains(line.as_str()))
+            .collect();
+        assert_eq!(about.len(), 1, "{report:#?}");
+        assert!(
+            about[0].contains("further back from the junction than the last edge")
+                && !about[0].contains("does not end at a junction"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_line_on_a_short_last_section_is_still_before_its_junction() {
+        // The tee again, its northern road's cross-section changing only 6 m short
+        // of the junction, with the stop line 4 m back: more than half of that last
+        // edge, but well within the lane, which leaves no junction to be at the
+        // start of.
+        let mut builder = MapBuilder::new(metadata("short"));
+        let north = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 70.0, 0.0),
+                    Point3::new(0.0, 14.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("north")
+                .with_cross_section(50.0, two_way()),
+            )
+            .unwrap();
+        let junction = builder.add_junction(Some("t"));
+        for (x, name) in [(70.0, "east"), (-70.0, "west")] {
+            let other = builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(x, 0.0, 0.0),
+                        Point3::new(x / 5.0, 0.0, 0.0),
+                        two_way(),
+                    )
+                    .unwrap()
+                    .with_name(name),
+                )
+                .unwrap();
+            builder
+                .connect_ends(&north, RoadEnd::End, &other, RoadEnd::End, Some(&junction))
+                .unwrap();
+        }
+        let line = builder
+            .add_stop_line_at(&LaneRef::new(north.clone(), 2), LaneEnd::End, 4.0)
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+
+        let approach = LaneId::of_road(&north, 2);
+        assert_eq!(network.lanes[&approach], "north.1.fwd_0");
+        let offsets = stop_offsets(&network);
+        assert_eq!(offsets.keys().collect::<Vec<_>>(), ["north.1.fwd_0"]);
+        assert!((offsets["north.1.fwd_0"] - 4.0).abs() < 1e-3, "{offsets:?}");
+
+        let report = check(&map);
+        assert!(
+            !report.iter().any(|line_| line_.contains(line.as_str())),
+            "{report:#?}"
+        );
+        assert!(
+            report.iter().any(|line_| line_.contains(
+                "1 stop line is written as the stopOffset of the \
+                                             lanes it crosses"
+            )),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn a_map_without_stop_lines_says_nothing_about_them() {
+        let report = check(&in_line()).join("\n");
+        assert!(!report.contains("stop line"), "{report}");
+        assert!(stop_offsets(&to_plain_xml(&in_line()).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_crossing_is_measured_back_from_the_end_of_the_path() {
+        let path = Polyline3::new([
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(10.0, 0.0, 0.0),
+            Point3::new(10.0, 10.0, 0.0),
+        ])
+        .unwrap();
+        let across = |x: f64, y: f64, dx: f64, dy: f64| {
+            Polyline3::new([
+                Point3::new(x - dx, y - dy, 0.0),
+                Point3::new(x + dx, y + dy, 0.0),
+            ])
+            .unwrap()
+        };
+        let near = |value: Option<LineCrossing>, expected: f64| {
+            value.is_some_and(|value| (value.from_end - expected).abs() < 1e-9)
+        };
+        assert!(near(crossing(&path, &across(4.0, 0.0, 0.0, 2.0)), 16.0));
+        assert!(near(crossing(&path, &across(10.0, 7.0, 2.0, 0.0)), 3.0));
+        // Drawn exactly to the end, it is at the end.
+        assert!(near(crossing(&path, &across(10.0, 10.0, 2.0, 0.0)), 0.0));
+        // The path back the other way crosses the same line the other way.
+        let back =
+            Polyline3::new([Point3::new(10.0, 0.0, 0.0), Point3::new(0.0, 0.0, 0.0)]).unwrap();
+        let line = across(4.0, 0.0, 0.0, 2.0);
+        assert_ne!(
+            crossing(&path, &line).unwrap().sense,
+            crossing(&back, &line).unwrap().sense
+        );
+        // Beside the path, or along it, it crosses nothing.
+        assert!(crossing(&path, &across(4.0, 5.0, 0.0, 2.0)).is_none());
+        assert!(crossing(&path, &across(4.0, 0.0, 2.0, 0.0)).is_none());
     }
 
     /// A road whose two sidewalks — one on each of its two edges, which share both

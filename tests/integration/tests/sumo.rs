@@ -920,12 +920,21 @@ fn what_the_format_cannot_carry_is_reported() {
     assert!(report.contains("markings"), "{report}");
     assert!(report.contains("mean width along"), "{report}");
 
-    let crossroads = roadgen_sumo::check(&scenarios::controlled_crossroads()).join("\n");
+    let crossroads = roadgen_sumo::check(&scenarios::controlled_crossroads());
+    let lost: Vec<&String> = crossroads
+        .iter()
+        .filter(|line| line.contains("stop line") && line.contains("is not written"))
+        .collect();
+    let crossroads = crossroads.join("\n");
     assert!(
         crossroads.contains("netconvert generates the phases"),
         "{crossroads}"
     );
     assert!(crossroads.contains("crosswalk"), "{crossroads}");
+    // Its stop line is right at the junction's mouth, so the stop offset it becomes
+    // is no offset at all, and nothing is lost.
+    assert!(crossroads.contains("stopOffset"), "{crossroads}");
+    assert!(lost.is_empty(), "{crossroads}");
 }
 
 /// The four network files are named after the map and refer to each other, so that
@@ -1016,6 +1025,117 @@ fn every_movement_netconvert_built_is_in_the_trace() {
     }
     // Every pair of the four arms, both ways.
     assert_eq!(matched, 12);
+}
+
+/// A stop line set back from the junction has to reach the simulation as the place a
+/// waiting vehicle stops — SUMO's `<stopOffset>` on the lane, read back here from what
+/// netconvert built rather than from what the export wrote.
+///
+/// The approach is split over two edges by a change of cross-section, so this also
+/// checks that the offset lands on the edge that reaches the junction and nowhere
+/// else; and the place it puts the stop is compared against the stop line's own
+/// geometry, so a distance measured from the wrong end, or along the wrong line,
+/// cannot pass.
+#[test]
+fn a_stop_line_set_back_from_the_junction_is_where_sumo_stops() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let mut builder = MapBuilder::new(scenarios::metadata("stopping"));
+    let north = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 70.0, 0.0),
+                Point3::new(0.0, 14.0, 0.0),
+                scenarios::two_way(),
+            )
+            .unwrap()
+            .with_name("north")
+            .with_cross_section(30.0, scenarios::two_way()),
+        )
+        .unwrap();
+    let arms: Vec<_> = [
+        (
+            "east",
+            Point3::new(70.0, 0.0, 0.0),
+            Point3::new(14.0, 0.0, 0.0),
+        ),
+        (
+            "west",
+            Point3::new(-70.0, 0.0, 0.0),
+            Point3::new(-14.0, 0.0, 0.0),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, start, end)| {
+        builder
+            .add_road(
+                RoadSpec::line(start, end, scenarios::two_way())
+                    .unwrap()
+                    .with_name(name),
+            )
+            .unwrap()
+    })
+    .collect();
+    let junction = builder.add_junction(Some("t"));
+    for arm in &arms {
+        builder
+            .connect_ends(&north, RoadEnd::End, arm, RoadEnd::End, Some(&junction))
+            .unwrap();
+    }
+    // Lanes are counted across the road's cross-sections, so 2 is the forward lane of
+    // the second one: the approach into the junction.
+    let approach = LaneRef::new(north.clone(), 2);
+    let stop_line = builder
+        .add_stop_line_at(&approach, LaneEnd::End, 8.0)
+        .unwrap();
+    builder.add_right_of_way(
+        vec![LaneRef::new(arms[0].clone(), 0)],
+        vec![approach],
+        Some(stop_line.clone()),
+    );
+    let map = builder.finish().unwrap().validate().unwrap();
+
+    let prefix = roadgen_sumo::network_name(&map);
+    let (directory, network) = sumo_build::build(&map);
+    sumo_build::simulate(directory.path(), &prefix);
+
+    let lane = network.edge("north.1.fwd").lane(0);
+    let offset = lane
+        .stop_offset
+        .unwrap_or_else(|| panic!("the approach lost its stop line: {lane:?}"));
+    assert!((offset - 8.0).abs() < 0.03, "a stop offset of {offset}");
+    for edge in network.roads() {
+        for other in &edge.lanes {
+            assert!(
+                other.id == lane.id || other.stop_offset.is_none(),
+                "{} has a stop offset, but no stop line is on it",
+                other.id
+            );
+        }
+    }
+
+    // Where SUMO stops a vehicle — that far back along the lane it built — is where
+    // the stop line is painted.
+    let mut remaining = lane.length - offset;
+    let mut stop = *lane.shape.last().unwrap();
+    for pair in lane.shape.windows(2) {
+        let length = pair[0].distance_to(pair[1]);
+        if remaining <= length {
+            stop = pair[0].lerp(pair[1], remaining / length);
+            break;
+        }
+        remaining -= length;
+    }
+    let object = map.objects.get(&stop_line).unwrap();
+    let ObjectGeometry::Line(curve) = &object.geometry else {
+        panic!("a stop line is a line");
+    };
+    let painted = curve.start_point().lerp(curve.end_point(), 0.5);
+    assert!(
+        stop.horizontal_distance_to(painted) < 0.05,
+        "SUMO stops at {stop:?}, but the line is at {painted:?}"
+    );
 }
 
 /// One of the `randomTrips.py` weight files the export wrote: each edge it names, and
