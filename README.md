@@ -1004,11 +1004,13 @@ anyway; and where two stop lines cross one lane, the one nearer the junction hol
 one offset. The trace records each as `merged` into the lane, with the role
 `stopOffset`.
 
-A stop line that cannot become an offset is named by `sumo_warnings()` with the
-reason: one on a lane no SUMO lane is written for (a junction's connector), one short
-of the end of an edge that does not meet a junction, one that does not cross the
-centreline of a lane it names, or one further back than its edge is long — which
-netconvert would refuse.
+Where a stop line cannot become an offset, `sumo_warnings()` names it with the lane
+it misses and the reason: a lane no SUMO lane is written for (a junction's connector),
+an edge that does not end at a junction, a lane whose centreline it does not cross, a
+lane where it is further back than its edge is long — which netconvert would refuse —
+or one whose offset a line nearer the junction already holds. It is named lane by
+lane, so a line drawn across both carriageways that is written on the approach is
+reported only for the lane leading away.
 
 ### Junctions, which SUMO models the same way round as the IR
 

@@ -91,7 +91,8 @@
 //! several edges carries it on the edge that reaches the junction, and only there. A
 //! stop line SUMO has no place for — on a lane that is not written, short of the end
 //! of a lane that does not meet a junction, further back than the lane is long — is
-//! named by [`check`] rather than dropped without a word.
+//! named by [`check`] rather than dropped without a word, lane by lane, so a line
+//! written on some of its lanes is reported only for the ones it misses.
 
 pub mod classes;
 pub mod error;
@@ -389,33 +390,43 @@ fn stop_line_problems(map: &ValidatedMap) -> Vec<String> {
          junction it runs into: the {total} stop lines are written as the stopOffset \
          of the lanes they cross, and the paint itself is not"
     )];
+    // Named lane by lane: a line drawn across both carriageways may well be written
+    // on the one that runs into the junction and not on the one that leaves it, and
+    // only what is missing is missing.
     for (reason, objects) in &exporter.unplaced {
         let why = match reason {
-            Unplaced::NotALine => "are not drawn as a line across the road",
+            Unplaced::NotALine => "it is not drawn as a line across the road",
             Unplaced::LaneNotWritten => {
-                "are on lanes no SUMO lane is written for — a junction's connector, or \
-                 a lane of a type SUMO has no place for"
+                "no SUMO lane is written there — a junction's connector, or a lane of a \
+                 type SUMO has no place for"
             }
             Unplaced::NoJunctionAhead => {
-                "are on lanes whose edge does not end at a junction, where a stop \
-                 offset stops nothing"
+                "the edge does not end at a junction, where a stop offset stops nothing"
             }
-            Unplaced::NotAcross => "do not cross the centreline of a lane they name",
+            Unplaced::NotAcross => "it does not cross the lane's centreline",
             Unplaced::BeyondLane => {
-                "are further back from the junction than their edge is long, which \
+                "it is further back from the junction than the edge is long, which \
                  netconvert refuses as an offset"
             }
             Unplaced::Superseded => {
-                "share a lane with a stop line nearer the junction, and a lane has one \
-                 stop offset"
+                "a stop line nearer the junction holds the lane's one stop offset"
             }
         };
-        let names: Vec<&str> = objects.iter().map(ObjectId::as_str).collect();
-        problems.push(format!(
-            "{} stop lines {why}, so they are not written: {}",
-            names.len(),
-            names.join(", ")
-        ));
+        for (object, lanes) in objects {
+            let lanes: Vec<String> = lanes.iter().map(LaneId::local_name).collect();
+            problems.push(match lanes.as_slice() {
+                [] => format!("stop line {} is not written: {why}", object.as_str()),
+                [lane] => format!(
+                    "stop line {} is not written on lane {lane}: {why}",
+                    object.as_str()
+                ),
+                _ => format!(
+                    "stop line {} is not written on lanes {}: {why}",
+                    object.as_str(),
+                    lanes.join(", ")
+                ),
+            });
+        }
     }
     problems
 }
@@ -519,15 +530,16 @@ struct Exporter<'a> {
     /// The stop offset of each written lane that has one, by (edge, lane index): how
     /// far back from the lane's end its stop line is, and which stop line that is.
     stop_offsets: BTreeMap<(usize, usize), (ObjectId, f64)>,
-    /// The stop lines that could not be written as a stop offset, each with the
-    /// reason, for [`check`] to name.
-    unplaced: BTreeMap<Unplaced, BTreeSet<ObjectId>>,
+    /// Where stop lines could not be written as a stop offset, for [`check`] to
+    /// name: by reason, each stop line with the lanes it misses. A line that is not
+    /// a line at all misses every lane, and is held with none.
+    unplaced: BTreeMap<Unplaced, BTreeMap<ObjectId, BTreeSet<LaneId>>>,
 }
 
 /// Why a stop line did not become a lane's stop offset.
 ///
 /// Ordered, so that [`check`] names the reasons in a fixed order and each once, with
-/// every stop line it applies to.
+/// every stop line and lane it applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Unplaced {
     /// The line is drawn as something other than a line across the road.
@@ -1093,7 +1105,7 @@ impl<'a> Exporter<'a> {
                 continue;
             }
             let ObjectGeometry::Line(curve) = &object.geometry else {
-                self.unplace(Unplaced::NotALine, &object.id);
+                self.unplace(Unplaced::NotALine, &object.id, None);
                 continue;
             };
             let line = curve.to_polyline(self.sampling)?;
@@ -1107,7 +1119,7 @@ impl<'a> Exporter<'a> {
                 let own = named.contains(lane);
                 let Some(&slot) = self.slots.get(lane) else {
                     if own {
-                        self.unplace(Unplaced::LaneNotWritten, &object.id);
+                        self.unplace(Unplaced::LaneNotWritten, &object.id, Some(lane));
                     }
                     continue;
                 };
@@ -1115,7 +1127,7 @@ impl<'a> Exporter<'a> {
                 let shape = &edge.lanes[slot.index].shape;
                 let Some(distance) = crossing_from_end(shape, &line) else {
                     if own {
-                        self.unplace(Unplaced::NotAcross, &object.id);
+                        self.unplace(Unplaced::NotAcross, &object.id, Some(lane));
                     }
                     continue;
                 };
@@ -1124,7 +1136,7 @@ impl<'a> Exporter<'a> {
                     .get(&edge.to)
                     .is_some_and(|node| node.junction.is_some());
                 if !at_junction {
-                    self.unplace(Unplaced::NoJunctionAhead, &object.id);
+                    self.unplace(Unplaced::NoJunctionAhead, &object.id, Some(lane));
                     continue;
                 }
                 // netconvert measures the limit against the edge, whose line is the
@@ -1132,7 +1144,7 @@ impl<'a> Exporter<'a> {
                 // that matters, on the inside of a bend.
                 let limit = shape.length().min(edge.shape.length());
                 if distance >= limit - MIN_STOP_OFFSET {
-                    self.unplace(Unplaced::BeyondLane, &object.id);
+                    self.unplace(Unplaced::BeyondLane, &object.id, Some(lane));
                     continue;
                 }
                 candidates
@@ -1150,7 +1162,8 @@ impl<'a> Exporter<'a> {
             };
             for (_, other) in placements {
                 if other != object {
-                    self.unplace(Unplaced::Superseded, &other);
+                    let lane = self.edges[key.0].lanes[key.1].lane.clone();
+                    self.unplace(Unplaced::Superseded, &other, Some(&lane));
                 }
             }
             // A line at the very end of the lane is where SUMO stops a vehicle
@@ -1162,11 +1175,14 @@ impl<'a> Exporter<'a> {
         Ok(())
     }
 
-    fn unplace(&mut self, reason: Unplaced, object: &ObjectId) {
-        self.unplaced
+    fn unplace(&mut self, reason: Unplaced, object: &ObjectId, lane: Option<&LaneId>) {
+        let lanes = self
+            .unplaced
             .entry(reason)
             .or_default()
-            .insert(object.clone());
+            .entry(object.clone())
+            .or_default();
+        lanes.extend(lane.cloned());
     }
 
     // ----------------------------------------------------------------------- //
@@ -1962,6 +1978,52 @@ mod tests {
         );
         assert!(!report.contains(at_mouth.as_str()), "{report}");
         assert!(!report.contains(set_back.as_str()), "{report}");
+    }
+
+    #[test]
+    fn a_stop_line_across_both_carriageways_is_missing_only_where_it_is_not_written() {
+        // The set-back line redrawn across the whole road, naming the approach and
+        // the lane beside it that leaves the junction, as an imported line would.
+        let (map, [set_back, ..]) = stop_lines();
+        let mut map = UnvalidatedMap::from_map(map.into_map());
+        let approach = LaneId::of_road(&RoadId::new("north"), 2);
+        let leaving = LaneId::of_road(&RoadId::new("north"), 3);
+        let object = map
+            .as_map_mut()
+            .objects
+            .get_mut(&set_back)
+            .expect("the set-back stop line");
+        object.geometry = ObjectGeometry::Line(
+            Curve3::line(Point3::new(-7.0, 22.0, 0.0), Point3::new(7.0, 22.0, 0.0)).unwrap(),
+        );
+        object.lanes = vec![approach.clone(), leaving.clone()];
+        let map = map.validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+
+        // Written where it stops traffic into the junction...
+        let offsets = stop_offsets(&network);
+        assert_eq!(offsets.keys().collect::<Vec<_>>(), ["north.1.fwd_0"]);
+        assert!((offsets["north.1.fwd_0"] - 8.0).abs() < 1e-3, "{offsets:?}");
+        assert_eq!(network.lanes[&approach], "north.1.fwd_0");
+
+        // ...and said to be missing only on the lane that leaves it.
+        let report = check(&map);
+        let about: Vec<&String> = report
+            .iter()
+            .filter(|line| line.contains(set_back.as_str()))
+            .collect();
+        assert_eq!(about.len(), 1, "{report:#?}");
+        assert!(
+            about[0].contains(&format!("is not written on lane {}:", leaving.local_name()))
+                && about[0].contains("does not end at a junction"),
+            "{report:#?}"
+        );
+        // The line's own name carries its lane's, so look for the approach as a lane.
+        assert!(
+            !about[0].contains("on lanes ")
+                && !about[0].contains(&format!("lane {}", approach.local_name())),
+            "{report:#?}"
+        );
     }
 
     #[test]
