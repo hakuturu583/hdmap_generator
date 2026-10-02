@@ -701,6 +701,133 @@ fn a_footway_admits_pedestrians_and_a_driving_lane_keeps_them_out() {
     assert_eq!(street.lane(1).disallow.as_deref(), Some("pedestrian"));
 }
 
+/// Two lanes the same way with `separator` painted between them, read off both of
+/// them.
+fn two_lanes_separated_by(separator: RoadMarking) -> ValidatedMap {
+    two_lanes_separated_in(TrafficHandedness::RightHand, separator)
+}
+
+fn two_lanes_separated_in(handedness: TrafficHandedness, separator: RoadMarking) -> ValidatedMap {
+    let marking = BoundaryMarking::new(separator, MarkingColor::White);
+    let mut builder = MapBuilder::new(scenarios::metadata("separated"));
+    builder.metadata_mut().handedness = handedness;
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::ORIGIN,
+                Point3::new(150.0, 0.0, 0.0),
+                (0..2)
+                    .map(|_| {
+                        scenarios::lane(3.5, Direction::Forward).with_markings(marking, marking)
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .with_name("road"),
+        )
+        .unwrap();
+    builder.finish().unwrap().validate().unwrap()
+}
+
+/// SUMO has no paint, but it has what a solid line between two lanes is for: the
+/// change across it is closed to everyone but emergency vehicles, in the plain XML
+/// that goes in and — which is what a simulation runs on — in the network netconvert
+/// builds from it.
+#[test]
+fn a_solid_line_between_lanes_closes_the_lane_change_and_a_broken_one_does_not() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+
+    let map = two_lanes_separated_by(RoadMarking::Solid);
+    let (directory, network) = sumo_build::build(&map);
+    let plain =
+        std::fs::read_to_string(directory.path().join("separated.edg.xml")).expect("the edge file");
+    assert_eq!(
+        plain.matches("changeLeft=\"emergency\"").count(),
+        1,
+        "{plain}"
+    );
+    assert_eq!(
+        plain.matches("changeRight=\"emergency\"").count(),
+        1,
+        "{plain}"
+    );
+
+    let road = network.edge("road.fwd");
+    assert_eq!(road.lanes.len(), 2);
+    // Lane 0 is on the right: its neighbour is to its left, and lane 1's to its right.
+    assert_eq!(road.lane(0).change_left.as_deref(), Some("emergency"));
+    assert_eq!(road.lane(1).change_right.as_deref(), Some("emergency"));
+    // The outer sides have no lane to change into and say nothing.
+    assert_eq!(road.lane(0).change_right, None);
+    assert_eq!(road.lane(1).change_left, None);
+    sumo_build::simulate(directory.path(), "separated");
+
+    let map = two_lanes_separated_by(RoadMarking::Broken);
+    let (directory, network) = sumo_build::build(&map);
+    let plain =
+        std::fs::read_to_string(directory.path().join("separated.edg.xml")).expect("the edge file");
+    assert!(!plain.contains("changeLeft"), "{plain}");
+    assert!(!plain.contains("changeRight"), "{plain}");
+    for lane in &network.edge("road.fwd").lanes {
+        assert_eq!(lane.change_left, None, "{}", lane.id);
+        assert_eq!(lane.change_right, None, "{}", lane.id);
+    }
+}
+
+/// `changeLeft` and `changeRight` are the driver's left and right in travel under
+/// either handedness — and a left-hand network counts its lanes from the left, so the
+/// next lane up from the kerb is on the driver's right. With a `solid broken` line
+/// between two forward lanes driving on the left, the outer lane 0 is left of the
+/// line looking along the road and faces its solid half, which is on its right: its
+/// `changeRight` is closed. Lane 1 faces the broken half and may change. The
+/// simulator is made to try both changes, so what is checked is what SUMO does with
+/// the attributes, not only that they arrive.
+#[test]
+fn under_left_hand_traffic_a_solid_broken_line_binds_the_lane_left_of_it() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = two_lanes_separated_in(TrafficHandedness::LeftHand, RoadMarking::SolidBroken);
+    let (directory, network) = sumo_build::build(&map);
+    assert!(network.lefthand);
+    let road = network.edge("road.fwd");
+    assert_eq!(road.lanes.len(), 2);
+    // Driving along +x on the left, lane 0 is the leftmost: the larger y.
+    assert!(road.lane(0).shape[0].y > road.lane(1).shape[0].y);
+    assert_eq!(road.lane(0).change_left, None);
+    assert_eq!(road.lane(0).change_right.as_deref(), Some("emergency"));
+    assert_eq!(road.lane(1).change_left, None);
+    assert_eq!(road.lane(1).change_right, None);
+    sumo_build::simulate(directory.path(), "separated");
+
+    let kept = sumo_build::lanes_driven(directory.path(), "separated", "road.fwd", 0, 1);
+    assert_eq!(kept.into_iter().collect::<Vec<_>>(), ["road.fwd_0"]);
+    let changed = sumo_build::lanes_driven(directory.path(), "separated", "road.fwd", 1, 0);
+    assert_eq!(
+        changed.into_iter().collect::<Vec<_>>(),
+        ["road.fwd_0", "road.fwd_1"]
+    );
+}
+
+/// A lane that drops has no way out but sideways, so the solid line the builder
+/// paints beside it by default does not close the change out of it — netconvert
+/// would refuse that prohibition, and `build` fails on its complaint — while the
+/// lanes that carry on keep theirs.
+#[test]
+fn a_lane_that_drops_may_always_be_left() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let (_directory, network) = sumo_build::build(&scenarios::lane_drop());
+    let before = network.edge("wide.0.fwd");
+    assert_eq!(before.lanes.len(), 3);
+    assert_eq!(before.lane(0).change_left, None);
+    assert_eq!(before.lane(1).change_right.as_deref(), Some("emergency"));
+    assert_eq!(before.lane(1).change_left.as_deref(), Some("emergency"));
+}
+
 /// A `SpeedLimit` rule is the speed of the lanes it names, in the network netconvert
 /// builds — not only in the file handed to it — and the lanes it does not name keep
 /// their road's.
