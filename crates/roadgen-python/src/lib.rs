@@ -1109,10 +1109,20 @@ impl PyMap {
     /// A signalised junction gets a fixed-time program of the export's own, written to
     /// `<prefix>.tll.xml` with the link index of every movement it controls.
     ///
+    /// Beside the network go `<prefix>.safe.src.xml`, `<prefix>.safe.dst.xml` and
+    /// `<prefix>.safe.via.xml`: edge weights for `randomTrips.py`, which keep it from
+    /// starting a car trip on an edge running into a dead end, ending one on an edge
+    /// no car can reach, or putting either on a footway.
+    ///
+    /// ```text
+    /// randomTrips.py -n network/<prefix>.net.xml --weights-prefix network/<prefix>.safe --validate
+    /// ```
+    ///
     /// Also writes `<prefix>.sumo.trace.json` in `directory` — the edge, lane, node and
     /// connection each road, lane, junction and movement became, and the program and
-    /// link indices each traffic light did — unless `trace` is false. The internal lanes netconvert draws across a junction are not in it,
-    /// since netconvert names them; `Trace.add_sumo_net` reads them from the built
+    /// link indices each traffic light did — unless `trace` is false. The internal
+    /// lanes netconvert draws across a junction are not in it, since netconvert names
+    /// them;`Trace.add_sumo_net` reads them from the built
     /// network.
     #[pyo3(signature = (directory, trace = true))]
     fn export_sumo(&mut self, directory: PathBuf, trace: bool) -> PyResult<String> {

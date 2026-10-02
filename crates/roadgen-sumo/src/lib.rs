@@ -17,13 +17,21 @@
 //! | `<name>.con.xml` | which lane may be left for which lane |
 //! | `<name>.tll.xml` | the program of each signalised junction, when there is one |
 //! | `<name>.netccfg` | the netconvert run that turns the rest into a `.net.xml` |
+//! | `<name>.safe.{src,dst,via}.xml` | where `randomTrips.py` may start, end and route trips |
 //!
 //! ```text
 //! netconvert -c <name>.netccfg
+//! randomTrips.py -n <name>.net.xml --weights-prefix <name>.safe --validate
 //! ```
 //!
 //! That is the format a network *generator* is expected to produce, and it is the
 //! one SUMO documents for the purpose.
+//!
+//! The last three are not part of the network but of the demand put on it: edge
+//! weights that keep `randomTrips.py` from starting a car trip where no car can leave,
+//! or ending one where no car can arrive. A generated network has many such places,
+//! since its unlinked road ends are dead ends with no U-turn; see [`weights`] for what
+//! is weighted and why.
 //!
 //! # What a SUMO edge is
 //!
@@ -60,6 +68,17 @@
 //! Every lane is written with its own shape, so the geometry the generator computed
 //! is the geometry SUMO gets — not a centreline with a width, which is what a
 //! network imported from OpenStreetMap has to make do with.
+//!
+//! # Lane changes
+//!
+//! SUMO has no paint, but it has the thing paint between two lanes is *for*: whether
+//! a vehicle may change across it. Each lane says so with `changeLeft` and
+//! `changeRight`, and the exporter reads both off the IR's marking on the boundary
+//! the lane shares with its neighbour in the edge. A solid line, a double solid line
+//! or a kerb leaves the change to `emergency` vehicles; a broken line or no paint at
+//! all says nothing, which SUMO reads as open to everyone. A line that is solid on
+//! one side and broken on the other binds each vehicle by the half nearer it. See
+//! [`lane_change`].
 //!
 //! # Junctions
 //!
@@ -141,6 +160,7 @@ pub mod classes;
 pub mod error;
 pub mod location;
 pub mod signals;
+pub mod weights;
 mod xml;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -150,7 +170,7 @@ use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
 use roadgen_core::map::{Lane, Projection, Road, TrafficHandedness};
 use roadgen_core::semantics::{LaneType, MapObjectKind, TrafficRule};
 use roadgen_core::topology::{
-    Direction, LaneConnection, LaneEnd, LaneEndpoint, RoadEnd, RoadLinkTarget,
+    Direction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadLinkTarget,
 };
 use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, ValidatedMap};
@@ -158,12 +178,14 @@ use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, Validated
 pub use classes::Permission;
 pub use error::ExportError;
 pub use location::{geo_reference, height_error, GeoReference};
+pub use weights::TripWeights;
 
 /// The name a map with none of its own is written under.
 const DEFAULT_NAME: &str = "network";
 
-/// A SUMO plain-XML network: the input files, and the netconvert run that turns
-/// them into a `.net.xml`.
+/// A SUMO plain-XML network: the input files, the netconvert run that turns them
+/// into a `.net.xml`, and the `randomTrips.py` edge weights for the network it
+/// builds.
 ///
 /// The file names are derived from [`PlainNetwork::prefix`], and the configuration
 /// refers to them, so they belong together in one directory.
@@ -179,6 +201,11 @@ pub struct PlainNetwork {
     /// with no traffic light, which is written without one.
     pub traffic_lights: Option<String>,
     pub config: String,
+    /// The `randomTrips.py` weights, written as `<prefix>.safe.src.xml`,
+    /// `<prefix>.safe.dst.xml` and `<prefix>.safe.via.xml` and read with
+    /// `--weights-prefix <prefix>.safe`. They name the edges as the built network
+    /// does, so they are used with the `.net.xml` netconvert makes of the rest.
+    pub weights: TripWeights,
     /// Where each lane of the IR ended up, as the `<edge>_<index>` identifier the
     /// built network gives it.
     ///
@@ -187,7 +214,7 @@ pub struct PlainNetwork {
     /// IR's: SUMO counts from the outside of the carriageway, which is the right of
     /// the direction of travel under right-hand traffic and the left under left-hand.
     pub lanes: BTreeMap<LaneId, String>,
-    /// Where each element of the IR ended up in the files: nodes, edges, lanes,
+    /// Where each element of the IR ended up in the network files: nodes, edges, lanes,
     /// connections and traffic lights, by the identifiers written for them. See the
     /// crate documentation for how each is named.
     ///
@@ -197,7 +224,8 @@ pub struct PlainNetwork {
 }
 
 impl PlainNetwork {
-    /// Each file's name and its contents, in the order netconvert reads them.
+    /// Each file's name and its contents: the network in the order netconvert reads
+    /// it, then the trip weights in the order `src`, `dst`, `via`.
     pub fn files(&self) -> Vec<(String, &str)> {
         let mut files = vec![
             (format!("{}.nod.xml", self.prefix), self.nodes.as_str()),
@@ -211,6 +239,12 @@ impl PlainNetwork {
             files.push((format!("{}.tll.xml", self.prefix), traffic_lights.as_str()));
         }
         files.push((format!("{}.netccfg", self.prefix), self.config.as_str()));
+        files.extend(
+            [&self.weights.src, &self.weights.dst, &self.weights.via]
+                .into_iter()
+                .zip(TripWeights::SUFFIXES)
+                .map(|(weights, suffix)| (format!("{}.{suffix}", self.prefix), weights.as_str())),
+        );
         files
     }
 
@@ -286,7 +320,8 @@ fn is_light(map: &ValidatedMap, id: &ObjectId) -> bool {
 pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = vec![
         "SUMO has no lane markings: which line is painted between two lanes, and in \
-         what colour, is not written"
+         what colour, is not written — only whether it may be crossed, which becomes \
+         each lane's `changeLeft` and `changeRight`"
             .to_owned(),
     ];
 
@@ -672,6 +707,11 @@ struct Node {
 struct Edge {
     id: String,
     road: RoadId,
+    /// Which cross-section of the road, and which way along it: what tells two edges
+    /// of one road that netconvert will join across a section node from the two
+    /// carriageways of it.
+    section: usize,
+    direction: Direction,
     from: String,
     to: String,
     name: Option<String>,
@@ -686,6 +726,11 @@ struct EdgeLane {
     width: f64,
     speed: Option<f64>,
     permission: Option<Permission>,
+    /// Whether the boundary on each side of the direction of travel is one only
+    /// emergency vehicles may change across. Never set on the outer side of the
+    /// outermost lanes: there is no lane there to change into.
+    restricted_left: bool,
+    restricted_right: bool,
     shape: Polyline3,
 }
 
@@ -943,6 +988,7 @@ impl<'a> Exporter<'a> {
         }
         self.build_connections()?;
         self.build_signals();
+        self.open_dead_ends();
         let points = self
             .nodes
             .values()
@@ -962,6 +1008,37 @@ impl<'a> Exporter<'a> {
             );
         self.location = location::location(self.map, points)?;
         Ok(())
+    }
+
+    /// Lifts the paint's restriction from every lane that leads nowhere while the
+    /// rest of its edge carries on: a lane that drops, say, past the end of a taper.
+    ///
+    /// The only way out of such a lane is sideways, so the topology of the IR says a
+    /// vehicle in it must change lanes whatever is painted beside it — and the
+    /// builder's default marking is a solid line, so a lane drop drawn without
+    /// thought for its paint has one. netconvert agrees: it refuses a prohibition
+    /// that would trap a vehicle in a dead-end lane, discards it and complains. So
+    /// it is not written, and the change out of the lane is left open to everyone.
+    /// An edge none of whose lanes lead anywhere is the end of the road rather than
+    /// a lane drop, and its paint is written as it is.
+    fn open_dead_ends(&mut self) {
+        let leaving: HashSet<(usize, usize)> = self
+            .movements
+            .keys()
+            .map(|&(edge, lane, _, _)| (edge, lane))
+            .collect();
+        for (index, edge) in self.edges.iter_mut().enumerate() {
+            let continues = |position: usize| leaving.contains(&(index, position));
+            if !(0..edge.lanes.len()).any(continues) {
+                continue;
+            }
+            for (position, lane) in edge.lanes.iter_mut().enumerate() {
+                if !continues(position) {
+                    lane.restricted_left = false;
+                    lane.restricted_right = false;
+                }
+            }
+        }
     }
 
     // ----------------------------------------------------------------------- //
@@ -1157,11 +1234,25 @@ impl<'a> Exporter<'a> {
         let mut written = Vec::with_capacity(lanes.len());
         for (position, lane) in lanes.iter().enumerate() {
             let travel = lane.travel_geometry(self.sampling)?;
+            // SUMO counts from the kerb, so the next lane up is the one further from
+            // it: to the driver's left where traffic keeps right, and to the right
+            // where it keeps left. `changeLeft` and `changeRight` name the driver's
+            // sides in travel under either handedness, not a direction in index.
+            let above = lanes.get(position + 1);
+            let below = position.checked_sub(1).and_then(|below| lanes.get(below));
+            let (to_left, to_right) = match self.map.metadata.handedness {
+                TrafficHandedness::RightHand => (above, below),
+                TrafficHandedness::LeftHand => (below, above),
+            };
             written.push(EdgeLane {
                 lane: lane.id.clone(),
                 width: self.mean_width(lane)?,
                 speed: self.lane_speed(lane),
                 permission: classes::permission(lane.lane_type),
+                restricted_left: to_left
+                    .is_some_and(|other| !lane_change(lane, other, LateralSide::Left)),
+                restricted_right: to_right
+                    .is_some_and(|other| !lane_change(lane, other, LateralSide::Right)),
                 shape: travel.centerline.to_polyline(self.sampling)?,
             });
             self.slots.insert(
@@ -1177,6 +1268,8 @@ impl<'a> Exporter<'a> {
         self.edges.push(Edge {
             id: edge_id(&self.ids.road(&road.id), road, section, direction),
             road: road.id.clone(),
+            section,
+            direction,
             from,
             to,
             name: road.name.clone(),
@@ -1736,6 +1829,7 @@ impl<'a> Exporter<'a> {
                 self.map.metadata.handedness,
                 !self.signals.is_empty(),
             ),
+            weights: self.render_weights(),
             trace: self.trace(),
             lanes: self
                 .slots
@@ -1986,6 +2080,14 @@ impl<'a> Exporter<'a> {
                     let (key, value) = permission.attribute();
                     attributes.push((key, value.to_owned()));
                 }
+                // Left out where the paint allows it: SUMO's default is that anyone
+                // may change.
+                if lane.restricted_left {
+                    attributes.push(("changeLeft", classes::CHANGE_ACROSS_SOLID.to_owned()));
+                }
+                if lane.restricted_right {
+                    attributes.push(("changeRight", classes::CHANGE_ACROSS_SOLID.to_owned()));
+                }
                 document.leaf("lane", &attributes);
             }
             document.close("edge");
@@ -2116,6 +2218,42 @@ impl<'a> Exporter<'a> {
             })
             .collect()
     }
+}
+
+/// Whether the paint lets a vehicle in `lane` change into `neighbour`, the lane
+/// beside it in the same edge on the `towards` side of its direction of travel.
+///
+/// The IR keeps a lane's markings by the side of the *reference line* they are on,
+/// and which side that is depends on which way the lane runs: a backward lane's
+/// left in travel is the reference line's right. Only the direction matters here,
+/// not the map's handedness: [`Exporter::add_edge`] has already picked the
+/// neighbour on the driver's `towards` side by where the lanes physically are —
+/// the next index up under right-hand traffic, the next one down under left-hand,
+/// since SUMO counts from the kerb either way and its `changeLeft` and
+/// `changeRight` name the driver's sides in travel.
+///
+/// The marking read is `lane`'s own on that side. Two lanes sharing a boundary
+/// normally agree about it — the OpenDRIVE reader gives each the same one, and a
+/// caller describing a road should too — and where they do not, each vehicle obeys
+/// the paint its own lane describes. A vehicle sits on the opposite side of the
+/// boundary from where the boundary sits relative to its lane, and that is the side
+/// [`classes::may_cross`] wants: it picks the nearer half of a line like
+/// `solid broken`.
+///
+/// Two lanes that are neighbours in SUMO but do not share a boundary in the IR have
+/// something between them SUMO has no lane for — a painted island, a border, a
+/// lane the other way — and crossing it is no lane change the map offers, so it is
+/// restricted like a solid line.
+fn lane_change(lane: &Lane, neighbour: &Lane, towards: LateralSide) -> bool {
+    let across = match lane.direction {
+        Direction::Forward => towards,
+        Direction::Backward => towards.opposite(),
+    };
+    let (marking, own, theirs) = match across {
+        LateralSide::Left => (lane.left_marking, lane.left_edge, neighbour.right_edge),
+        LateralSide::Right => (lane.right_marking, lane.right_edge, neighbour.left_edge),
+    };
+    own == theirs && classes::may_cross(marking.marking, across.opposite())
 }
 
 /// The netconvert run that builds the `.net.xml`.
@@ -3621,6 +3759,186 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------- //
+    // Lane changes
+    // ----------------------------------------------------------------------- //
+
+    /// A straight road whose lanes, listed from the reference line outwards, all run
+    /// `direction` and all carry `separator` on both sides — so the line between
+    /// every pair of them is `separator`, whichever lane it is read off.
+    fn separated(direction: Direction, separator: RoadMarking) -> ValidatedMap {
+        separated_in(TrafficHandedness::RightHand, direction, separator)
+    }
+
+    fn separated_in(
+        handedness: TrafficHandedness,
+        direction: Direction,
+        separator: RoadMarking,
+    ) -> ValidatedMap {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let marking = BoundaryMarking::new(separator, MarkingColor::White);
+        let lanes = (0..2)
+            .map(|_| LaneSpec::new(width, direction).with_markings(marking, marking))
+            .collect();
+        let mut builder = MapBuilder::new(MapMetadata {
+            handedness,
+            ..metadata("separated")
+        });
+        builder
+            .add_road(
+                RoadSpec::line(Point3::ORIGIN, Point3::new(100.0, 0.0, 0.0), lanes)
+                    .unwrap()
+                    .with_name("road"),
+            )
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// Each written lane's `changeLeft` and `changeRight`, by `<edge>_<index>`, read
+    /// back from the `.edg.xml`.
+    fn lane_changes(network: &PlainNetwork) -> BTreeMap<String, (Option<String>, Option<String>)> {
+        let mut found = BTreeMap::new();
+        let mut edge = String::new();
+        let mut reader = quick_xml::Reader::from_str(&network.edges);
+        loop {
+            let event = reader.read_event().unwrap();
+            let element = match &event {
+                Event::Eof => break,
+                Event::Start(element) | Event::Empty(element) => element,
+                _ => continue,
+            };
+            let attributes: HashMap<String, String> = element
+                .attributes()
+                .map(|attribute| {
+                    let attribute = attribute.unwrap();
+                    (
+                        String::from_utf8_lossy(attribute.key.as_ref()).into_owned(),
+                        String::from_utf8_lossy(&attribute.value).into_owned(),
+                    )
+                })
+                .collect();
+            match element.name().as_ref() {
+                b"edge" => edge = attributes["id"].clone(),
+                b"lane" => {
+                    found.insert(
+                        format!("{edge}_{}", attributes["index"]),
+                        (
+                            attributes.get("changeLeft").cloned(),
+                            attributes.get("changeRight").cloned(),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    fn emergency() -> Option<String> {
+        Some("emergency".to_owned())
+    }
+
+    #[test]
+    fn a_solid_line_between_two_lanes_keeps_all_but_emergency_vehicles_from_crossing() {
+        let network = to_plain_xml(&separated(Direction::Forward, RoadMarking::Solid)).unwrap();
+        let changes = lane_changes(&network);
+        // Lane 0 is the right-hand lane, so its neighbour is on its left and lane 1's
+        // is on its right. The outer sides have no neighbour and say nothing.
+        assert_eq!(changes["road.fwd_0"], (emergency(), None));
+        assert_eq!(changes["road.fwd_1"], (None, emergency()));
+    }
+
+    #[test]
+    fn a_broken_line_or_none_lets_anyone_change() {
+        for separator in [RoadMarking::Broken, RoadMarking::None] {
+            let network = to_plain_xml(&separated(Direction::Forward, separator)).unwrap();
+            for (lane, change) in lane_changes(&network) {
+                assert_eq!(change, (None, None), "{lane} across {separator:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_line_no_one_may_cross_restricts_the_change() {
+        for separator in [
+            RoadMarking::Solid,
+            RoadMarking::SolidSolid,
+            RoadMarking::Curbstone,
+        ] {
+            let network = to_plain_xml(&separated(Direction::Forward, separator)).unwrap();
+            let changes = lane_changes(&network);
+            assert_eq!(changes["road.fwd_0"].0, emergency(), "{separator:?}");
+            assert_eq!(changes["road.fwd_1"].1, emergency(), "{separator:?}");
+        }
+    }
+
+    #[test]
+    fn half_of_a_solid_broken_line_binds_the_vehicle_on_its_side() {
+        // Forward lanes on the right of the reference line, looking along it: lane 1
+        // is the inner one, on the left of the line between them, and so faces the
+        // solid half of `solid broken`; lane 0 faces the broken half.
+        let network =
+            to_plain_xml(&separated(Direction::Forward, RoadMarking::SolidBroken)).unwrap();
+        let changes = lane_changes(&network);
+        assert_eq!(changes["road.fwd_0"], (None, None));
+        assert_eq!(changes["road.fwd_1"], (None, emergency()));
+
+        let network =
+            to_plain_xml(&separated(Direction::Forward, RoadMarking::BrokenSolid)).unwrap();
+        let changes = lane_changes(&network);
+        assert_eq!(changes["road.fwd_0"], (emergency(), None));
+        assert_eq!(changes["road.fwd_1"], (None, None));
+    }
+
+    #[test]
+    fn a_backward_lane_reads_its_markings_the_other_way_round() {
+        // Backward lanes sit left of the reference line and run against it. Lane 0
+        // is the outer one, which is on the left of the line between the two looking
+        // along the reference line — so it faces the solid half of `solid broken`,
+        // and that half is on its left in travel.
+        let network =
+            to_plain_xml(&separated(Direction::Backward, RoadMarking::SolidBroken)).unwrap();
+        let changes = lane_changes(&network);
+        assert_eq!(changes["road.bwd_0"], (emergency(), None));
+        assert_eq!(changes["road.bwd_1"], (None, None));
+    }
+
+    #[test]
+    fn handedness_moves_the_lanes_but_not_which_half_of_the_line_binds_whom() {
+        // Under left-hand traffic the forward lanes sit left of the reference line
+        // and SUMO counts them from the kerb, so lane 0 is the outer one — the
+        // leftmost in travel — and lane 1 is on its right. Lane 0 is on the left of
+        // the line between the two looking along the reference line, so it faces
+        // the solid half of `solid broken`, which is on its right in travel; lane 1
+        // faces the broken half.
+        let map = separated_in(
+            TrafficHandedness::LeftHand,
+            Direction::Forward,
+            RoadMarking::SolidBroken,
+        );
+        let changes = lane_changes(&to_plain_xml(&map).unwrap());
+        assert_eq!(changes["road.fwd_0"], (None, emergency()));
+        assert_eq!(changes["road.fwd_1"], (None, None));
+    }
+
+    #[test]
+    fn under_left_hand_traffic_the_kerb_lane_changes_to_its_right() {
+        // `changeLeft` and `changeRight` are the driver's sides in travel, and in a
+        // left-hand network the next lane up from the kerb is on the right — so a
+        // solid line closes lane 0's change to the right and lane 1's to the left,
+        // the mirror of a right-hand road. The outer sides have no neighbour.
+        for direction in [Direction::Forward, Direction::Backward] {
+            let map = separated_in(TrafficHandedness::LeftHand, direction, RoadMarking::Solid);
+            let changes = lane_changes(&to_plain_xml(&map).unwrap());
+            let edge = match direction {
+                Direction::Forward => "road.fwd",
+                Direction::Backward => "road.bwd",
+            };
+            assert_eq!(changes[&format!("{edge}_0")], (None, emergency()), "{edge}");
+            assert_eq!(changes[&format!("{edge}_1")], (emergency(), None), "{edge}");
+        }
+    }
+
+    // ----------------------------------------------------------------------- //
     // Speed-limit rules
     // ----------------------------------------------------------------------- //
 
@@ -3844,10 +4162,18 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("roadgen-sumo-trace-{}", std::process::id()));
         let (prefix, trace) = write_traced(&map, &directory).unwrap();
-        let names: Vec<String> = ["nod.xml", "edg.xml", "con.xml", "netccfg"]
-            .iter()
-            .map(|suffix| format!("{prefix}.{suffix}"))
-            .collect();
+        let names: Vec<String> = [
+            "nod.xml",
+            "edg.xml",
+            "con.xml",
+            "netccfg",
+            "safe.src.xml",
+            "safe.dst.xml",
+            "safe.via.xml",
+        ]
+        .iter()
+        .map(|suffix| format!("{prefix}.{suffix}"))
+        .collect();
         assert_eq!(
             trace.files,
             names
@@ -3858,6 +4184,182 @@ mod tests {
         assert!(trace.files.iter().all(|path| path.is_file()));
         assert_eq!(trace.links, to_plain_xml(&map).unwrap().trace.links);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    // ----------------------------------------------------------------------- //
+    // The randomTrips weights
+    // ----------------------------------------------------------------------- //
+
+    /// Each edge's weight in one of the `edgedata` files, read back from the XML.
+    fn weights(xml: &str) -> BTreeMap<String, f64> {
+        let mut found = BTreeMap::new();
+        let mut reader = quick_xml::Reader::from_str(xml);
+        loop {
+            let event = reader.read_event().unwrap();
+            let element = match &event {
+                Event::Eof => break,
+                Event::Start(element) | Event::Empty(element) => element,
+                _ => continue,
+            };
+            if element.name().as_ref() != b"edge" {
+                continue;
+            }
+            let attribute = |key: &[u8]| {
+                let value = element
+                    .attributes()
+                    .map(Result::unwrap)
+                    .find(|attribute| attribute.key.as_ref() == key)
+                    .unwrap()
+                    .value;
+                String::from_utf8_lossy(&value).into_owned()
+            };
+            found.insert(attribute(b"id"), attribute(b"value").parse().unwrap());
+        }
+        found
+    }
+
+    /// The edges given a weight in one file.
+    fn weighted(xml: &str) -> BTreeSet<String> {
+        weights(xml)
+            .into_iter()
+            .filter(|(_, value)| *value > 0.0)
+            .map(|(edge, _)| edge)
+            .collect()
+    }
+
+    fn set(edges: &[&str]) -> BTreeSet<String> {
+        edges.iter().map(|edge| (*edge).to_owned()).collect()
+    }
+
+    /// Each arm of the crossroads runs out to a dead end with no U-turn, so the edge
+    /// approaching the junction can only be left and the edge leaving it can only be
+    /// arrived on: a trip may start on the one and end on the other, and a way point
+    /// may be neither.
+    #[test]
+    fn a_road_into_a_dead_end_is_no_place_to_start_a_trip() {
+        let network = to_plain_xml(&crossroads()).unwrap();
+        let every = weights(&network.weights.src);
+        assert_eq!(every.len(), 8, "every edge is named: {every:?}");
+        assert_eq!(
+            weighted(&network.weights.src),
+            set(&["north.fwd", "east.fwd", "south.fwd", "west.fwd"])
+        );
+        assert_eq!(
+            weighted(&network.weights.dst),
+            set(&["north.bwd", "east.bwd", "south.bwd", "west.bwd"])
+        );
+        assert!(weighted(&network.weights.via).is_empty());
+
+        // A weighted edge carries its length, which is the length of its lane: the
+        // arm runs from 70 m out to 14 m short of the centre.
+        for (edge, value) in every {
+            if value > 0.0 {
+                assert!((value - 56.0).abs() < 0.01, "{edge}: {value}");
+            }
+        }
+    }
+
+    /// The two carriageways of a road whose ends link nowhere are two one-way strips
+    /// once U-turns are gone, and no trip joins the one to the other. Only one of them
+    /// is weighted, so every trip drawn has a route.
+    #[test]
+    fn only_the_largest_connected_part_of_the_network_is_weighted() {
+        let network = to_plain_xml(&in_line()).unwrap();
+        let src = weighted(&network.weights.src);
+        let dst = weighted(&network.weights.dst);
+        assert!(
+            (src == set(&["a.fwd"]) && dst == set(&["b.fwd"]))
+                || (src == set(&["b.bwd"]) && dst == set(&["a.bwd"])),
+            "src {src:?}, dst {dst:?}"
+        );
+        assert!(weighted(&network.weights.via).is_empty());
+        // And the choice is the same every time.
+        assert_eq!(to_plain_xml(&in_line()).unwrap().weights, network.weights);
+    }
+
+    /// Three one-way roads end to end. The middle one has a way in and a way out, so
+    /// it is the one place a way point may be.
+    fn chain(builder: &mut MapBuilder, name: &str, y: f64, lanes: Vec<LaneSpec>) {
+        let roads: Vec<RoadId> = (0..3)
+            .map(|index| {
+                let x = 100.0 * f64::from(index);
+                builder
+                    .add_road(
+                        RoadSpec::line(
+                            Point3::new(x, y, 0.0),
+                            Point3::new(x + 100.0, y, 0.0),
+                            lanes.clone(),
+                        )
+                        .unwrap()
+                        .with_name(format!("{name}{index}")),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        builder.connect(&roads[0], &roads[1]).unwrap();
+        builder.connect(&roads[1], &roads[2]).unwrap();
+    }
+
+    #[test]
+    fn an_edge_with_a_way_in_and_a_way_out_may_be_passed_through() {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("chain"));
+        chain(
+            &mut builder,
+            "road",
+            0.0,
+            vec![LaneSpec::new(width, Direction::Forward)],
+        );
+        let map = builder.finish().unwrap().validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+        assert_eq!(
+            weighted(&network.weights.src),
+            set(&["road0.fwd", "road1.fwd"])
+        );
+        assert_eq!(
+            weighted(&network.weights.dst),
+            set(&["road1.fwd", "road2.fwd"])
+        );
+        assert_eq!(weighted(&network.weights.via), set(&["road1.fwd"]));
+    }
+
+    /// The weights are for cars, so a footway gets none even where it has a way in
+    /// and a way out — and a street carrying a footway alongside its driving lane is
+    /// still a street.
+    #[test]
+    fn a_footway_is_no_place_for_a_car_trip() {
+        let width = PositiveWidth::new(3.0).unwrap();
+        let mut builder = MapBuilder::new(metadata("footways"));
+        chain(
+            &mut builder,
+            "path",
+            50.0,
+            vec![LaneSpec::new(width, Direction::Forward).with_type(LaneType::Sidewalk)],
+        );
+        chain(
+            &mut builder,
+            "street",
+            0.0,
+            vec![
+                LaneSpec::new(width, Direction::Forward),
+                LaneSpec::new(width, Direction::Forward).with_type(LaneType::Sidewalk),
+            ],
+        );
+        let map = builder.finish().unwrap().validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+
+        // The footway is named, with nothing.
+        let every = weights(&network.weights.via);
+        assert_eq!(every.get("path1.fwd"), Some(&0.0), "{every:?}");
+        assert_eq!(weighted(&network.weights.via), set(&["street1.fwd"]));
+        assert_eq!(
+            weighted(&network.weights.src),
+            set(&["street0.fwd", "street1.fwd"])
+        );
+        assert_eq!(
+            weighted(&network.weights.dst),
+            set(&["street1.fwd", "street2.fwd"])
+        );
     }
 
     // ----------------------------------------------------------------------- //
