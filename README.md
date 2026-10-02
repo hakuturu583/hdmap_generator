@@ -1115,22 +1115,27 @@ it misses and the reason: a stop line not drawn as a line across the road at all
 lane no SUMO lane is written for (a junction's connector), an edge that does not end at
 a junction, a line set back further than the last edge before the junction is long
 (so on an earlier edge of the approach, named on that edge's lane), a lane whose
-centreline it does not cross, a lane where it is at the start
-rather than before the junction ahead, a lane where it is further back than its edge
-is long — which netconvert would refuse — or one whose offset a line nearer the
+centreline it does not cross, a lane where it is at the start — drawn across both
+carriageways, it belongs to the other one — a lane where it is further back than its
+edge is long — which netconvert would refuse — or one whose offset a line nearer the
 junction already holds. It is named lane by lane, so a line drawn across both
 carriageways that is written on the approach is reported only for the lane leading
 away.
 
-A line carries no direction, so "at the start" is judged only where it is in doubt: on
-an edge that runs from one junction to another, and only for a line that crosses lanes
-running both ways — one drawn across the whole road, crossing both the lane
-approaching the far junction and the one leaving the near one. There it belongs to the
-lane whose end it is nearer. A line whose lanes all run the same way stands before the
-junction they run into, however short the road between the two junctions. Anywhere else the lane
-leaving a junction ends at a node that is no junction and is already turned away for
-that, so an approach split by a change of cross-section close to the junction keeps
-its stop line even when the last edge is shorter than the line is set back.
+A line carries no direction, so which carriageway it belongs to is judged only where
+it is in doubt: for a line that crosses lanes running both ways, as one drawn across
+the whole road does. That is decided on the IR road, before anything about SUMO
+edges or nodes: the crossing with each lane is projected onto the road's reference
+line, and the line belongs to a lane if it is nearer the end of the road the lane runs
+to than the end it begins at, measured over the whole road, every cross-section of it.
+A lane for which it is nearer the start is "at the start" of it, however the road is
+cut into edges and whatever the nodes at their ends are; exactly halfway, a lane a rule
+naming the line governs is preferred, and the others are at the start. Only the lanes
+the line belongs to are then placed as above — on the edge that reaches the junction,
+or reported as on an earlier edge, or as running into no junction. A line whose lanes
+all run the same way stands before wherever they run to, however short the road, so
+an approach split by a change of cross-section close to the junction keeps its stop
+line even when the last edge is shorter than the line is set back.
 
 ### Junctions, which SUMO models the same way round as the IR
 
