@@ -24,7 +24,7 @@ use roadgen_core::validation::ValidatedMap;
 ///
 /// A package manager puts them on `PATH`; a source or pip install puts them in
 /// `$SUMO_HOME/bin` and may not.
-fn tool(name: &str) -> Option<PathBuf> {
+pub fn tool(name: &str) -> Option<PathBuf> {
     if let Ok(home) = std::env::var("SUMO_HOME") {
         let candidate = Path::new(&home).join("bin").join(name);
         if candidate.is_file() {

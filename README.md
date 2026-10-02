@@ -987,6 +987,22 @@ This is why the arms are left exactly where the IR puts them, 14 m short of the
 centre: **the gap is the junction**, and netconvert fills it. Nothing here moves
 geometry, which is the one thing the OpenStreetMap export has to do.
 
+**Footways are the exception.** The IR lays a pavement round every corner of a
+junction — a connector from one arm's sidewalk to the next arm's — but SUMO's
+pedestrians do not walk along connections. They cross a node on a **walking area**
+that netconvert builds there, joining every footway that meets at the node, walked
+either way. So no connection is written between two footways, and the `.netccfg`
+sets `walkingareas`, which makes netconvert build one wherever footways meet rather
+than only where there is a pedestrian crossing. Each paved corner comes out as one
+walking area joining the same two sidewalks, and a pedestrian walks round it in
+either direction; the trace puts the pavement, and the connections into and out of
+it, in the junction's `node:` with the role `walkingarea`, because netconvert names
+the walking area itself. Writing the pavement as a connection would not work: which
+sidewalk faces a corner depends on which end of each arm meets the junction and on
+the side traffic keeps to, so a pavement can run from a sidewalk *leaving* the
+junction, and netconvert refuses a connection out of an edge that does not end
+there. `sumo_warnings()` counts the footway connections left to the walking areas.
+
 A junction with a traffic light on an approach becomes a `traffic_light` node.
 netconvert generates the phases, because the IR holds no signal timing to write.
 

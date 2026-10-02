@@ -700,10 +700,13 @@ fn parse_net(text: &str) -> Result<Net, String> {
                 }
             }
             b"edge" => {
-                let internal =
-                    attributes.get(b"function".as_slice()).map(String::as_str) == Some("internal");
+                // Any edge with a `function` is netconvert's own: an `internal` lane
+                // across a junction, and — where the export has footways — the
+                // `walkingarea` joining them at a node, or a `crossing`. The export's
+                // edges are the ones without.
+                let generated = attributes.contains_key(b"function".as_slice());
                 let id = attributes.remove(b"id".as_slice()).unwrap_or_default();
-                if !internal {
+                if !generated {
                     net.edges.insert(id.clone());
                     if !empty {
                         edge = Some(id);

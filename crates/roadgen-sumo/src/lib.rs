@@ -53,6 +53,13 @@
 //! This is why the arms are left exactly where the IR puts them, short of the
 //! junction: the gap is the junction, and netconvert fills it.
 //!
+//! Footways are the exception. SUMO's pedestrians do not walk along connections:
+//! they cross a node on a *walking area* that netconvert builds there, joining every
+//! footway that meets at the node, walked either way. So the pavement the IR lays
+//! round a junction corner — a connector between two sidewalks — is not written as a
+//! connection, and neither is any other movement from one footway to another; the
+//! configuration asks netconvert for walking areas instead.
+//!
 //! # The trace
 //!
 //! [`PlainNetwork::trace`] records where each element of the IR went, naming the
@@ -66,6 +73,7 @@
 //! | `lane:<edge>_<index>` | a lane | exact |
 //! | `connection:<from edge>_<from lane>><to edge>_<to lane>` | a lane connection | exact, or merged |
 //! | the same connection | a connector lane it runs over | collapsed |
+//! | `node:<id>`, role `walkingarea` | a connection between two footways, and a pavement lane round a corner | collapsed |
 //!
 //! A connection is named by its two lanes as the built network names them, so the
 //! `.net.xml` `<connection from fromLane to toLane via>` that netconvert writes for it
@@ -83,7 +91,7 @@ use std::path::Path;
 
 use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
 use roadgen_core::map::{Lane, Road};
-use roadgen_core::semantics::{MapObjectKind, TrafficRule};
+use roadgen_core::semantics::{LaneType, MapObjectKind, TrafficRule};
 use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
 use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, ValidatedMap};
@@ -316,6 +324,25 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         );
     }
 
+    let footway = |lane: &LaneId| {
+        map.lane(lane)
+            .is_some_and(|lane| lane.lane_type == LaneType::Sidewalk)
+    };
+    let walks = map
+        .connections
+        .iter()
+        .filter(|connection| footway(&connection.from.lane) && footway(&connection.to.lane))
+        .count();
+    if walks > 0 {
+        problems.push(format!(
+            "SUMO's pedestrians cross a node on the walking area netconvert builds \
+             there, not along connections, so the {walks} connections between \
+             footways — the pavements round junction corners among them — are not \
+             written: at each node, a pedestrian may walk between any of the footways \
+             that meet there, in either direction"
+        ));
+    }
+
     if !map.junctions.is_empty() {
         problems.push(format!(
             "the connector roads of the {} junctions are not written as edges: SUMO \
@@ -418,6 +445,11 @@ struct Exporter<'a> {
     /// connectors between one pair of lanes would otherwise write the same movement
     /// twice.
     movements: BTreeMap<(usize, usize, usize, usize), Movement>,
+    /// What the IR says about walking from one footway to another, by the node it
+    /// happens at. None of it is written as a connection: netconvert builds a
+    /// walking area at every node footways meet at, and that is how SUMO's
+    /// pedestrians get from one to the next. See [`Exporter::connect`].
+    walking: BTreeMap<String, Movement>,
     slots: HashMap<LaneId, Slot>,
     /// Junctions a traffic light controls an approach to.
     /// The signalised junctions, each with the lights that govern it.
@@ -439,6 +471,7 @@ impl<'a> Exporter<'a> {
             nodes: BTreeMap::new(),
             edges: Vec::new(),
             movements: BTreeMap::new(),
+            walking: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: BTreeMap::new(),
             right_of_way: HashSet::new(),
@@ -912,8 +945,37 @@ impl<'a> Exporter<'a> {
             .is_some_and(Road::is_connector)
     }
 
+    /// Records one movement between two written lanes — as a connection, unless both
+    /// are footways.
+    ///
+    /// SUMO does not walk its pedestrians along connections. Where footways meet,
+    /// netconvert builds a *walking area* — a patch of pavement joining every
+    /// footway that ends or starts at the node, walked in any direction — and a
+    /// pedestrian crosses the node on it. That is the model every SUMO network with
+    /// pedestrians uses, and it is the one asked for here: the configuration sets
+    /// `walkingareas` (see [`render_config`]).
+    ///
+    /// The IR's model is not that. A pavement round a junction corner is a connector
+    /// road from one arm's sidewalk to the next arm's, and it is joined to them by a
+    /// connection at each end, read in whatever direction the two sidewalks happen
+    /// to run. Which sidewalk faces a corner depends on which end of each arm meets
+    /// the junction and on the side traffic keeps to, so the pavement can run *from*
+    /// a sidewalk that leaves the junction *to* one that arrives at it. Written as a
+    /// SUMO connection, that is a connection from an edge that starts at the node to
+    /// one that ends there, and netconvert refuses the network: "could not insert
+    /// connection … after build". Even where the directions happen to line up, the
+    /// connection would only say a pedestrian may walk round the corner one way, and
+    /// it would draw an internal lane across the walking area that netconvert builds
+    /// anyway.
+    ///
+    /// So a movement from footway to footway is not written. Where it happens — the
+    /// node the two edges share — is kept instead, and the trace says that the IR's
+    /// connections and pavement lanes became part of that node's walking area. A
+    /// joint between two roads is treated the same way, for the same reason: the
+    /// walking area netconvert builds there is what joins the two footways, in both
+    /// directions.
     fn connect(&mut self, from: &LaneId, to: &LaneId, movement: Movement) {
-        let (Some(from), Some(to)) = (self.slots.get(from), self.slots.get(to)) else {
+        let (Some(&from), Some(&to)) = (self.slots.get(from), self.slots.get(to)) else {
             return;
         };
         if from.edge == to.edge {
@@ -921,10 +983,39 @@ impl<'a> Exporter<'a> {
             // connection.
             return;
         }
+        if self.is_footway(from) && self.is_footway(to) {
+            let node = self.shared_node(from.edge, to.edge);
+            let walked = self.walking.entry(node).or_default();
+            walked.connections.extend(movement.connections);
+            walked.connectors.extend(movement.connectors);
+            return;
+        }
         let key = (from.edge, from.index, to.edge, to.index);
         let merged = self.movements.entry(key).or_default();
         merged.connections.extend(movement.connections);
         merged.connectors.extend(movement.connectors);
+    }
+
+    /// Whether a written lane is one only pedestrians may use.
+    fn is_footway(&self, slot: Slot) -> bool {
+        self.edges[slot.edge].lanes[slot.index].permission
+            == classes::permission(LaneType::Sidewalk)
+    }
+
+    /// The node two edges meet at.
+    ///
+    /// Read from the edges' own ends rather than from the direction of travel,
+    /// because a movement between two footways need not follow it: the pavement
+    /// round a corner can start on a sidewalk that leaves the junction. Where the
+    /// first edge's far end is one of the second's ends, that is the node; otherwise
+    /// it is the first edge's near end.
+    fn shared_node(&self, from: usize, to: usize) -> String {
+        let (from, to) = (&self.edges[from], &self.edges[to]);
+        if from.to == to.from || from.to == to.to {
+            from.to.clone()
+        } else {
+            from.from.clone()
+        }
     }
 
     // ----------------------------------------------------------------------- //
@@ -1042,6 +1133,29 @@ impl<'a> Exporter<'a> {
                 trace.link(connector.clone(), local.clone(), Relation::Collapsed);
             }
         }
+
+        // A walk from one footway to another is the walking area netconvert builds
+        // at the node, which the export cannot name — so it is traced to the node,
+        // as part of what that node became.
+        for (node, walked) in &self.walking {
+            let local = format!("node:{node}");
+            for connection in &walked.connections {
+                trace.link_as(
+                    connection.clone(),
+                    local.clone(),
+                    Relation::Collapsed,
+                    "walkingarea",
+                );
+            }
+            for connector in &walked.connectors {
+                trace.link_as(
+                    connector.clone(),
+                    local.clone(),
+                    Relation::Collapsed,
+                    "walkingarea",
+                );
+            }
+        }
         trace
     }
 
@@ -1136,6 +1250,13 @@ impl<'a> Exporter<'a> {
 /// turn back where, in the OpenDRIVE and the Lanelet2 map written from the same IR,
 /// the lane simply ends; and the internal lane it draws for one would be the only
 /// lane in the network the trace could not follow back to the map.
+///
+/// Walking areas are turned on because they are how SUMO's pedestrians cross a node,
+/// and the export relies on them: no connection is written between two footways (see
+/// [`Exporter::connect`]). Left to itself netconvert builds walking areas only at a
+/// node that also has a pedestrian crossing, which the export never writes, so a
+/// sidewalk would end at every junction. A network with no footways gets none, and
+/// nothing else about it changes.
 fn render_config(prefix: &str) -> String {
     let mut document = xml::Document::new(
         "configuration",
@@ -1156,6 +1277,9 @@ fn render_config(prefix: &str) -> String {
     document.leaf("offset.disable-normalization", &[("value", "true".into())]);
     document.leaf("no-turnarounds", &[("value", "true".into())]);
     document.close("processing");
+    document.open("pedestrian", &[]);
+    document.leaf("walkingareas", &[("value", "true".into())]);
+    document.close("pedestrian");
     document.finish()
 }
 
