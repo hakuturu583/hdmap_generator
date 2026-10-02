@@ -909,7 +909,7 @@ A SUMO edge is a one-way bundle of lanes, so a road carrying traffic both ways i
 of them pointing at each other:
 
 ```xml
-<edge id="north.fwd" from="n_north_start" to="j_x" priority="4" numLanes="1"
+<edge id="north.fwd" from="n_north_start" to="j_x" priority="5" numLanes="1"
       speed="13.890" spreadType="center" name="north"
       shape="-1.750,70.000,0.000 -1.750,14.000,0.000">
   <lane index="0" width="3.500" disallow="pedestrian"
@@ -943,7 +943,8 @@ vehicles.
 SUMO's right of way is a **matrix over pairs of movements** — which stream gives way
 to which other stream — and a plain XML file has no way to state one: `<request>` is
 something netconvert computes and writes into the `.net.xml`. What the format does
-have is the edge `priority` ladder, the same one the OpenStreetMap export climbs.
+have is the edge `priority` ladder, the same one the OpenStreetMap export climbs —
+lifted one rung, so that even a footway has a rung below it to yield on.
 
 So a `RightOfWay` rule moves the **approach edges it names** one rung apart, and the
 junction is marked `rightOfWay="edgePriority"`:
