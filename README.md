@@ -978,15 +978,25 @@ as a **node**: the arms stop at its edge, and netconvert generates an internal l
 for every connection across it. The two models agree about the thing that matters —
 the movements are enumerated, not guessed — so the connectors are not written as
 edges. Each becomes the `<connection>` saying its approach lane may be left for its
-exit lane:
+exit lane, and the connector's **centreline is written as the connection's shape**:
 
 ```xml
-<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"/>
+<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"
+            shape="-1.750,14.000,0.000 -1.748,13.200,0.000 … -14.000,1.750,0.000"/>
 ```
 
+netconvert takes a connection's shape as the shape of the internal lane it draws for
+it, so the path across the junction in SUMO is the curve the IR drew — the same one
+the OpenDRIVE connecting road and the Lanelet2 lanelet carry — and not one netconvert
+invented. A turn that must wait inside the junction for oncoming traffic is still
+split into two internal lanes at the point where it waits, but both lie along the
+connector. A movement through a chain of connectors gets their centrelines end to end,
+in the order it crosses them.
+
 This is why the arms are left exactly where the IR puts them, 14 m short of the
-centre: **the gap is the junction**, and netconvert fills it. Nothing here moves
-geometry, which is the one thing the OpenStreetMap export has to do.
+centre: **the gap is the junction**, and netconvert fills it along the IR's
+connectors. Nothing here moves geometry, which is the one thing the OpenStreetMap
+export has to do.
 
 A junction with a traffic light on an approach becomes a `traffic_light` node.
 netconvert generates the phases, because the IR holds no signal timing to write.
