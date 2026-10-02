@@ -64,8 +64,11 @@
 //! crossing at a node, across the mouth of the edges it names, between the walking
 //! areas either side of them; so a crosswalk near the end of a road — where the IR
 //! puts one at a junction — is written at that end's node, across the road's edges
-//! there. A crosswalk further along the road, or across one without a footway at
-//! both kerbs, has nothing to be in SUMO and is reported by [`check`] instead.
+//! there that have vehicle lanes on them (an edge that is all footway, like the far
+//! pavement of a one-way street, is not crossed). A crosswalk further along the
+//! road, across one without a footway at both kerbs or without traffic, or across a
+//! one-way road at a dead end, has nothing to be in SUMO and is reported by
+//! [`check`] instead.
 //!
 //! # The trace
 //!
@@ -379,6 +382,8 @@ fn crosswalk_problems(map: &ValidatedMap) -> Vec<String> {
     let mut moved: Vec<f64> = Vec::new();
     let mut mid_block: Vec<String> = Vec::new();
     let mut no_footway: Vec<&str> = Vec::new();
+    let mut nothing_to_cross: Vec<&str> = Vec::new();
+    let mut dead_end: Vec<&str> = Vec::new();
     let mut unplaced: Vec<&str> = Vec::new();
     for object in map
         .objects
@@ -391,6 +396,8 @@ fn crosswalk_problems(map: &ValidatedMap) -> Vec<String> {
                 mid_block.push(format!("{} ({offset:.1} m)", object.id.as_str()))
             }
             Placement::NoFootway => no_footway.push(object.id.as_str()),
+            Placement::NothingToCross => nothing_to_cross.push(object.id.as_str()),
+            Placement::DeadEnd => dead_end.push(object.id.as_str()),
             Placement::Unplaced => unplaced.push(object.id.as_str()),
         }
     }
@@ -425,6 +432,23 @@ fn crosswalk_problems(map: &ValidatedMap) -> Vec<String> {
             no_footway.join(", ")
         ));
     }
+    if !nothing_to_cross.is_empty() {
+        problems.push(format!(
+            "a SUMO crossing lies across vehicle lanes, so the {} crosswalks across a \
+             road with nothing but footway at the end they are near are not written: {}",
+            nothing_to_cross.len(),
+            nothing_to_cross.join(", ")
+        ));
+    }
+    if !dead_end.is_empty() {
+        problems.push(format!(
+            "a SUMO crossing joins two walking areas, and at a dead end one walking \
+             area wraps round the end of the road, so the {} crosswalks at a dead end \
+             of a road with traffic one way only are not written: {}",
+            dead_end.len(),
+            dead_end.join(", ")
+        ));
+    }
     if !unplaced.is_empty() {
         problems.push(format!(
             "a SUMO crossing lies across the edges at a node, and the junction itself \
@@ -434,6 +458,11 @@ fn crosswalk_problems(map: &ValidatedMap) -> Vec<String> {
         ));
     }
     problems
+}
+
+/// Whether a lane written with `permission` is one only pedestrians may use.
+fn is_footway(permission: Option<Permission>) -> bool {
+    permission == classes::permission(LaneType::Sidewalk)
 }
 
 /// How far from the end of its road a crosswalk may lie and still be written as a
@@ -470,6 +499,12 @@ enum Placement {
     /// At the end of a road with no footway on one side or the other, so the
     /// crossing would have nowhere to land.
     NoFootway,
+    /// At the end of a road whose lanes there are all footway, so there is no
+    /// vehicle lane for the crossing to cross.
+    NothingToCross,
+    /// At a dead end, across a single edge with vehicle lanes on it: the one walking
+    /// area round the end of the road is at both ends of it.
+    DeadEnd,
     /// Across a connector road — inside a junction, where SUMO has no edge to lay a
     /// crossing over — or across no road at all.
     Unplaced,
@@ -532,12 +567,35 @@ fn place_crosswalk(map: &ValidatedMap, object: &MapObject) -> Placement {
         .filter(|lane| classes::permission(lane.lane_type).is_some())
         .collect();
     kerb_to_kerb.sort_by(|a, b| a.center_offset().total_cmp(&b.center_offset()));
-    let footway = |lane: &&Lane| {
-        classes::permission(lane.lane_type) == classes::permission(LaneType::Sidewalk)
-    };
+    let footway = |lane: &&Lane| is_footway(classes::permission(lane.lane_type));
     let kerbs = kerb_to_kerb.first().zip(kerb_to_kerb.last());
     if !kerbs.is_some_and(|(right, left)| footway(right) && footway(left) && right.id != left.id) {
         return Placement::NoFootway;
+    }
+    // The crossing lies across the edges with something on them a pedestrian has to
+    // cross: one direction's lanes are an edge, and where that is all footway — the
+    // pavement on the far kerb of a one-way street, say — the edge is left out of
+    // the crossing, since netconvert discards a crossing over no vehicle lane ("no
+    // vehicle lanes to cross") rather than build it.
+    let crossed: Vec<Direction> = [Direction::Forward, Direction::Backward]
+        .into_iter()
+        .filter(|direction| {
+            kerb_to_kerb
+                .iter()
+                .any(|lane| lane.direction == *direction && !footway(lane))
+        })
+        .collect();
+    if crossed.is_empty() {
+        return Placement::NothingToCross;
+    }
+    // At a dead end netconvert builds one walking area round the end of the road
+    // unless the crossing has two edges to lie between, so a crossing over one edge
+    // there starts and ends on the same walking area, and netconvert says so ("starts
+    // and ends at walkingarea") and leaves it out of the pedestrian network. That is
+    // the case whether the edge holds both footways or the far one is an edge of its
+    // own beside it.
+    if road.link.at(end).is_none() && crossed.len() == 1 {
+        return Placement::DeadEnd;
     }
     Placement::AtEnd {
         road: road.id.clone(),
@@ -1222,8 +1280,7 @@ impl<'a> Exporter<'a> {
 
     /// Whether a written lane is one only pedestrians may use.
     fn is_footway(&self, slot: Slot) -> bool {
-        self.edges[slot.edge].lanes[slot.index].permission
-            == classes::permission(LaneType::Sidewalk)
+        is_footway(self.edges[slot.edge].lanes[slot.index].permission)
     }
 
     /// The nodes a walk from footway `source` to footway `target` crosses, each with
@@ -1408,6 +1465,10 @@ impl<'a> Exporter<'a> {
             let Some(edge) = self.edges.iter().find(|edge| edge.id == id) else {
                 continue;
             };
+            if edge.lanes.iter().all(|lane| is_footway(lane.permission)) {
+                // Nothing on it to cross; see [`place_crosswalk`].
+                continue;
+            }
             let at = match (end, direction) {
                 (RoadEnd::Start, Direction::Forward) | (RoadEnd::End, Direction::Backward) => {
                     &edge.from
@@ -1418,7 +1479,7 @@ impl<'a> Exporter<'a> {
             edges.push(id);
         }
         edges.sort();
-        Some((node?, edges))
+        Some((node?, edges)).filter(|(_, edges)| !edges.is_empty())
     }
 
     // ----------------------------------------------------------------------- //
@@ -2024,6 +2085,98 @@ mod tests {
         );
         // Nothing about crosswalks for a map with none.
         assert!(!check(&in_line()).join("\n").contains("crosswalk"));
+    }
+
+    /// One-way streets with a footway at each kerb, the far one running against the
+    /// traffic: `through` joined end to end to `onward`, with a crosswalk at the joint;
+    /// `dead_end`, ending in nothing, with a crosswalk at that end; and `footpath`,
+    /// two footways and nothing else, with a crosswalk across it.
+    fn one_way_streets() -> ValidatedMap {
+        let mut builder = MapBuilder::new(metadata("one_way_crossings"));
+        let width = PositiveWidth::new(3.5).unwrap();
+        let footway = PositiveWidth::new(2.0).unwrap();
+        let sidewalk = |direction| LaneSpec::new(footway, direction).with_type(LaneType::Sidewalk);
+        let one_way = || {
+            vec![
+                sidewalk(Direction::Backward),
+                LaneSpec::new(width, Direction::Forward),
+                sidewalk(Direction::Forward),
+            ]
+        };
+        let mut road = |name: &str, y: f64, x: (f64, f64), lanes: Vec<LaneSpec>| {
+            builder
+                .add_road(
+                    RoadSpec::line(Point3::new(x.0, y, 0.0), Point3::new(x.1, y, 0.0), lanes)
+                        .unwrap()
+                        .with_name(name),
+                )
+                .unwrap()
+        };
+        let through = road("through", 0.0, (0.0, 100.0), one_way());
+        let onward = road("onward", 0.0, (100.0, 200.0), one_way());
+        let dead_end = road("dead_end", 50.0, (0.0, 100.0), one_way());
+        let footpath = road(
+            "footpath",
+            100.0,
+            (0.0, 100.0),
+            vec![sidewalk(Direction::Backward), sidewalk(Direction::Forward)],
+        );
+        builder.connect(&through, &onward).unwrap();
+        builder.add_crosswalk(&through, 0.95, 4.0).unwrap();
+        builder.add_crosswalk(&dead_end, 0.05, 4.0).unwrap();
+        builder.add_crosswalk(&footpath, 0.05, 4.0).unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// A crossing lies across the edges with vehicle lanes on them, never across an
+    /// edge that is all footway — netconvert discards a crossing with "no vehicle lanes
+    /// to cross" — and none is written where that leaves nothing to cross, or one edge
+    /// at a dead end, where netconvert would find the crossing "starts and ends at" the
+    /// one walking area there. The report says which crosswalks those are.
+    #[test]
+    fn a_crossing_crosses_only_the_edges_with_traffic_on_them() {
+        let map = one_way_streets();
+        let network = to_plain_xml(&map).unwrap();
+        let crossings: Vec<&str> = network
+            .connections
+            .lines()
+            .filter(|line| line.contains("<crossing"))
+            .collect();
+        assert_eq!(
+            crossings,
+            [
+                r#"    <crossing node="n_onward_start" edges="through.fwd" priority="1" width="4.000"/>"#
+            ],
+            "{}",
+            network.connections
+        );
+        let traced: Vec<&TraceLink> = map
+            .objects
+            .iter()
+            .flat_map(|object| network.trace.links_of(&IrRef::Object(object.id.clone())))
+            .collect();
+        assert_eq!(traced.len(), 1, "{traced:?}");
+        assert_eq!(traced[0].local, "crossing:n_onward_start/through.fwd");
+
+        let report = check(&map).join("\n");
+        assert!(
+            report.contains("the 1 crosswalks near the end of their road are written"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "nothing but footway at the end they are near are not written: \
+                 object/crosswalk/footpath/0.05"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "at a dead end of a road with traffic one way only are not written: \
+                 object/crosswalk/dead_end/0.05"
+            ),
+            "{report}"
+        );
     }
 
     /// Every `<kind>:<local>` the rendered files actually contain, read back from the

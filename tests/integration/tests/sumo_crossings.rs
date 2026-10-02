@@ -275,3 +275,186 @@ fn the_trace_follows_each_crosswalk_to_its_crossing() {
         }
     }
 }
+
+// --------------------------------------------------------------------------- //
+// A one-way arm
+// --------------------------------------------------------------------------- //
+
+/// The edges a crossing across `arm` of the one-way scenario crosses: the west arm
+/// has one carriageway with traffic on it, and an edge of nothing but the far kerb's
+/// footway, which there is nothing to cross on; the others have two carriageways.
+fn crossed_one_way(arm: &str) -> BTreeSet<String> {
+    if arm == "west" {
+        BTreeSet::from(["west.fwd".to_owned()])
+    } else {
+        both_ways(arm)
+    }
+}
+
+/// On a one-way arm with a footway at each kerb, the far kerb's footway is a lane
+/// against the traffic, and so an edge of its own with nothing else on it. The
+/// crossing is written across the edge with traffic on it only — netconvert discards
+/// one across an edge with no vehicle lane — and netconvert builds it, without a
+/// word of complaint, across that edge.
+#[test]
+fn a_crossing_of_a_one_way_arm_crosses_its_traffic_only() {
+    for handedness in HANDEDNESS {
+        let (map, _) = scenarios::one_way_crosswalk_crossroads(handedness);
+        let report = roadgen_sumo::check(&map).join("\n");
+        assert!(
+            report.contains("the 4 crosswalks near the end of their road are written as crossings"),
+            "{handedness:?}: {report}"
+        );
+        assert!(
+            !report.contains("not written: object/crosswalk"),
+            "{handedness:?}: {report}"
+        );
+
+        if !sumo_build::sumo_available() {
+            continue;
+        }
+        let prefix = roadgen_sumo::network_name(&map);
+        let (directory, network) = sumo_build::build(&map);
+        sumo_build::simulate(directory.path(), &prefix);
+
+        let plain =
+            std::fs::read_to_string(directory.path().join(format!("{prefix}.con.xml"))).unwrap();
+        assert!(
+            plain.contains(r#"<crossing node="j_x" edges="west.fwd" priority="1" width="4.000"/>"#),
+            "{handedness:?}: {plain}"
+        );
+
+        let mut built = crossings(&network);
+        built.sort();
+        let mut expected: Vec<(String, BTreeSet<String>)> = ARMS
+            .iter()
+            .map(|arm| ("j_x".to_owned(), crossed_one_way(arm)))
+            .collect();
+        expected.sort();
+        assert_eq!(built, expected, "{handedness:?}");
+    }
+}
+
+/// A pedestrian crosses the one-way arm at the junction, both ways, from the footway
+/// with the traffic to the one against it and back.
+#[test]
+fn a_pedestrian_crosses_the_one_way_arm() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    for handedness in HANDEDNESS {
+        let (map, _) = scenarios::one_way_crosswalk_crossroads(handedness);
+        let prefix = roadgen_sumo::network_name(&map);
+        let (directory, network) = sumo_build::build(&map);
+
+        let near_junction = |edge: &str| {
+            let edge = network.edge(edge);
+            let pavement = edge
+                .lanes
+                .iter()
+                .find(|lane| lane.allow.as_deref() == Some("pedestrian"))
+                .unwrap_or_else(|| panic!("{} has no pavement", edge.id));
+            let arriving = edge.to.as_deref() == Some("j_x");
+            let position = if arriving { pavement.length - 1.0 } else { 1.0 };
+            (edge.id.clone(), position)
+        };
+        let walks = [("west.fwd", "west.bwd"), ("west.bwd", "west.fwd")];
+        let mut persons = String::new();
+        for (index, (from, to)) in walks.iter().enumerate() {
+            let (from_edge, depart) = near_junction(from);
+            let (to_edge, arrive) = near_junction(to);
+            persons.push_str(&format!(
+                r#"    <person id="p{index}" depart="0" departPos="{depart:.2}">
+        <walk from="{from_edge}" to="{to_edge}" arrivalPos="{arrive:.2}"/>
+    </person>
+"#
+            ));
+        }
+        let routes = format!("<routes>\n{persons}</routes>\n");
+        std::fs::write(directory.path().join("walks.rou.xml"), routes).unwrap();
+
+        let walked = sumo_build::walk(directory.path(), &prefix);
+        assert_eq!(walked.len(), walks.len(), "{handedness:?}: {walked:?}");
+        for (person, length) in &walked {
+            let (from, to) = &walks[person.trim_start_matches('p').parse::<usize>().unwrap()];
+            assert!(
+                *length < 25.0,
+                "{handedness:?}: {from} to {to} took {length} m, so it did not use the \
+                 crossing"
+            );
+        }
+    }
+}
+
+/// The trace follows the one-way arm's crosswalk to the crossing over its traffic,
+/// and the built network loads against the trace with every crossing accounted for.
+#[test]
+fn the_trace_follows_the_one_way_crosswalk_to_its_crossing() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    for handedness in HANDEDNESS {
+        let (map, arms) = scenarios::one_way_crosswalk_crossroads(handedness);
+        let directory = tempfile::tempdir().unwrap();
+        write_ir(&map, directory.path().join("map.ir.json")).unwrap();
+        let (prefix, trace) = roadgen_sumo::write_traced(&map, directory.path()).unwrap();
+        let sidecar = directory_sidecar(directory.path(), &prefix, &trace.format);
+        write_trace(&trace, &map, &sidecar).unwrap();
+
+        let mut west = None;
+        for crosswalk in map
+            .objects
+            .iter()
+            .filter(|object| object.kind == MapObjectKind::Crosswalk)
+        {
+            let arm = map.lane(&crosswalk.lanes[0]).unwrap().road.clone();
+            let name = ARMS[arms.iter().position(|road| *road == arm).unwrap()];
+            let links: Vec<_> = trace
+                .links_of(&IrRef::Object(crosswalk.id.clone()))
+                .collect();
+            assert_eq!(links.len(), 1, "{handedness:?}: {links:?}");
+            let crossed: Vec<String> = crossed_one_way(name).into_iter().collect();
+            assert_eq!(
+                links[0].local,
+                format!("crossing:j_x/{}", crossed.join("+")),
+                "{handedness:?}"
+            );
+            if name == "west" {
+                west = Some(crosswalk.id.to_string());
+            }
+        }
+
+        let net = sumo_build::netconvert(directory.path(), &prefix);
+        let network = SumoNetwork::read(&net);
+        let mut index = TraceIndex::new();
+        index.load(directory.path().join("map.ir.json")).unwrap();
+        index.load(&sidecar).unwrap();
+        let report = index
+            .load_sumo_net(&net)
+            .expect("the built network, crossings and all, is the export's");
+        assert_eq!(report.untraced, 0, "{handedness:?}");
+        assert_eq!(report.crossings, 4, "{handedness:?}");
+
+        let built = network
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.function.as_deref() == Some("crossing")
+                    && edge.crossing_edges.iter().cloned().collect::<BTreeSet<_>>()
+                        == crossed_one_way("west")
+            })
+            .unwrap_or_else(|| panic!("{handedness:?}: no crossing of west"));
+        let lanes: Vec<String> = index
+            .from_ir(&west.unwrap(), "sumo")
+            .unwrap()
+            .into_iter()
+            .filter(|link| link.role.as_deref() == Some("crossing"))
+            .map(|link| link.local.clone())
+            .collect();
+        assert_eq!(
+            lanes,
+            [format!("lane:{}", built.lanes[0].id)],
+            "{handedness:?}"
+        );
+    }
+}

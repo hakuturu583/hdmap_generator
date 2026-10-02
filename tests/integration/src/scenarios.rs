@@ -567,7 +567,7 @@ pub fn sidewalk_crossroads(handedness: TrafficHandedness) -> ValidatedMap {
         TrafficHandedness::RightHand => "sidewalks",
         TrafficHandedness::LeftHand => "sidewalks_lht",
     };
-    let (builder, _) = sidewalk_crossroads_builder(handedness, name);
+    let (builder, _) = sidewalk_crossroads_builder(handedness, name, false);
     finish(builder)
 }
 
@@ -586,7 +586,7 @@ pub fn crosswalk_crossroads(handedness: TrafficHandedness) -> (ValidatedMap, [Ro
         TrafficHandedness::RightHand => "crosswalks",
         TrafficHandedness::LeftHand => "crosswalks_lht",
     };
-    let (mut builder, arms) = sidewalk_crossroads_builder(handedness, name);
+    let (mut builder, arms) = sidewalk_crossroads_builder(handedness, name, false);
     let [west, east, north, south] = &arms;
     for (arm, fraction) in [(west, 0.95), (east, 0.05), (north, 0.05), (south, 0.95)] {
         builder.add_crosswalk(arm, fraction, 4.0).unwrap();
@@ -595,11 +595,32 @@ pub fn crosswalk_crossroads(handedness: TrafficHandedness) -> (ValidatedMap, [Ro
     (finish(builder), arms)
 }
 
+/// [`crosswalk_crossroads`] with the west arm one-way, towards the junction, and
+/// without the crosswalk half way along it: a footway at each kerb and a single
+/// driving lane between them, so the pavement on the far kerb runs against the
+/// traffic and is a backward lane of its own — in SUMO, an edge with nothing on it
+/// but a footway, which a crossing has no vehicle lane on to cross.
+///
+/// The arms are returned west, east, north, south.
+pub fn one_way_crosswalk_crossroads(handedness: TrafficHandedness) -> (ValidatedMap, [RoadId; 4]) {
+    let name = match handedness {
+        TrafficHandedness::RightHand => "crosswalks_one_way",
+        TrafficHandedness::LeftHand => "crosswalks_one_way_lht",
+    };
+    let (mut builder, arms) = sidewalk_crossroads_builder(handedness, name, true);
+    let [west, east, north, south] = &arms;
+    for (arm, fraction) in [(west, 0.95), (east, 0.05), (north, 0.05), (south, 0.95)] {
+        builder.add_crosswalk(arm, fraction, 4.0).unwrap();
+    }
+    (finish(builder), arms)
+}
+
 /// The builder of [`sidewalk_crossroads`], with its four arms — west, east, north,
 /// south — so that more can be put on them.
 fn sidewalk_crossroads_builder(
     handedness: TrafficHandedness,
     name: &str,
+    one_way_west: bool,
 ) -> (MapBuilder, [RoadId; 4]) {
     let mut builder = MapBuilder::new(MapMetadata {
         handedness,
@@ -613,14 +634,26 @@ fn sidewalk_crossroads_builder(
             lane(2.0, Direction::Forward).with_type(LaneType::Sidewalk),
         ]
     };
+    let one_way = || {
+        vec![
+            lane(2.0, Direction::Backward).with_type(LaneType::Sidewalk),
+            lane(3.5, Direction::Forward),
+            lane(2.0, Direction::Forward).with_type(LaneType::Sidewalk),
+        ]
+    };
     let junction = builder.add_junction(Some("x"));
     let mut arm = |name: &str, from: (f64, f64), to: (f64, f64)| {
+        let lanes = if one_way_west && name == "west" {
+            one_way()
+        } else {
+            street()
+        };
         builder
             .add_road(
                 RoadSpec::line(
                     Point3::new(from.0, from.1, 0.0),
                     Point3::new(to.0, to.1, 0.0),
-                    street(),
+                    lanes,
                 )
                 .unwrap()
                 .with_name(name),
