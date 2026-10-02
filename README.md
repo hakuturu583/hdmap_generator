@@ -924,17 +924,55 @@ network imported from OpenStreetMap has to make do with. The heights go with it:
 SUMO shape is `x,y,z`, so the relief that plain OSM could only put in `ele` tags is
 part of the geometry here.
 
-Lanes are numbered from the **right in the direction of travel**, index 0 outwards.
-The IR counts outwards from the reference line instead, which for the opposing
-carriageway is the other way round — so the same physical lane has different numbers
-in the two directions. `sumo_lane_ids()` is the way back:
+Lanes are numbered from the **outside of the carriageway**, index 0 being the kerb
+lane: the rightmost in the direction of travel where traffic drives on the right, the
+leftmost where it drives on the left. The IR counts outwards from the reference line
+instead, which for the opposing carriageway is the other way round — so the same
+physical lane has different numbers in the two directions. `sumo_lane_ids()` is the
+way back:
 
 ```python
 dict(m.sumo_lane_ids())["lane/north/1"]     # 'north.bwd_0'
 ```
 
+### Left-hand traffic
+
+netconvert does not read handedness off the geometry: it builds a right-hand network
+unless it is told otherwise. A map made with `handedness="lht"` therefore gets
+`lefthand` in its `.netccfg`, and netconvert records it on the `<net>` it writes:
+
+```xml
+<processing>
+    <offset.disable-normalization value="true"/>
+    <no-turnarounds value="true"/>
+    <lefthand value="true"/>
+</processing>
+```
+
+That is more than bookkeeping. Left-hand traffic decides which turn crosses the
+oncoming carriageway — the right one — and so which movement on a major approach has
+to give way, which side of a junction the internal lanes are laid out on, and which
+lane is the slow one. Without it a left-hand map would be simulated as a right-hand
+one drawn on the wrong side of the road: right turns would cut across oncoming
+traffic with priority, and the kerb lane would be SUMO's overtaking lane. A right-hand
+map writes nothing, since that is netconvert's default.
+
 `speed` is the road's limit in m/s, or SUMO's own default for the OSM `highway` value
-the road type maps to. What may use a lane is the whole of what SUMO knows about lane
+the road type maps to. A lane with a limit of its own carries it as the lane's `speed`,
+and so does a lane a **`SpeedLimit` rule** names — the rule *is* that lane's limit and
+replaces any it had, as it overwrites the lanelet's `speed_limit` tag in the Lanelet2
+export:
+
+```xml
+<lane index="0" width="3.500" shape="..." speed="8.333" disallow="pedestrian"/>
+```
+
+An IR lane runs the whole of one cross-section, which is exactly one lane of one edge,
+so the rule covers the SUMO lane from end to end. Where two rules name one lane, the
+lower is written. The trace records the rule as `merged` into each `lane:` it set,
+with role `speed`, the way a right-of-way rule is merged into an edge's `priority`.
+
+What may use a lane is the whole of what SUMO knows about lane
 type: a driving lane is written as one pedestrians are kept out of, a footway as one
 that admits only them, a bike lane only bicycles and a hard shoulder only emergency
 vehicles.
@@ -970,7 +1008,24 @@ movement of the priority arm must still give way to an oncoming one is netconver
 decision, and `sumo_warnings()` says so.
 
 A road whose **cross-section changes** becomes a chain of edges with a node between
-them, because an edge has one lane count from end to end.
+them, because an edge has one lane count from end to end. Which lane carries on into
+which is still the IR's: the connections it holds across the boundary are written as
+`<connection>`s through that node, and netconvert, given an edge's connections, adds
+none of its own — a lane with no connection onward ends at the boundary.
+
+That leaves the edge with *no* connection across: every lane on that side ends, say a
+driving lane that becomes a cycle lane. netconvert reads an edge with nothing listed
+as one whose movements are unspecified, and would guess some, carrying the driving
+lane on into the cycle lane. So the movements of such an edge onto every edge
+leaving the node it runs into are listed as deleted,
+`<delete from="r.0.fwd" to="r.1.fwd"/>`, and netconvert warns that the edge goes
+nowhere — which is what the map says. (A `<connection from="r.0.fwd"/>` with no
+target means the same to recent netconvert, but SUMO 1.18 still guesses past it;
+the deletions hold on both, and deleting a movement netconvert would not have built
+is silent.) The same
+holds for any edge the IR carries nothing on from, wherever it ends short of a dead
+end — except a footway, since pedestrians cross a node on its walking area rather
+than along connections, so there is nothing for netconvert to guess.
 
 ### Junctions, which SUMO models the same way round as the IR
 
@@ -979,15 +1034,41 @@ as a **node**: the arms stop at its edge, and netconvert generates an internal l
 for every connection across it. The two models agree about the thing that matters —
 the movements are enumerated, not guessed — so the connectors are not written as
 edges. Each becomes the `<connection>` saying its approach lane may be left for its
-exit lane:
+exit lane, and the connector's **centreline is written as the connection's shape**:
 
 ```xml
-<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"/>
+<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"
+            shape="-1.750,14.000,0.000 -1.748,13.200,0.000 … -14.000,1.750,0.000"/>
 ```
 
+netconvert takes a connection's shape as the shape of the internal lane it draws for
+it, so the path across the junction in SUMO is the curve the IR drew — the same one
+the OpenDRIVE connecting road and the Lanelet2 lanelet carry — and not one netconvert
+invented. A turn that must wait inside the junction for oncoming traffic is still
+split into two internal lanes at the point where it waits, but both lie along the
+connector. A movement through a chain of connectors gets their centrelines end to end,
+in the order it crosses them.
+
 This is why the arms are left exactly where the IR puts them, 14 m short of the
-centre: **the gap is the junction**, and netconvert fills it. Nothing here moves
-geometry, which is the one thing the OpenStreetMap export has to do.
+centre: **the gap is the junction**, and netconvert fills it along the IR's
+connectors. Nothing here moves geometry, which is the one thing the OpenStreetMap
+export has to do.
+
+**Footways are the exception.** The IR lays a pavement round every corner of a
+junction — a connector from one arm's sidewalk to the next arm's — but SUMO's
+pedestrians do not walk along connections. They cross a node on a **walking area**
+that netconvert builds there, joining every footway that meets at the node, walked
+either way. So no connection is written between two footways, and the `.netccfg`
+sets `walkingareas`, which makes netconvert build one wherever footways meet rather
+than only where there is a pedestrian crossing. Each paved corner comes out as one
+walking area joining the same two sidewalks, and a pedestrian walks round it in
+either direction; the trace puts the pavement, and the connections into and out of
+it, in the junction's `node:` with the role `walkingarea`, because netconvert names
+the walking area itself. Writing the pavement as a connection would not work: which
+sidewalk faces a corner depends on which end of each arm meets the junction and on
+the side traffic keeps to, so a pavement can run from a sidewalk *leaving* the
+junction, and netconvert refuses a connection out of an edge that does not end
+there. `sumo_warnings()` counts the footway connections left to the walking areas.
 
 ### Traffic lights
 
@@ -1052,6 +1133,45 @@ turn back at the far end of an arm where the OpenDRIVE and Lanelet2 maps of the 
 IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
 `no-turnarounds`, and the network has the movements the map has and no others.
 
+### Where on the globe
+
+The network is in the map's own metres about its origin — the generated configuration
+turns off netconvert's offset normalisation so that it stays that way, in the same
+coordinates as the other exports — and it is **georeferenced** all the same. The node
+file opens with a `<location>`, which netconvert carries into the `.net.xml` without
+moving a node:
+
+```xml
+<location netOffset="0.000,0.000" convBoundary="-2000.000,-2000.000,2000.000,2000.000"
+          origBoundary="139.737907026,35.661974335,139.782092974,35.698025610"
+          projParameter="+proj=tmerc +lat_0=35.68 +lon_0=139.76 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"/>
+```
+
+SUMO reads a network position as the projected position plus `netOffset`, so
+`sumolib`'s `net.convertXY2LonLat(x, y)` hands back the latitude and longitude the IR
+puts a point at — the ones the Lanelet2 export writes. For a UTM map netconvert
+writes the offset to the centimetre, which leaves them less than a centimetre apart.
+
+| map projection | `projParameter` | `netOffset` |
+| --- | --- | --- |
+| `local_cartesian`, `mgrs` | transverse Mercator about the origin, `+k=1+h/R` for an origin `h` m up (`R` the ellipsoid's mean radius of curvature there) — at `h = 0` the OpenDRIVE `<geoReference>` string, word for word | `0,0` |
+| `utm` | `+proj=utm +zone=<zone>` (`+south` below the equator) | minus the origin's easting and northing |
+
+An MGRS map's metres are local Cartesian about its origin like any other — MGRS only
+changes the grid position the Lanelet2 export reports beside them — so it is written
+the same way as a local one.
+
+A local map's metres are an east/north/up frame: a plane tangent to the ellipsoid at
+the origin's *altitude*, which the Lanelet2 export projects through. A metre on that
+plane is longer, measured on the ellipsoid beneath it, by `1 + h/R`, so the transverse
+Mercator is scaled by that much — at unit scale, 2 km out from an origin 2000 m up, it
+would be 0.63 m off; scaled, it is 1.5 mm off. (The OpenDRIVE `<geoReference>` is
+not scaled, so above sea level the two strings differ by the `+k`.) What a 2D
+`<location>` cannot carry at all is a point's own height above that plane: a point
+`z` above it and `d` from the origin is placed `d·|z|/R` from where the Lanelet2
+export puts it — 1.6 cm for 50 m at 2 km — and `sumo_warnings()` states that bound
+for the map whenever it reaches a centimetre.
+
 ### What it cannot carry
 
 - **Lane markings.** Which line is painted between two lanes, and in what colour, has
@@ -1067,9 +1187,14 @@ IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
   right of way and no more.
 - **Signal timing.** The IR has none, so a signalised junction runs on the fixed-time
   program above rather than one the map states.
-- **The geo-reference.** The network is in the map's own metres about its origin, and
-  the generated configuration turns off netconvert's offset normalisation so that it
-  stays that way — the same coordinates as the other four exports.
+- **A speed-limit rule on a lane that is not written.** The connector lanes inside a
+  junction become internal lanes whose speed netconvert sets for the turn, and a lane
+  of a type SUMO has no place for is dropped with its rule. Where rules disagree about
+  a lane, the higher ones are dropped. `sumo_warnings()` names the lanes in each case.
+- **Heights in the geo-reference.** A `<location>` is horizontal only; the heights
+  are the map's own `z`, as in every other export. The origin's altitude goes into a
+  local map's projection scale rather than being lost, but each point's own height
+  above the origin's plane cannot be, which `sumo_warnings()` bounds as above.
 
 ## CARLA
 
@@ -1936,7 +2061,7 @@ their boundary points the *same* points rather than merely nearby ones.
 
 Every format numbers its output its own way. OpenDRIVE numbers roads in the IR's
 order; Lanelet2 and OpenStreetMap count; SUMO names edges after roads and counts lanes
-from the right; ClipGT and GPUDrive have nothing but the row. None of those numbers
+from the kerb; ClipGT and GPUDrive have nothing but the row. None of those numbers
 flow back into the IR, so "which lanelet is OpenDRIVE road 4, lane -1?" has no answer
 in the files themselves.
 

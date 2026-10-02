@@ -611,13 +611,19 @@ fn built_from(sumo: &FormatLinks, net: &Net) -> Result<(), String> {
     if let Some(nodes) = nodes {
         let text = std::fs::read_to_string(nodes)
             .map_err(|error| format!("{}: {error}", nodes.display()))?;
-        for (id, (x, y)) in parse_nodes(&text)? {
+        let (declared, nodes) = parse_nodes(&text)?;
+        // The network's coordinates are the export's moved by however far netconvert
+        // shifted them, and rounded to the centimetre. The shift is the difference
+        // between the network's offset and the one the node file's own `<location>`
+        // declared — that part of the offset is the geo-reference, which netconvert
+        // carries through without moving anything — so it is zero for an export
+        // built with normalisation off, whatever its projection.
+        let shift = (net.offset.0 - declared.0, net.offset.1 - declared.1);
+        for (id, (x, y)) in nodes {
             let Some(&(net_x, net_y)) = net.junctions.get(&id) else {
                 return Err(format!("it has no junction {id}, which the export wrote"));
             };
-            // The network's coordinates are the export's moved by its offset, and
-            // rounded to the centimetre.
-            let (net_x, net_y) = (net_x - net.offset.0, net_y - net.offset.1);
+            let (net_x, net_y) = (net_x - shift.0, net_y - shift.1);
             if (net_x - x).hypot(net_y - y) > NODE_TOLERANCE {
                 return Err(format!(
                     "its junction {id} is at ({net_x:.2}, {net_y:.2}), not at ({x:.2}, {y:.2}) \
@@ -746,19 +752,17 @@ fn parse_net(text: &str) -> Result<Net, String> {
         match element.name().as_ref() {
             b"location" => {
                 if let Some(offset) = attributes.get(b"netOffset".as_slice()) {
-                    let unreadable = || format!("an unreadable netOffset {offset}");
-                    let (x, y) = offset.split_once(',').ok_or_else(unreadable)?;
-                    net.offset = (
-                        x.trim().parse().map_err(|_| unreadable())?,
-                        y.trim().parse().map_err(|_| unreadable())?,
-                    );
+                    net.offset = net_offset(offset)?;
                 }
             }
             b"edge" => {
-                let internal =
-                    attributes.get(b"function".as_slice()).map(String::as_str) == Some("internal");
+                // Any edge with a `function` is netconvert's own: an `internal` lane
+                // across a junction, and — where the export has footways — the
+                // `walkingarea` joining them at a node, or a `crossing`. The export's
+                // edges are the ones without.
+                let generated = attributes.contains_key(b"function".as_slice());
                 let id = attributes.remove(b"id".as_slice()).unwrap_or_default();
-                if !internal {
+                if !generated {
                     net.edges.insert(id.clone());
                     if !empty {
                         edge = Some(id);
@@ -857,13 +861,22 @@ fn parse_controlled(text: &str) -> Result<Vec<NetConnection>, String> {
     Ok(connections)
 }
 
-/// The nodes of a plain `.nod.xml`, by id.
-fn parse_nodes(text: &str) -> Result<Vec<(String, Position)>, String> {
+/// The offset a plain `.nod.xml` declares in its `<location>` — zero when it has
+/// none — and its nodes, by id.
+fn parse_nodes(text: &str) -> Result<(Position, Vec<(String, Position)>), String> {
     let mut reader = Reader::from_str(text);
+    let mut offset = (0.0, 0.0);
     let mut nodes = Vec::new();
     loop {
         match reader.read_event().map_err(|error| error.to_string())? {
             Event::Eof => break,
+            Event::Start(element) | Event::Empty(element)
+                if element.name().as_ref() == b"location" =>
+            {
+                if let Some(declared) = attributes(&element)?.get(b"netOffset".as_slice()) {
+                    offset = net_offset(declared)?;
+                }
+            }
             Event::Start(element) | Event::Empty(element) if element.name().as_ref() == b"node" => {
                 let attributes = attributes(&element)?;
                 let position = (
@@ -877,5 +890,42 @@ fn parse_nodes(text: &str) -> Result<Vec<(String, Position)>, String> {
             _ => {}
         }
     }
-    Ok(nodes)
+    Ok((offset, nodes))
+}
+
+/// A `netOffset`: `x,y`, or `x,y,z` with the height ignored.
+fn net_offset(value: &str) -> Result<Position, String> {
+    let unreadable = || format!("an unreadable netOffset {value}");
+    let mut parts = value.split(',').map(|part| part.trim().parse::<f64>());
+    match (parts.next(), parts.next()) {
+        (Some(Ok(x)), Some(Ok(y))) => Ok((x, y)),
+        _ => Err(unreadable()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_node_file_declares_the_offset_of_its_location_and_no_other() {
+        let georeferenced = r#"<nodes>
+            <location netOffset="-386000.25,-3950000.50" convBoundary="0,0,1,1"
+                      origBoundary="0,0,1,1" projParameter="+proj=utm +zone=54"/>
+            <node id="a" x="1.5" y="-2.0"/>
+        </nodes>"#;
+        let (offset, nodes) = parse_nodes(georeferenced).unwrap();
+        assert_eq!(offset, (-386000.25, -3950000.5));
+        assert_eq!(nodes, vec![("a".to_owned(), (1.5, -2.0))]);
+
+        let plain = r#"<nodes><node id="a" x="1.5" y="-2.0"/></nodes>"#;
+        assert_eq!(parse_nodes(plain).unwrap().0, (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_net_offset_may_carry_a_height() {
+        assert_eq!(net_offset("1.5,-2").unwrap(), (1.5, -2.0));
+        assert_eq!(net_offset("1.5, -2, 30").unwrap(), (1.5, -2.0));
+        assert!(net_offset("1.5").is_err());
+    }
 }
