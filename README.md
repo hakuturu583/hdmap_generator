@@ -923,14 +923,38 @@ network imported from OpenStreetMap has to make do with. The heights go with it:
 SUMO shape is `x,y,z`, so the relief that plain OSM could only put in `ele` tags is
 part of the geometry here.
 
-Lanes are numbered from the **right in the direction of travel**, index 0 outwards.
-The IR counts outwards from the reference line instead, which for the opposing
-carriageway is the other way round — so the same physical lane has different numbers
-in the two directions. `sumo_lane_ids()` is the way back:
+Lanes are numbered from the **outside of the carriageway**, index 0 being the kerb
+lane: the rightmost in the direction of travel where traffic drives on the right, the
+leftmost where it drives on the left. The IR counts outwards from the reference line
+instead, which for the opposing carriageway is the other way round — so the same
+physical lane has different numbers in the two directions. `sumo_lane_ids()` is the
+way back:
 
 ```python
 dict(m.sumo_lane_ids())["lane/north/1"]     # 'north.bwd_0'
 ```
+
+### Left-hand traffic
+
+netconvert does not read handedness off the geometry: it builds a right-hand network
+unless it is told otherwise. A map made with `handedness="lht"` therefore gets
+`lefthand` in its `.netccfg`, and netconvert records it on the `<net>` it writes:
+
+```xml
+<processing>
+    <offset.disable-normalization value="true"/>
+    <no-turnarounds value="true"/>
+    <lefthand value="true"/>
+</processing>
+```
+
+That is more than bookkeeping. Left-hand traffic decides which turn crosses the
+oncoming carriageway — the right one — and so which movement on a major approach has
+to give way, which side of a junction the internal lanes are laid out on, and which
+lane is the slow one. Without it a left-hand map would be simulated as a right-hand
+one drawn on the wrong side of the road: right turns would cut across oncoming
+traffic with priority, and the kerb lane would be SUMO's overtaking lane. A right-hand
+map writes nothing, since that is netconvert's default.
 
 `speed` is the road's limit in m/s, or SUMO's own default for the OSM `highway` value
 the road type maps to. What may use a lane is the whole of what SUMO knows about lane
@@ -1888,7 +1912,7 @@ their boundary points the *same* points rather than merely nearby ones.
 
 Every format numbers its output its own way. OpenDRIVE numbers roads in the IR's
 order; Lanelet2 and OpenStreetMap count; SUMO names edges after roads and counts lanes
-from the right; ClipGT and GPUDrive have nothing but the row. None of those numbers
+from the kerb; ClipGT and GPUDrive have nothing but the row. None of those numbers
 flow back into the IR, so "which lanelet is OpenDRIVE road 4, lane -1?" has no answer
 in the files themselves.
 

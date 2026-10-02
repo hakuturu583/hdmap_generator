@@ -29,10 +29,26 @@
 //! A one-way bundle of lanes. A road carrying traffic both ways is therefore two
 //! edges, pointing at each other, and the IR's reference line — which has no
 //! direction as far as traffic is concerned — becomes the thing they are both
-//! measured against. Lanes within an edge are numbered from the **right** in the
-//! direction of travel, which is index 0, so the numbering of the same physical lane
-//! differs between the two carriageways. That is SUMO's convention and not a choice
-//! made here.
+//! measured against. Lanes within an edge are numbered from the **outside** of the
+//! carriageway — the kerb side, which is the right in the direction of travel where
+//! traffic drives on the right — so the numbering of the same physical lane differs
+//! between the two carriageways. That is SUMO's convention and not a choice made
+//! here.
+//!
+//! # Left-hand traffic
+//!
+//! SUMO does not read handedness off the geometry: a network is right-hand unless
+//! netconvert is told otherwise, and what it is told decides far more than which side
+//! the lanes are drawn on. It decides which movement crosses oncoming traffic and so
+//! must give way to it, which side the internal lanes of a junction are laid out on,
+//! and which lane is the slow one. So a map whose metadata says it drives on the left
+//! is written with `lefthand` in its configuration, and netconvert records it in the
+//! `.net.xml` for the simulator.
+//!
+//! The lane numbering follows. In a left-hand network SUMO's index 0 is still the
+//! outer lane, and the outer lane is now the **leftmost** in the direction of travel
+//! — which is what netconvert itself lays out when it spreads an edge's lanes with
+//! `lefthand` set, and what a vehicle keeping to its side drives in.
 //!
 //! A road whose cross-section changes becomes one edge per cross-section, joined at
 //! an internal node: a SUMO edge has one lane count from end to end.
@@ -85,7 +101,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use roadgen_core::geometry::{Point3, Polyline3, SamplingConfig};
-use roadgen_core::map::{Lane, Road};
+use roadgen_core::map::{Lane, Road, TrafficHandedness};
 use roadgen_core::semantics::{MapObjectKind, TrafficRule};
 use roadgen_core::topology::{Direction, LaneEnd, RoadEnd, RoadLinkTarget};
 use roadgen_core::trace::{IrRef, Relation, Trace};
@@ -116,7 +132,8 @@ pub struct PlainNetwork {
     ///
     /// A SUMO lane's identity is positional, so this is the only way back from a
     /// lane of the map to the lane of the network — and the numbering is not the
-    /// IR's: SUMO counts from the right of the direction of travel.
+    /// IR's: SUMO counts from the outside of the carriageway, which is the right of
+    /// the direction of travel under right-hand traffic and the left under left-hand.
     pub lanes: BTreeMap<LaneId, String>,
     /// Where each element of the IR ended up in the four files: nodes, edges, lanes
     /// and connections, by the identifiers written for them. See the crate
@@ -751,12 +768,22 @@ impl<'a> Exporter<'a> {
     }
 
     /// The lanes of one cross-section that run in one direction, ordered as SUMO
-    /// numbers them: index 0 is the rightmost in the direction of travel.
+    /// numbers them: index 0 is the outer lane — the rightmost in the direction of
+    /// travel where traffic drives on the right, and the leftmost where it drives on
+    /// the left.
     ///
     /// Ordered by where the lanes actually are rather than by which side of the
     /// reference line they sit on, because which side is the driver's right depends
     /// on the direction of travel — and, for the reference line itself, on whether
     /// the map drives on the left.
+    ///
+    /// The handedness matters a second time for the order itself. netconvert is told
+    /// a left-hand map is one (see [`render_config`]), and a left-hand SUMO network
+    /// counts its lanes from the left: lane 0 is the kerb lane a vehicle keeps to and
+    /// the highest index the one beside the oncoming traffic. Numbering a left-hand
+    /// carriageway from the right would hand SUMO its overtaking lane as its slow one,
+    /// and every lane-change and turn-lane decision would be taken from the wrong
+    /// side.
     fn carriageway(&self, road: &Road, section: usize, direction: Direction) -> Vec<&'a Lane> {
         let mut lanes: Vec<&Lane> = self
             .map
@@ -777,6 +804,9 @@ impl<'a> Exporter<'a> {
                 .total_cmp(&rightwards(b))
                 .then(a.index.cmp(&b.index))
         });
+        if self.map.metadata.handedness == TrafficHandedness::LeftHand {
+            lanes.reverse();
+        }
         lanes
     }
 
@@ -866,13 +896,20 @@ impl<'a> Exporter<'a> {
     /// that a carriageway with lanes of different widths still has its geometric
     /// middle. It is only ever the *edge's* line — every lane carries its own shape,
     /// so nothing is laid out from this.
+    ///
+    /// `lanes` is in SUMO's order, outer lane first, so which end of it is the
+    /// rightmost lane depends on the map's handedness.
     fn carriageway_shape(
         &self,
         lanes: &[&Lane],
         written: &[EdgeLane],
     ) -> Result<Polyline3, ExportError> {
-        let (Some(rightmost), Some(leftmost)) = (lanes.first(), lanes.last()) else {
+        let (Some(outer), Some(inner)) = (lanes.first(), lanes.last()) else {
             return Err(ExportError::Unknown("an edge with no lanes".to_owned()));
+        };
+        let (rightmost, leftmost) = match self.map.metadata.handedness {
+            TrafficHandedness::RightHand => (outer, inner),
+            TrafficHandedness::LeftHand => (inner, outer),
         };
         let right = rightmost.travel_geometry(self.sampling)?.right;
         let left = leftmost.travel_geometry(self.sampling)?.left;
@@ -1120,7 +1157,7 @@ impl<'a> Exporter<'a> {
             nodes: self.render_nodes(),
             edges: self.render_edges(),
             connections: self.render_connections(),
-            config: render_config(&prefix),
+            config: render_config(&prefix, self.map.metadata.handedness),
             trace: self.trace(),
             lanes: self
                 .slots
@@ -1323,7 +1360,16 @@ impl<'a> Exporter<'a> {
 /// turn back where, in the OpenDRIVE and the Lanelet2 map written from the same IR,
 /// the lane simply ends; and the internal lane it draws for one would be the only
 /// lane in the network the trace could not follow back to the map.
-fn render_config(prefix: &str) -> String {
+///
+/// Left-hand traffic is stated when the map drives on the left, because netconvert
+/// cannot infer it and assumes the right. Left unsaid, a left-hand map is built as a
+/// right-hand one drawn on the wrong side of the road: the turn that crosses oncoming
+/// traffic is taken to be the left one and made to give way, the right turn across
+/// the oncoming carriageway is given priority it does not have, and lane 0 — which
+/// the export has made the left, kerb-side lane, see [`Exporter::carriageway`] — is
+/// taken for the right. Nothing is written for a right-hand map, which is
+/// netconvert's default, so its configuration is the same as it always was.
+fn render_config(prefix: &str, handedness: TrafficHandedness) -> String {
     let mut document = xml::Document::new(
         "configuration",
         "http://sumo.dlr.de/xsd/netconvertConfiguration.xsd",
@@ -1342,6 +1388,9 @@ fn render_config(prefix: &str) -> String {
     document.open("processing", &[]);
     document.leaf("offset.disable-normalization", &[("value", "true".into())]);
     document.leaf("no-turnarounds", &[("value", "true".into())]);
+    if handedness == TrafficHandedness::LeftHand {
+        document.leaf("lefthand", &[("value", "true".into())]);
+    }
     document.close("processing");
     document.finish()
 }
@@ -2231,6 +2280,92 @@ mod tests {
         let first = to_plain_xml(&map).unwrap();
         for _ in 0..3 {
             assert_eq!(to_plain_xml(&map).unwrap().trace, first.trace);
+        }
+    }
+
+    // ----------------------------------------------------------------------- //
+    // Handedness
+    // ----------------------------------------------------------------------- //
+
+    /// One road, two lanes each way, under the given handedness.
+    fn dual(handedness: TrafficHandedness) -> ValidatedMap {
+        let mut builder = MapBuilder::new(MapMetadata {
+            handedness,
+            ..metadata("dual")
+        });
+        let width = PositiveWidth::new(3.5).unwrap();
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(200.0, 0.0, 0.0),
+                    vec![
+                        LaneSpec::new(width, Direction::Forward),
+                        LaneSpec::new(width, Direction::Forward),
+                        LaneSpec::new(width, Direction::Backward),
+                        LaneSpec::new(width, Direction::Backward),
+                    ],
+                )
+                .unwrap()
+                .with_name("dual"),
+            )
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    #[test]
+    fn a_left_hand_map_tells_netconvert_so() {
+        let config = to_plain_xml(&dual(TrafficHandedness::LeftHand))
+            .unwrap()
+            .config;
+        // In the processing section, beside the other options that shape the build.
+        let processing =
+            &config[config.find("<processing>").unwrap()..config.find("</processing>").unwrap()];
+        assert!(
+            processing.contains(r#"<lefthand value="true"/>"#),
+            "{config}"
+        );
+    }
+
+    #[test]
+    fn a_right_hand_map_leaves_netconvert_at_its_default() {
+        let config = to_plain_xml(&dual(TrafficHandedness::RightHand))
+            .unwrap()
+            .config;
+        assert!(!config.contains("lefthand"), "{config}");
+    }
+
+    /// Lane 0 is the outer lane either way, so the two handednesses number each
+    /// carriageway from opposite sides — and the edge's own line is the middle of the
+    /// carriageway whichever end of the list its kerb is at.
+    #[test]
+    fn lane_zero_is_the_outer_lane_under_either_handedness() {
+        let y = |network: &PlainNetwork, map: &ValidatedMap, id: &str| {
+            let (lane, _) = network
+                .lanes
+                .iter()
+                .find(|(_, written)| written.as_str() == id)
+                .unwrap();
+            map.lane(lane).unwrap().center_offset()
+        };
+        for (handedness, outward) in [
+            (TrafficHandedness::RightHand, -1.0),
+            (TrafficHandedness::LeftHand, 1.0),
+        ] {
+            let map = dual(handedness);
+            let network = to_plain_xml(&map).unwrap();
+            // Forward traffic runs along +x, on the side its handedness puts it.
+            let (outer, inner) = (
+                y(&network, &map, "dual.fwd_0"),
+                y(&network, &map, "dual.fwd_1"),
+            );
+            assert!(outer * outward > inner * outward, "{handedness:?}");
+            assert!(outer.abs() > inner.abs(), "{handedness:?}");
+            let (outer, inner) = (
+                y(&network, &map, "dual.bwd_0"),
+                y(&network, &map, "dual.bwd_1"),
+            );
+            assert!(outer.abs() > inner.abs(), "{handedness:?}");
         }
     }
 
