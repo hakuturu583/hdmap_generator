@@ -1119,6 +1119,32 @@ the side traffic keeps to, so a pavement can run from a sidewalk *leaving* the
 junction, and netconvert refuses a connection out of an edge that does not end
 there. `sumo_warnings()` counts the footway connections left to the walking areas.
 
+**A crosswalk becomes a pedestrian crossing.** SUMO's crossing is not a strip with a
+place along the road, as the IR's is: it belongs to a node, and netconvert lays it
+across the mouth of the edges it names, between the walking areas either side. So a
+crosswalk near the end of a road — where the IR puts one at a junction, a little short
+of the mouth — is written as the crossing at that end's node, across both
+carriageways of the road:
+
+```xml
+<crossing node="j_x" edges="west.bwd west.fwd" priority="1" width="4.000"/>
+```
+
+"Near" is within 15 m of the road end, measured to the crosswalk's nearer edge;
+`sumo_warnings()` says how far the furthest one moved. Pedestrians have priority on
+every crossing, because a crosswalk in the IR is a painted one; at a signalised
+node the light decides instead (see [Traffic lights](#traffic-lights)). (`priority` is written as `1`
+rather than `true` because SUMO's schema types it as a number, and netconvert refuses
+`true` when it validates the file.) Two kinds of crosswalk are not written, and
+`sumo_warnings()` names each: one further along the road than that, a mid-block
+crossing, which SUMO could only carry by splitting the road with a node of its own
+there; and one across a road without a footway at both kerbs, which netconvert would
+build with nothing leading off one end. The trace names a crossing
+`crossing:<node>/<edge>+<edge>`, the edges sorted, since the plain format gives it no
+id; once the built network is loaded, the crosswalk also reaches the lane of the
+crossing netconvert built for it (`:j_x_c0_0`, role `crossing`), matched by the
+`crossingEdges` netconvert records on it.
+
 ### Traffic lights
 
 A junction with a traffic light on an approach — or on a lane a `TrafficLight` rule
@@ -1174,8 +1200,18 @@ from the lane a movement leaves to the lane it joins — and not off netconvert'
 `dir`, so the program does not depend on netconvert being told which side the map
 drives on. A turn with nothing facing it, off the stem of a tee, is protected.
 
+At a node with pedestrian crossings the built program is longer than the one
+written. netconvert accepts the export's program and extends it: it appends the
+crossings' links after the vehicle links, numbered on from the last of them, and
+splits each green to end it with a pedestrian clearance (a 35 s green becomes 30 s
+and then 5 s in which the crossings turn red), keeping the yellow and the all-red.
+The vehicle links and their indices are still the export's, and so is the order of
+green, yellow and red each of them goes through; the crossing slots are netconvert's,
+and the trace does not name them.
+
 The tests build the network and check that netconvert kept exactly this program and
-these link indices, then drive traffic through every movement in `sumo`.
+these link indices — at a node with crossings, the vehicle links of it — then drive
+traffic through every movement in `sumo`.
 
 No U-turns. Left to itself netconvert adds one at every dead end, so a vehicle could
 turn back at the far end of an arm where the OpenDRIVE and Lanelet2 maps of the same
@@ -1266,8 +1302,10 @@ for the map whenever it reaches a centimetre.
 - **Superelevation.** A SUMO lane is flat across. The heights along it survive.
 - **Lanes traffic does not run along** — borders, painted islands, parking bays — are
   dropped rather than written as something they are not.
-- **Crosswalks and signs.** A SUMO crossing belongs to a node and a sign is an
-  additional file, not part of the network.
+- **Signs.** A sign is an additional file, not part of the network.
+- **Crosswalks far from either end of their road**, and across a road without a
+  footway at both kerbs, as above: a SUMO crossing belongs to a node and joins two
+  footways.
 - **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
   right of way and no more.
 - **Signal timing.** The IR has none, so a signalised junction runs on the fixed-time

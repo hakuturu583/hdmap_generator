@@ -1107,7 +1107,10 @@ impl PyMap {
     /// producing one without netconvert would mean reimplementing it.
     ///
     /// A signalised junction gets a fixed-time program of the export's own, written to
-    /// `<prefix>.tll.xml` with the link index of every movement it controls.
+    /// `<prefix>.tll.xml` with the link index of every movement it controls. At one with
+    /// pedestrian crossings netconvert appends the crossings' links after those and
+    /// splits each green to add a pedestrian clearance; the vehicle links and their
+    /// indices stay the export's.
     ///
     /// Beside the network go `<prefix>.safe.src.xml`, `<prefix>.safe.dst.xml` and
     /// `<prefix>.safe.via.xml`: edge weights for `randomTrips.py`, which keep it from
@@ -1122,8 +1125,7 @@ impl PyMap {
     /// connection each road, lane, junction and movement became, and the program and
     /// link indices each traffic light did — unless `trace` is false. The internal
     /// lanes netconvert draws across a junction are not in it, since netconvert names
-    /// them;`Trace.add_sumo_net` reads them from the built
-    /// network.
+    /// them; `Trace.add_sumo_net` reads them from the built network.
     #[pyo3(signature = (directory, trace = true))]
     fn export_sumo(&mut self, directory: PathBuf, trace: bool) -> PyResult<String> {
         self.ensure_built()?;

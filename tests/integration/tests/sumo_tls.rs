@@ -51,6 +51,10 @@ type Movement = (String, usize, String, usize);
 struct Lights {
     programs: BTreeMap<String, Program>,
     links: BTreeMap<Movement, (String, usize)>,
+    /// The controlled connections between netconvert's internal lanes, which are the
+    /// way onto a built network's pedestrian crossings: by the internal edge they
+    /// lead to, its light and link index. A `.tll.xml` the export wrote has none.
+    internal: BTreeMap<String, (String, usize)>,
 }
 
 impl Lights {
@@ -94,8 +98,20 @@ impl Lights {
                                 attributes["state"].clone(),
                             )),
                         // A connection out of one of netconvert's internal lanes is
-                        // the second half of a movement and carries no signal.
-                        b"connection" if !attributes["from"].starts_with(':') => {
+                        // the second half of a movement and carries no signal —
+                        // except the one from a walking area onto a pedestrian
+                        // crossing, which a light at a node with crossings controls.
+                        b"connection" if attributes["from"].starts_with(':') => {
+                            if let (Some(light), Some(index)) =
+                                (attributes.get("tl"), attributes.get("linkIndex"))
+                            {
+                                lights.internal.insert(
+                                    attributes["to"].clone(),
+                                    (light.clone(), index.parse().unwrap()),
+                                );
+                            }
+                        }
+                        b"connection" => {
                             if let (Some(light), Some(index)) =
                                 (attributes.get("tl"), attributes.get("linkIndex"))
                             {
@@ -168,21 +184,35 @@ fn build_and_compare_warned(
     let built = Lights::read(&net_path);
 
     assert!(!written.programs.is_empty(), "the export wrote no program");
-    assert_eq!(
-        built.programs, written.programs,
-        "netconvert built a different program from the one it was given"
-    );
+    let plain =
+        std::fs::read_to_string(directory.path().join(format!("{prefix}.con.xml"))).unwrap();
+    if plain.contains("<crossing ") {
+        // At a node with pedestrian crossings netconvert extends the program it was
+        // given: the crossings' links go after the vehicle links, and each green is
+        // split to end in a pedestrian clearance. What must hold is that the vehicle
+        // links are the export's, on the same indices, each going through the same
+        // signals in the same order for the same time.
+        compare_vehicle_links(&written, &built);
+    } else {
+        assert_eq!(
+            built.programs, written.programs,
+            "netconvert built a different program from the one it was given"
+        );
+    }
     assert_eq!(
         built.links, written.links,
         "netconvert numbered the links differently from the export"
     );
 
-    // And nothing into a signalised node is left uncontrolled.
+    // And nothing into a signalised node is left uncontrolled. A pavement's
+    // connection into a walking area (`:j_x_w0`) is not a movement across the
+    // junction, and is uncontrolled in any network: pedestrians meet the light at the
+    // crossing.
     let network = sumo_build::SumoNetwork::read(&net_path);
     for connection in network
         .connections
         .iter()
-        .filter(|connection| !connection.from.starts_with(':'))
+        .filter(|connection| !connection.from.starts_with(':') && !connection.to.starts_with(':'))
     {
         let edge = network.edge(&connection.from);
         let Some(node) = &edge.to else { continue };
@@ -197,6 +227,56 @@ fn build_and_compare_warned(
         }
     }
     (directory, prefix, written)
+}
+
+/// Checks that each program `built` holds the vehicle links of the one `written`:
+/// the same light, type, programme id and offset; every state starting with as many
+/// signals as the export wrote, and longer only by netconvert's crossing links; and
+/// each vehicle link going through the same signals — green, yellow, red — in the
+/// same order and for the same time, however netconvert split the phases.
+fn compare_vehicle_links(written: &Lights, built: &Lights) {
+    assert_eq!(
+        built.programs.keys().collect::<Vec<_>>(),
+        written.programs.keys().collect::<Vec<_>>(),
+        "netconvert built different lights from the ones it was given"
+    );
+    for (id, program) in &written.programs {
+        let other = &built.programs[id];
+        assert_eq!(
+            (&other.kind, &other.program, other.offset),
+            (&program.kind, &program.program, program.offset),
+            "{id}: netconvert changed the program's type, id or offset"
+        );
+        let vehicles = program.phases[0].1.len();
+        assert!(
+            other
+                .phases
+                .iter()
+                .all(|(_, state)| state.len() >= vehicles),
+            "{id}: netconvert dropped vehicle links: {other:?}"
+        );
+        // Each link's signal over the cycle, a phase at a time, with a phase netconvert
+        // split in two read as one: consecutive phases showing the link the same signal
+        // are merged, adding their durations.
+        let signals = |program: &Program, index: usize| {
+            let mut merged: Vec<(char, f64)> = Vec::new();
+            for (duration, state) in &program.phases {
+                let signal = state.as_bytes()[index] as char;
+                match merged.last_mut() {
+                    Some((last, total)) if *last == signal => *total += duration,
+                    _ => merged.push((signal, *duration)),
+                }
+            }
+            merged
+        };
+        for index in 0..vehicles {
+            assert_eq!(
+                signals(other, index),
+                signals(program, index),
+                "{id}: vehicle link {index} does not run as the export wrote it"
+            );
+        }
+    }
 }
 
 /// Runs the network in the simulator for [`STEPS`] seconds with a steady flow of
@@ -641,4 +721,163 @@ fn a_network_numbering_the_links_otherwise_is_refused() {
         _ => false,
     };
     assert!(refused, "{error}");
+}
+
+/// A signalised crossroads with a pedestrian crossing across every arm, in a
+/// right-hand and a left-hand version. netconvert takes the export's program and
+/// extends it with the crossings: it must say nothing about it, keep every vehicle
+/// link on the index the export gave it and running as the export wrote it, and put
+/// each crossing on the same light, after the vehicle links. Then cars on every
+/// movement get through in the simulator without a collision or a teleport, and a
+/// pedestrian crosses every arm both ways on its crossing.
+#[test]
+fn a_signalised_crossroads_with_crossings_keeps_the_vehicle_links() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+        let (map, _) = scenarios::signalised_crosswalk_crossroads(handedness);
+        let (directory, prefix, lights) = build_and_compare(&map);
+        let net = directory.path().join(format!("{prefix}.net.xml"));
+        let built = Lights::read(&net);
+
+        // Each of the four arms turns into the other three.
+        assert_eq!(lights.links.len(), 12, "{handedness:?}");
+        let program = &lights.programs["j_x"];
+        assert!(program.phases.iter().all(|(_, state)| state.len() == 12));
+
+        // Four crossings, each controlled by the junction's light, on the indices
+        // after the vehicle links.
+        let network = sumo_build::SumoNetwork::read(&net);
+        let crossings: BTreeSet<&str> = network
+            .edges
+            .iter()
+            .filter(|edge| edge.function.as_deref() == Some("crossing"))
+            .map(|edge| edge.id.as_str())
+            .collect();
+        assert_eq!(crossings.len(), 4, "{handedness:?}: {crossings:?}");
+        let crossing_slots: BTreeSet<usize> = crossings
+            .iter()
+            .map(|crossing| {
+                let (light, index) = built
+                    .internal
+                    .get(*crossing)
+                    .unwrap_or_else(|| panic!("{handedness:?}: {crossing} is not controlled"));
+                assert_eq!(light, "j_x", "{handedness:?}: {crossing}");
+                *index
+            })
+            .collect();
+        assert_eq!(
+            crossing_slots,
+            (12..16).collect(),
+            "{handedness:?}: the crossings are not after the vehicle links"
+        );
+        let built_program = &built.programs["j_x"];
+        assert!(built_program
+            .phases
+            .iter()
+            .all(|(_, state)| state.len() == 16));
+        // And each crossing gets a green of its own at some point in the cycle.
+        for &crossing in &crossing_slots {
+            assert!(
+                built_program
+                    .phases
+                    .iter()
+                    .any(|(_, state)| state.as_bytes()[crossing] == b'G'),
+                "{handedness:?}: crossing link {crossing} is never green: {built_program:?}"
+            );
+        }
+
+        // Cars on every movement get through under the program, without a
+        // collision or a teleport.
+        drive(directory.path(), &prefix, &lights);
+
+        // And a pedestrian crosses every arm at the junction, both ways, on the
+        // crossing and under the light: from a metre short of the junction on one
+        // pavement to a metre short of it on the other, a walk of a few metres.
+        let near_junction = |edge: &str| {
+            let edge = network.edge(edge);
+            let pavement = edge
+                .lanes
+                .iter()
+                .find(|lane| lane.allow.as_deref() == Some("pedestrian"))
+                .unwrap_or_else(|| panic!("{} has no pavement", edge.id));
+            let arriving = edge.to.as_deref() == Some("j_x");
+            let position = if arriving { pavement.length - 1.0 } else { 1.0 };
+            (edge.id.clone(), position)
+        };
+        let mut walks = Vec::new();
+        let mut persons = String::new();
+        for arm in ["west", "east", "north", "south"] {
+            let (fwd, bwd) = (format!("{arm}.fwd"), format!("{arm}.bwd"));
+            for (from, to) in [(&fwd, &bwd), (&bwd, &fwd)] {
+                let (from_edge, depart) = near_junction(from);
+                let (to_edge, arrive) = near_junction(to);
+                persons.push_str(&format!(
+                    "    <person id=\"p{}\" depart=\"0\" departPos=\"{depart:.2}\">\n        \
+                     <walk from=\"{from_edge}\" to=\"{to_edge}\" arrivalPos=\"{arrive:.2}\"/>\n    \
+                     </person>\n",
+                    walks.len()
+                ));
+                walks.push((from.clone(), to.clone()));
+            }
+        }
+        std::fs::write(
+            directory.path().join("walks.rou.xml"),
+            format!("<routes>\n{persons}</routes>\n"),
+        )
+        .unwrap();
+        let walked = sumo_build::walk(directory.path(), &prefix);
+        assert_eq!(
+            walked.len(),
+            walks.len(),
+            "{handedness:?}: every pedestrian should arrive: {walked:?}"
+        );
+        for (person, length) in &walked {
+            let (from, to) = &walks[person.trim_start_matches('p').parse::<usize>().unwrap()];
+            assert!(
+                *length < 25.0,
+                "{handedness:?}: {from} to {to} took {length} m, so it did not use the \
+                 crossing"
+            );
+        }
+    }
+}
+
+/// The trace index takes the network netconvert built for a signalised junction with
+/// crossings: the vehicle slots it checks are the export's, and the crossing slots
+/// netconvert appended after them are its own, which the trace neither names nor
+/// refuses the network for. Each light still traces to the vehicle slots only.
+#[test]
+fn the_trace_index_takes_a_signalised_network_with_crossings() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+        let (map, _) = scenarios::signalised_crosswalk_crossroads(handedness);
+        let directory = tempfile::tempdir().unwrap();
+        write_ir(&map, directory.path().join("map.ir.json")).unwrap();
+        let (prefix, trace) = roadgen_sumo::write_traced(&map, directory.path()).unwrap();
+        let sidecar = directory_sidecar(directory.path(), &prefix, &trace.format);
+        write_trace(&trace, &map, &sidecar).unwrap();
+        let net = sumo_build::netconvert(directory.path(), &prefix);
+        let built = Lights::read(&net);
+        assert_eq!(built.internal.len(), 4, "{handedness:?}: {built:?}");
+
+        let mut index = TraceIndex::new();
+        index.load(directory.path().join("map.ir.json")).unwrap();
+        index.load(&sidecar).unwrap();
+        index
+            .load_sumo_net(&net)
+            .unwrap_or_else(|error| panic!("{handedness:?}: {error}"));
+
+        let slots: BTreeSet<usize> = map
+            .objects
+            .iter()
+            .filter(|object| object.kind.is_traffic_light())
+            .flat_map(|light| index.from_ir(light.id.as_str(), "sumo").unwrap())
+            .filter_map(|link| link.local.strip_prefix("tls:j_x/")?.parse().ok())
+            .collect();
+        assert_eq!(slots, (0..12).collect(), "{handedness:?}");
+    }
 }

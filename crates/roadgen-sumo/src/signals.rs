@@ -15,7 +15,11 @@
 //! phases (so netconvert has nothing left to generate), and every controlled connection
 //! with the `linkIndex` it is given (so the position of each movement in a state string
 //! is the export's). The result is the same network every
-//! time, whatever netconvert's defaults.
+//! time, whatever netconvert's defaults — with one addition of netconvert's own: at a
+//! node with pedestrian crossings it appends the crossings' links after the vehicle
+//! links and splits each green to end it with a pedestrian clearance. The vehicle
+//! links, their indices and the order of green, yellow and red each goes through stay
+//! the export's.
 //!
 //! # The heuristic
 //!

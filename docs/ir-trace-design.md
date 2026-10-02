@@ -185,7 +185,7 @@ SUMO なら `{"ir": "road/north", "ref": "edge:north.fwd", "rel": "part"}` の�
 | --- | --- | --- |
 | opendrive | `road` `junction` `lane` `signal` `object` `building` `connection` `controller` | `lane:<road>/<section index>/<lane no>`、`connection:<junction>/<connection id>` |
 | lanelet2 | `lanelet` `linestring` `point` `regulatory_element` | 整数 |
-| sumo | `edge` `lane` `node` `connection` `tls` | SUMO の ID 文字列、connection は `<fromLane>><toLane>`、tls は `<tlLogic id>`、そのスロットは `<tlLogic id>/<linkIndex>`（§8.2） |
+| sumo | `edge` `lane` `node` `connection` `crossing` `tls` | SUMO の ID 文字列、connection は `<fromLane>><toLane>`、crossing は `<node>/<edge>+<edge>`（edge は名前順）、tls は `<tlLogic id>`、そのスロットは `<tlLogic id>/<linkIndex>`（§8.2） |
 | osm | `node` `way` `relation` | 負の整数 |
 | carla | `mesh` `actor` + `.xodr` 分は opendrive を参照 | 名前 |
 | clipgt | レイヤ名 (`lane` `lane_line` `wait_line` …) | 行番号 |
@@ -440,6 +440,12 @@ IR の信号機がどのプログラムのどのスロットを制御するか�
 `<connection tl linkIndex>`）で引く。`TraceIndex::load_sumo_net` は、トレースの `tls:` がすべて
 `.net.xml` にあること、および `.tll.xml` に書いた各 connection の `tl` / `linkIndex` が `.net.xml`
 と一致することを検査し、一致しないネットワーク（例えば netconvert が自分でプログラムを作ったもの）は拒否する。
+
+横断歩道（`<crossing>`）のある信号付きノードでは、netconvert は `.tll.xml` のプログラムを受け入れたうえで
+拡張する: 車両の linkIndex 0..n-1 はそのまま、横断歩道の link を n 以降に追加し、各青を
+分割して末尾に歩行者クリアランスを入れる（例: 35 s → 30 s + 5 s。黄・全赤はそのまま。
+SUMO 1.18 / 1.26 で確認、警告なし）。追加されたスロットは netconvert のものなので
+`load_sumo_net` は検査もリンクもせず、エクスポータが書いた車両スロットだけを検査する。
 
 制御する connection が 1 本も無い信号付きノードはプログラムを書かず、従来どおり信号機を
 `node:<id>` に `merged` で対応させる。
