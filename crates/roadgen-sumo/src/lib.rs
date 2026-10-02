@@ -35,7 +35,10 @@
 //! made here.
 //!
 //! A road whose cross-section changes becomes one edge per cross-section, joined at
-//! an internal node: a SUMO edge has one lane count from end to end.
+//! an internal node: a SUMO edge has one lane count from end to end. Which lane
+//! carries on across that node is the IR's connections, written as the movements
+//! through it; an edge the IR carries nothing on from is listed as connecting to
+//! nothing, so netconvert does not guess a movement for it.
 //!
 //! Every lane is written with its own shape, so the geometry the generator computed
 //! is the geometry SUMO gets — not a centreline with a width, which is what a
@@ -1111,7 +1114,34 @@ impl<'a> Exporter<'a> {
                 ],
             );
         }
+        // An edge none of whose lanes the IR carries on from, leading anywhere but a
+        // dead end. With nothing listed for it netconvert would take its movements
+        // as unspecified and guess some — a lane dropped where the type changes, say
+        // driving into cycling, would be carried on into the cycle lane — so it is
+        // listed with no target, which is plain XML for "this edge connects to
+        // nothing". netconvert warns that the edge goes nowhere, and that is what the
+        // IR says.
+        for unconnected in self.unconnected_edges() {
+            document.leaf(
+                "connection",
+                &[("from", self.edges[unconnected].id.clone())],
+            );
+        }
         document.finish()
+    }
+
+    /// The edges that run into a node something could continue from, but from which
+    /// the IR states no movement at all.
+    fn unconnected_edges(&self) -> Vec<usize> {
+        let connected: BTreeSet<usize> = self.movements.keys().map(|key| key.0).collect();
+        (0..self.edges.len())
+            .filter(|edge| !connected.contains(edge))
+            .filter(|&edge| {
+                self.nodes
+                    .get(&self.edges[edge].to)
+                    .is_some_and(|node| node.kind != NodeKind::DeadEnd)
+            })
+            .collect()
     }
 }
 
@@ -1328,6 +1358,32 @@ mod tests {
         builder.finish().unwrap().validate().unwrap()
     }
 
+    /// A two-way road whose forward lane becomes a cycle lane halfway along, while the
+    /// backward lane stays a driving lane throughout.
+    fn type_change() -> ValidatedMap {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("type-change"));
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(200.0, 0.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("r")
+                .with_cross_section(
+                    100.0,
+                    vec![
+                        LaneSpec::new(width, Direction::Forward).with_type(LaneType::Biking),
+                        LaneSpec::new(width, Direction::Backward),
+                    ],
+                ),
+            )
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
     /// Every `<kind>:<local>` the rendered files actually contain, read back from the
     /// XML rather than from the exporter's state.
     fn written(network: &PlainNetwork) -> BTreeSet<String> {
@@ -1363,6 +1419,10 @@ mod tests {
                     b"lane" => {
                         found.insert(format!("lane:{edge}_{}", attributes["index"]));
                     }
+                    b"connection" if !attributes.contains_key("to") => {
+                        // An edge listed with no target: it connects to nothing.
+                        found.insert(format!("nowhere:{}", attributes["from"]));
+                    }
                     b"connection" => {
                         found.insert(format!(
                             "connection:{}_{}>{}_{}",
@@ -1381,7 +1441,7 @@ mod tests {
 
     #[test]
     fn everything_the_trace_names_is_in_the_files() {
-        for map in [crossroads(), in_line()] {
+        for map in [crossroads(), in_line(), type_change()] {
             let network = to_plain_xml(&map).unwrap();
             let written = written(&network);
             assert_eq!(network.trace.format, "sumo");
@@ -1409,7 +1469,7 @@ mod tests {
 
     #[test]
     fn every_written_lane_has_one_exact_link_matching_its_id() {
-        for map in [crossroads(), in_line()] {
+        for map in [crossroads(), in_line(), type_change()] {
             let network = to_plain_xml(&map).unwrap();
             assert!(!network.lanes.is_empty());
             for (lane, id) in &network.lanes {
@@ -1480,6 +1540,35 @@ mod tests {
             .links
             .iter()
             .any(|link| link.local == "connection:north.fwd_0>west.bwd_0"));
+    }
+
+    /// Where no lane of an edge carries on into the next cross-section, the edge is
+    /// listed as connecting to nothing; left out, netconvert would guess a movement
+    /// the IR does not have.
+    #[test]
+    fn an_edge_the_map_carries_nothing_on_from_connects_to_nothing() {
+        let map = type_change();
+        let network = to_plain_xml(&map).unwrap();
+        let written = written(&network);
+
+        // The driving lane ends where the cycle lane begins: nothing joins them.
+        assert!(written.contains("nowhere:r.0.fwd"), "{written:?}");
+        assert!(
+            !written
+                .iter()
+                .any(|element| element.starts_with("connection:r.0.fwd_")),
+            "{written:?}"
+        );
+        // The other carriageway carries on, so it is written as the movement it is.
+        assert!(
+            written.contains("connection:r.1.bwd_0>r.0.bwd_0"),
+            "{written:?}"
+        );
+        assert!(!written.contains("nowhere:r.1.bwd"), "{written:?}");
+        // Nor is the far end of either carriageway listed: nothing continues from a
+        // dead end for netconvert to guess.
+        assert!(!written.contains("nowhere:r.1.fwd"), "{written:?}");
+        assert!(!written.contains("nowhere:r.0.bwd"), "{written:?}");
     }
 
     #[test]

@@ -426,7 +426,6 @@ fn a_right_of_way_rule_decides_who_gives_way() {
 }
 
 /// A SUMO edge has one lane count from end to end, so a road that drops a lane is a
-/// A SUMO edge has one lane count from end to end, so a road that drops a lane is a
 /// chain of edges with a node between them.
 #[test]
 fn a_changing_cross_section_becomes_a_chain_of_edges() {
@@ -457,12 +456,28 @@ fn a_changing_cross_section_becomes_a_chain_of_edges() {
     // And which lane carries on into which is the IR's, not netconvert's: the
     // connections the core makes across the boundary are written as the movements
     // through the node, and the built network has exactly those.
-    let lanes = roadgen_sumo::to_plain_xml(&map).unwrap().lanes;
+    let (stated, built) = across(&map, &network, "wide.0.fwd", "wide.1.fwd");
+    assert_eq!(stated.len(), 2, "the two lanes that carry on: {stated:?}");
+    assert_eq!(built, stated);
+}
+
+/// Movements as (from edge, from lane, to edge, to lane).
+type Movements = BTreeSet<(String, usize, String, usize)>;
+
+/// The movements from one edge into another, as the IR states them and as the built
+/// network has them.
+fn across(
+    map: &ValidatedMap,
+    network: &SumoNetwork,
+    from: &str,
+    to: &str,
+) -> (Movements, Movements) {
+    let lanes = roadgen_sumo::to_plain_xml(map).unwrap().lanes;
     let sumo = |lane: &LaneId| {
         let (edge, index) = lanes.get(lane)?.rsplit_once('_')?;
         Some((edge.to_owned(), index.parse::<usize>().ok()?))
     };
-    let stated: BTreeSet<(String, usize, String, usize)> = map
+    let stated = map
         .connections
         .iter()
         .filter_map(|connection| {
@@ -470,15 +485,72 @@ fn a_changing_cross_section_becomes_a_chain_of_edges() {
             let (to, to_lane) = sumo(&connection.to.lane)?;
             Some((from, from_lane, to, to_lane))
         })
-        .filter(|(from, _, to, _)| from == "wide.0.fwd" && to == "wide.1.fwd")
+        .filter(|(edge, _, next, _)| edge == from && next == to)
         .collect();
-    let built: BTreeSet<(String, usize, String, usize)> = network
+    let built = network
         .movements()
         .into_iter()
-        .filter(|(from, _, to, _)| *from == "wide.0.fwd" && *to == "wide.1.fwd")
-        .map(|(from, from_lane, to, to_lane)| (from.to_owned(), from_lane, to.to_owned(), to_lane))
+        .filter(|(edge, _, next, _)| *edge == from && *next == to)
+        .map(|(edge, from_lane, next, to_lane)| {
+            (edge.to_owned(), from_lane, next.to_owned(), to_lane)
+        })
         .collect();
-    assert_eq!(stated.len(), 2, "the two lanes that carry on: {stated:?}");
+    (stated, built)
+}
+
+/// Where no lane of an edge carries on across a cross-section boundary — here a
+/// driving lane that becomes a cycle lane — the IR states no movement from it, and
+/// the built network has none: netconvert is told the edge connects to nothing
+/// rather than left to guess, which would carry the driving lane on into the cycle
+/// lane. That it warns the edge goes nowhere is what the map says, and all it warns.
+#[test]
+fn a_lane_that_ends_where_its_type_changes_is_not_carried_on() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::lane_type_change();
+    let (directory, network, warnings) = sumo_build::build_with_warnings(&map);
+
+    let onward: Vec<_> = network
+        .movements()
+        .into_iter()
+        .filter(|(from, ..)| *from == "r.0.fwd")
+        .collect();
+    assert!(onward.is_empty(), "the driving lane ends, but: {onward:?}");
+
+    // The other carriageway is untouched by it, and carries on as the IR says.
+    let (stated, built) = across(&map, &network, "r.1.bwd", "r.0.bwd");
+    assert_eq!(stated.len(), 1, "{stated:?}");
+    assert_eq!(built, stated);
+
+    let warnings: BTreeSet<String> = warnings.into_iter().collect();
+    let expected: BTreeSet<String> = [
+        "Warning: Edge 'r.0.fwd' is not connected to outgoing edges at junction 'n_r_s1'.",
+        "Warning: Lane 'r.1.fwd_0' is not connected from any incoming edge at junction 'n_r_s1'.",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(warnings, expected);
+
+    // And it is a network the simulator runs.
+    sumo_build::simulate(directory.path(), &roadgen_sumo::network_name(&map));
+}
+
+/// A lane drop on a backward carriageway: traffic runs from the second section into
+/// the first, and the lane that carries on is the IR's, whichever way round.
+#[test]
+fn a_lane_dropped_on_a_backward_carriageway_is_the_irs() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::backward_lane_drop();
+    let (_directory, network) = sumo_build::build(&map);
+
+    assert_eq!(network.edge("r.1.bwd").lanes.len(), 2);
+    assert_eq!(network.edge("r.0.bwd").lanes.len(), 1);
+    let (stated, built) = across(&map, &network, "r.1.bwd", "r.0.bwd");
+    assert_eq!(stated.len(), 1, "the one lane that carries on: {stated:?}");
     assert_eq!(built, stated);
 }
 
@@ -556,13 +628,6 @@ fn what_the_format_cannot_carry_is_reported() {
         "{crossroads}"
     );
     assert!(crossroads.contains("crosswalk"), "{crossroads}");
-
-    // A changing cross-section is a chain of edges, but the movements across each
-    // node are the IR's own connections: nothing is lost there, so nothing about
-    // it is reported.
-    let sectioned = roadgen_sumo::check(&scenarios::lane_drop()).join("\n");
-    assert!(!sectioned.contains("cross-section"), "{sectioned}");
-    assert!(!sectioned.contains("chain of edges"), "{sectioned}");
 }
 
 /// The four files are named after the map and refer to each other, so that building

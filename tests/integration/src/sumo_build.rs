@@ -91,10 +91,33 @@ pub fn build(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork) {
     (directory, SumoNetwork::read(&path))
 }
 
+/// [`build`], for a map netconvert is *right* to warn about: what it said comes back
+/// alongside the network instead of failing the test, so the test can check that it
+/// warned about exactly what the map holds and nothing else.
+pub fn build_with_warnings(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork, Vec<String>) {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let prefix = roadgen_sumo::write(map, directory.path()).expect("the map should export as SUMO");
+
+    let (path, warnings) = run_netconvert(directory.path(), &prefix);
+    (directory, SumoNetwork::read(&path), warnings)
+}
+
 /// Runs `netconvert` on the SUMO export in `directory` whose files are named after
 /// `prefix`, checks that it built the network without complaint, and returns the
 /// path of the `.net.xml` it wrote.
 pub fn netconvert(directory: &Path, prefix: &str) -> PathBuf {
+    let (path, complaints) = run_netconvert(directory, prefix);
+    assert!(
+        complaints.is_empty(),
+        "netconvert accepted the export but complained about it:\n{}",
+        complaints.join("\n")
+    );
+    path
+}
+
+/// Runs `netconvert` as [`netconvert`] does and checks that it built the network,
+/// returning the `.net.xml` it wrote and every line it complained with.
+fn run_netconvert(directory: &Path, prefix: &str) -> (PathBuf, Vec<String>) {
     // Through the generated configuration, which is how a user runs it: if the
     // `.netccfg` names the wrong files or asks for the wrong processing, that is a
     // fault in the export and the test should see it.
@@ -116,13 +139,8 @@ pub fn netconvert(directory: &Path, prefix: &str) -> PathBuf {
         output.status.success(),
         "netconvert rejected the export:\n{stderr}"
     );
-    assert!(
-        complaints.is_empty(),
-        "netconvert accepted the export but complained about it:\n{}",
-        complaints.join("\n")
-    );
 
-    directory.join(format!("{prefix}.net.xml"))
+    (directory.join(format!("{prefix}.net.xml")), complaints)
 }
 
 /// Loads a built network into the simulator itself.

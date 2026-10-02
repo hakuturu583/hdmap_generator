@@ -971,8 +971,17 @@ decision, and `sumo_warnings()` says so.
 A road whose **cross-section changes** becomes a chain of edges with a node between
 them, because an edge has one lane count from end to end. Which lane carries on into
 which is still the IR's: the connections it holds across the boundary are written as
-`<connection>`s through that node, so netconvert has no lane-matching of its own to do
-there, and a lane that ends at the boundary simply ends.
+`<connection>`s through that node, and netconvert, given an edge's connections, adds
+none of its own — a lane with no connection onward ends at the boundary.
+
+That leaves the edge with *no* connection across: every lane on that side ends, say a
+driving lane that becomes a cycle lane. netconvert reads an edge with nothing listed
+as one whose movements are unspecified, and would guess some, carrying the driving
+lane on into the cycle lane. So such an edge is listed with no target,
+`<connection from="r.0.fwd"/>`, which is plain XML for "connects to nothing", and
+netconvert warns that the edge goes nowhere — which is what the map says. The same
+holds for any edge the IR carries nothing on from, wherever it ends short of a dead
+end.
 
 ### Junctions, which SUMO models the same way round as the IR
 
