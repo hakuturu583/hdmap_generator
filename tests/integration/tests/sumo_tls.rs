@@ -215,6 +215,11 @@ fn drive(directory: &Path, prefix: &str, lights: &Lights) {
         .args(["--end", &STEPS.to_string()])
         .args(["--no-step-log", "true"])
         .args(["--tripinfo-output", "trips.xml"])
+        // Collisions inside the junction are what a wrong program causes, and SUMO
+        // only looks for them there when asked; the statistics then say whether any
+        // happened, and whether a vehicle had to be teleported out of a deadlock.
+        .args(["--collision.check-junctions", "true"])
+        .args(["--statistic-output", "statistics.xml"])
         .current_dir(directory)
         .output()
         .expect("sumo should run");
@@ -232,6 +237,35 @@ fn drive(directory: &Path, prefix: &str, lights: &Lights) {
         complaints.is_empty(),
         "sumo ran the network but complained about it:\n{}",
         complaints.join("\n")
+    );
+
+    let statistics = std::fs::read_to_string(directory.join("statistics.xml")).unwrap();
+    let mut counted = BTreeMap::new();
+    let mut reader = Reader::from_str(&statistics);
+    loop {
+        match reader.read_event().unwrap() {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element) => {
+                let name = String::from_utf8_lossy(element.name().as_ref()).into_owned();
+                let key = match name.as_str() {
+                    "safety" => "collisions",
+                    "teleports" => "total",
+                    _ => continue,
+                };
+                counted.insert(name, attributes(&element)[key].clone());
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        counted.get("safety").map(String::as_str),
+        Some("0"),
+        "vehicles collided under the program:\n{statistics}"
+    );
+    assert_eq!(
+        counted.get("teleports").map(String::as_str),
+        Some("0"),
+        "vehicles had to be teleported under the program:\n{statistics}"
     );
 
     // A vehicle of flow `m3` is called `m3.<n>`.
