@@ -619,7 +619,25 @@ impl<'a> Exporter<'a> {
     // ----------------------------------------------------------------------- //
 
     /// The one or two edges of one cross-section: one per direction traffic runs in.
+    ///
+    /// A cross-section none of whose lanes SUMO has a place for — all of them
+    /// borders, parking or the like — writes no edge, and then it writes no node
+    /// either. The nodes at its two ends exist only for edges to run between, and a
+    /// node no edge reaches is not a dead end or a joint but a stray point netconvert
+    /// has to throw away. So the carriageways are read first, and the ends are made
+    /// only once there is something to hang on them. A node another road does reach
+    /// is still written, by that road.
     fn section_edges(&mut self, road: &Road, section: usize) -> Result<(), ExportError> {
+        let carriageways: Vec<(Direction, Vec<&'a Lane>)> =
+            [Direction::Forward, Direction::Backward]
+                .into_iter()
+                .map(|direction| (direction, self.carriageway(road, section, direction)))
+                .filter(|(_, lanes)| !lanes.is_empty())
+                .collect();
+        if carriageways.is_empty() {
+            return Ok(());
+        }
+
         let at_start = if section == 0 {
             self.road_end_node(road, RoadEnd::Start)
         } else {
@@ -631,11 +649,7 @@ impl<'a> Exporter<'a> {
             self.section_node(road, section + 1)?
         };
 
-        for direction in [Direction::Forward, Direction::Backward] {
-            let lanes = self.carriageway(road, section, direction);
-            if lanes.is_empty() {
-                continue;
-            }
+        for (direction, lanes) in carriageways {
             let (from, to) = match direction {
                 Direction::Forward => (at_start.clone(), at_end.clone()),
                 Direction::Backward => (at_end.clone(), at_start.clone()),
@@ -1506,6 +1520,54 @@ mod tests {
             assert_eq!(link.relation, Relation::Exact, "{}", link.local);
             assert!(matches!(link.ir, IrRef::Connection(_)));
         }
+    }
+
+    /// A road none of whose lanes SUMO can carry leaves nothing behind: no edge, and
+    /// no node for an edge that was never written to run between.
+    #[test]
+    fn a_road_with_no_sumo_lanes_writes_no_nodes() {
+        let mut builder = MapBuilder::new(metadata("verge"));
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("street"),
+            )
+            .unwrap();
+        let width = PositiveWidth::new(2.0).unwrap();
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 50.0, 0.0),
+                    Point3::new(100.0, 50.0, 0.0),
+                    vec![
+                        LaneSpec::new(width, Direction::Forward).with_type(LaneType::Border),
+                        LaneSpec::new(width, Direction::Backward).with_type(LaneType::Parking),
+                    ],
+                )
+                .unwrap()
+                .with_name("verge"),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+
+        let mut exporter = Exporter::new(&map);
+        exporter.build().unwrap();
+        assert!(exporter
+            .edges
+            .iter()
+            .all(|edge| edge.id.starts_with("street")));
+        let reached: BTreeSet<&str> = exporter
+            .edges
+            .iter()
+            .flat_map(|edge| [edge.from.as_str(), edge.to.as_str()])
+            .collect();
+        let nodes: BTreeSet<&str> = exporter.nodes.keys().map(String::as_str).collect();
+        assert_eq!(nodes, reached, "every node written should be an edge's end");
     }
 
     #[test]
