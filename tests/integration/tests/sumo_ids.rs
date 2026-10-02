@@ -158,3 +158,99 @@ fn no_written_id_holds_a_character_sumo_refuses() {
         }
     }
 }
+
+/// A map whose distinct names become one once the refused characters are replaced: a
+/// chain of roads `A;B`, `A_B` and `A B`, and two junctions `J;1` and `J 1` with three
+/// arms each.
+fn colliding_map() -> ValidatedMap {
+    let mut builder = MapBuilder::new(metadata("colliding"));
+    let mut previous: Option<RoadId> = None;
+    for (index, name) in ["A;B", "A_B", "A B"].into_iter().enumerate() {
+        let x = index as f64 * 100.0;
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(x, 0.0, 0.0),
+                    Point3::new(x + 100.0, 0.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name(name),
+            )
+            .unwrap();
+        if let Some(previous) = &previous {
+            builder.connect(previous, &road).unwrap();
+        }
+        previous = Some(road);
+    }
+
+    for (index, junction) in ["J;1", "J 1"].into_iter().enumerate() {
+        let centre = Point3::new(index as f64 * 300.0, 300.0, 0.0);
+        let arms: Vec<RoadId> = [(0.0, 1.0), (1.0, 0.0), (0.0, -1.0)]
+            .into_iter()
+            .enumerate()
+            .map(|(arm, (dx, dy))| {
+                let at =
+                    |reach: f64| Point3::new(centre.x + dx * reach, centre.y + dy * reach, 0.0);
+                builder
+                    .add_road(
+                        RoadSpec::line(at(100.0), at(14.0), two_way())
+                            .unwrap()
+                            .with_name(format!("t{index}{arm}")),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let junction = builder.add_junction(Some(junction));
+        for (index, from) in arms.iter().enumerate() {
+            for to in arms.iter().skip(index + 1) {
+                builder
+                    .connect_ends(from, RoadEnd::End, to, RoadEnd::End, Some(&junction))
+                    .unwrap();
+            }
+        }
+    }
+
+    builder
+        .finish()
+        .expect("the map should build")
+        .validate()
+        .expect("the map should validate")
+}
+
+/// Two names that reduce to the same id are still two edges and two junctions in the
+/// built network: netconvert takes the files, and the simulator loads the result.
+#[test]
+fn names_that_reduce_to_one_id_still_build_as_separate_edges_and_junctions() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = colliding_map();
+    let prefix = roadgen_sumo::network_name(&map);
+    let (directory, network) = sumo_build::build(&map);
+    sumo_build::simulate(directory.path(), &prefix);
+
+    for road in ["A_B", "A_B~1", "A_B~2"] {
+        for sense in ["fwd", "bwd"] {
+            let id = format!("{road}.{sense}");
+            assert_eq!(network.edge(&id).id, id);
+        }
+    }
+    assert_ne!(
+        network.edge("A_B.fwd").to,
+        network.edge("A_B~1.fwd").to,
+        "two joints of the chain were merged into one node"
+    );
+    for junction in ["j_J_1", "j_J_1~1"] {
+        assert_eq!(network.junction(junction).id, junction);
+    }
+
+    // check() says which ids were changed, and to what.
+    let problems = roadgen_sumo::check(&map);
+    for written in ["`A_B~1`", "`A_B~2`", "`J_1~1`"] {
+        assert!(
+            problems.iter().any(|problem| problem.contains(written)),
+            "check() does not mention {written}: {problems:#?}"
+        );
+    }
+}

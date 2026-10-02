@@ -325,6 +325,8 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         ));
     }
 
+    problems.extend(Ids::new(map).renamed);
+
     problems.push(
         "the network is in the map's own metres about its origin; SUMO carries no \
          geo-reference for it"
@@ -411,6 +413,8 @@ struct Movement {
 struct Exporter<'a> {
     map: &'a ValidatedMap,
     sampling: SamplingConfig,
+    /// The name every id derived from a road or a junction is built from.
+    ids: Ids,
     nodes: BTreeMap<String, Node>,
     edges: Vec<Edge>,
     /// Each written connection, by (from edge, from lane, to edge, to lane), and what
@@ -436,6 +440,7 @@ impl<'a> Exporter<'a> {
         let mut exporter = Exporter {
             map,
             sampling: map.metadata.sampling,
+            ids: Ids::new(map),
             nodes: BTreeMap::new(),
             edges: Vec::new(),
             movements: BTreeMap::new(),
@@ -558,7 +563,7 @@ impl<'a> Exporter<'a> {
                     .junction_centre(&junction)
                     .unwrap_or_else(|| road.endpoint(end));
                 self.node(
-                    format!("j_{}", identifier(junction.local_name())),
+                    format!("j_{}", self.ids.junction(&junction)),
                     point,
                     kind,
                     self.ruled.contains(&junction),
@@ -568,8 +573,8 @@ impl<'a> Exporter<'a> {
             Some(RoadLinkTarget::Road(other)) => {
                 // Both roads have to name the joint the same way, so the pair is put
                 // in a fixed order and the first of the two names it.
-                let here = (identifier(road.id.local_name()), end);
-                let there = (identifier(other.road.local_name()), other.end);
+                let here = (self.ids.road(&road.id), end);
+                let there = (self.ids.road(&other.road), other.end);
                 let first =
                     if (here.0.as_str(), here.1.as_str()) <= (there.0.as_str(), there.1.as_str()) {
                         &here
@@ -591,7 +596,7 @@ impl<'a> Exporter<'a> {
                 )
             }
             None => self.node(
-                format!("n_{}_{}", identifier(road.id.local_name()), end.as_str()),
+                format!("n_{}_{}", self.ids.road(&road.id), end.as_str()),
                 road.endpoint(end),
                 NodeKind::DeadEnd,
                 false,
@@ -606,7 +611,7 @@ impl<'a> Exporter<'a> {
         let station = road.sections[section].station;
         let point = road.reference_line.sample_at(station, self.sampling)?.point;
         Ok(self.node(
-            format!("n_{}_s{section}", identifier(road.id.local_name())),
+            format!("n_{}_s{section}", self.ids.road(&road.id)),
             point,
             NodeKind::Unstated,
             false,
@@ -706,7 +711,7 @@ impl<'a> Exporter<'a> {
 
         let shape = self.carriageway_shape(lanes, &written)?;
         self.edges.push(Edge {
-            id: edge_id(road, section, direction),
+            id: edge_id(&self.ids.road(&road.id), road, section, direction),
             road: road.id.clone(),
             from,
             to,
@@ -1161,8 +1166,7 @@ fn render_config(prefix: &str) -> String {
 
 /// What an edge is called: the road, the cross-section when there is more than one,
 /// and which way traffic runs along it.
-fn edge_id(road: &Road, section: usize, direction: Direction) -> String {
-    let name = identifier(road.id.local_name());
+fn edge_id(name: &str, road: &Road, section: usize, direction: Direction) -> String {
     let sense = match direction {
         Direction::Forward => "fwd",
         Direction::Backward => "bwd",
@@ -1172,6 +1176,197 @@ fn edge_id(road: &Road, section: usize, direction: Direction) -> String {
     } else {
         format!("{name}.{sense}")
     }
+}
+
+/// The name each road and junction is written under: its own, reduced by
+/// [`identifier`], and made unique where that reduction made two of them one.
+///
+/// Replacing the characters SUMO refuses loses information: `A;B`, `A B` and `A_B`
+/// are three roads to the IR and one name after [`identifier`], and the edges and
+/// nodes built from it would then share ids — which netconvert refuses, or which
+/// would silently merge two nodes into one. An edge id also adds to the name, so
+/// road `a` with two cross-sections and a road called `a.0` would both write
+/// `a.0.fwd`.
+///
+/// So the names are settled once, before anything is written, over the whole map:
+/// every road and junction whose reduced name — and, for a road, every edge id it
+/// will write — is not already someone else's keeps it, in the IR's order. Only the
+/// ones left over are changed, by appending `~1`, `~2` and so on until nothing they
+/// would write is taken; `~` is a character SUMO accepts in an id and [`identifier`]
+/// leaves alone, so it reads as a mark of the export rather than of the map. Every
+/// id that does not collide is exactly what [`identifier`] makes of its name, and
+/// the same map is always given the same names. [`crate::check`] lists the changes.
+///
+/// Node ids need no table of their own: a node is named `j_` and a junction's name,
+/// or `n_` and a road's name followed by `_start`, `_end` or `_s` and a number, so
+/// distinct names give distinct nodes.
+#[derive(Default)]
+struct Ids {
+    roads: HashMap<RoadId, String>,
+    junctions: HashMap<JunctionId, String>,
+    /// One sentence per name that was changed, for [`crate::check`].
+    renamed: Vec<String>,
+}
+
+impl Ids {
+    fn new(map: &ValidatedMap) -> Self {
+        let mut ids = Ids::default();
+
+        let roads = map
+            .roads
+            .iter()
+            .filter(|road| !road.is_connector())
+            .map(|road| {
+                let senses = edge_suffixes(map, road);
+                (road.id.clone(), road.id.local_name().to_owned(), senses)
+            });
+        let roads: Vec<_> = roads.collect();
+        let written = settle(
+            roads
+                .iter()
+                .map(|(id, name, senses)| (id.as_str(), name.as_str(), senses.as_slice())),
+            &mut ids.renamed,
+        );
+        ids.roads = roads.into_iter().map(|(id, ..)| id).zip(written).collect();
+
+        let junctions: Vec<_> = map
+            .junctions
+            .iter()
+            .map(|junction| (junction.id.clone(), junction.id.local_name().to_owned()))
+            .collect();
+        let written = settle(
+            junctions
+                .iter()
+                .map(|(id, name)| (id.as_str(), name.as_str(), &[][..])),
+            &mut ids.renamed,
+        );
+        ids.junctions = junctions
+            .into_iter()
+            .map(|(id, _)| id)
+            .zip(written)
+            .collect();
+        ids
+    }
+
+    /// The name a road's edges and nodes are built from.
+    fn road(&self, road: &RoadId) -> String {
+        self.roads
+            .get(road)
+            .cloned()
+            .unwrap_or_else(|| identifier(road.local_name()))
+    }
+
+    /// The name a junction's node is built from.
+    fn junction(&self, junction: &JunctionId) -> String {
+        self.junctions
+            .get(junction)
+            .cloned()
+            .unwrap_or_else(|| identifier(junction.local_name()))
+    }
+}
+
+/// What a road's edge ids add to its name, one per edge it will write: `.fwd`,
+/// `.bwd`, or `.<section>.fwd` and so on when it has several cross-sections. Only
+/// the directions that carry a lane SUMO has a place for are an edge.
+fn edge_suffixes(map: &ValidatedMap, road: &Road) -> Vec<String> {
+    let mut suffixes = Vec::new();
+    for section in 0..road.sections.len() {
+        let lanes = map.lanes_of_section(&road.id, section);
+        for direction in [Direction::Forward, Direction::Backward] {
+            let carries = lanes.iter().any(|lane| {
+                lane.direction == direction && classes::permission(lane.lane_type).is_some()
+            });
+            if carries {
+                // The name is left empty: this is the part of the id after it.
+                suffixes.push(edge_id("", road, section, direction));
+            }
+        }
+    }
+    suffixes
+}
+
+/// Gives each of a list of `(IR id, name, edge suffixes)` the name it is written
+/// under, in the same order: see [`Ids`].
+fn settle<'a>(
+    elements: impl Iterator<Item = (&'a str, &'a str, &'a [String])>,
+    renamed: &mut Vec<String>,
+) -> Vec<String> {
+    // Everything one element will write, each tagged with what kind of id it is so
+    // a name never clashes with an edge id it merely spells the same as.
+    let claims = |name: &str, suffixes: &[String]| -> Vec<(String, String)> {
+        std::iter::once((format!("name\0{name}"), name.to_owned()))
+            .chain(suffixes.iter().map(|suffix| {
+                let edge = format!("{name}{suffix}");
+                (format!("edge\0{edge}"), edge)
+            }))
+            .collect()
+    };
+    let mut owners: HashMap<String, &str> = HashMap::new();
+    let mut written: Vec<Option<String>> = Vec::new();
+    // The ones whose plain name was taken, and by whom, settled once every plain
+    // name is known.
+    struct Clash<'a> {
+        index: usize,
+        id: &'a str,
+        plain: String,
+        suffixes: &'a [String],
+        owner: &'a str,
+        what: String,
+    }
+    let mut left: Vec<Clash> = Vec::new();
+    for (index, (id, name, suffixes)) in elements.enumerate() {
+        let plain = identifier(name);
+        let wanted = claims(&plain, suffixes);
+        if let Some((owner, what)) = wanted
+            .iter()
+            .find_map(|(key, what)| owners.get(key).map(|owner| (*owner, what.clone())))
+        {
+            written.push(None);
+            left.push(Clash {
+                index,
+                id,
+                plain,
+                suffixes,
+                owner,
+                what,
+            });
+            continue;
+        }
+        for (key, _) in wanted {
+            owners.insert(key, id);
+        }
+        written.push(Some(plain));
+    }
+    for Clash {
+        index,
+        id,
+        plain,
+        suffixes,
+        owner,
+        what,
+    } in left
+    {
+        let (name, wanted) = (1..)
+            .map(|n| {
+                let name = format!("{plain}~{n}");
+                let wanted = claims(&name, suffixes);
+                (name, wanted)
+            })
+            .find(|(_, wanted)| wanted.iter().all(|(key, _)| !owners.contains_key(key)))
+            .expect("some suffix is free");
+        for (key, _) in wanted {
+            owners.insert(key, id);
+        }
+        renamed.push(format!(
+            "a SUMO id is unique, but {owner} and {id} would both be written as \
+             `{what}`, so {id} is written as `{name}` instead of `{plain}`"
+        ));
+        written[index] = Some(name);
+    }
+    written
+        .into_iter()
+        .map(|name| name.expect("every element is named"))
+        .collect()
 }
 
 /// A name reduced to something a SUMO identifier can hold.
@@ -1373,6 +1568,183 @@ mod tests {
         builder.finish().unwrap().validate().unwrap()
     }
 
+    /// A map whose names collide once SUMO's refused characters are replaced: a chain
+    /// of roads called `A;B`, `A_B`, `A B` and `A_B~1`, two junctions called `J;1` and
+    /// `J 1` with three arms each, and a road `c` with two cross-sections next to a
+    /// road `c.0`, whose edge ids would meet at `c.0.fwd`.
+    fn colliding() -> ValidatedMap {
+        let mut builder = MapBuilder::new(metadata("colliding"));
+        let mut previous: Option<RoadId> = None;
+        for (index, name) in ["A;B", "A_B", "A B", "A_B~1"].into_iter().enumerate() {
+            let x = index as f64 * 100.0;
+            let road = builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(x, 0.0, 0.0),
+                        Point3::new(x + 100.0, 0.0, 0.0),
+                        two_way(),
+                    )
+                    .unwrap()
+                    .with_name(name),
+                )
+                .unwrap();
+            if let Some(previous) = &previous {
+                builder.connect(previous, &road).unwrap();
+            }
+            previous = Some(road);
+        }
+
+        for (index, junction) in ["J;1", "J 1"].into_iter().enumerate() {
+            let centre = Point3::new(index as f64 * 300.0, 300.0, 0.0);
+            let arms: Vec<RoadId> = [(0.0, 1.0), (1.0, 0.0), (0.0, -1.0)]
+                .into_iter()
+                .enumerate()
+                .map(|(arm, (dx, dy))| {
+                    let at =
+                        |reach: f64| Point3::new(centre.x + dx * reach, centre.y + dy * reach, 0.0);
+                    builder
+                        .add_road(
+                            RoadSpec::line(at(100.0), at(14.0), two_way())
+                                .unwrap()
+                                .with_name(format!("t{index}{arm}")),
+                        )
+                        .unwrap()
+                })
+                .collect();
+            let junction = builder.add_junction(Some(junction));
+            for (index, from) in arms.iter().enumerate() {
+                for to in arms.iter().skip(index + 1) {
+                    builder
+                        .connect_ends(from, RoadEnd::End, to, RoadEnd::End, Some(&junction))
+                        .unwrap();
+                }
+            }
+        }
+
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut wider = two_way();
+        wider.push(LaneSpec::new(width, Direction::Forward));
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, -300.0, 0.0),
+                    Point3::new(100.0, -300.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_cross_section(50.0, wider)
+                .with_name("c"),
+            )
+            .unwrap();
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, -400.0, 0.0),
+                    Point3::new(100.0, -400.0, 0.0),
+                    two_way(),
+                )
+                .unwrap()
+                .with_name("c.0"),
+            )
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    fn traced(network: &PlainNetwork, element: IrRef) -> Vec<String> {
+        network
+            .trace
+            .links_of(&element)
+            .map(|link| link.local.clone())
+            .collect()
+    }
+
+    #[test]
+    fn names_that_reduce_to_one_are_told_apart() {
+        let map = colliding();
+        let network = to_plain_xml(&map).unwrap();
+        let edges = |road: &str| traced(&network, IrRef::Road(RoadId::new(road)));
+
+        // The first to claim a name keeps it, a road whose own name already ends in
+        // `~1` keeps that, and the rest are numbered past every name in use.
+        assert_eq!(edges("A;B"), ["edge:A_B.fwd", "edge:A_B.bwd"]);
+        assert_eq!(edges("A_B~1"), ["edge:A_B~1.fwd", "edge:A_B~1.bwd"]);
+        assert_eq!(edges("A_B"), ["edge:A_B~2.fwd", "edge:A_B~2.bwd"]);
+        assert_eq!(edges("A B"), ["edge:A_B~3.fwd", "edge:A_B~3.bwd"]);
+        // An edge id is a name and more, and a collision there counts too.
+        assert_eq!(
+            edges("c"),
+            [
+                "edge:c.0.fwd",
+                "edge:c.0.bwd",
+                "edge:c.1.fwd",
+                "edge:c.1.bwd"
+            ]
+        );
+        assert_eq!(edges("c.0"), ["edge:c.0~1.fwd", "edge:c.0~1.bwd"]);
+        // A name that collides with nothing is exactly what it was.
+        assert_eq!(edges("t00"), ["edge:t00.fwd", "edge:t00.bwd"]);
+
+        let node = |junction: &str| traced(&network, IrRef::Junction(JunctionId::new(junction)));
+        assert_eq!(node("J;1"), ["node:j_J_1"]);
+        assert_eq!(node("J 1"), ["node:j_J_1~1"]);
+
+        // Every edge and every node written is its own.
+        let written: Vec<&str> = network
+            .trace
+            .links
+            .iter()
+            .filter(|link| matches!(link.ir, IrRef::Road(_)))
+            .map(|link| link.local.as_str())
+            .collect();
+        let distinct: BTreeSet<&str> = written.iter().copied().collect();
+        assert_eq!(distinct.len(), written.len(), "{written:?}");
+        let nodes: Vec<&str> = network
+            .nodes
+            .split("<node id=\"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap())
+            .collect();
+        let distinct: BTreeSet<&str> = nodes.iter().copied().collect();
+        assert_eq!(distinct.len(), nodes.len(), "{nodes:?}");
+        // The chain's ends and joints are five nodes, none merged into another.
+        for id in [
+            "n_A_B_start",
+            "n_A_B_end",
+            "n_A_B~2_end",
+            "n_A_B~1_start",
+            "n_A_B~1_end",
+        ] {
+            assert!(distinct.contains(id), "{id} missing from {distinct:?}");
+        }
+
+        // The same map is always given the same names.
+        for _ in 0..3 {
+            assert_eq!(to_plain_xml(&map).unwrap(), network);
+        }
+    }
+
+    #[test]
+    fn check_names_every_id_it_changed() {
+        let problems = check(&colliding());
+        let renamed: Vec<&String> = problems
+            .iter()
+            .filter(|problem| problem.starts_with("a SUMO id is unique"))
+            .collect();
+        assert_eq!(renamed.len(), 4, "{renamed:#?}");
+        assert!(renamed.iter().any(|problem| problem.contains("road/A;B")
+            && problem.contains("road/A_B would")
+            && problem.contains("`A_B~2`")));
+        assert!(renamed
+            .iter()
+            .any(|problem| problem.contains("`c.0.fwd`") && problem.contains("`c.0~1`")));
+        assert!(renamed
+            .iter()
+            .any(|problem| problem.contains("junction/J 1") && problem.contains("`J_1~1`")));
+        assert!(check(&in_line())
+            .iter()
+            .all(|problem| !problem.starts_with("a SUMO id is unique")));
+    }
+
     /// Every `<kind>:<local>` the rendered files actually contain, read back from the
     /// XML rather than from the exporter's state.
     fn written(network: &PlainNetwork) -> BTreeSet<String> {
@@ -1426,7 +1798,7 @@ mod tests {
 
     #[test]
     fn everything_the_trace_names_is_in_the_files() {
-        for map in [crossroads(), in_line()] {
+        for map in [crossroads(), in_line(), colliding()] {
             let network = to_plain_xml(&map).unwrap();
             let written = written(&network);
             assert_eq!(network.trace.format, "sumo");
@@ -1454,7 +1826,7 @@ mod tests {
 
     #[test]
     fn every_written_lane_has_one_exact_link_matching_its_id() {
-        for map in [crossroads(), in_line()] {
+        for map in [crossroads(), in_line(), colliding()] {
             let network = to_plain_xml(&map).unwrap();
             assert!(!network.lanes.is_empty());
             for (lane, id) in &network.lanes {
