@@ -185,7 +185,7 @@ SUMO なら `{"ir": "road/north", "ref": "edge:north.fwd", "rel": "part"}` の�
 | --- | --- | --- |
 | opendrive | `road` `junction` `lane` `signal` `object` `building` `connection` `controller` | `lane:<road>/<section index>/<lane no>`、`connection:<junction>/<connection id>` |
 | lanelet2 | `lanelet` `linestring` `point` `regulatory_element` | 整数 |
-| sumo | `edge` `lane` `node` `connection` `tls` | SUMO の ID 文字列、connection は `<fromLane>><toLane>` |
+| sumo | `edge` `lane` `node` `connection` `tls` | SUMO の ID 文字列、connection は `<fromLane>><toLane>`、tls は `<tlLogic id>`、そのスロットは `<tlLogic id>/<linkIndex>`（§8.2） |
 | osm | `node` `way` `relation` | 負の整数 |
 | carla | `mesh` `actor` + `.xodr` 分は opendrive を参照 | 名前 |
 | clipgt | レイヤ名 (`lane` `lane_line` `wait_line` …) | 行番号 |
@@ -350,7 +350,7 @@ furniture manifest（IR object ↔ xodr signal ↔ actor 名）で追える。
 | OpenDRIVE | road / section 内 lane / junction / connection / signal / object / building / controller | `Numbering` を流用。純関数 |
 | Lanelet2 | lanelet / linestring / regulatory_element | 連番。exporter の private 表を返すだけ |
 | OSM | node / way / relation | 信号等はノードに統合（`merged`）、restriction は腕のペア単位で複数 connection に対応 |
-| SUMO | node / edge / lane / connection | plain XML の ID を記録。netconvert が作る内部 lane（`:j_x_0_0`）は、`.net.xml` の `<connection from to fromLane toLane via>` を読んで connection 経由で解決する（§8.1） |
+| SUMO | node / edge / lane / connection / tls | plain XML の ID を記録。信号は `tls:<id>` とスロット `tls:<id>/<linkIndex>`（§8.2）。netconvert が作る内部 lane（`:j_x_0_0`）は、`.net.xml` の `<connection from to fromLane toLane via>` を読んで connection 経由で解決する（§8.1） |
 | ClipGT | `<layer>:<row>` | 行番号が唯一の ID。走行不可 lane は出力されない（リンク無し）、lane_line は重複排除で `merged` |
 | GPUDrive | `road:<index>` / `agent:<id>` | 行番号。edge/line は重複排除で `merged`。agent は走行ルートの lane 列に `part` で対応 |
 | CARLA（xodr・furniture のみ） | opendrive の ref + actor 名 | FBX メッシュは対象外 |
@@ -397,6 +397,40 @@ IR に対応物が無いので、リンクなしとして扱う。
 解決の手順: `via` の接続の `from`+`fromLane` と `to`+`toLane` を SUMO のトレースで
 IR lane に戻し、IR 上で「進入 lane → connector lane → 退出 lane」となる connector lane を
 探す。候補はどのケースでも 1 本に決まった。
+
+### 8.2 SUMO の信号
+
+netconvert に信号のプログラムを作らせると、フェーズも connection の linkIndex の振り方も
+netconvert のものになり、バージョンやジャンクションの形状の読み方で変わる。これでは
+IR の信号機がどのプログラムのどのスロットを制御するかをトレースに書けない。
+
+そこでエクスポータがプログラムを自分で決めて書く（`roadgen_sumo::signals`）:
+
+- 信号付きノードには IR の junction から決まる名前を付ける（ノード id と同じ。`<node tl="j_x">`）
+- `<prefix>.tll.xml` に `<tlLogic id="j_x" programID="0" type="static" offset="0">` のフェーズと、
+  ノードに入る全 connection の `<connection ... tl="j_x" linkIndex="n"/>` を書き、`.netccfg` の
+  `tllogic-files` で読ませる。plain の `.con.xml` のスキーマは `tl` / `linkIndex` を許さないので、
+  これらは `.tll.xml` 側に置く（SUMO 1.26 で確認）
+- フェーズは Autoware `lanelet2_to_sumo` の静的ヒューリスティック（進入方向の軸 mod 180° で 35° 以内を
+  同じグループ、グループごとに青 35 s（3 グループ以上なら 25 s）・黄 3 s・全赤 2 s、対向を横切る
+  右左折と、同じ出口 lane に入る他の動きがある動きは `g`）。対向を横切るかは netconvert の `dir`
+  ではなく、lane の幾何と `metadata.handedness` から判定する
+
+トレースは次のとおり:
+
+| IR | ref | rel | role |
+| --- | --- | --- | --- |
+| 信号機（object） | `tls:<id>` | merged | `traffic_light` |
+| 信号機（object） | `tls:<id>/<linkIndex>`（その信号機が制御する lane から出る各 connection） | merged | `link` |
+| `TrafficLight` ルール | `tls:<id>` | merged | `traffic_light` |
+
+スロットがどの connection かは、`.tll.xml` の `<connection>`（または `.net.xml` の
+`<connection tl linkIndex>`）で引く。`TraceIndex::load_sumo_net` は、トレースの `tls:` がすべて
+`.net.xml` にあること、および `.tll.xml` に書いた各 connection の `tl` / `linkIndex` が `.net.xml`
+と一致することを検査し、一致しないネットワーク（例えば netconvert が自分でプログラムを作ったもの）は拒否する。
+
+制御する connection が 1 本も無い信号付きノードはプログラムを書かず、従来どおり信号機を
+`node:<id>` に `merged` で対応させる。
 
 | フェーズ | 内容 |
 | --- | --- |

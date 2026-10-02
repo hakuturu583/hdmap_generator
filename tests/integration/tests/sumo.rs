@@ -310,7 +310,7 @@ fn only_the_movements_the_map_permits_are_written() {
 }
 
 /// A traffic light in the IR has no timing, so what it can say is *which* junction is
-/// signalised. netconvert generates the phases from that.
+/// signalised. The program the export writes for it is checked in `sumo_tls.rs`.
 #[test]
 fn a_traffic_light_makes_its_junction_a_signalised_node() {
     if !sumo_build::sumo_available() {
@@ -523,7 +523,7 @@ fn what_the_format_cannot_carry_is_reported() {
 
     let crossroads = roadgen_sumo::check(&scenarios::controlled_crossroads()).join("\n");
     assert!(
-        crossroads.contains("netconvert generates the phases"),
+        crossroads.contains("fixed-time program of the export's own"),
         "{crossroads}"
     );
     assert!(crossroads.contains("crosswalk"), "{crossroads}");

@@ -1106,9 +1106,12 @@ impl PyMap {
     /// job, it carries the shape of every junction and the right-of-way matrix, and
     /// producing one without netconvert would mean reimplementing it.
     ///
+    /// A signalised junction gets a fixed-time program of the export's own, written to
+    /// `<prefix>.tll.xml` with the link index of every movement it controls.
+    ///
     /// Also writes `<prefix>.sumo.trace.json` in `directory` — the edge, lane, node and
-    /// connection each road, lane, junction and movement became — unless `trace` is
-    /// false. The internal lanes netconvert draws across a junction are not in it,
+    /// connection each road, lane, junction and movement became, and the program and
+    /// link indices each traffic light did — unless `trace` is false. The internal lanes netconvert draws across a junction are not in it,
     /// since netconvert names them; `Trace.add_sumo_net` reads them from the built
     /// network.
     #[pyo3(signature = (directory, trace = true))]

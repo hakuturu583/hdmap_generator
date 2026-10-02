@@ -15,7 +15,8 @@
 //! | `<name>.nod.xml` | junctions and road ends, as points |
 //! | `<name>.edg.xml` | one edge per direction of travel, with its lanes |
 //! | `<name>.con.xml` | which lane may be left for which lane |
-//! | `<name>.netccfg` | the netconvert run that turns the three into a `.net.xml` |
+//! | `<name>.tll.xml` | the program of each signalised junction, when there is one |
+//! | `<name>.netccfg` | the netconvert run that turns the rest into a `.net.xml` |
 //!
 //! ```text
 //! netconvert -c <name>.netccfg
@@ -53,6 +54,18 @@
 //! This is why the arms are left exactly where the IR puts them, short of the
 //! junction: the gap is the junction, and netconvert fills it.
 //!
+//! # Traffic lights
+//!
+//! A junction a light governs an approach to is a `traffic_light` node, and its
+//! traffic light is named after it — the node `j_x` is controlled by the light `j_x`,
+//! written as the node's `tl` — so that the name does not depend on how netconvert
+//! would have chosen one. The IR holds no timing, so the program is a fixed-time one
+//! decided here (see [`signals`]) and written to `<name>.tll.xml`: the phases as a
+//! `<tlLogic>`, and beside them every connection into the node again, with that
+//! light's `tl` and the `linkIndex` it is given. netconvert then has nothing to
+//! generate, and the position of each movement in each state string is the export's,
+//! which is what lets the trace say which slot a light of the map controls.
+//!
 //! # The trace
 //!
 //! [`PlainNetwork::trace`] records where each element of the IR went, naming the
@@ -61,11 +74,19 @@
 //! | written element | IR element | relation |
 //! | --- | --- | --- |
 //! | `node:<id>` | a junction | exact |
-//! | `node:<id>` | a traffic light, role `traffic_light` | merged |
+//! | `tls:<id>` | a traffic light, or a traffic-light rule, role `traffic_light` | merged |
+//! | `tls:<id>/<link index>` | a traffic light, for each controlled connection leaving a lane it governs, role `link` | merged |
 //! | `edge:<id>` | a road — one edge per direction and cross-section | part |
 //! | `lane:<edge>_<index>` | a lane | exact |
 //! | `connection:<from edge>_<from lane>><to edge>_<to lane>` | a lane connection | exact, or merged |
 //! | the same connection | a connector lane it runs over | collapsed |
+//!
+//! A light's program is named by its SUMO id, the `id` of its `<tlLogic>`, and each
+//! slot in it by that id and the `linkIndex` of the connection the slot controls — the
+//! position of that connection's signal in every `state` of the program. A light
+//! governs the lanes it stands on and the lanes any rule naming it lists, and so the
+//! slots of every movement off those lanes; the connection itself is the one written
+//! with that `tl` and `linkIndex` in `<name>.tll.xml`.
 //!
 //! A connection is named by its two lanes as the built network names them, so the
 //! `.net.xml` `<connection from fromLane to toLane via>` that netconvert writes for it
@@ -76,6 +97,7 @@
 
 pub mod classes;
 pub mod error;
+pub mod signals;
 mod xml;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -94,19 +116,22 @@ pub use error::ExportError;
 /// The name a map with none of its own is written under.
 const DEFAULT_NAME: &str = "network";
 
-/// A SUMO plain-XML network: the three input files, and the netconvert run that
-/// turns them into a `.net.xml`.
+/// A SUMO plain-XML network: the input files, and the netconvert run that turns
+/// them into a `.net.xml`.
 ///
 /// The file names are derived from [`PlainNetwork::prefix`], and the configuration
-/// refers to them, so the four belong together in one directory.
+/// refers to them, so they belong together in one directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainNetwork {
-    /// What the files are named before their `.nod.xml`, `.edg.xml`, `.con.xml` and
-    /// `.netccfg` suffixes.
+    /// What the files are named before their `.nod.xml`, `.edg.xml`, `.con.xml`,
+    /// `.tll.xml` and `.netccfg` suffixes.
     pub prefix: String,
     pub nodes: String,
     pub edges: String,
     pub connections: String,
+    /// The program of every signalised junction, as a `.tll.xml`; `None` for a map
+    /// with no traffic light, which is written without one.
+    pub traffic_lights: Option<String>,
     pub config: String,
     /// Where each lane of the IR ended up, as the `<edge>_<index>` identifier the
     /// built network gives it.
@@ -115,9 +140,9 @@ pub struct PlainNetwork {
     /// lane of the map to the lane of the network — and the numbering is not the
     /// IR's: SUMO counts from the right of the direction of travel.
     pub lanes: BTreeMap<LaneId, String>,
-    /// Where each element of the IR ended up in the four files: nodes, edges, lanes
-    /// and connections, by the identifiers written for them. See the crate
-    /// documentation for how each is named.
+    /// Where each element of the IR ended up in the files: nodes, edges, lanes,
+    /// connections and traffic lights, by the identifiers written for them. See the
+    /// crate documentation for how each is named.
     ///
     /// Its `files` are empty: the network is in memory until [`write_traced`] puts it
     /// somewhere.
@@ -127,18 +152,22 @@ pub struct PlainNetwork {
 impl PlainNetwork {
     /// Each file's name and its contents, in the order netconvert reads them.
     pub fn files(&self) -> Vec<(String, &str)> {
-        vec![
+        let mut files = vec![
             (format!("{}.nod.xml", self.prefix), self.nodes.as_str()),
             (format!("{}.edg.xml", self.prefix), self.edges.as_str()),
             (
                 format!("{}.con.xml", self.prefix),
                 self.connections.as_str(),
             ),
-            (format!("{}.netccfg", self.prefix), self.config.as_str()),
-        ]
+        ];
+        if let Some(traffic_lights) = &self.traffic_lights {
+            files.push((format!("{}.tll.xml", self.prefix), traffic_lights.as_str()));
+        }
+        files.push((format!("{}.netccfg", self.prefix), self.config.as_str()));
+        files
     }
 
-    /// Writes the four files into `directory`, creating it if it is not there.
+    /// Writes the files into `directory`, creating it if it is not there.
     pub fn write_to(&self, directory: impl AsRef<Path>) -> Result<(), ExportError> {
         let directory = directory.as_ref();
         std::fs::create_dir_all(directory)
@@ -176,7 +205,7 @@ pub fn write(map: &ValidatedMap, directory: impl AsRef<Path>) -> Result<String, 
 }
 
 /// Writes `map` into `directory` as [`write`] does, and hands back the trace of what
-/// was written alongside the prefix, with the four files' paths in it.
+/// was written alongside the prefix, with the files' paths in it.
 pub fn write_traced(
     map: &ValidatedMap,
     directory: impl AsRef<Path>,
@@ -269,15 +298,22 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         ));
     }
 
-    let signals = map
+    let lights = map
         .objects
         .iter()
         .filter(|object| object.kind.is_traffic_light())
         .count();
-    if signals > 0 {
+    if lights > 0 {
         problems.push(format!(
-            "the IR holds no signal timing, so the {signals} traffic lights make their \
-             junctions `traffic_light` nodes and netconvert generates the phases"
+            "the IR holds no signal timing, so the junctions of the {lights} traffic \
+             lights get a fixed-time program of the export's own: opposing approaches \
+             green together for {few} s ({many} s where a junction has more than two \
+             groups of them), then {yellow} s yellow and {red} s all-red, with turns \
+             across oncoming traffic permissive",
+            few = signals::GREEN_FEW_SECONDS,
+            many = signals::GREEN_MANY_SECONDS,
+            yellow = signals::YELLOW_SECONDS,
+            red = signals::ALL_RED_SECONDS,
         ));
     }
 
@@ -348,7 +384,8 @@ enum NodeKind {
     Unstated,
     /// Nothing continues past this point.
     DeadEnd,
-    /// A signalised junction, whose phases netconvert generates.
+    /// A signalised junction, whose program is written alongside it (see
+    /// [`Signal`]).
     TrafficLight,
 }
 
@@ -400,6 +437,17 @@ struct Slot {
     index: usize,
 }
 
+/// The traffic light of one signalised node, and its program.
+struct Signal {
+    /// What the light is called in SUMO, which is the node's own id: a name that
+    /// follows from the IR junction rather than from netconvert's choice of one.
+    id: String,
+    /// The connections it controls, by their key in [`Exporter::movements`], in
+    /// link-index order: the n-th is the n-th signal of every state.
+    links: Vec<(usize, usize, usize, usize)>,
+    phases: Vec<signals::Phase>,
+}
+
 /// The IR behind one written connection: the lane connections it was followed along,
 /// and the connector lanes it crossed a junction on.
 #[derive(Default)]
@@ -419,9 +467,16 @@ struct Exporter<'a> {
     /// twice.
     movements: BTreeMap<(usize, usize, usize, usize), Movement>,
     slots: HashMap<LaneId, Slot>,
-    /// Junctions a traffic light controls an approach to.
     /// The signalised junctions, each with the lights that govern it.
     signalised: BTreeMap<JunctionId, BTreeSet<ObjectId>>,
+    /// The lanes each light governs: the ones it stands on, and the ones any
+    /// traffic-light rule naming it lists.
+    governed: BTreeMap<ObjectId, BTreeSet<LaneId>>,
+    /// The traffic-light rules, by their index among the map's rules, each with the
+    /// junctions its lanes run into.
+    light_rules: BTreeMap<usize, BTreeSet<JunctionId>>,
+    /// The light of each signalised node with something to control, by node id.
+    signals: BTreeMap<String, Signal>,
     /// Lanes that keep right of way where another yields to them, and the lanes that
     /// yield. Held as lanes, not roads: a rule about one carriageway's approach must
     /// not move the opposing carriageway's priority with it.
@@ -441,6 +496,9 @@ impl<'a> Exporter<'a> {
             movements: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: BTreeMap::new(),
+            governed: BTreeMap::new(),
+            light_rules: BTreeMap::new(),
+            signals: BTreeMap::new(),
             right_of_way: HashSet::new(),
             yielding: HashSet::new(),
             ruled: HashSet::new(),
@@ -457,11 +515,22 @@ impl<'a> Exporter<'a> {
                 continue;
             }
             for lane in &object.lanes {
+                self.govern(&object.id, lane);
+            }
+        }
+        // A rule says which lanes its lights govern in so many words, and they need
+        // not be the lanes the lights stand on: a light on a gantry over one lane can
+        // govern the whole approach.
+        for (index, rule) in self.map.rules.iter().enumerate() {
+            let TrafficRule::TrafficLight { lights, lanes, .. } = rule else {
+                continue;
+            };
+            for lane in lanes {
+                for light in lights {
+                    self.govern(light, lane);
+                }
                 if let Some(junction) = self.junction_ahead_of(lane) {
-                    self.signalised
-                        .entry(junction)
-                        .or_default()
-                        .insert(object.id.clone());
+                    self.light_rules.entry(index).or_default().insert(junction);
                 }
             }
         }
@@ -482,6 +551,21 @@ impl<'a> Exporter<'a> {
             }
             self.right_of_way.extend(right_of_way.iter().cloned());
             self.yielding.extend(yielding.iter().cloned());
+        }
+    }
+
+    /// Records that `light` governs `lane`, and so signalises the junction it runs
+    /// into.
+    fn govern(&mut self, light: &ObjectId, lane: &LaneId) {
+        self.governed
+            .entry(light.clone())
+            .or_default()
+            .insert(lane.clone());
+        if let Some(junction) = self.junction_ahead_of(lane) {
+            self.signalised
+                .entry(junction)
+                .or_default()
+                .insert(light.clone());
         }
     }
 
@@ -519,6 +603,7 @@ impl<'a> Exporter<'a> {
             }
         }
         self.build_connections();
+        self.build_signals();
         Ok(())
     }
 
@@ -928,6 +1013,80 @@ impl<'a> Exporter<'a> {
     }
 
     // ----------------------------------------------------------------------- //
+    // Traffic lights
+    // ----------------------------------------------------------------------- //
+
+    /// The light and the program of every signalised node.
+    ///
+    /// A light controls *every* connection into its node, not only those off the
+    /// approaches a light of the map stands on: SUMO's traffic light is a property of
+    /// the junction, and a junction where one approach is signalled and the others
+    /// merely give way is not a thing it models. Which approaches the map's lights do
+    /// govern is what the trace records.
+    ///
+    /// The links are numbered in the order the connections are written, which is
+    /// fixed, and the program is decided from the geometry the export wrote: each
+    /// approach's heading where its edge meets the node, and each movement's swing
+    /// from the end of the lane it leaves to the start of the lane it joins. See
+    /// [`signals`] for what is made of them.
+    fn build_signals(&mut self) {
+        let handedness = self.map.metadata.handedness;
+        for (id, node) in &self.nodes {
+            if node.kind != NodeKind::TrafficLight {
+                continue;
+            }
+            let keys: Vec<(usize, usize, usize, usize)> = self
+                .movements
+                .keys()
+                .filter(|(from, ..)| self.edges[*from].to == *id)
+                .copied()
+                .collect();
+            if keys.is_empty() {
+                // Nothing to control, so nothing to program: the node stays a
+                // `traffic_light`, and what netconvert makes of it is its own.
+                continue;
+            }
+            let links: Vec<signals::Link> = keys
+                .iter()
+                .map(|&(from_edge, from_lane, to_edge, to_lane)| {
+                    let leaving = &self.edges[from_edge].lanes[from_lane].shape;
+                    let joining = &self.edges[to_edge].lanes[to_lane].shape;
+                    signals::Link {
+                        approach: from_edge,
+                        heading: final_heading(&self.edges[from_edge].shape),
+                        turn: signals::swing(final_heading(leaving), initial_heading(joining)),
+                        target: (to_edge, to_lane),
+                    }
+                })
+                .collect();
+            let phases = signals::program(&links, handedness);
+            self.signals.insert(
+                id.clone(),
+                Signal {
+                    id: id.clone(),
+                    links: keys,
+                    phases,
+                },
+            );
+        }
+    }
+
+    /// The light controlling each written connection that one does, and the link
+    /// index it has there.
+    fn link_indices(&self) -> HashMap<(usize, usize, usize, usize), (&str, usize)> {
+        self.signals
+            .values()
+            .flat_map(|signal| {
+                signal
+                    .links
+                    .iter()
+                    .enumerate()
+                    .map(|(index, key)| (*key, (signal.id.as_str(), index)))
+            })
+            .collect()
+    }
+
+    // ----------------------------------------------------------------------- //
     // Rendering
     // ----------------------------------------------------------------------- //
 
@@ -936,7 +1095,8 @@ impl<'a> Exporter<'a> {
             nodes: self.render_nodes(),
             edges: self.render_edges(),
             connections: self.render_connections(),
-            config: render_config(&prefix),
+            traffic_lights: self.render_traffic_lights(),
+            config: render_config(&prefix, !self.signals.is_empty()),
             trace: self.trace(),
             lanes: self
                 .slots
@@ -964,16 +1124,54 @@ impl<'a> Exporter<'a> {
                 junction_nodes.insert(junction, id);
             }
         }
-        // A light is part of the signal of the node it made one, as `read_rules`
-        // decided when it chose which nodes are signalised.
+        // A light is part of the traffic light of the node it made one, as
+        // `read_rules` decided when it chose which nodes are signalised — or, at a
+        // node with nothing to control and so no program, part of the node.
+        let link_indices = self.link_indices();
         for (junction, lights) in &self.signalised {
             let Some(node) = junction_nodes.get(junction) else {
                 continue;
             };
+            let signal = self.signals.get(*node);
             for light in lights {
+                let local = match signal {
+                    Some(signal) => format!("tls:{}", signal.id),
+                    None => format!("node:{node}"),
+                };
+                trace.link_as(light.clone(), local, Relation::Merged, "traffic_light");
+                // And of the slot of every movement off a lane it governs. A light on
+                // a connector governs the movements that run over it.
+                let Some(signal) = signal else { continue };
+                let governed = self.governed.get(light);
+                let governs = |lane: &LaneId| governed.is_some_and(|lanes| lanes.contains(lane));
+                for key in &signal.links {
+                    let from = &self.edges[key.0].lanes[key.1].lane;
+                    let movement = &self.movements[key];
+                    if governs(from) || movement.connectors.iter().any(governs) {
+                        let (id, index) = link_indices[key];
+                        trace.link_as(
+                            light.clone(),
+                            format!("tls:{id}/{index}"),
+                            Relation::Merged,
+                            "link",
+                        );
+                    }
+                }
+            }
+        }
+        // A traffic-light rule is carried by the program of each junction its lanes
+        // run into, alongside the lights it names.
+        for (index, junctions) in &self.light_rules {
+            for junction in junctions {
+                let Some(signal) = junction_nodes
+                    .get(junction)
+                    .and_then(|node| self.signals.get(*node))
+                else {
+                    continue;
+                };
                 trace.link_as(
-                    light.clone(),
-                    format!("node:{node}"),
+                    IrRef::Rule(*index),
+                    format!("tls:{}", signal.id),
                     Relation::Merged,
                     "traffic_light",
                 );
@@ -1062,6 +1260,10 @@ impl<'a> Exporter<'a> {
                 // than netconvert's reading of the geometry.
                 attributes.push(("rightOfWay", "edgePriority".to_owned()));
             }
+            if let Some(signal) = self.signals.get(id) {
+                // Named, so that netconvert does not name it.
+                attributes.push(("tl", signal.id.clone()));
+            }
             document.leaf("node", &attributes);
         }
         document.finish()
@@ -1109,18 +1311,72 @@ impl<'a> Exporter<'a> {
     fn render_connections(&self) -> String {
         let mut document =
             xml::Document::new("connections", "http://sumo.dlr.de/xsd/connections_file.xsd");
-        for (from_edge, from_lane, to_edge, to_lane) in self.movements.keys() {
-            document.leaf(
-                "connection",
-                &[
-                    ("from", self.edges[*from_edge].id.clone()),
-                    ("to", self.edges[*to_edge].id.clone()),
-                    ("fromLane", from_lane.to_string()),
-                    ("toLane", to_lane.to_string()),
-                ],
-            );
+        for key in self.movements.keys() {
+            document.leaf("connection", &self.connection_attributes(key));
         }
         document.finish()
+    }
+
+    /// The four attributes that name a written connection.
+    fn connection_attributes(
+        &self,
+        &(from_edge, from_lane, to_edge, to_lane): &(usize, usize, usize, usize),
+    ) -> Vec<(&'static str, String)> {
+        vec![
+            ("from", self.edges[from_edge].id.clone()),
+            ("to", self.edges[to_edge].id.clone()),
+            ("fromLane", from_lane.to_string()),
+            ("toLane", to_lane.to_string()),
+        ]
+    }
+
+    /// The `.tll.xml`: one static program per signalised node, and the link index
+    /// of every connection it controls — or nothing at all for a map with no traffic
+    /// light.
+    ///
+    /// The link indices go here rather than on the connections of the `.con.xml`,
+    /// because that is where SUMO's schema has them: a connection file says which
+    /// movements exist, and a traffic-light file says which signal each obeys. A
+    /// connection named here is matched to the one the `.con.xml` declared by its
+    /// two lanes. Stating the index rather than leaving netconvert to number the
+    /// links is what makes the program's state strings mean what the export says they
+    /// mean.
+    fn render_traffic_lights(&self) -> Option<String> {
+        if self.signals.is_empty() {
+            return None;
+        }
+        let mut document =
+            xml::Document::new("tlLogics", "http://sumo.dlr.de/xsd/tllogic_file.xsd");
+        for signal in self.signals.values() {
+            document.open(
+                "tlLogic",
+                &[
+                    ("id", signal.id.clone()),
+                    ("type", "static".to_owned()),
+                    ("programID", signals::PROGRAM_ID.to_owned()),
+                    ("offset", "0".to_owned()),
+                ],
+            );
+            for phase in &signal.phases {
+                document.leaf(
+                    "phase",
+                    &[
+                        ("duration", phase.duration.to_string()),
+                        ("state", phase.state.clone()),
+                    ],
+                );
+            }
+            document.close("tlLogic");
+        }
+        for signal in self.signals.values() {
+            for (index, key) in signal.links.iter().enumerate() {
+                let mut attributes = self.connection_attributes(key);
+                attributes.push(("tl", signal.id.clone()));
+                attributes.push(("linkIndex", index.to_string()));
+                document.leaf("connection", &attributes);
+            }
+        }
+        Some(document.finish())
     }
 }
 
@@ -1136,7 +1392,10 @@ impl<'a> Exporter<'a> {
 /// turn back where, in the OpenDRIVE and the Lanelet2 map written from the same IR,
 /// the lane simply ends; and the internal lane it draws for one would be the only
 /// lane in the network the trace could not follow back to the map.
-fn render_config(prefix: &str) -> String {
+///
+/// The traffic-light file is named only when there is one, which is when the map has
+/// a signalised junction with something to control.
+fn render_config(prefix: &str, traffic_lights: bool) -> String {
     let mut document = xml::Document::new(
         "configuration",
         "http://sumo.dlr.de/xsd/netconvertConfiguration.xsd",
@@ -1148,6 +1407,9 @@ fn render_config(prefix: &str) -> String {
         "connection-files",
         &[("value", format!("{prefix}.con.xml"))],
     );
+    if traffic_lights {
+        document.leaf("tllogic-files", &[("value", format!("{prefix}.tll.xml"))]);
+    }
     document.close("input");
     document.open("output", &[]);
     document.leaf("output-file", &[("value", format!("{prefix}.net.xml"))]);
@@ -1157,6 +1419,23 @@ fn render_config(prefix: &str) -> String {
     document.leaf("no-turnarounds", &[("value", "true".into())]);
     document.close("processing");
     document.finish()
+}
+
+/// The heading a line leaves by: the direction of its last segment, radians
+/// anticlockwise from +x, in the horizontal plane.
+fn final_heading(line: &Polyline3) -> f64 {
+    match line.points() {
+        [.., a, b] => (b.y - a.y).atan2(b.x - a.x),
+        _ => 0.0,
+    }
+}
+
+/// The heading a line sets off on: the direction of its first segment.
+fn initial_heading(line: &Polyline3) -> f64 {
+    match line.points() {
+        [a, b, ..] => (b.y - a.y).atan2(b.x - a.x),
+        _ => 0.0,
+    }
 }
 
 /// What an edge is called: the road, the cross-section when there is more than one,
@@ -1259,7 +1538,15 @@ mod tests {
     /// Four arms meeting at one junction, every pair of them connected, with a light
     /// on the northern approach.
     fn crossroads() -> ValidatedMap {
-        let mut builder = MapBuilder::new(metadata("crossroads"));
+        crossroads_driving(TrafficHandedness::RightHand)
+    }
+
+    /// The same crossroads, on whichever side of the road traffic keeps to.
+    fn crossroads_driving(handedness: TrafficHandedness) -> ValidatedMap {
+        let mut builder = MapBuilder::new(MapMetadata {
+            handedness,
+            ..metadata("crossroads")
+        });
         let arms = [
             (
                 "north",
@@ -1380,6 +1667,14 @@ mod tests {
                             attributes["to"],
                             attributes["toLane"]
                         ));
+                        if let (Some(tl), Some(index)) =
+                            (attributes.get("tl"), attributes.get("linkIndex"))
+                        {
+                            found.insert(format!("tls:{tl}/{index}"));
+                        }
+                    }
+                    b"tlLogic" => {
+                        found.insert(format!("tls:{}", attributes["id"]));
                     }
                     _ => {}
                 }
@@ -1450,11 +1745,13 @@ mod tests {
             .iter()
             .find(|object| object.kind.is_traffic_light())
             .unwrap();
-        let signal: Vec<_> = trace.links_of(&IrRef::Object(light.id.clone())).collect();
+        let signal: Vec<_> = trace
+            .links_of(&IrRef::Object(light.id.clone()))
+            .filter(|link| link.role.as_deref() == Some("traffic_light"))
+            .collect();
         assert_eq!(signal.len(), 1);
-        assert_eq!(signal[0].local, "node:j_x");
+        assert_eq!(signal[0].local, "tls:j_x");
         assert_eq!(signal[0].relation, Relation::Merged);
-        assert_eq!(signal[0].role.as_deref(), Some("traffic_light"));
 
         // A two-way arm is two edges.
         let north = map
@@ -1515,6 +1812,243 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(to_plain_xml(&map).unwrap().trace, first.trace);
         }
+    }
+
+    // ----------------------------------------------------------------------- //
+    // Traffic lights
+    // ----------------------------------------------------------------------- //
+
+    /// The attributes of every `element` in `xml`, in document order.
+    fn elements(xml: &str, element: &str) -> Vec<HashMap<String, String>> {
+        let mut reader = quick_xml::Reader::from_str(xml);
+        let mut found = Vec::new();
+        loop {
+            match reader.read_event().unwrap() {
+                Event::Eof => break,
+                Event::Start(tag) | Event::Empty(tag)
+                    if tag.name().as_ref() == element.as_bytes() =>
+                {
+                    found.push(
+                        tag.attributes()
+                            .map(|attribute| {
+                                let attribute = attribute.unwrap();
+                                (
+                                    String::from_utf8_lossy(attribute.key.as_ref()).into_owned(),
+                                    String::from_utf8_lossy(&attribute.value).into_owned(),
+                                )
+                            })
+                            .collect(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_signalised_node_names_its_light_after_itself() {
+        let network = to_plain_xml(&crossroads()).unwrap();
+        let nodes = elements(&network.nodes, "node");
+        let junction = nodes.iter().find(|node| node["id"] == "j_x").unwrap();
+        assert_eq!(junction["type"], "traffic_light");
+        assert_eq!(junction["tl"], "j_x");
+        // And no other node has a light.
+        assert_eq!(
+            nodes.iter().filter(|node| node.contains_key("tl")).count(),
+            1
+        );
+    }
+
+    /// The state of the movement `from` → `to` in each phase of the one program in
+    /// `network`, read through the link index the export gave the movement.
+    fn states(network: &PlainNetwork, from: &str, to: &str) -> String {
+        let tll = network.traffic_lights.as_deref().expect("a .tll.xml");
+        let link = elements(tll, "connection")
+            .into_iter()
+            .find(|connection| connection["from"] == from && connection["to"] == to)
+            .unwrap_or_else(|| panic!("no controlled connection {from} → {to}"));
+        let index: usize = link["linkIndex"].parse().unwrap();
+        elements(tll, "phase")
+            .iter()
+            .map(|phase| phase["state"].as_bytes()[index] as char)
+            .collect()
+    }
+
+    #[test]
+    fn every_connection_into_a_signalised_node_has_its_own_link_index() {
+        let network = to_plain_xml(&crossroads()).unwrap();
+        let declared = elements(&network.connections, "connection");
+        // Four arms, each turning into the other three.
+        assert_eq!(declared.len(), 12);
+        // The connection file stays SUMO's plain format: it says which movements
+        // exist and nothing about signals.
+        assert!(declared
+            .iter()
+            .all(|connection| !connection.contains_key("tl")));
+
+        let tll = network.traffic_lights.as_deref().unwrap();
+        let controlled = elements(tll, "connection");
+        let name = |connection: &HashMap<String, String>| {
+            ["from", "fromLane", "to", "toLane"].map(|key| connection[key].clone())
+        };
+        assert_eq!(
+            controlled.iter().map(name).collect::<BTreeSet<_>>(),
+            declared.iter().map(name).collect::<BTreeSet<_>>(),
+            "every movement into the node is controlled, and only those"
+        );
+        let mut indices: Vec<usize> = controlled
+            .iter()
+            .map(|connection| {
+                assert_eq!(connection["tl"], "j_x");
+                connection["linkIndex"].parse().unwrap()
+            })
+            .collect();
+        indices.sort();
+        assert_eq!(indices, (0..12).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_program_is_written_and_named_by_the_configuration() {
+        let network = to_plain_xml(&crossroads()).unwrap();
+        let tll = network.traffic_lights.as_deref().expect("a .tll.xml");
+        let logics = elements(tll, "tlLogic");
+        assert_eq!(logics.len(), 1);
+        assert_eq!(logics[0]["id"], "j_x");
+        assert_eq!(logics[0]["programID"], "0");
+        assert_eq!(logics[0]["type"], "static");
+        assert_eq!(logics[0]["offset"], "0");
+
+        // Two groups of approaches, north-south and east-west, each a green, a
+        // yellow and an all-red.
+        let phases = elements(tll, "phase");
+        let durations: Vec<&str> = phases
+            .iter()
+            .map(|phase| phase["duration"].as_str())
+            .collect();
+        assert_eq!(durations, ["35", "3", "2", "35", "3", "2"]);
+        assert!(phases.iter().all(|phase| phase["state"].len() == 12));
+        assert!(phases[2]["state"].chars().all(|state| state == 'r'));
+
+        // The northern approach is written first, so its group is released first.
+        // Straight on is protected. Every turn runs into a one-lane exit that the
+        // opposing approach turns into too, and so gives way.
+        assert_eq!(states(&network, "north.fwd", "south.bwd"), "Gyrrrr");
+        assert_eq!(states(&network, "south.fwd", "north.bwd"), "Gyrrrr");
+        assert_eq!(states(&network, "north.fwd", "east.bwd"), "gyrrrr");
+        assert_eq!(states(&network, "north.fwd", "west.bwd"), "gyrrrr");
+        assert_eq!(states(&network, "east.fwd", "west.bwd"), "rrrGyr");
+        assert_eq!(states(&network, "west.fwd", "south.bwd"), "rrrgyr");
+
+        assert!(network
+            .config
+            .contains(r#"<tllogic-files value="crossroads.tll.xml"/>"#));
+        assert!(network
+            .files()
+            .iter()
+            .any(|(name, _)| name == "crossroads.tll.xml"));
+    }
+
+    /// A tee with no movement between its two side arms: north runs straight on to
+    /// south and turns into west, and nothing else turns into west from the north–
+    /// south road. So the turn into west gives way only if it crosses the stream
+    /// coming the other way — which depends on the side traffic keeps to.
+    fn tee(handedness: TrafficHandedness) -> ValidatedMap {
+        let mut builder = MapBuilder::new(MapMetadata {
+            handedness,
+            ..metadata("tee")
+        });
+        let mut arm = |name: &str, start: Point3, end: Point3| {
+            builder
+                .add_road(
+                    RoadSpec::line(start, end, two_way())
+                        .unwrap()
+                        .with_name(name),
+                )
+                .unwrap()
+        };
+        let north = arm(
+            "north",
+            Point3::new(0.0, 70.0, 0.0),
+            Point3::new(0.0, 14.0, 0.0),
+        );
+        let south = arm(
+            "south",
+            Point3::new(0.0, -70.0, 0.0),
+            Point3::new(0.0, -14.0, 0.0),
+        );
+        let west = arm(
+            "west",
+            Point3::new(-70.0, 0.0, 0.0),
+            Point3::new(-14.0, 0.0, 0.0),
+        );
+        let junction = builder.add_junction(Some("t"));
+        for other in [&south, &west] {
+            builder
+                .connect_ends(&north, RoadEnd::End, other, RoadEnd::End, Some(&junction))
+                .unwrap();
+        }
+        builder
+            .add_traffic_light(&LaneRef::new(north, 0), LaneEnd::End, 5.0)
+            .unwrap();
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    #[test]
+    fn the_turn_across_oncoming_traffic_follows_the_handedness() {
+        // Heading south, west is on the right: a turn across nothing where traffic
+        // keeps right, and across the northbound stream where it keeps left.
+        let right = to_plain_xml(&tee(TrafficHandedness::RightHand)).unwrap();
+        assert_eq!(states(&right, "north.fwd", "west.bwd"), "Gyrrrr");
+        let left = to_plain_xml(&tee(TrafficHandedness::LeftHand)).unwrap();
+        assert_eq!(states(&left, "north.fwd", "west.bwd"), "gyrrrr");
+
+        // Straight on is protected either way, and the side arm runs on its own.
+        for network in [&right, &left] {
+            assert_eq!(states(network, "north.fwd", "south.bwd"), "Gyrrrr");
+            assert_eq!(states(network, "west.fwd", "north.bwd"), "rrrGyr");
+        }
+    }
+
+    #[test]
+    fn a_map_without_lights_has_no_program() {
+        let network = to_plain_xml(&in_line()).unwrap();
+        assert!(network.traffic_lights.is_none());
+        assert!(!network.config.contains("tllogic-files"));
+        assert!(network
+            .files()
+            .iter()
+            .all(|(name, _)| !name.ends_with(".tll.xml")));
+    }
+
+    #[test]
+    fn a_light_is_traced_to_the_slots_of_the_lane_it_governs() {
+        let map = crossroads();
+        let network = to_plain_xml(&map).unwrap();
+        let light = map
+            .objects
+            .iter()
+            .find(|object| object.kind.is_traffic_light())
+            .unwrap();
+        let slots: BTreeSet<String> = network
+            .trace
+            .links_of(&IrRef::Object(light.id.clone()))
+            .filter(|link| link.role.as_deref() == Some("link"))
+            .map(|link| {
+                assert_eq!(link.relation, Relation::Merged);
+                link.local.clone()
+            })
+            .collect();
+        // The light stands on the northern approach's lane 0, which turns into the
+        // three other arms.
+        let expected: BTreeSet<String> =
+            elements(network.traffic_lights.as_deref().unwrap(), "connection")
+                .iter()
+                .filter(|connection| connection["from"] == "north.fwd")
+                .map(|connection| format!("tls:j_x/{}", connection["linkIndex"]))
+                .collect();
+        assert_eq!(expected.len(), 3);
+        assert_eq!(slots, expected);
     }
 
     #[test]

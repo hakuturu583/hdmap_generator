@@ -24,7 +24,7 @@ use roadgen_core::validation::ValidatedMap;
 ///
 /// A package manager puts them on `PATH`; a source or pip install puts them in
 /// `$SUMO_HOME/bin` and may not.
-fn tool(name: &str) -> Option<PathBuf> {
+pub fn tool(name: &str) -> Option<PathBuf> {
     if let Ok(home) = std::env::var("SUMO_HOME") {
         let candidate = Path::new(&home).join("bin").join(name);
         if candidate.is_file() {
@@ -72,7 +72,7 @@ pub fn sumo_available() -> bool {
 /// `two_roads_joined`, which bends by 26 degrees at the joint, should produce it.
 ///
 /// Everything else counts as a complaint and fails the test.
-fn is_about_the_machine_or_the_map(line: &str) -> bool {
+pub fn is_about_the_machine_or_the_map(line: &str) -> bool {
     line.contains("SUMO_HOME")
         || (line.contains("Speed of") && line.contains("due to turning radius"))
 }

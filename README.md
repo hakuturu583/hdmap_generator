@@ -897,7 +897,8 @@ prefix = m.export_sumo("network/")     # returns the name the files were given
 | `<name>.nod.xml` | junctions and road ends, as points |
 | `<name>.edg.xml` | one edge per direction of travel, with its lanes |
 | `<name>.con.xml` | which lane may be left for which lane |
-| `<name>.netccfg` | the netconvert run that turns the three into a `.net.xml` |
+| `<name>.tll.xml` | the program of each signalised junction, when the map has one |
+| `<name>.netccfg` | the netconvert run that turns the rest into a `.net.xml` |
 
 ```bash
 netconvert -c network/demo_town.netccfg
@@ -987,8 +988,51 @@ This is why the arms are left exactly where the IR puts them, 14 m short of the
 centre: **the gap is the junction**, and netconvert fills it. Nothing here moves
 geometry, which is the one thing the OpenStreetMap export has to do.
 
-A junction with a traffic light on an approach becomes a `traffic_light` node.
-netconvert generates the phases, because the IR holds no signal timing to write.
+### Traffic lights
+
+A junction with a traffic light on an approach — or on a lane a `TrafficLight` rule
+names — becomes a `traffic_light` node, and its light is named after it, so that the
+name follows from the map rather than from netconvert:
+
+```xml
+<node id="j_x" x="0.000" y="0.000" z="0.000" type="traffic_light" tl="j_x"/>
+```
+
+The IR holds no signal timing, and netconvert would happily make a program up — but
+its phases and its numbering of the movements would be netconvert's, moving whenever
+its version or its reading of the junction did, and nothing could say which slot of
+the program a light of the map controls. So the export decides the program itself and
+writes it to `<name>.tll.xml`: the phases, and the link index of every movement into
+the node, which fixes the position of each movement in every state string.
+
+```xml
+<tlLogic id="j_x" type="static" programID="0" offset="0">
+    <phase duration="35" state="gGgrrrGggrrr"/>
+    <phase duration="3"  state="yyyrrryyyrrr"/>
+    <phase duration="2"  state="rrrrrrrrrrrr"/>
+    ...
+</tlLogic>
+<connection from="north.fwd" to="east.bwd" fromLane="0" toLane="0" tl="j_x" linkIndex="0"/>
+```
+
+The program is a static heuristic — the one Autoware's `lanelet2_to_sumo` writes:
+
+- Approaches are grouped by **axis**, the heading they arrive on modulo 180°, within
+  35° — so an approach and the one facing it run together and the crossing road waits.
+- Each group gets a **green** of 35 s (25 s when a junction has more than two groups),
+  then 3 s of **yellow** and 2 s of **all-red**.
+- In a green, a movement is **permissive** (`g`) if it turns across the oncoming
+  traffic released with it, or if another released movement runs into the same lane;
+  everything else released is protected (`G`), and the rest red.
+
+"Across the oncoming traffic" is a left turn where traffic keeps right and a right turn
+where it keeps left. It is read off the geometry and the map's handedness — the swing
+from the lane a movement leaves to the lane it joins — and not off netconvert's own
+`dir`, so the program does not depend on netconvert being told which side the map
+drives on. A turn with nothing facing it, off the stem of a tee, is protected.
+
+The tests build the network and check that netconvert kept exactly this program and
+these link indices, then drive traffic through every movement in `sumo`.
 
 No U-turns. Left to itself netconvert adds one at every dead end, so a vehicle could
 turn back at the far end of an arm where the OpenDRIVE and Lanelet2 maps of the same
@@ -1008,6 +1052,8 @@ IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
   additional file, not part of the network.
 - **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
   right of way and no more.
+- **Signal timing.** The IR has none, so a signalised junction runs on the fixed-time
+  program above rather than one the map states.
 - **The geo-reference.** The network is in the map's own metres about its origin, and
   the generated configuration turns off netconvert's offset normalisation so that it
   stays that way — the same coordinates as the other four exports.
