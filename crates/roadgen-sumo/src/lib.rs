@@ -660,8 +660,9 @@ fn stop_line_problems(map: &ValidatedMap) -> Vec<String> {
             }
             Unplaced::AtLaneStart => {
                 "it is at the lane's start: drawn across lanes running both ways, it \
-                 is nearer the end of the road where the lane begins than the end it \
-                 runs to, and belongs to the lanes running the other way"
+                 is nearer the junction the lane leaves than the first junction the \
+                 lane runs into (or no nearer either), and belongs to the lanes running \
+                 the other way"
             }
             Unplaced::NotAcross => "it does not cross the lane's centreline",
             Unplaced::BeyondLane => {
@@ -1179,9 +1180,10 @@ enum Unplaced {
     /// change of cross-section or joint, where a stop offset stops nothing.
     BeyondLastEdge,
     /// A line that also crosses lanes running the other way crosses this one nearer
-    /// the end of its IR road where the lane begins than the end it runs to,
-    /// measured over the whole road whatever SUMO edges it is cut into: a line
-    /// across both carriageways, seen from the one it does not stop.
+    /// the junction the lane leaves than the first junction it runs into — measured
+    /// along the lane's travel through plain joints, a dead end counting as never
+    /// reaching one — or no nearer either: a line across both carriageways, seen from
+    /// the one it does not stop.
     AtLaneStart,
     /// It does not cross the centreline of the lane it names.
     NotAcross,
@@ -4522,6 +4524,7 @@ mod tests {
             assert!(
                 said[0].contains(&format!("is not written on lane {}:", leaving.local_name()))
                     && said[0].contains("it is at the lane's start")
+                    && said[0].contains("nearer the junction the lane leaves")
                     && !said[0].contains("does not end at a junction"),
                 "{context}: {said:#?}"
             );
