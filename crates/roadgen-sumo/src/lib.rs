@@ -16,13 +16,21 @@
 //! | `<name>.edg.xml` | one edge per direction of travel, with its lanes |
 //! | `<name>.con.xml` | which lane may be left for which lane |
 //! | `<name>.netccfg` | the netconvert run that turns the three into a `.net.xml` |
+//! | `<name>.safe.{src,dst,via}.xml` | where `randomTrips.py` may start, end and route trips |
 //!
 //! ```text
 //! netconvert -c <name>.netccfg
+//! randomTrips.py -n <name>.net.xml --weights-prefix <name>.safe --validate
 //! ```
 //!
 //! That is the format a network *generator* is expected to produce, and it is the
 //! one SUMO documents for the purpose.
+//!
+//! The last three are not part of the network but of the demand put on it: edge
+//! weights that keep `randomTrips.py` from starting a car trip where no car can leave,
+//! or ending one where no car can arrive. A generated network has many such places,
+//! since its unlinked road ends are dead ends with no U-turn; see [`weights`] for what
+//! is weighted and why.
 //!
 //! # What a SUMO edge is
 //!
@@ -146,6 +154,7 @@
 pub mod classes;
 pub mod error;
 pub mod location;
+pub mod weights;
 mod xml;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -163,15 +172,17 @@ use roadgen_core::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId, Validated
 pub use classes::Permission;
 pub use error::ExportError;
 pub use location::{geo_reference, height_error, GeoReference};
+pub use weights::TripWeights;
 
 /// The name a map with none of its own is written under.
 const DEFAULT_NAME: &str = "network";
 
-/// A SUMO plain-XML network: the three input files, and the netconvert run that
-/// turns them into a `.net.xml`.
+/// A SUMO plain-XML network: the three input files, the netconvert run that turns
+/// them into a `.net.xml`, and the `randomTrips.py` edge weights for the network it
+/// builds.
 ///
 /// The file names are derived from [`PlainNetwork::prefix`], and the configuration
-/// refers to them, so the four belong together in one directory.
+/// refers to them, so the seven belong together in one directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainNetwork {
     /// What the files are named before their `.nod.xml`, `.edg.xml`, `.con.xml` and
@@ -181,6 +192,11 @@ pub struct PlainNetwork {
     pub edges: String,
     pub connections: String,
     pub config: String,
+    /// The `randomTrips.py` weights, written as `<prefix>.safe.src.xml`,
+    /// `<prefix>.safe.dst.xml` and `<prefix>.safe.via.xml` and read with
+    /// `--weights-prefix <prefix>.safe`. They name the edges as the built network
+    /// does, so they are used with the `.net.xml` netconvert makes of the rest.
+    pub weights: TripWeights,
     /// Where each lane of the IR ended up, as the `<edge>_<index>` identifier the
     /// built network gives it.
     ///
@@ -189,7 +205,7 @@ pub struct PlainNetwork {
     /// IR's: SUMO counts from the outside of the carriageway, which is the right of
     /// the direction of travel under right-hand traffic and the left under left-hand.
     pub lanes: BTreeMap<LaneId, String>,
-    /// Where each element of the IR ended up in the four files: nodes, edges, lanes
+    /// Where each element of the IR ended up in the network files: nodes, edges, lanes
     /// and connections, by the identifiers written for them. See the crate
     /// documentation for how each is named.
     ///
@@ -199,7 +215,8 @@ pub struct PlainNetwork {
 }
 
 impl PlainNetwork {
-    /// Each file's name and its contents, in the order netconvert reads them.
+    /// Each file's name and its contents: the network in the order netconvert reads
+    /// it, then the trip weights in the order `src`, `dst`, `via`.
     pub fn files(&self) -> Vec<(String, &str)> {
         vec![
             (format!("{}.nod.xml", self.prefix), self.nodes.as_str()),
@@ -209,10 +226,22 @@ impl PlainNetwork {
                 self.connections.as_str(),
             ),
             (format!("{}.netccfg", self.prefix), self.config.as_str()),
+            (
+                format!("{}.{}", self.prefix, TripWeights::SUFFIXES[0]),
+                self.weights.src.as_str(),
+            ),
+            (
+                format!("{}.{}", self.prefix, TripWeights::SUFFIXES[1]),
+                self.weights.dst.as_str(),
+            ),
+            (
+                format!("{}.{}", self.prefix, TripWeights::SUFFIXES[2]),
+                self.weights.via.as_str(),
+            ),
         ]
     }
 
-    /// Writes the four files into `directory`, creating it if it is not there.
+    /// Writes the seven files into `directory`, creating it if it is not there.
     pub fn write_to(&self, directory: impl AsRef<Path>) -> Result<(), ExportError> {
         let directory = directory.as_ref();
         std::fs::create_dir_all(directory)
@@ -250,7 +279,7 @@ pub fn write(map: &ValidatedMap, directory: impl AsRef<Path>) -> Result<String, 
 }
 
 /// Writes `map` into `directory` as [`write`] does, and hands back the trace of what
-/// was written alongside the prefix, with the four files' paths in it.
+/// was written alongside the prefix, with the seven files' paths in it.
 pub fn write_traced(
     map: &ValidatedMap,
     directory: impl AsRef<Path>,
@@ -880,6 +909,11 @@ struct Node {
 struct Edge {
     id: String,
     road: RoadId,
+    /// Which cross-section of the road, and which way along it: what tells two edges
+    /// of one road that netconvert will join across a section node from the two
+    /// carriageways of it.
+    section: usize,
+    direction: Direction,
     from: String,
     to: String,
     name: Option<String>,
@@ -1389,6 +1423,8 @@ impl<'a> Exporter<'a> {
         self.edges.push(Edge {
             id: edge_id(&self.ids.road(&road.id), road, section, direction),
             road: road.id.clone(),
+            section,
+            direction,
             from,
             to,
             name: road.name.clone(),
@@ -1945,6 +1981,7 @@ impl<'a> Exporter<'a> {
             edges: self.render_edges(),
             connections: self.render_connections(),
             config: render_config(&prefix, self.map.metadata.handedness),
+            weights: self.render_weights(),
             trace: self.trace(),
             lanes: self
                 .slots
@@ -4090,10 +4127,18 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("roadgen-sumo-trace-{}", std::process::id()));
         let (prefix, trace) = write_traced(&map, &directory).unwrap();
-        let names: Vec<String> = ["nod.xml", "edg.xml", "con.xml", "netccfg"]
-            .iter()
-            .map(|suffix| format!("{prefix}.{suffix}"))
-            .collect();
+        let names: Vec<String> = [
+            "nod.xml",
+            "edg.xml",
+            "con.xml",
+            "netccfg",
+            "safe.src.xml",
+            "safe.dst.xml",
+            "safe.via.xml",
+        ]
+        .iter()
+        .map(|suffix| format!("{prefix}.{suffix}"))
+        .collect();
         assert_eq!(
             trace.files,
             names
@@ -4104,6 +4149,182 @@ mod tests {
         assert!(trace.files.iter().all(|path| path.is_file()));
         assert_eq!(trace.links, to_plain_xml(&map).unwrap().trace.links);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    // ----------------------------------------------------------------------- //
+    // The randomTrips weights
+    // ----------------------------------------------------------------------- //
+
+    /// Each edge's weight in one of the `edgedata` files, read back from the XML.
+    fn weights(xml: &str) -> BTreeMap<String, f64> {
+        let mut found = BTreeMap::new();
+        let mut reader = quick_xml::Reader::from_str(xml);
+        loop {
+            let event = reader.read_event().unwrap();
+            let element = match &event {
+                Event::Eof => break,
+                Event::Start(element) | Event::Empty(element) => element,
+                _ => continue,
+            };
+            if element.name().as_ref() != b"edge" {
+                continue;
+            }
+            let attribute = |key: &[u8]| {
+                let value = element
+                    .attributes()
+                    .map(Result::unwrap)
+                    .find(|attribute| attribute.key.as_ref() == key)
+                    .unwrap()
+                    .value;
+                String::from_utf8_lossy(&value).into_owned()
+            };
+            found.insert(attribute(b"id"), attribute(b"value").parse().unwrap());
+        }
+        found
+    }
+
+    /// The edges given a weight in one file.
+    fn weighted(xml: &str) -> BTreeSet<String> {
+        weights(xml)
+            .into_iter()
+            .filter(|(_, value)| *value > 0.0)
+            .map(|(edge, _)| edge)
+            .collect()
+    }
+
+    fn set(edges: &[&str]) -> BTreeSet<String> {
+        edges.iter().map(|edge| (*edge).to_owned()).collect()
+    }
+
+    /// Each arm of the crossroads runs out to a dead end with no U-turn, so the edge
+    /// approaching the junction can only be left and the edge leaving it can only be
+    /// arrived on: a trip may start on the one and end on the other, and a way point
+    /// may be neither.
+    #[test]
+    fn a_road_into_a_dead_end_is_no_place_to_start_a_trip() {
+        let network = to_plain_xml(&crossroads()).unwrap();
+        let every = weights(&network.weights.src);
+        assert_eq!(every.len(), 8, "every edge is named: {every:?}");
+        assert_eq!(
+            weighted(&network.weights.src),
+            set(&["north.fwd", "east.fwd", "south.fwd", "west.fwd"])
+        );
+        assert_eq!(
+            weighted(&network.weights.dst),
+            set(&["north.bwd", "east.bwd", "south.bwd", "west.bwd"])
+        );
+        assert!(weighted(&network.weights.via).is_empty());
+
+        // A weighted edge carries its length, which is the length of its lane: the
+        // arm runs from 70 m out to 14 m short of the centre.
+        for (edge, value) in every {
+            if value > 0.0 {
+                assert!((value - 56.0).abs() < 0.01, "{edge}: {value}");
+            }
+        }
+    }
+
+    /// The two carriageways of a road whose ends link nowhere are two one-way strips
+    /// once U-turns are gone, and no trip joins the one to the other. Only one of them
+    /// is weighted, so every trip drawn has a route.
+    #[test]
+    fn only_the_largest_connected_part_of_the_network_is_weighted() {
+        let network = to_plain_xml(&in_line()).unwrap();
+        let src = weighted(&network.weights.src);
+        let dst = weighted(&network.weights.dst);
+        assert!(
+            (src == set(&["a.fwd"]) && dst == set(&["b.fwd"]))
+                || (src == set(&["b.bwd"]) && dst == set(&["a.bwd"])),
+            "src {src:?}, dst {dst:?}"
+        );
+        assert!(weighted(&network.weights.via).is_empty());
+        // And the choice is the same every time.
+        assert_eq!(to_plain_xml(&in_line()).unwrap().weights, network.weights);
+    }
+
+    /// Three one-way roads end to end. The middle one has a way in and a way out, so
+    /// it is the one place a way point may be.
+    fn chain(builder: &mut MapBuilder, name: &str, y: f64, lanes: Vec<LaneSpec>) {
+        let roads: Vec<RoadId> = (0..3)
+            .map(|index| {
+                let x = 100.0 * f64::from(index);
+                builder
+                    .add_road(
+                        RoadSpec::line(
+                            Point3::new(x, y, 0.0),
+                            Point3::new(x + 100.0, y, 0.0),
+                            lanes.clone(),
+                        )
+                        .unwrap()
+                        .with_name(format!("{name}{index}")),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        builder.connect(&roads[0], &roads[1]).unwrap();
+        builder.connect(&roads[1], &roads[2]).unwrap();
+    }
+
+    #[test]
+    fn an_edge_with_a_way_in_and_a_way_out_may_be_passed_through() {
+        let width = PositiveWidth::new(3.5).unwrap();
+        let mut builder = MapBuilder::new(metadata("chain"));
+        chain(
+            &mut builder,
+            "road",
+            0.0,
+            vec![LaneSpec::new(width, Direction::Forward)],
+        );
+        let map = builder.finish().unwrap().validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+        assert_eq!(
+            weighted(&network.weights.src),
+            set(&["road0.fwd", "road1.fwd"])
+        );
+        assert_eq!(
+            weighted(&network.weights.dst),
+            set(&["road1.fwd", "road2.fwd"])
+        );
+        assert_eq!(weighted(&network.weights.via), set(&["road1.fwd"]));
+    }
+
+    /// The weights are for cars, so a footway gets none even where it has a way in
+    /// and a way out — and a street carrying a footway alongside its driving lane is
+    /// still a street.
+    #[test]
+    fn a_footway_is_no_place_for_a_car_trip() {
+        let width = PositiveWidth::new(3.0).unwrap();
+        let mut builder = MapBuilder::new(metadata("footways"));
+        chain(
+            &mut builder,
+            "path",
+            50.0,
+            vec![LaneSpec::new(width, Direction::Forward).with_type(LaneType::Sidewalk)],
+        );
+        chain(
+            &mut builder,
+            "street",
+            0.0,
+            vec![
+                LaneSpec::new(width, Direction::Forward),
+                LaneSpec::new(width, Direction::Forward).with_type(LaneType::Sidewalk),
+            ],
+        );
+        let map = builder.finish().unwrap().validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+
+        // The footway is named, with nothing.
+        let every = weights(&network.weights.via);
+        assert_eq!(every.get("path1.fwd"), Some(&0.0), "{every:?}");
+        assert_eq!(weighted(&network.weights.via), set(&["street1.fwd"]));
+        assert_eq!(
+            weighted(&network.weights.src),
+            set(&["street0.fwd", "street1.fwd"])
+        );
+        assert_eq!(
+            weighted(&network.weights.dst),
+            set(&["street1.fwd", "street2.fwd"])
+        );
     }
 
     // ----------------------------------------------------------------------- //

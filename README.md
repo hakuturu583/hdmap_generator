@@ -898,6 +898,7 @@ prefix = m.export_sumo("network/")     # returns the name the files were given
 | `<name>.edg.xml` | one edge per direction of travel, with its lanes |
 | `<name>.con.xml` | which lane may be left for which lane |
 | `<name>.netccfg` | the netconvert run that turns the three into a `.net.xml` |
+| `<name>.safe.{src,dst,via}.xml` | `randomTrips.py` weights; see [Random traffic](#random-traffic-randomtripspy-weights) |
 
 ```bash
 netconvert -c network/demo_town.netccfg
@@ -1150,6 +1151,42 @@ No U-turns. Left to itself netconvert adds one at every dead end, so a vehicle c
 turn back at the far end of an arm where the OpenDRIVE and Lanelet2 maps of the same
 IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
 `no-turnarounds`, and the network has the movements the map has and no others.
+
+### Random traffic: `randomTrips.py` weights
+
+No U-turns means every unlinked road end is a dead end a car cannot turn back at, so
+a trip that starts on the carriageway running *into* one, or ends on the one running
+*out of* one, has no route. Alongside the network the export writes three
+[`edgedata`](https://sumo.dlr.de/docs/Tools/Trip.html#customized_weights) files that
+tell `randomTrips.py` where trips may go:
+
+| file | an edge is weighted when |
+| --- | --- |
+| `<name>.safe.src.xml` | a trip may **depart** there: some connection leaves it |
+| `<name>.safe.dst.xml` | a trip may **arrive** there: some connection reaches it |
+| `<name>.safe.via.xml` | a trip may **pass through** there (`--intermediate`): both |
+
+```bash
+netconvert -c network/demo_town.netccfg
+python $SUMO_HOME/tools/randomTrips.py -n network/demo_town.net.xml \
+    --weights-prefix network/demo_town.safe -o trips.xml -r routes.rou.xml --validate
+```
+
+A weighted edge carries its length, so long roads draw more trips than short ones;
+every other edge is written with 0, which `randomTrips.py` never draws. The weights are
+for **passenger cars**, its default vehicle class: an edge with no lane a car may use —
+a footway, a cycle track, a hard shoulder — is 0 in all three, where `randomTrips.py`
+left to itself would happily start a car on a footway. And only the largest connected
+part of the network is weighted, so that a trip is never drawn between two pieces no
+route could join — the two carriageways of a lone road with nothing at either end, for
+one, are two separate one-way strips once U-turns are gone.
+
+The rule is per file rather than `lanelet2_to_sumo`'s "both a way in and a way out for
+all three": on a tree-shaped network with dead-end arms, every arm edge has only one
+of the two, and that rule would weight nothing. Even so, within one part of the network
+a car cannot turn back onto the arm it came from, so keep `--validate`, which has
+`duarouter` drop the few trips left without a route. A network with no connection at all
+— one road, linked to nothing — has no edge a car can leave, and every weight is 0.
 
 ### Where on the globe
 
