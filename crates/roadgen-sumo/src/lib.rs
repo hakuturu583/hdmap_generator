@@ -223,6 +223,14 @@ pub fn write_traced(
     Ok((network.prefix, trace))
 }
 
+/// Whether `id` names a traffic light of the map — not a missing object, and not an
+/// object of another kind.
+fn is_light(map: &ValidatedMap, id: &ObjectId) -> bool {
+    map.objects
+        .get(id)
+        .is_some_and(|object| object.kind.is_traffic_light())
+}
+
 /// What this map loses on the way into a SUMO network.
 ///
 /// All of these are properties of the format rather than faults in the map. SUMO is
@@ -314,6 +322,31 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             many = signals::GREEN_MANY_SECONDS,
             yellow = signals::YELLOW_SECONDS,
             red = signals::ALL_RED_SECONDS,
+        ));
+    }
+
+    let unresolved: Vec<String> = map
+        .rules
+        .iter()
+        .filter_map(|rule| match rule {
+            TrafficRule::TrafficLight { lights, .. } => Some(lights),
+            _ => None,
+        })
+        .flatten()
+        .filter(|light| !is_light(map, light))
+        .map(|light| match map.objects.get(light) {
+            Some(object) => format!("{light} (a {})", object.kind.as_str()),
+            None => format!("{light} (missing)"),
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !unresolved.is_empty() {
+        problems.push(format!(
+            "a traffic-light rule names {} objects that are not traffic lights, which \
+             govern nothing: a rule with no light left signalises no junction: {}",
+            unresolved.len(),
+            unresolved.join(", ")
         ));
     }
 
@@ -525,8 +558,20 @@ impl<'a> Exporter<'a> {
             let TrafficRule::TrafficLight { lights, lanes, .. } = rule else {
                 continue;
             };
+            // Only a name that resolves to a traffic light governs anything. A rule
+            // naming a missing object, or a sign or a stop line, passes validation —
+            // which checks a rule's lanes, not its lights — but signalising a junction
+            // on its word would write a program, and trace it, for a light the map
+            // does not have. `check` reports the names skipped.
+            let lights: Vec<&ObjectId> = lights
+                .iter()
+                .filter(|light| is_light(self.map, light))
+                .collect();
+            if lights.is_empty() {
+                continue;
+            }
             for lane in lanes {
-                for light in lights {
+                for light in &lights {
                     self.govern(light, lane);
                 }
                 if let Some(junction) = self.junction_ahead_of(lane) {
@@ -1565,6 +1610,19 @@ mod tests {
 
     /// The same crossroads, on whichever side of the road traffic keeps to.
     fn crossroads_driving(handedness: TrafficHandedness) -> ValidatedMap {
+        crossroads_controlled(handedness, |builder, roads| {
+            builder
+                .add_traffic_light(&LaneRef::new(roads[0].clone(), 0), LaneEnd::End, 5.0)
+                .unwrap();
+        })
+    }
+
+    /// The same crossroads, with its controls — lights, signs, rules — added by
+    /// `control`, which is handed the four arms north, east, south, west.
+    fn crossroads_controlled(
+        handedness: TrafficHandedness,
+        control: impl FnOnce(&mut MapBuilder, &[RoadId]),
+    ) -> ValidatedMap {
         let mut builder = MapBuilder::new(MapMetadata {
             handedness,
             ..metadata("crossroads")
@@ -1611,9 +1669,7 @@ mod tests {
                     .unwrap();
             }
         }
-        builder
-            .add_traffic_light(&LaneRef::new(roads[0].clone(), 0), LaneEnd::End, 5.0)
-            .unwrap();
+        control(&mut builder, &roads);
         builder.finish().unwrap().validate().unwrap()
     }
 
@@ -2188,6 +2244,66 @@ mod tests {
                 .collect();
         assert_eq!(expected.len(), 3);
         assert_eq!(slots, expected);
+    }
+
+    #[test]
+    fn a_rule_naming_no_light_signalises_nothing() {
+        // A rule over the eastern approach that names a sign and an object the map
+        // does not have: validation accepts it, but neither is a light.
+        let map = crossroads_controlled(TrafficHandedness::RightHand, |builder, roads| {
+            let sign = builder
+                .add_traffic_sign(
+                    &LaneRef::new(roads[1].clone(), 0),
+                    LaneEnd::End,
+                    "stop",
+                    2.0,
+                )
+                .unwrap();
+            builder.add_traffic_light_rule(
+                vec![sign, ObjectId::new("nowhere")],
+                None,
+                vec![LaneRef::new(roads[1].clone(), 0)],
+            );
+        });
+        let network = to_plain_xml(&map).unwrap();
+        assert!(network.traffic_lights.is_none());
+        assert!(!network.nodes.contains("traffic_light"));
+        assert!(network
+            .trace
+            .links
+            .iter()
+            .all(|link| !link.local.starts_with("tls:")));
+        let problems = check(&map);
+        let skipped = problems
+            .iter()
+            .find(|problem| problem.contains("not traffic lights"))
+            .expect("the skipped names are reported");
+        assert!(skipped.contains("object/nowhere (missing)"), "{skipped}");
+        assert!(skipped.contains("(a traffic_sign)"), "{skipped}");
+    }
+
+    #[test]
+    fn a_rule_naming_a_light_and_a_stranger_signalises_with_the_light_only() {
+        let map = crossroads_controlled(TrafficHandedness::RightHand, |builder, roads| {
+            let light = builder
+                .add_traffic_light(&LaneRef::new(roads[0].clone(), 0), LaneEnd::End, 5.0)
+                .unwrap();
+            builder.add_traffic_light_rule(
+                vec![light, ObjectId::new("nowhere")],
+                None,
+                vec![LaneRef::new(roads[1].clone(), 0)],
+            );
+        });
+        let network = to_plain_xml(&map).unwrap();
+        assert!(network.traffic_lights.is_some());
+        assert_eq!(
+            network
+                .trace
+                .links_of(&IrRef::Object(ObjectId::new("nowhere")))
+                .count(),
+            0
+        );
+        assert!(network.trace.links_of(&IrRef::Rule(0)).count() > 0);
     }
 
     #[test]
