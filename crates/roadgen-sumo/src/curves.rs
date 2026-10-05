@@ -14,10 +14,11 @@
 //!
 //! A SUMO lane has one speed from end to end, so the export does what netconvert's
 //! own `<split>` would: it cuts an edge where its curvature changes, and gives each
-//! piece the speed `√(a / κ)` its sharpest point allows for the lateral acceleration
-//! `a` asked for, capped by the limit the edge already had. SUMO's vehicles look
-//! ahead at the speeds of the lanes they are about to enter, so they brake for a
-//! piece before they reach it.
+//! lane of each piece the speed `√(a / κ)` its sharpest point allows for the lateral
+//! acceleration `a` asked for, where that is below the lane's limit. Each lane is
+//! measured on its own line, so the inside of a bend is slower than the outside.
+//! SUMO's vehicles look ahead at the speeds of the lanes they are about to enter,
+//! so they brake for a piece before they reach it.
 //!
 //! The cut is the export's rather than netconvert's because the export knows what
 //! every piece is: it names them, traces each back to the IR lane it is part of,
@@ -33,16 +34,16 @@
 //!
 //! # How an edge is cut
 //!
-//! The curvature is measured on the carriageway's centre line every
-//! [`STEP`] metres, as that of the circle through the points [`HALF_CHORD`] metres
-//! either side: long enough that the polyline's sampling does not read as
-//! curvature, short enough to find a bend. Where the curve speed is below the
-//! edge's speed by more than [`MARGIN`], the line is curved; the runs of curved and
-//! straight line are the pieces, and a run shorter than [`MIN_PIECE`] metres is
-//! taken as curved, so that a bend is never broken up by a stretch too short to
-//! drive. A piece is cut no closer than [`MIN_PIECE`] to the edge's end where a stop
-//! offset has to fit on the last piece. An edge curved or straight from end to end
-//! is not cut, though a curved one still has its speed lowered.
+//! The curvature is measured every [`STEP`] metres, as that of the circle through
+//! the points [`HALF_CHORD`] metres either side: long enough that the polyline's
+//! sampling does not read as curvature, short enough to find a bend. Where the
+//! carriageway's centre line is slower than the edge's speed by more than
+//! [`MARGIN`], it is curved; the runs of curved and straight line are the pieces.
+//! A run shorter than [`MIN_PIECE`] is folded into its neighbour — a straight one
+//! into the bends either side of it — so that no piece is too short to drive. The
+//! last piece reaches back past every stop line on the edge, since a stop offset
+//! only works on the lane that runs into the junction. An edge curved or straight
+//! from end to end is not cut, though a curved one still has its lanes slowed.
 
 use roadgen_core::geometry::{Point3, Polyline3};
 
@@ -58,88 +59,213 @@ pub const MIN_PIECE: f64 = 15.0;
 /// as curved, m/s.
 pub const MARGIN: f64 = 0.5;
 
-/// A stretch of an edge's centre line, by station, and the speed its curvature
-/// holds traffic to — `None` where that is no lower than the edge's own.
+/// A polyline measured along in plan: the station of every vertex, so that a point
+/// at a station is a binary search away.
+pub struct Plan<'a> {
+    line: &'a Polyline3,
+    stations: Vec<f64>,
+}
+
+impl<'a> Plan<'a> {
+    pub fn new(line: &'a Polyline3) -> Self {
+        let mut stations = Vec::with_capacity(line.len());
+        let mut travelled = 0.0;
+        stations.push(travelled);
+        for pair in line.points().windows(2) {
+            travelled += pair[0].horizontal_distance_to(pair[1]);
+            stations.push(travelled);
+        }
+        Plan { line, stations }
+    }
+
+    /// The length in plan.
+    pub fn length(&self) -> f64 {
+        *self.stations.last().expect("a polyline has vertices")
+    }
+
+    /// The point `station` metres along in plan, clamped to the ends.
+    pub fn point_at(&self, station: f64) -> Point3 {
+        let points = self.line.points();
+        let after = self.stations.partition_point(|&s| s < station);
+        if after == 0 {
+            return points[0];
+        }
+        if after == points.len() {
+            return points[points.len() - 1];
+        }
+        let (s0, s1) = (self.stations[after - 1], self.stations[after]);
+        let t = if s1 > s0 {
+            (station - s0) / (s1 - s0)
+        } else {
+            0.0
+        };
+        points[after - 1].lerp(points[after], t)
+    }
+
+    /// The part between two stations, with the points at both ends interpolated.
+    pub fn slice(&self, start: f64, end: f64) -> Result<Polyline3, ExportError> {
+        let inside = self
+            .stations
+            .iter()
+            .zip(self.line.points())
+            .filter(|(&s, _)| s > start && s < end)
+            .map(|(_, &point)| point);
+        let points: Vec<Point3> = std::iter::once(self.point_at(start))
+            .chain(inside)
+            .chain(std::iter::once(self.point_at(end)))
+            .collect();
+        Ok(Polyline3::new(points)?)
+    }
+
+    /// The curvature at `station`, 1/m: that of the circle through the point and
+    /// the points `half_chord` either side of it, in plan. Zero where the line is
+    /// too short to hold the chord.
+    fn curvature_at(&self, station: f64, half_chord: f64) -> f64 {
+        let before = (station - half_chord).max(0.0);
+        let after = (station + half_chord).min(self.length());
+        if after - before < half_chord {
+            return 0.0;
+        }
+        let (a, b, c) = (
+            self.point_at(before),
+            self.point_at(station),
+            self.point_at(after),
+        );
+        let denominator =
+            a.horizontal_distance_to(b) * b.horizontal_distance_to(c) * a.horizontal_distance_to(c);
+        if denominator < 1e-12 {
+            return 0.0;
+        }
+        let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        2.0 * cross.abs() / denominator
+    }
+
+    /// The speed the curvature allows at `lateral_acceleration` m/s², every
+    /// [`STEP`] metres from the start: sample `i` is at station `i · STEP`.
+    /// Infinite where the line is straight.
+    pub fn curve_speeds(&self, lateral_acceleration: f64) -> Vec<f64> {
+        let length = self.length();
+        (0..=(length / STEP).floor() as usize)
+            .map(|index| {
+                let curvature = self.curvature_at(index as f64 * STEP, HALF_CHORD);
+                if curvature > 1e-9 {
+                    (lateral_acceleration / curvature).sqrt()
+                } else {
+                    f64::INFINITY
+                }
+            })
+            .collect()
+    }
+}
+
+/// The slowest of `speeds` (as [`Plan::curve_speeds`] samples them) from `start` up
+/// to, not including, `end`, rounded down to a tenth of a metre per second, where
+/// it is more than [`MARGIN`] below `limit`.
+///
+/// Up to and not including: a piece ends where the next begins, at the first
+/// sample of the next one's bend, which is not this piece's to slow for.
+pub fn cap(speeds: &[f64], start: f64, end: f64, limit: f64) -> Option<f64> {
+    let first = ((start / STEP).ceil() as usize).min(speeds.len() - 1);
+    let last = ((end / STEP).ceil() as usize)
+        .saturating_sub(1)
+        .clamp(first, speeds.len() - 1);
+    let slowest = speeds[first..=last]
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    Some(round_down(slowest)).filter(|&speed| speed < limit - MARGIN)
+}
+
+/// A stretch of an edge's centre line, by station.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stretch {
     pub start: f64,
     pub end: f64,
-    pub speed: Option<f64>,
 }
 
-/// The pieces `line` is cut into for traffic at `speed` m/s and a lateral
-/// acceleration of `lateral_acceleration` m/s², keeping the last at least `tail`
-/// metres long.
+/// A run of samples, `start..end`, that are all curved or all straight.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    start: usize,
+    end: usize,
+    curved: bool,
+}
+
+impl Run {
+    fn length(&self) -> f64 {
+        (self.end - self.start) as f64 * STEP
+    }
+}
+
+/// Joins neighbouring runs that agree.
+fn coalesce(runs: &mut Vec<Run>) {
+    runs.dedup_by(|next, run| {
+        let same = run.curved == next.curved;
+        if same {
+            run.end = next.end;
+        }
+        same
+    });
+}
+
+/// The pieces a centre line is cut into, from its curve speeds `speeds` (see
+/// [`Plan::curve_speeds`]) for traffic at `speed` m/s, cut nowhere after station
+/// `latest_cut`.
 ///
-/// Always at least one; one stretch over the whole line where it is not cut.
-pub fn stretches(
-    line: &Polyline3,
-    speed: f64,
-    lateral_acceleration: f64,
-    tail: f64,
-) -> Vec<Stretch> {
-    let length = horizontal_length(line);
-    let count = (length / STEP).floor() as usize;
-    let samples: Vec<f64> = (0..=count)
-        .map(|index| {
-            let station = (index as f64 * STEP).min(length);
-            let curvature = curvature_at(line, station, length, HALF_CHORD);
-            if curvature > 1e-9 {
-                (lateral_acceleration / curvature).sqrt()
-            } else {
-                f64::INFINITY
-            }
-        })
-        .collect();
-
-    // Runs of curved and straight line, as half-open sample ranges.
-    let curved = |sample: f64| sample < speed - MARGIN;
-    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
-    for (index, &sample) in samples.iter().enumerate() {
-        match runs.last_mut() {
-            Some(run) if run.2 == curved(sample) => run.1 = index + 1,
-            _ => runs.push((index, index + 1, curved(sample))),
-        }
-    }
-    let run_length = |run: &(usize, usize, bool)| (run.1 - run.0) as f64 * STEP;
-    for run in &mut runs {
-        if run_length(run) < MIN_PIECE {
-            run.2 = true;
-        }
-    }
-    let mut merged: Vec<(usize, usize, bool)> = Vec::new();
-    for run in runs {
-        match merged.last_mut() {
-            Some(last) if last.2 == run.2 => last.1 = run.1,
-            _ => merged.push(run),
-        }
-    }
-    // The last piece carries the stop offset; fold pieces into it until it fits.
-    while merged.len() > 1 && run_length(merged.last().expect("not empty")) < tail.max(MIN_PIECE) {
-        let last = merged.pop().expect("not empty");
-        let before = merged.last_mut().expect("more than one");
-        before.1 = last.1;
-        before.2 |= last.2;
-    }
-
-    let slowest = |run: &(usize, usize, bool)| {
-        samples[run.0..run.1]
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min)
-    };
-    let pieces = merged.len();
-    merged
+/// Always at least one, covering `0..length`.
+pub fn stretches(speeds: &[f64], length: f64, speed: f64, latest_cut: f64) -> Vec<Stretch> {
+    let mut runs: Vec<Run> = speeds
         .iter()
         .enumerate()
+        .map(|(index, &sample)| Run {
+            start: index,
+            end: index + 1,
+            curved: sample < speed - MARGIN,
+        })
+        .collect();
+    coalesce(&mut runs);
+    // Fold the shortest run that is too short into a neighbour until none is: a
+    // straight one becomes part of the bend beside it, a curved one widens into
+    // the straight beside it, and either way the result is curved.
+    while runs.len() > 1 {
+        let Some((index, _)) = runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| run.length() < MIN_PIECE)
+            .min_by(|a, b| a.1.length().total_cmp(&b.1.length()))
+        else {
+            break;
+        };
+        let neighbour = match (index.checked_sub(1), runs.get(index + 1)) {
+            (Some(before), Some(after)) if runs[before].length() > after.length() => index + 1,
+            (Some(before), _) => before,
+            (None, _) => index + 1,
+        };
+        let (low, high) = (index.min(neighbour), index.max(neighbour));
+        runs[low] = Run {
+            start: runs[low].start,
+            end: runs[high].end,
+            curved: true,
+        };
+        runs.remove(high);
+        coalesce(&mut runs);
+    }
+    // The last piece carries the stop offsets; fold pieces into it until it does.
+    while runs.len() > 1 && runs[runs.len() - 1].start as f64 * STEP > latest_cut {
+        let last = runs.pop().expect("more than one");
+        runs.last_mut().expect("more than one").end = last.end;
+    }
+
+    let count = runs.len();
+    runs.iter()
+        .enumerate()
         .map(|(index, run)| Stretch {
-            start: if index == 0 { 0.0 } else { run.0 as f64 * STEP },
-            end: if index + 1 == pieces {
+            start: run.start as f64 * STEP,
+            end: if index + 1 == count {
                 length
             } else {
-                run.1 as f64 * STEP
+                run.end as f64 * STEP
             },
-            speed: Some(round_down(slowest(run))).filter(|&limit| limit < speed - MARGIN),
         })
         .collect()
 }
@@ -151,7 +277,8 @@ pub fn stretches(
 /// measured with: the chord shrinks to a third of the line so that a tight turn still
 /// reads as one.
 pub fn slowest(line: &Polyline3, lateral_acceleration: f64) -> Option<f64> {
-    let length = horizontal_length(line);
+    let plan = Plan::new(line);
+    let length = plan.length();
     let half_chord = HALF_CHORD.min(length / 3.0);
     if half_chord < STEP {
         return None;
@@ -159,7 +286,7 @@ pub fn slowest(line: &Polyline3, lateral_acceleration: f64) -> Option<f64> {
     let mut station = half_chord;
     let mut sharpest: f64 = 0.0;
     while station <= length - half_chord {
-        sharpest = sharpest.max(curvature_at(line, station, length, half_chord));
+        sharpest = sharpest.max(plan.curvature_at(station, half_chord));
         station += STEP;
     }
     (sharpest > 1e-9).then(|| round_down((lateral_acceleration / sharpest).sqrt()))
@@ -169,73 +296,6 @@ pub fn slowest(line: &Polyline3, lateral_acceleration: f64) -> Option<f64> {
 /// what the curve allows.
 fn round_down(speed: f64) -> f64 {
     (speed * 10.0).floor() / 10.0
-}
-
-/// The curvature of `line` at `station`, 1/m: that of the circle through the points
-/// `half_chord` either side of it and the point itself, in plan.
-fn curvature_at(line: &Polyline3, station: f64, length: f64, half_chord: f64) -> f64 {
-    let before = (station - half_chord).max(0.0);
-    let after = (station + half_chord).min(length);
-    if after - before < half_chord {
-        return 0.0;
-    }
-    let (a, b, c) = (
-        point_at(line, before),
-        point_at(line, station),
-        point_at(line, after),
-    );
-    let (ab, bc, ac) = (
-        (b.x - a.x).hypot(b.y - a.y),
-        (c.x - b.x).hypot(c.y - b.y),
-        (c.x - a.x).hypot(c.y - a.y),
-    );
-    let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-    let denominator = ab * bc * ac;
-    if denominator < 1e-12 {
-        return 0.0;
-    }
-    2.0 * cross.abs() / denominator
-}
-
-/// The length of `line` in plan.
-pub fn horizontal_length(line: &Polyline3) -> f64 {
-    line.points()
-        .windows(2)
-        .map(|segment| (segment[1].x - segment[0].x).hypot(segment[1].y - segment[0].y))
-        .sum()
-}
-
-/// The point `station` metres along `line` in plan, clamped to its ends.
-pub fn point_at(line: &Polyline3, station: f64) -> Point3 {
-    let mut travelled = 0.0;
-    for segment in line.points().windows(2) {
-        let (a, b) = (segment[0], segment[1]);
-        let length = (b.x - a.x).hypot(b.y - a.y);
-        if travelled + length >= station && length > 0.0 {
-            return a.lerp(b, ((station - travelled) / length).clamp(0.0, 1.0));
-        }
-        travelled += length;
-    }
-    if station <= 0.0 {
-        line.first()
-    } else {
-        line.last()
-    }
-}
-
-/// The part of `line` between two stations in plan, with the points at both ends
-/// interpolated.
-pub fn slice(line: &Polyline3, start: f64, end: f64) -> Result<Polyline3, ExportError> {
-    let mut points = vec![point_at(line, start)];
-    let mut travelled = 0.0;
-    for segment in line.points().windows(2) {
-        travelled += (segment[1].x - segment[0].x).hypot(segment[1].y - segment[0].y);
-        if travelled > start && travelled < end {
-            points.push(segment[1]);
-        }
-    }
-    points.push(point_at(line, end));
-    Ok(Polyline3::new(points)?)
 }
 
 #[cfg(test)]
@@ -256,40 +316,65 @@ mod tests {
         Polyline3::new(points).unwrap()
     }
 
+    /// Straight, then a bend of `radius` turning `degrees` left, then straight.
+    fn bend_between(before: f64, radius: f64, degrees: f64, after: f64) -> Polyline3 {
+        let mut points = vec![Point3::new(-before, 0.0, 0.0)];
+        points.extend(arc(radius, degrees));
+        let end = *points.last().unwrap();
+        let heading = degrees.to_radians();
+        points.push(Point3::new(
+            end.x + after * heading.cos(),
+            end.y + after * heading.sin(),
+            0.0,
+        ));
+        line(points)
+    }
+
+    fn cut(line: &Polyline3, speed: f64, latest_cut: f64) -> (Vec<Stretch>, Vec<f64>) {
+        let plan = Plan::new(line);
+        let speeds = plan.curve_speeds(3.0);
+        (stretches(&speeds, plan.length(), speed, latest_cut), speeds)
+    }
+
     #[test]
     fn a_straight_line_is_one_uncapped_piece() {
         let straight = line(vec![
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(100.0, 0.0, 0.0),
         ]);
-        let pieces = stretches(&straight, 13.9, 3.0, 0.0);
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].speed, None);
-        assert!((pieces[0].end - 100.0).abs() < 1e-9);
+        let (pieces, speeds) = cut(&straight, 13.9, f64::INFINITY);
+        assert_eq!(
+            pieces,
+            [Stretch {
+                start: 0.0,
+                end: 100.0
+            }]
+        );
+        assert_eq!(cap(&speeds, 0.0, 100.0, 13.9), None);
     }
 
     #[test]
     fn an_arc_from_end_to_end_is_one_capped_piece() {
         // 30 m radius at 3 m/s²: √90 ≈ 9.49 m/s.
         let bend = line(arc(30.0, 90.0));
-        let pieces = stretches(&bend, 13.9, 3.0, 0.0);
+        let (pieces, speeds) = cut(&bend, 13.9, f64::INFINITY);
         assert_eq!(pieces.len(), 1);
-        let speed = pieces[0].speed.unwrap();
+        let speed = cap(&speeds, pieces[0].start, pieces[0].end, 13.9).unwrap();
         assert!((9.0..=9.5).contains(&speed), "{speed}");
     }
 
     #[test]
     fn a_bend_between_straights_is_cut_out() {
-        let mut points = vec![Point3::new(-50.0, 0.0, 0.0)];
-        points.extend(arc(30.0, 90.0));
-        let end = *points.last().unwrap();
-        points.push(Point3::new(end.x, end.y + 50.0, 0.0));
-        let road = line(points);
-        let pieces = stretches(&road, 13.9, 3.0, 0.0);
+        let road = bend_between(50.0, 30.0, 90.0, 50.0);
+        let (pieces, speeds) = cut(&road, 13.9, f64::INFINITY);
         assert_eq!(pieces.len(), 3, "{pieces:?}");
-        assert_eq!(pieces[0].speed, None);
-        assert!(pieces[1].speed.unwrap() < 9.5);
-        assert_eq!(pieces[2].speed, None);
+        let capped: Vec<_> = pieces
+            .iter()
+            .map(|p| cap(&speeds, p.start, p.end, 13.9))
+            .collect();
+        assert_eq!(capped[0], None);
+        assert!(capped[1].unwrap() < 9.5);
+        assert_eq!(capped[2], None);
         // The bend starts 50 m in and is about 47 m long; the chord blurs its ends.
         assert!(
             (pieces[1].start - 50.0).abs() <= HALF_CHORD + STEP,
@@ -299,20 +384,36 @@ mod tests {
             (pieces[2].start - 97.1).abs() <= HALF_CHORD + STEP,
             "{pieces:?}"
         );
-        assert!((pieces[2].end - horizontal_length(&road)).abs() < 1e-9);
+        assert!((pieces[2].end - Plan::new(&road).length()).abs() < 1e-9);
     }
 
     #[test]
-    fn a_short_last_piece_is_folded_back_to_fit_the_tail() {
-        let mut points = vec![Point3::new(-50.0, 0.0, 0.0)];
-        points.extend(arc(30.0, 90.0));
-        let end = *points.last().unwrap();
-        points.push(Point3::new(end.x, end.y + 20.0, 0.0));
-        let road = line(points);
-        let pieces = stretches(&road, 13.9, 3.0, 25.0);
+    fn a_short_bend_is_widened_to_a_drivable_piece() {
+        // 3 m of arc at 15 m radius: a kink no longer than the chord.
+        let road = bend_between(50.0, 15.0, 3.0_f64.to_degrees() / 15.0, 50.0);
+        let (pieces, _) = cut(&road, 13.9, f64::INFINITY);
+        assert!(
+            pieces.iter().all(|p| p.end - p.start >= MIN_PIECE),
+            "{pieces:?}"
+        );
+    }
+
+    #[test]
+    fn the_last_piece_reaches_back_past_the_latest_cut() {
+        let road = bend_between(50.0, 30.0, 90.0, 50.0);
+        let length = Plan::new(&road).length();
+        // A stop line 60 m before the end: the last piece has to hold it.
+        let (pieces, _) = cut(&road, 13.9, length - 60.0);
+        assert!(pieces.last().unwrap().start <= length - 60.0, "{pieces:?}");
         assert_eq!(pieces.len(), 2, "{pieces:?}");
-        assert!(pieces[1].speed.is_some());
-        assert!(pieces[1].end - pieces[1].start >= 25.0);
+    }
+
+    #[test]
+    fn the_inside_of_a_bend_is_slower_than_the_outside() {
+        let inside = Plan::new(&line(arc(20.0, 90.0))).curve_speeds(3.0);
+        let outside = Plan::new(&line(arc(27.0, 90.0))).curve_speeds(3.0);
+        let speed = |speeds: &[f64]| cap(speeds, 0.0, 1e9, 20.0).unwrap();
+        assert!(speed(&inside) < speed(&outside));
     }
 
     #[test]
@@ -335,7 +436,7 @@ mod tests {
             Point3::new(10.0, 0.0, 0.0),
             Point3::new(10.0, 10.0, 0.0),
         ]);
-        let part = slice(&road, 5.0, 15.0).unwrap();
+        let part = Plan::new(&road).slice(5.0, 15.0).unwrap();
         assert_eq!(
             part.points(),
             &[

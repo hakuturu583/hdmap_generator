@@ -128,7 +128,6 @@ impl TripWeights {
 struct Use {
     depart: bool,
     arrive: bool,
-    length: f64,
 }
 
 impl Exporter<'_> {
@@ -150,12 +149,7 @@ impl Exporter<'_> {
             for (edge, used) in self.edges.iter().zip(&uses) {
                 for piece in &edge.pieces {
                     let value = if weighted(used) {
-                        let length = piece
-                            .lanes
-                            .iter()
-                            .map(|lane| lane.length())
-                            .fold(0.0, f64::max);
-                        length.max(MINIMUM_WEIGHT)
+                        piece.length.max(MINIMUM_WEIGHT)
                     } else {
                         0.0
                     };
@@ -262,7 +256,6 @@ impl Exporter<'_> {
                 Use {
                     depart: inside && has_exit[edge],
                     arrive: inside && has_entry[edge],
-                    length: length(edge),
                 }
             })
             .collect()

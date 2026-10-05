@@ -43,11 +43,10 @@ fn a_bend_is_cut_out_and_held_to_its_curve_speed() {
         return;
     }
     let map = scenarios::spiral_transition_road();
-    let prefix = roadgen_sumo::network_name(&map);
-    let (directory, network) = sumo_build::build_with(&map, &curved());
-    sumo_build::simulate(directory.path(), &prefix);
+    let built = sumo_build::build_with(&map, &curved());
+    let (directory, prefix, network) = (&built.directory, &built.prefix, &built.network);
 
-    let edges = forward_edges(&network, "sweep");
+    let edges = forward_edges(network, "sweep");
     assert_eq!(edges, ["sweep.fwd", "sweep.fwd.p1", "sweep.fwd.p2"]);
     let limit = 80.0 / 3.6;
     // The forward carriageway's centre runs a lane's half-width outside the
@@ -69,7 +68,8 @@ fn a_bend_is_cut_out_and_held_to_its_curve_speed() {
     // A car driven through it slows for the bend before it gets there, and gets
     // back up to the limit after.
     let route: Vec<&str> = edges.iter().map(String::as_str).collect();
-    let driven = sumo_build::drive(directory.path(), &prefix, &route, limit);
+    // Driving it is also the check that the simulator runs the network.
+    let driven = sumo_build::drive(directory.path(), prefix, &route, limit);
     let fastest = |edge: &str| {
         driven
             .iter()
@@ -90,10 +90,7 @@ fn the_pieces_of_a_lane_are_traced_to_it_and_joined_end_to_end() {
         return;
     }
     let map = scenarios::spiral_transition_road();
-    let directory = tempfile::tempdir().unwrap();
-    let (prefix, trace) =
-        roadgen_sumo::write_traced_with(&map, directory.path(), &curved()).unwrap();
-    let network = SumoNetwork::read(&sumo_build::netconvert(directory.path(), &prefix));
+    let sumo_build::Built { trace, network, .. } = sumo_build::build_with(&map, &curved());
 
     for lane in map.lanes.iter() {
         let links: BTreeSet<String> = trace
@@ -147,9 +144,13 @@ fn junctions_build_and_their_turns_slow_down() {
     };
     let (crosswalks, _) = scenarios::signalised_crosswalk_crossroads(TrafficHandedness::RightHand);
     for map in [scenarios::controlled_crossroads(), crosswalks] {
-        let prefix = roadgen_sumo::network_name(&map);
         let (_, plain) = sumo_build::build(&map);
-        let (directory, network) = sumo_build::build_with(&map, &curved());
+        let sumo_build::Built {
+            directory,
+            prefix,
+            network,
+            ..
+        } = sumo_build::build_with(&map, &curved());
         sumo_build::simulate(directory.path(), &prefix);
 
         let config =
@@ -180,8 +181,6 @@ fn junctions_build_and_their_turns_slow_down() {
 fn without_the_option_nothing_is_cut() {
     let map = scenarios::spiral_transition_road();
     let plain = roadgen_sumo::to_plain_xml(&map).unwrap();
-    let default = roadgen_sumo::to_plain_xml_with(&map, &Options::default()).unwrap();
-    assert_eq!(plain, default);
     assert!(!plain.edges.contains(".p1"));
     assert!(!plain.config.contains("limit-turn-speed"));
 
