@@ -1003,10 +1003,10 @@ def sumo_tools():
     return netconvert, sumolib
 
 
-def build_with_netconvert(m, directory):
+def build_with_netconvert(m, directory, **options):
     """Exports, builds with netconvert, and hands back the network SUMO read."""
     netconvert, sumolib = sumo_tools()
-    prefix = m.export_sumo(str(directory))
+    prefix = m.export_sumo(str(directory), **options)
     result = subprocess.run(
         [netconvert, "-c", f"{prefix}.netccfg"],
         cwd=directory,
@@ -1112,6 +1112,38 @@ def test_every_export_writes_a_trace_and_they_join_through_the_ir(tmp_path):
         assert answers[0]["via"] is None
         checked += 1
     assert checked >= 8
+
+
+def test_a_sumo_export_can_hold_bends_to_their_curve_speed(tmp_path):
+    m = roadgen.Map(name="bend")
+    radius = 120.0
+    al = roadgen.Alignment(start=(0.0, 0.0, 0.0), heading=0.0)
+    al.line(80.0)
+    al.spiral(60.0, curvature_end=1 / radius)
+    al.arc(140.0, curvature=1 / radius)
+    al.spiral(60.0, curvature_end=0.0)
+    al.line(80.0)
+    m.add_road(lanes=two_way(), alignment=al, name="sweep", speed_limit_kph=80.0)
+
+    prefix, net = build_with_netconvert(m, tmp_path, curve_lateral_acceleration=2.0)
+    roads = sorted(edge.getID() for edge in net.getEdges() if edge.getFunction() != "internal")
+    assert roads == [
+        "sweep.bwd", "sweep.bwd.p1", "sweep.bwd.p2",
+        "sweep.fwd", "sweep.fwd.p1", "sweep.fwd.p2",
+    ]
+    bend = net.getEdge("sweep.fwd.p1").getSpeed()
+    assert bend < (2.0 * (radius + 3.5)) ** 0.5
+    assert net.getEdge("sweep.fwd").getSpeed() == pytest.approx(80.0 / 3.6, abs=0.01)
+
+    # Every piece of a lane is traced back to it.
+    written = json.loads((tmp_path / f"{prefix}.sumo.trace.json").read_text())
+    pieces = {link["ref"] for link in written["links"] if link["ref"].startswith("lane:sweep.fwd")}
+    assert {piece.split("_")[0] for piece in pieces} == {
+        "lane:sweep.fwd", "lane:sweep.fwd.p1", "lane:sweep.fwd.p2",
+    }
+
+    with pytest.raises(RuntimeError, match="positive"):
+        m.export_sumo(str(tmp_path / "bad"), curve_lateral_acceleration=0.0)
 
 
 def test_an_export_can_be_told_not_to_write_its_trace(tmp_path):

@@ -14,6 +14,8 @@ pub enum ExportError {
     /// UTM grid, say — so the network's `<location>` cannot be written.
     Projection(String),
     Io(String),
+    /// A curve's lateral acceleration that is not a positive number of m/s².
+    InvalidCurveAcceleration(f64),
 }
 
 impl From<GeometryError> for ExportError {
@@ -31,6 +33,10 @@ impl fmt::Display for ExportError {
                 write!(f, "the network cannot be georeferenced: {detail}")
             }
             ExportError::Io(detail) => write!(f, "{detail}"),
+            ExportError::InvalidCurveAcceleration(value) => write!(
+                f,
+                "a curve's lateral acceleration has to be positive, not {value}"
+            ),
         }
     }
 }

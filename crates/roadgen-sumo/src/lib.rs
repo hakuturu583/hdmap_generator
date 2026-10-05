@@ -147,6 +147,14 @@
 //! | `node:<id>`, role `walkingarea` | a connection between two footways, and a pavement lane round a corner | collapsed |
 //! | `crossing:<node>/<edge>+<edge>` | a crosswalk | exact, or merged |
 //!
+//! With [`Options::curve_lateral_acceleration`] an edge may be cut into pieces at its
+//! bends (see [`curves`]): the first keeps the edge's id and the rest are
+//! `<edge>.p1`, `<edge>.p2`, …, joined by nodes `n_<edge>_p1`, …. Each piece is `part`
+//! of the road, each of its lanes `part` of the IR lane, and so is each
+//! `connection:<edge>_<i>><edge>.p1_<i>` straight on between them. Connections and
+//! stop offsets leaving an edge are on its last piece, connections arriving on it on
+//! its first, and [`PlainNetwork::lanes`] names the first.
+//!
 //! A light's program is named by its SUMO id, the `id` of its `<tlLogic>`, and each
 //! slot in it by that id and the `linkIndex` of the connection the slot controls — the
 //! position of that connection's signal in every `state` of the program. A light
@@ -199,6 +207,7 @@
 //! [`location`] for which projection each of the map's projections becomes.
 
 pub mod classes;
+pub mod curves;
 pub mod error;
 pub mod location;
 pub mod signals;
@@ -263,6 +272,9 @@ pub struct PlainNetwork {
     /// lane of the map to the lane of the network — and the numbering is not the
     /// IR's: SUMO counts from the outside of the carriageway, which is the right of
     /// the direction of travel under right-hand traffic and the left under left-hand.
+    ///
+    /// Where an edge is cut at curves (see [`Options`]) this is the lane of its first
+    /// piece, where traffic enters it; the trace's `part` links name the rest.
     pub lanes: BTreeMap<LaneId, String>,
     /// Where each element of the IR ended up in the network files: nodes, edges, lanes,
     /// connections and traffic lights, by the identifiers written for them. See the
@@ -321,9 +333,38 @@ pub fn network_name(map: &ValidatedMap) -> String {
     }
 }
 
+/// Choices about the network that the map does not make.
+///
+/// The default writes the map as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Options {
+    /// Hold traffic to the speed a curve allows at this lateral acceleration, m/s²:
+    /// the edges are cut where their curvature changes and each piece is given the
+    /// speed `√(a / κ)` of its sharpest point, where that is below the limit, and
+    /// netconvert is asked to do the same for the internal lanes of junctions with
+    /// `junctions.limit-turn-speed`. See [`curves`].
+    ///
+    /// `None` writes every edge whole at its limit, and leaves the internal lanes to
+    /// netconvert's default.
+    pub curve_lateral_acceleration: Option<f64>,
+}
+
 /// Renders `map` as a SUMO plain-XML network.
 pub fn to_plain_xml(map: &ValidatedMap) -> Result<PlainNetwork, ExportError> {
-    let mut exporter = Exporter::new(map);
+    to_plain_xml_with(map, &Options::default())
+}
+
+/// Renders `map` as a SUMO plain-XML network, as `options` say.
+pub fn to_plain_xml_with(
+    map: &ValidatedMap,
+    options: &Options,
+) -> Result<PlainNetwork, ExportError> {
+    if let Some(acceleration) = options.curve_lateral_acceleration {
+        if !(acceleration.is_finite() && acceleration > 0.0) {
+            return Err(ExportError::InvalidCurveAcceleration(acceleration));
+        }
+    }
+    let mut exporter = Exporter::new(map, *options);
     exporter.build()?;
     Ok(exporter.render(network_name(map)))
 }
@@ -341,8 +382,17 @@ pub fn write_traced(
     map: &ValidatedMap,
     directory: impl AsRef<Path>,
 ) -> Result<(String, Trace), ExportError> {
+    write_traced_with(map, directory, &Options::default())
+}
+
+/// Writes `map` into `directory` as [`write_traced`] does, as `options` say.
+pub fn write_traced_with(
+    map: &ValidatedMap,
+    directory: impl AsRef<Path>,
+    options: &Options,
+) -> Result<(String, Trace), ExportError> {
     let directory = directory.as_ref();
-    let network = to_plain_xml(map)?;
+    let network = to_plain_xml_with(map, options)?;
     network.write_to(directory)?;
     let files = network
         .files()
@@ -678,7 +728,7 @@ fn stop_line_problems(map: &ValidatedMap) -> Vec<String> {
     if total == 0 {
         return Vec::new();
     }
-    let mut exporter = Exporter::new(map);
+    let mut exporter = Exporter::new(map, Options::default());
     if exporter.build().is_err() {
         return Vec::new();
     }
@@ -1144,6 +1194,37 @@ struct Edge {
     speed: f64,
     shape: Polyline3,
     lanes: Vec<EdgeLane>,
+    /// What the edge is written as, in travel order: itself whole, or the pieces
+    /// [`curves`] cut it into. Filled in once everything else is built, by
+    /// [`Exporter::cut_curves`]; the first piece keeps the edge's id.
+    pieces: Vec<Piece>,
+}
+
+/// One written edge of an [`Edge`]: the whole of it, or a stretch between two cuts.
+/// The first piece keeps the edge's id, so connections arriving on the edge name
+/// it as they always did.
+struct Piece {
+    id: String,
+    from: String,
+    to: String,
+    shape: Polyline3,
+    /// Each lane's shape over the stretch, in the edge's lane order.
+    lanes: Vec<Polyline3>,
+    /// Each lane's speed over the stretch where its curvature holds traffic below
+    /// the lane's limit, m/s; see [`curves::cap`].
+    speeds: Vec<Option<f64>>,
+    /// The longest of its lanes, which is what its trip weight is.
+    length: f64,
+}
+
+impl Edge {
+    /// The piece traffic leaves the edge from, which connections, signals and stop
+    /// offsets belong to.
+    fn exit(&self) -> &Piece {
+        self.pieces
+            .last()
+            .expect("cut_curves gives every edge a piece")
+    }
 }
 
 struct EdgeLane {
@@ -1205,6 +1286,7 @@ struct Movement {
 
 struct Exporter<'a> {
     map: &'a ValidatedMap,
+    options: Options,
     sampling: SamplingConfig,
     /// The name every id derived from a road or a junction is built from.
     ids: Ids,
@@ -1222,7 +1304,7 @@ struct Exporter<'a> {
     walking: BTreeMap<String, Movement>,
     /// The pedestrian crossings, by the node each is at and the edges it crosses
     /// there, in the order they are written; see [`Exporter::build_crossings`].
-    crossings: BTreeMap<(String, Vec<String>), Crossing>,
+    crossings: BTreeMap<(String, Vec<usize>), Crossing>,
     slots: HashMap<LaneId, Slot>,
     /// The signalised junctions, each with the lights that govern it.
     signalised: BTreeMap<JunctionId, BTreeSet<ObjectId>>,
@@ -1305,9 +1387,10 @@ enum LineEnd {
 }
 
 impl<'a> Exporter<'a> {
-    fn new(map: &'a ValidatedMap) -> Self {
+    fn new(map: &'a ValidatedMap, options: Options) -> Self {
         let mut exporter = Exporter {
             map,
+            options,
             sampling: map.metadata.sampling,
             ids: Ids::new(map),
             nodes: BTreeMap::new(),
@@ -1486,6 +1569,7 @@ impl<'a> Exporter<'a> {
         self.build_crossings();
         self.open_dead_ends();
         self.place_stop_lines()?;
+        self.cut_curves()?;
         let points = self
             .nodes
             .values()
@@ -1777,8 +1861,130 @@ impl<'a> Exporter<'a> {
                 .unwrap_or_else(|| classes::default_speed(road.road_type)),
             shape,
             lanes: written,
+            pieces: Vec::new(),
         });
         Ok(())
+    }
+
+    /// Cuts every edge into the pieces [`curves`] finds along it, or writes it whole
+    /// when the options ask for no curve speeds; see [`Options`].
+    ///
+    /// Done last, once the stop offsets are placed: the last piece is kept long
+    /// enough to carry the edge's.
+    fn cut_curves(&mut self) -> Result<(), ExportError> {
+        for index in 0..self.edges.len() {
+            let pieces = self.pieces_of(index)?;
+            for piece in &pieces[1..] {
+                let point = piece.shape.first();
+                self.node(piece.from.clone(), point, NodeKind::Unstated, false, None);
+            }
+            self.edges[index].pieces = pieces;
+        }
+        Ok(())
+    }
+
+    fn pieces_of(&self, index: usize) -> Result<Vec<Piece>, ExportError> {
+        let edge = &self.edges[index];
+        let longest = |lanes: &[Polyline3]| lanes.iter().map(Polyline3::length).fold(0.0, f64::max);
+        let Some(acceleration) = self.options.curve_lateral_acceleration else {
+            let lanes: Vec<Polyline3> = edge.lanes.iter().map(|lane| lane.shape.clone()).collect();
+            return Ok(vec![Piece {
+                id: edge.id.clone(),
+                from: edge.from.clone(),
+                to: edge.to.clone(),
+                shape: edge.shape.clone(),
+                length: longest(&lanes),
+                speeds: vec![None; lanes.len()],
+                lanes,
+            }]);
+        };
+        let limit = |lane: &EdgeLane| lane.speed.unwrap_or(edge.speed);
+        let centre = curves::Plan::new(&edge.shape);
+        let plans: Vec<curves::Plan> = edge
+            .lanes
+            .iter()
+            .map(|lane| curves::Plan::new(&lane.shape))
+            .collect();
+        // No cut after the furthest-back stop line, as each lane measures it, so
+        // every stop offset lands on the last piece and fits on its lane.
+        let latest_cut = self
+            .stop_offsets
+            .range((index, 0)..(index + 1, 0))
+            .map(|(&(_, lane), (_, distance))| {
+                let plan = &plans[lane];
+                let line = plan.point_at(plan.length() - distance - MIN_STOP_OFFSET);
+                station_along(&edge.shape, line).0
+            })
+            .fold(f64::INFINITY, f64::min);
+        let fastest = edge.lanes.iter().map(limit).fold(edge.speed, f64::max);
+        let stretches = curves::stretches(
+            &centre.curve_speeds(acceleration),
+            centre.length(),
+            fastest,
+            latest_cut,
+        );
+        let whole = stretches.len() == 1;
+        // Each lane is cut where the centre line is, across the carriageway.
+        let lane_stations: Vec<Vec<f64>> = edge
+            .lanes
+            .iter()
+            .zip(&plans)
+            .map(|(lane, plan)| {
+                std::iter::once(0.0)
+                    .chain(stretches[1..].iter().map(|stretch| {
+                        station_along(&lane.shape, centre.point_at(stretch.start)).0
+                    }))
+                    .chain(std::iter::once(plan.length()))
+                    .collect()
+            })
+            .collect();
+        let lane_speeds: Vec<Vec<f64>> = plans
+            .iter()
+            .map(|plan| plan.curve_speeds(acceleration))
+            .collect();
+        let node = |k: usize| format!("n_{}_p{k}", edge.id);
+        let mut pieces = Vec::with_capacity(stretches.len());
+        for (k, stretch) in stretches.iter().enumerate() {
+            let lanes: Vec<Polyline3> = if whole {
+                edge.lanes.iter().map(|lane| lane.shape.clone()).collect()
+            } else {
+                plans
+                    .iter()
+                    .zip(&lane_stations)
+                    .map(|(plan, stations)| plan.slice(stations[k], stations[k + 1]))
+                    .collect::<Result<_, _>>()?
+            };
+            pieces.push(Piece {
+                id: if k == 0 {
+                    edge.id.clone()
+                } else {
+                    format!("{}.p{k}", edge.id)
+                },
+                from: if k == 0 { edge.from.clone() } else { node(k) },
+                to: if k + 1 == stretches.len() {
+                    edge.to.clone()
+                } else {
+                    node(k + 1)
+                },
+                shape: if whole {
+                    edge.shape.clone()
+                } else {
+                    centre.slice(stretch.start, stretch.end)?
+                },
+                speeds: edge
+                    .lanes
+                    .iter()
+                    .zip(&lane_speeds)
+                    .zip(&lane_stations)
+                    .map(|((lane, speeds), stations)| {
+                        curves::cap(speeds, stations[k], stations[k + 1], limit(lane))
+                    })
+                    .collect(),
+                length: longest(&lanes),
+                lanes,
+            });
+        }
+        Ok(pieces)
     }
 
     /// The one width SUMO lets a lane have: the area of the lane divided by its
@@ -2621,7 +2827,7 @@ impl<'a> Exporter<'a> {
     /// cross-section's edges at the start of the road, the last one's at its end, of
     /// which a forward edge leaves the start and arrives at the end, and a backward
     /// edge the other way round.
-    fn edges_at(&self, road: &RoadId, end: RoadEnd) -> Option<(String, Vec<String>)> {
+    fn edges_at(&self, road: &RoadId, end: RoadEnd) -> Option<(String, Vec<usize>)> {
         let road = self.map.road(road)?;
         let section = match end {
             RoadEnd::Start => 0,
@@ -2631,7 +2837,12 @@ impl<'a> Exporter<'a> {
         let mut edges = Vec::new();
         for direction in [Direction::Forward, Direction::Backward] {
             let id = edge_id(&self.ids.road(&road.id), road, section, direction);
-            let Some(edge) = self.edges.iter().find(|edge| edge.id == id) else {
+            let Some((index, edge)) = self
+                .edges
+                .iter()
+                .enumerate()
+                .find(|(_, edge)| edge.id == id)
+            else {
                 continue;
             };
             if edge.lanes.iter().all(|lane| is_footway(lane.permission)) {
@@ -2645,10 +2856,39 @@ impl<'a> Exporter<'a> {
                 _ => &edge.to,
             };
             node.get_or_insert_with(|| at.clone());
-            edges.push(id);
+            edges.push(index);
         }
         edges.sort();
         Some((node?, edges)).filter(|(_, edges)| !edges.is_empty())
+    }
+
+    /// The crossings as they are written: each by its node and the edges it crosses
+    /// there, sorted by name. An edge cut at curves is crossed on the piece at the
+    /// node — the last of one arriving, the first (which keeps the edge's id) of one
+    /// leaving.
+    fn written_crossings(&self) -> Vec<(String, Vec<String>, &Crossing)> {
+        let mut written: Vec<_> = self
+            .crossings
+            .iter()
+            .map(|((node, edges), crossing)| {
+                let mut names: Vec<String> = edges
+                    .iter()
+                    .map(|&index| {
+                        let edge = &self.edges[index];
+                        let piece = if &edge.to == node {
+                            edge.exit()
+                        } else {
+                            &edge.pieces[0]
+                        };
+                        piece.id.clone()
+                    })
+                    .collect();
+                names.sort();
+                (node.clone(), names, crossing)
+            })
+            .collect();
+        written.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        written
     }
 
     // ----------------------------------------------------------------------- //
@@ -2665,6 +2905,7 @@ impl<'a> Exporter<'a> {
                 &prefix,
                 self.map.metadata.handedness,
                 !self.signals.is_empty(),
+                self.options.curve_lateral_acceleration,
             ),
             weights: self.render_weights(),
             trace: self.trace(),
@@ -2767,12 +3008,14 @@ impl<'a> Exporter<'a> {
                 .map(|slot| slot.edge)
                 .collect();
             for edge in named {
-                trace.link_as(
-                    IrRef::Rule(index),
-                    format!("edge:{}", self.edges[edge].id),
-                    Relation::Merged,
-                    "priority",
-                );
+                for piece in &self.edges[edge].pieces {
+                    trace.link_as(
+                        IrRef::Rule(index),
+                        format!("edge:{}", piece.id),
+                        Relation::Merged,
+                        "priority",
+                    );
+                }
             }
         }
 
@@ -2786,29 +3029,47 @@ impl<'a> Exporter<'a> {
                     continue;
                 };
                 for rule in rules {
-                    trace.link_as(
-                        IrRef::Rule(*rule),
-                        format!("lane:{}_{index}", edge.id),
-                        Relation::Merged,
-                        "speed",
-                    );
+                    for piece in &edge.pieces {
+                        trace.link_as(
+                            IrRef::Rule(*rule),
+                            format!("lane:{}_{index}", piece.id),
+                            Relation::Merged,
+                            "speed",
+                        );
+                    }
                 }
             }
         }
 
+        // An edge cut at curves is several edges, and each of its lanes several lanes
+        // and the connections straight on between them: all of them part of the IR's.
         for edge in &self.edges {
+            let lane_relation = if edge.pieces.len() == 1 {
+                Relation::Exact
+            } else {
+                Relation::Part
+            };
+            for piece in &edge.pieces {
+                trace.link(
+                    edge.road.clone(),
+                    format!("edge:{}", piece.id),
+                    Relation::Part,
+                );
+                for (index, lane) in edge.lanes.iter().enumerate() {
+                    trace.link(
+                        lane.lane.clone(),
+                        format!("lane:{}_{index}", piece.id),
+                        lane_relation,
+                    );
+                }
+            }
+        }
+        for (lane, from, to, index) in self.piece_joints() {
             trace.link(
-                edge.road.clone(),
-                format!("edge:{}", edge.id),
+                lane.lane.clone(),
+                format!("connection:{}_{index}>{}_{index}", from.id, to.id),
                 Relation::Part,
             );
-            for (index, lane) in edge.lanes.iter().enumerate() {
-                trace.link(
-                    lane.lane.clone(),
-                    format!("lane:{}_{index}", edge.id),
-                    Relation::Exact,
-                );
-            }
         }
 
         // A stop line is carried by the stop offset of each lane it was measured
@@ -2816,7 +3077,7 @@ impl<'a> Exporter<'a> {
         for (&(edge, index), (object, _)) in &self.stop_offsets {
             trace.link_as(
                 object.clone(),
-                format!("lane:{}_{index}", self.edges[edge].id),
+                format!("lane:{}_{index}", self.edges[edge].exit().id),
                 Relation::Merged,
                 "stopOffset",
             );
@@ -2825,7 +3086,8 @@ impl<'a> Exporter<'a> {
         for (&(from_edge, from_lane, to_edge, to_lane), movement) in &self.movements {
             let local = format!(
                 "connection:{}_{from_lane}>{}_{to_lane}",
-                self.edges[from_edge].id, self.edges[to_edge].id
+                self.edges[from_edge].exit().id,
+                self.edges[to_edge].id
             );
             // One IR connection straight from lane to lane is this connection; any
             // more, or any connector between them, and it is one of several.
@@ -2844,8 +3106,8 @@ impl<'a> Exporter<'a> {
 
         // A crosswalk is the crossing written for it, and one of several where two
         // crosswalks cross the same end of the same road.
-        for ((node, edges), crossing) in &self.crossings {
-            let local = format!("crossing:{}", crossing_name(node, edges));
+        for (node, edges, crossing) in self.written_crossings() {
+            let local = format!("crossing:{}", crossing_name(&node, &edges));
             let relation = if crossing.crosswalks.len() == 1 {
                 Relation::Exact
             } else {
@@ -2913,57 +3175,87 @@ impl<'a> Exporter<'a> {
     fn render_edges(&self) -> String {
         let mut document = xml::Document::new("edges", "http://sumo.dlr.de/xsd/edges_file.xsd");
         for (edge_index, edge) in self.edges.iter().enumerate() {
-            let mut attributes = vec![
-                ("id", edge.id.clone()),
-                ("from", edge.from.clone()),
-                ("to", edge.to.clone()),
-                ("priority", edge.priority.to_string()),
-                ("numLanes", edge.lanes.len().to_string()),
-                ("speed", metres(edge.speed)),
-                // The lanes carry their own shapes, so this one is the middle of the
-                // carriageway and is spread from as such.
-                ("spreadType", "center".to_owned()),
-                ("shape", shape(&edge.shape)),
-            ];
-            if let Some(name) = &edge.name {
-                attributes.push(("name", name.clone()));
+            for piece_index in 0..edge.pieces.len() {
+                self.render_piece(&mut document, edge_index, piece_index);
             }
-            document.open("edge", &attributes);
-            for (index, lane) in edge.lanes.iter().enumerate() {
-                let mut attributes = vec![
-                    ("index", index.to_string()),
-                    ("width", metres(lane.width)),
-                    ("shape", shape(&lane.shape)),
-                ];
-                if let Some(speed) = lane.speed {
-                    attributes.push(("speed", metres(speed)));
-                }
-                if let Some(permission) = lane.permission {
-                    let (key, value) = permission.attribute();
-                    attributes.push((key, value.to_owned()));
-                }
-                // Left out where the paint allows it: SUMO's default is that anyone
-                // may change.
-                if lane.restricted_left {
-                    attributes.push(("changeLeft", classes::CHANGE_ACROSS_SOLID.to_owned()));
-                }
-                if lane.restricted_right {
-                    attributes.push(("changeRight", classes::CHANGE_ACROSS_SOLID.to_owned()));
-                }
-                match self.stop_offsets.get(&(edge_index, index)) {
-                    // No `vClasses`: a stop line binds everything that drives up to
-                    // it, which is SUMO's default of `all`.
-                    Some((_, distance)) => {
-                        document.open("lane", &attributes);
-                        document.leaf("stopOffset", &[("value", metres(*distance))]);
-                        document.close("lane");
-                    }
-                    None => document.leaf("lane", &attributes),
-                }
-            }
-            document.close("edge");
         }
         document.finish()
+    }
+
+    /// One `<edge>`: piece `piece_index` of edge `edge_index`. The last piece
+    /// carries the edge's stop offsets.
+    fn render_piece(&self, document: &mut xml::Document, edge_index: usize, piece_index: usize) {
+        let edge = &self.edges[edge_index];
+        let piece = &edge.pieces[piece_index];
+        let last = piece_index + 1 == edge.pieces.len();
+        let mut attributes = vec![
+            ("id", piece.id.clone()),
+            ("from", piece.from.clone()),
+            ("to", piece.to.clone()),
+            ("priority", edge.priority.to_string()),
+            ("numLanes", edge.lanes.len().to_string()),
+            ("speed", metres(edge.speed)),
+            // The lanes carry their own shapes, so this one is the middle of the
+            // carriageway and is spread from as such.
+            ("spreadType", "center".to_owned()),
+            ("shape", shape(&piece.shape)),
+        ];
+        if let Some(name) = &edge.name {
+            attributes.push(("name", name.clone()));
+        }
+        document.open("edge", &attributes);
+        for (index, ((lane, lane_shape), curve_speed)) in edge
+            .lanes
+            .iter()
+            .zip(&piece.lanes)
+            .zip(&piece.speeds)
+            .enumerate()
+        {
+            let mut attributes = vec![
+                ("index", index.to_string()),
+                ("width", metres(lane.width)),
+                ("shape", shape(lane_shape)),
+            ];
+            if let Some(speed) = curve_speed.or(lane.speed) {
+                attributes.push(("speed", metres(speed)));
+            }
+            if let Some(permission) = lane.permission {
+                let (key, value) = permission.attribute();
+                attributes.push((key, value.to_owned()));
+            }
+            // Left out where the paint allows it: SUMO's default is that anyone
+            // may change.
+            if lane.restricted_left {
+                attributes.push(("changeLeft", classes::CHANGE_ACROSS_SOLID.to_owned()));
+            }
+            if lane.restricted_right {
+                attributes.push(("changeRight", classes::CHANGE_ACROSS_SOLID.to_owned()));
+            }
+            match self.stop_offsets.get(&(edge_index, index)).filter(|_| last) {
+                // No `vClasses`: a stop line binds everything that drives up to
+                // it, which is SUMO's default of `all`.
+                Some((_, distance)) => {
+                    document.open("lane", &attributes);
+                    document.leaf("stopOffset", &[("value", metres(*distance))]);
+                    document.close("lane");
+                }
+                None => document.leaf("lane", &attributes),
+            }
+        }
+        document.close("edge");
+    }
+
+    /// The lane-to-lane connections that carry an edge on from each of its pieces
+    /// to the next, as (lane, from piece, to piece, lane index).
+    fn piece_joints(&self) -> impl Iterator<Item = (&EdgeLane, &Piece, &Piece, usize)> {
+        self.edges.iter().flat_map(|edge| {
+            edge.pieces.windows(2).flat_map(move |pair| {
+                edge.lanes
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, lane)| (lane, &pair[0], &pair[1], index))
+            })
+        })
     }
 
     fn render_connections(&self) -> String {
@@ -2975,8 +3267,23 @@ impl<'a> Exporter<'a> {
                 // What becomes the internal lane: the IR's own path across the
                 // junction rather than one netconvert would invent.
                 attributes.push(("shape", shape(path)));
+                if let Some(speed) = self.turn_speed(key, path) {
+                    attributes.push(("speed", metres(speed)));
+                }
             }
             document.leaf("connection", &attributes);
+        }
+        // Each lane carries straight on from one piece of its edge to the next.
+        for (_, from, to, lane) in self.piece_joints() {
+            document.leaf(
+                "connection",
+                &[
+                    ("from", from.id.clone()),
+                    ("to", to.id.clone()),
+                    ("fromLane", lane.to_string()),
+                    ("toLane", lane.to_string()),
+                ],
+            );
         }
         // `priority` is written as a number because that is what SUMO's schema for
         // the file says it is, though netconvert reads it as a yes or no: with
@@ -2989,11 +3296,11 @@ impl<'a> Exporter<'a> {
         // appends the crossing's links after the export's, numbered on from the last
         // of them, splitting each green to end it with a pedestrian clearance. The
         // vehicle links and their indices stay the export's.
-        for ((node, edges), crossing) in &self.crossings {
+        for (node, edges, crossing) in self.written_crossings() {
             document.leaf(
                 "crossing",
                 &[
-                    ("node", node.clone()),
+                    ("node", node),
                     ("edges", edges.join(" ")),
                     ("priority", "1".to_owned()),
                     ("width", metres(crossing.width)),
@@ -3015,11 +3322,33 @@ impl<'a> Exporter<'a> {
             for next in self.edges.iter().filter(|next| next.from == edge.to) {
                 document.leaf(
                     "delete",
-                    &[("from", edge.id.clone()), ("to", next.id.clone())],
+                    &[("from", edge.exit().id.clone()), ("to", next.id.clone())],
                 );
             }
         }
         document.finish()
+    }
+
+    /// The speed a movement's path across a junction holds traffic to, where the
+    /// options ask for curve speeds and that is below what either lane allows.
+    ///
+    /// netconvert's own `junctions.limit-turn-speed` reads a radius off the whole of
+    /// the internal lane — its length over how far it turns — which is the mean of a
+    /// turn drawn tighter in the middle than at its ends, as the connectors of real
+    /// junctions are. So the export measures the IR's path itself, as it does the
+    /// edges, and states the speed.
+    fn turn_speed(
+        &self,
+        &(from_edge, from_lane, to_edge, to_lane): &(usize, usize, usize, usize),
+        path: &Polyline3,
+    ) -> Option<f64> {
+        let acceleration = self.options.curve_lateral_acceleration?;
+        let lane_speed = |edge: usize, lane: usize| {
+            let edge = &self.edges[edge];
+            edge.lanes[lane].speed.unwrap_or(edge.speed)
+        };
+        let limit = lane_speed(from_edge, from_lane).min(lane_speed(to_edge, to_lane));
+        curves::slowest(path, acceleration).filter(|&speed| speed < limit - curves::MARGIN)
     }
 
     /// The four attributes that name a written connection.
@@ -3028,7 +3357,7 @@ impl<'a> Exporter<'a> {
         &(from_edge, from_lane, to_edge, to_lane): &(usize, usize, usize, usize),
     ) -> Vec<(&'static str, String)> {
         vec![
-            ("from", self.edges[from_edge].id.clone()),
+            ("from", self.edges[from_edge].exit().id.clone()),
             ("to", self.edges[to_edge].id.clone()),
             ("fromLane", from_lane.to_string()),
             ("toLane", to_lane.to_string()),
@@ -3193,7 +3522,12 @@ fn lane_change(lane: &Lane, neighbour: &Lane, towards: LateralSide) -> bool {
 ///
 /// The traffic-light file is named only when there is one, which is when the map has
 /// a signalised junction with something to control.
-fn render_config(prefix: &str, handedness: TrafficHandedness, traffic_lights: bool) -> String {
+fn render_config(
+    prefix: &str,
+    handedness: TrafficHandedness,
+    traffic_lights: bool,
+    turn_acceleration: Option<f64>,
+) -> String {
     let mut document = xml::Document::new(
         "configuration",
         "http://sumo.dlr.de/xsd/netconvertConfiguration.xsd",
@@ -3219,6 +3553,15 @@ fn render_config(prefix: &str, handedness: TrafficHandedness, traffic_lights: bo
         document.leaf("lefthand", &[("value", "true".into())]);
     }
     document.close("processing");
+    if let Some(acceleration) = turn_acceleration {
+        // The internal lanes' counterpart of the edges' curve speeds; see `curves`.
+        document.open("junctions", &[]);
+        document.leaf(
+            "junctions.limit-turn-speed",
+            &[("value", metres(acceleration))],
+        );
+        document.close("junctions");
+    }
     document.open("pedestrian", &[]);
     document.leaf("walkingareas", &[("value", "true".into())]);
     document.close("pedestrian");
@@ -5264,7 +5607,7 @@ mod tests {
             .unwrap();
         let map = builder.finish().unwrap().validate().unwrap();
 
-        let mut exporter = Exporter::new(&map);
+        let mut exporter = Exporter::new(&map, Options::default());
         exporter.build().unwrap();
         assert!(exporter
             .edges
@@ -5328,7 +5671,7 @@ mod tests {
         );
         let map = builder.finish().unwrap().validate().unwrap();
 
-        let mut exporter = Exporter::new(&map);
+        let mut exporter = Exporter::new(&map, Options::default());
         exporter.build().unwrap();
         let priority = |id: &str| {
             exporter

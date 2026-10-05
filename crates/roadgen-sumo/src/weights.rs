@@ -128,7 +128,6 @@ impl TripWeights {
 struct Use {
     depart: bool,
     arrive: bool,
-    length: f64,
 }
 
 impl Exporter<'_> {
@@ -145,16 +144,20 @@ impl Exporter<'_> {
                     ("end", "1".to_owned()),
                 ],
             );
+            // An edge cut at curves is written piece by piece, each weighted as the
+            // edge is and by its own share of the length.
             for (edge, used) in self.edges.iter().zip(&uses) {
-                let value = if weighted(used) {
-                    used.length.max(MINIMUM_WEIGHT)
-                } else {
-                    0.0
-                };
-                document.leaf(
-                    "edge",
-                    &[("id", edge.id.clone()), ("value", crate::metres(value))],
-                );
+                for piece in &edge.pieces {
+                    let value = if weighted(used) {
+                        piece.length.max(MINIMUM_WEIGHT)
+                    } else {
+                        0.0
+                    };
+                    document.leaf(
+                        "edge",
+                        &[("id", piece.id.clone()), ("value", crate::metres(value))],
+                    );
+                }
             }
             document.close("interval");
             document.finish()
@@ -253,7 +256,6 @@ impl Exporter<'_> {
                 Use {
                     depart: inside && has_exit[edge],
                     arrive: inside && has_entry[edge],
-                    length: length(edge),
                 }
             })
             .collect()

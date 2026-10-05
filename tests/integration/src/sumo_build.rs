@@ -88,11 +88,31 @@ pub fn is_about_the_machine_or_the_map(line: &str) -> bool {
 /// test can look at the plain files that went in as well as the network that came
 /// out.
 pub fn build(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork) {
+    let built = build_with(map, &roadgen_sumo::Options::default());
+    (built.directory, built.network)
+}
+
+/// A network built by [`build_with`], with what went into it.
+pub struct Built {
+    pub directory: tempfile::TempDir,
+    pub prefix: String,
+    pub trace: roadgen_core::trace::Trace,
+    pub network: SumoNetwork,
+}
+
+/// [`build`], with the export's `options`, keeping the prefix and the trace.
+pub fn build_with(map: &ValidatedMap, options: &roadgen_sumo::Options) -> Built {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let prefix = roadgen_sumo::write(map, directory.path()).expect("the map should export as SUMO");
+    let (prefix, trace) = roadgen_sumo::write_traced_with(map, directory.path(), options)
+        .expect("the map should export as SUMO");
 
     let path = netconvert(directory.path(), &prefix);
-    (directory, SumoNetwork::read(&path))
+    Built {
+        network: SumoNetwork::read(&path),
+        directory,
+        prefix,
+        trace,
+    }
 }
 
 /// [`build`], for a map netconvert is *right* to warn about: what it said comes back
@@ -304,14 +324,40 @@ pub fn lanes_driven(
     depart_lane: usize,
     arrival_lane: usize,
 ) -> BTreeSet<String> {
-    let routes = directory.join("drive.rou.xml");
-    std::fs::write(
-        &routes,
-        format!(
-            r#"<routes><vehicle id="car" depart="0" departLane="{depart_lane}" arrivalLane="{arrival_lane}" departSpeed="10"><route edges="{edge}"/></vehicle></routes>"#
-        ),
-    )
-    .expect("the route file");
+    let routes = format!(
+        r#"<routes><vehicle id="car" depart="0" departLane="{depart_lane}" arrivalLane="{arrival_lane}" departSpeed="10"><route edges="{edge}"/></vehicle></routes>"#
+    );
+    fcd(directory, prefix, &routes)
+        .into_iter()
+        .filter_map(|mut vehicle| vehicle.remove("lane"))
+        .collect()
+}
+
+/// Drives one passenger car along `edges` of a built network, departing at
+/// `depart_speed`, and returns the lane it was on and its speed at every step.
+pub fn drive(
+    directory: &Path,
+    prefix: &str,
+    edges: &[&str],
+    depart_speed: f64,
+) -> Vec<(String, f64)> {
+    let routes = format!(
+        r#"<routes><vType id="exact" speedFactor="1" speedDev="0"/><vehicle id="car" type="exact" depart="0" departSpeed="{depart_speed}"><route edges="{}"/></vehicle></routes>"#,
+        edges.join(" ")
+    );
+    fcd(directory, prefix, &routes)
+        .into_iter()
+        .filter_map(|mut vehicle| {
+            let speed = vehicle.remove("speed")?.parse().expect("a speed");
+            Some((vehicle.remove("lane")?, speed))
+        })
+        .collect()
+}
+
+/// Runs the simulator on a built network with `routes` as its demand, and returns
+/// the attributes of every `<vehicle>` of its floating car data, step by step.
+fn fcd(directory: &Path, prefix: &str, routes: &str) -> Vec<HashMap<String, String>> {
+    std::fs::write(directory.join("drive.rou.xml"), routes).expect("the route file");
     let output = Command::new(tool("sumo").expect("sumo"))
         .args(["-n", &format!("{prefix}.net.xml")])
         .args(["-r", "drive.rou.xml"])
@@ -327,7 +373,7 @@ pub fn lanes_driven(
         String::from_utf8_lossy(&output.stderr)
     );
     let fcd = std::fs::read_to_string(directory.join("drive.fcd.xml")).expect("the fcd output");
-    let mut lanes = BTreeSet::new();
+    let mut vehicles = Vec::new();
     let mut reader = Reader::from_str(&fcd);
     loop {
         match reader.read_event().expect("well-formed fcd output") {
@@ -335,14 +381,12 @@ pub fn lanes_driven(
             Event::Start(element) | Event::Empty(element)
                 if element.name().as_ref() == b"vehicle" =>
             {
-                if let Some(lane) = attributes(&element).remove("lane") {
-                    lanes.insert(lane);
-                }
+                vehicles.push(attributes(&element));
             }
             _ => {}
         }
     }
-    lanes
+    vehicles
 }
 
 // --------------------------------------------------------------------------- //
