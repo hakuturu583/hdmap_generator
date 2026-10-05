@@ -145,16 +145,25 @@ impl Exporter<'_> {
                     ("end", "1".to_owned()),
                 ],
             );
+            // An edge cut at curves is written piece by piece, each weighted as the
+            // edge is and by its own share of the length.
             for (edge, used) in self.edges.iter().zip(&uses) {
-                let value = if weighted(used) {
-                    used.length.max(MINIMUM_WEIGHT)
-                } else {
-                    0.0
-                };
-                document.leaf(
-                    "edge",
-                    &[("id", edge.id.clone()), ("value", crate::metres(value))],
-                );
+                for piece in &edge.pieces {
+                    let value = if weighted(used) {
+                        let length = piece
+                            .lanes
+                            .iter()
+                            .map(|lane| lane.length())
+                            .fold(0.0, f64::max);
+                        length.max(MINIMUM_WEIGHT)
+                    } else {
+                        0.0
+                    };
+                    document.leaf(
+                        "edge",
+                        &[("id", piece.id.clone()), ("value", crate::metres(value))],
+                    );
+                }
             }
             document.close("interval");
             document.finish()

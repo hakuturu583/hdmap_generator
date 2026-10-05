@@ -95,6 +95,19 @@ pub fn build(map: &ValidatedMap) -> (tempfile::TempDir, SumoNetwork) {
     (directory, SumoNetwork::read(&path))
 }
 
+/// [`build`], with the export's `options`.
+pub fn build_with(
+    map: &ValidatedMap,
+    options: &roadgen_sumo::Options,
+) -> (tempfile::TempDir, SumoNetwork) {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let (prefix, _) = roadgen_sumo::write_traced_with(map, directory.path(), options)
+        .expect("the map should export as SUMO");
+
+    let path = netconvert(directory.path(), &prefix);
+    (directory, SumoNetwork::read(&path))
+}
+
 /// [`build`], for a map netconvert is *right* to warn about: what it said comes back
 /// alongside the network instead of failing the test, so the test can check that it
 /// warned about exactly what the map holds and nothing else.
@@ -343,6 +356,59 @@ pub fn lanes_driven(
         }
     }
     lanes
+}
+
+/// Drives one passenger car along `edges` of a built network, departing at
+/// `depart_speed`, and returns the lane it was on and its speed at every step.
+pub fn drive(
+    directory: &Path,
+    prefix: &str,
+    edges: &[&str],
+    depart_speed: f64,
+) -> Vec<(String, f64)> {
+    let routes = directory.join("drive.rou.xml");
+    std::fs::write(
+        &routes,
+        format!(
+            r#"<routes><vType id="exact" speedFactor="1" speedDev="0"/><vehicle id="car" type="exact" depart="0" departSpeed="{depart_speed}"><route edges="{}"/></vehicle></routes>"#,
+            edges.join(" ")
+        ),
+    )
+    .expect("the route file");
+    let output = Command::new(tool("sumo").expect("sumo"))
+        .args(["-n", &format!("{prefix}.net.xml")])
+        .args(["-r", "drive.rou.xml"])
+        .args(["--fcd-output", "drive.fcd.xml"])
+        .args(["--no-step-log", "true"])
+        .args(["--no-warnings", "true"])
+        .current_dir(directory)
+        .output()
+        .expect("sumo should run");
+    assert!(
+        output.status.success(),
+        "sumo could not drive the network:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fcd = std::fs::read_to_string(directory.join("drive.fcd.xml")).expect("the fcd output");
+    let mut driven = Vec::new();
+    let mut reader = Reader::from_str(&fcd);
+    loop {
+        match reader.read_event().expect("well-formed fcd output") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element)
+                if element.name().as_ref() == b"vehicle" =>
+            {
+                let mut attributes = attributes(&element);
+                if let (Some(lane), Some(speed)) =
+                    (attributes.remove("lane"), attributes.remove("speed"))
+                {
+                    driven.push((lane, speed.parse().expect("a speed")));
+                }
+            }
+            _ => {}
+        }
+    }
+    driven
 }
 
 // --------------------------------------------------------------------------- //

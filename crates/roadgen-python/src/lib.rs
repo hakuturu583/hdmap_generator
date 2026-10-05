@@ -1126,12 +1126,28 @@ impl PyMap {
     /// link indices each traffic light did — unless `trace` is false. The internal
     /// lanes netconvert draws across a junction are not in it, since netconvert names
     /// them; `Trace.add_sumo_net` reads them from the built network.
-    #[pyo3(signature = (directory, trace = true))]
-    fn export_sumo(&mut self, directory: PathBuf, trace: bool) -> PyResult<String> {
+    ///
+    /// `curve_lateral_acceleration`, in m/s², holds traffic to the speed each bend
+    /// allows: an edge is cut where its curvature changes and each piece is given the
+    /// speed `sqrt(a / curvature)` of its sharpest point where that is below the
+    /// limit — the first piece keeps the edge's id, the rest are `<edge>.p1`,
+    /// `<edge>.p2`, … and the trace has every one — and netconvert is asked for the
+    /// same on the internal lanes of junctions with `junctions.limit-turn-speed`.
+    /// Left at `None`, every edge is written whole at its limit.
+    #[pyo3(signature = (directory, trace = true, curve_lateral_acceleration = None))]
+    fn export_sumo(
+        &mut self,
+        directory: PathBuf,
+        trace: bool,
+        curve_lateral_acceleration: Option<f64>,
+    ) -> PyResult<String> {
         self.ensure_built()?;
         let map = self.built.as_ref().expect("just built");
+        let options = roadgen_sumo::Options {
+            curve_lateral_acceleration,
+        };
         let (prefix, written) =
-            roadgen_sumo::write_traced(map, &directory).map_err(runtime_error)?;
+            roadgen_sumo::write_traced_with(map, &directory, &options).map_err(runtime_error)?;
         if trace {
             let path = roadgen_trace::directory_sidecar(&directory, &prefix, &written.format);
             self.write_sidecar(&written, path)?;
