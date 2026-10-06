@@ -522,7 +522,9 @@ surface rather than straight up, which is what "five metres above the road" mean
 slope and what `zOffset` carries.
 
 A traffic light's line is the bottom edge of its housing, which is where `zOffset`
-puts a signal. A light can also say what Autoware draws of it besides — the height
+puts a signal. `add_traffic_light` gives a light a standard head: a housing 0.38 m
+wide and 1.05 m tall over the middle of its lane, its bar that wide at the `height`
+asked for, and three lamps one above the other — green, yellow, red from the bottom. A light can also say what Autoware draws of it besides — the height
 of its housing and its lamps, each with a position, a colour and an arrow — as its
 `LightHead`, and both formats carry it: Lanelet2 as Autoware writes it, the
 `height` tag on the light's way and a `light_bulbs` way of tagged points naming
@@ -1675,9 +1677,12 @@ drops any mesh whose name holds `light` or `sign` before it is placed.
 So the furniture is built, and it is built to the road: a pole on the pavement,
 `kerb_setback` in from the kerb on the side the governed traffic keeps to; a mast arm
 from there, perpendicular to the road, long enough to reach `arm_overhang` past the
-middle of the farthest lane the light governs, at the height the IR gave the bar; a
-three-lamp head hung from it over the middle of every governed lane, facing the
-traffic. A sign is a post on the same pavement, `sign_setback_along` before the line
+middle of the farthest lane the light governs; a head hung from it over the middle
+of every governed lane, facing the traffic. The head is the IR's: its housing stands
+on the light's bar (the bar is the housing's bottom edge), as wide as the bar and as
+tall as the head's `height`, with a lamp at each of its bulbs, and the arm runs just
+above it. So the housing and lamps CARLA shows are the `traffic_light` and
+`light_bulbs` ways the Lanelet2 map gives Autoware, to the centimetre. A sign is a post on the same pavement, `sign_setback_along` before the line
 it applies to, with an octagon, a triangle, a disc or a square on it for what the
 code says it is. A road with no pavement stands both on the verge instead.
 

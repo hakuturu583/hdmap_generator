@@ -17,8 +17,8 @@ use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::layout::{self, RoadGeometry, SectionLayout};
 use crate::map::{CrossSection, Lane, Map, MapMetadata, Road};
 use crate::semantics::{
-    BoundaryMarking, LaneType, MapObject, MapObjectKind, ObjectGeometry, RoadMarking, RoadType,
-    TrafficRule,
+    BoundaryMarking, LaneType, LightHead, MapObject, MapObjectKind, ObjectGeometry, RoadMarking,
+    RoadType, TrafficRule,
 };
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
@@ -749,8 +749,9 @@ impl MapBuilder {
         self.add_traffic_light_at(lane, end, height, 0.0)
     }
 
-    /// Adds a traffic light bar above `lane`, `setback` metres back from one of its
-    /// ends.
+    /// Adds a traffic light over the middle of `lane`, `setback` metres back from
+    /// one of its ends: a standard head ([`LightHead::standard`]) whose bar -- the
+    /// housing's bottom edge -- is `height` above the road.
     pub fn add_traffic_light_at(
         &mut self,
         lane: &LaneRef,
@@ -2073,19 +2074,31 @@ impl Generator {
                         LaneEnd::End => (finish - setback).max(start),
                         LaneEnd::Start => (start + setback).min(finish),
                     };
-                    let up = self
+                    let normal = self
                         .map
                         .road(&lane.road)
                         .ok_or_else(|| BuildError::UnknownRoad(lane.road.clone()))
-                        .and_then(|road| Ok(road.frame_at(station, config)?.up.scaled(height)))?;
+                        .and_then(|road| Ok(road.frame_at(station, config)?.up))?;
+                    let up = normal.scaled(height);
                     let raise = |point: Point3| point + up;
+                    let (mut left, mut right) = (raise(left), raise(right));
+                    let mut kind = kind;
+                    if let MapObjectKind::TrafficLight { head } = &mut kind {
+                        if *head == LightHead::default() {
+                            // A light is a head hung over the middle of its lane,
+                            // and its bar is that head's bottom edge -- the
+                            // housing every export draws, not the lane's width.
+                            let middle = left.lerp(right, 0.5);
+                            let across = (right - left).normalize()?;
+                            let half = across.scaled(LightHead::STANDARD_WIDTH / 2.0);
+                            (left, right) = (middle - half, middle + half);
+                            *head = LightHead::standard(middle, normal);
+                        }
+                    }
                     MapObject {
                         id: id.clone(),
                         kind,
-                        geometry: ObjectGeometry::Line(Curve3::polyline([
-                            raise(left),
-                            raise(right),
-                        ])?),
+                        geometry: ObjectGeometry::Line(Curve3::polyline([left, right])?),
                         lanes: self.lane_ids(&lanes)?,
                     }
                 }
@@ -2433,6 +2446,39 @@ mod tests {
         builder
             .add_road(RoadSpec::line(from, to, two_way()).unwrap().with_name(name))
             .unwrap()
+    }
+
+    #[test]
+    fn a_light_is_a_standard_head_over_the_middle_of_its_lane_at_any_height() {
+        for height in [5.0, 0.0] {
+            let mut builder = MapBuilder::default();
+            let road = straight(
+                &mut builder,
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(100.0, 0.0, 0.0),
+                "main",
+            );
+            let light = builder
+                .add_traffic_light(&LaneRef::new(road, 0), LaneEnd::End, height)
+                .unwrap();
+            let map = builder.finish().unwrap().into_map();
+            let object = map.objects.iter().find(|o| o.id == light).unwrap();
+            let (MapObjectKind::TrafficLight { head }, ObjectGeometry::Line(bar)) =
+                (&object.kind, &object.geometry)
+            else {
+                panic!("not a light bar");
+            };
+            // 0.38 m across the forward lane's middle (y = -1.75), at the height asked.
+            let (from, to) = (bar.start_point(), bar.end_point());
+            assert!((from.distance_to(to) - LightHead::STANDARD_WIDTH).abs() < 1e-9);
+            assert!((from.lerp(to, 0.5).y + 1.75).abs() < 1e-9);
+            assert!((from.z - height).abs() < 1e-9 && (to.z - height).abs() < 1e-9);
+            // Three lamps standing on the bar, red at the top.
+            assert_eq!(head.bulbs.len(), 3);
+            assert!(head.bulbs.iter().all(|bulb| bulb.position.z > height));
+            assert_eq!(head.bulbs[2].color, crate::semantics::LightColor::Red);
+            assert!(head.bulbs[2].position.z < height + head.height.unwrap());
+        }
     }
 
     #[test]

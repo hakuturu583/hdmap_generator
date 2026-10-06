@@ -332,7 +332,10 @@ fn geometry(out: &mut String, id: i64, mesh: &Mesh) {
     if mesh.is_one_material() {
         out.push_str("\t\t\tMappingInformationType: \"AllSame\"\n");
         out.push_str("\t\t\tReferenceInformationType: \"IndexToDirect\"\n");
-        integers(out, 3, "Materials", &[0]);
+        // The slot its triangles use, which need not be the first it has: a head
+        // whose lamps are all green still has red and amber slots before green.
+        let slot = mesh.slots.first().copied().unwrap_or(0) as i64;
+        integers(out, 3, "Materials", &[slot]);
     } else {
         out.push_str("\t\t\tMappingInformationType: \"ByPolygon\"\n");
         out.push_str("\t\t\tReferenceInformationType: \"IndexToDirect\"\n");
@@ -535,6 +538,28 @@ mod tests {
             0,
         );
         mesh
+    }
+
+    #[test]
+    fn a_mesh_of_one_material_names_the_slot_it_uses() {
+        // Three slots, every triangle in the last: green lamps, not red ones.
+        let mut mesh = Mesh::new("Town01_Lamps_0", Role::TrafficLight, materials::LAMP_RED);
+        mesh.slot_for(materials::LAMP_AMBER);
+        let green = mesh.slot_for(materials::LAMP_GREEN);
+        mesh.face(
+            &[
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+            ],
+            green,
+        );
+        assert!(mesh.is_one_material());
+        let text = document(&[mesh], "roadgen");
+        assert!(
+            text.contains(&format!("Materials: *1 {{\n\t\t\t\ta: {green}")),
+            "{text}"
+        );
     }
 
     #[test]

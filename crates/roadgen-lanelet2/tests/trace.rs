@@ -177,15 +177,23 @@ fn objects_and_rules_are_traced_to_what_they_became() {
         1
     );
 
-    // A signal is a single line, so it is its linestring exactly.
+    // A signal is a single line, so it is its linestring exactly; a builder's
+    // light has a standard head, whose lamps are the whole light again.
     let light = map
         .objects
         .iter()
         .find(|object| object.kind.is_traffic_light())
         .unwrap();
     let links: Vec<_> = trace.links_of(&IrRef::Object(light.id.clone())).collect();
-    assert_eq!(links.len(), 1);
-    assert_eq!(links[0].relation, Relation::Exact);
+    assert_eq!(links.len(), 2);
+    assert!(links.iter().all(|link| link.relation == Relation::Exact));
+    assert_eq!(
+        links
+            .iter()
+            .filter(|link| link.role.as_deref() == Some("light_bulbs"))
+            .count(),
+        1
+    );
 
     let rule = |index| trace.links_of(&IrRef::Rule(index)).collect::<Vec<_>>();
     for index in [0, 3] {
