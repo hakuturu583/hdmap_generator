@@ -2944,6 +2944,39 @@ impl<'a> Exporter<'a> {
                 continue;
             };
             let signal = self.signals.get(*node);
+            // The movements of the program a light governs: off the lanes it stands
+            // over, or off every lane its rules give it. None without a program.
+            let reach = |light: &ObjectId, own: bool| -> BTreeSet<&(usize, usize, usize, usize)> {
+                let Some(signal) = signal else {
+                    return BTreeSet::new();
+                };
+                let lanes = if own {
+                    self.map
+                        .objects
+                        .get(light)
+                        .map(|object| object.lanes.iter().collect())
+                } else {
+                    self.governed.get(light).map(|lanes| lanes.iter().collect())
+                };
+                let lanes: BTreeSet<&LaneId> = lanes.unwrap_or_default();
+                signal
+                    .links
+                    .iter()
+                    .filter(|key| {
+                        let from = &self.edges[key.0].lanes[key.1].lane;
+                        lanes.contains(from)
+                            || self.movements[*key]
+                                .connectors
+                                .iter()
+                                .any(|lane| lanes.contains(lane))
+                    })
+                    .collect()
+            };
+            let own: BTreeMap<&ObjectId, BTreeSet<_>> = lights
+                .iter()
+                .map(|light| (light, reach(light, true)))
+                .collect();
+            let claimed: BTreeSet<_> = own.values().flatten().copied().collect();
             for light in lights {
                 let local = match signal {
                     Some(signal) => format!("tls:{}", signal.id),
@@ -2959,26 +2992,13 @@ impl<'a> Exporter<'a> {
                 // all their lanes — which is right for the program, but traced that way
                 // two lights of one controller would each claim the other's movements,
                 // and a simulator that does switch them apart could not tell which
-                // light a movement follows. Only a light whose own lanes reach no
-                // movement here is traced by the rule's.
-                let Some(signal) = signal else { continue };
-                let own = self.map.objects.get(light).map(|object| &object.lanes);
-                let governed = self.governed.get(light);
-                let movements =
-                    |governs: &dyn Fn(&LaneId) -> bool| -> Vec<&(usize, usize, usize, usize)> {
-                        signal
-                            .links
-                            .iter()
-                            .filter(|key| {
-                                let from = &self.edges[key.0].lanes[key.1].lane;
-                                governs(from) || self.movements[*key].connectors.iter().any(governs)
-                            })
-                            .collect()
-                    };
-                let mut keys = movements(&|lane| own.is_some_and(|lanes| lanes.contains(lane)));
-                if keys.is_empty() {
-                    keys = movements(&|lane| governed.is_some_and(|lanes| lanes.contains(lane)));
-                }
+                // light a movement follows. So a light answers for the movements off
+                // its own lanes, and for those its rules give it that no light here
+                // stands over.
+                let unclaimed = reach(light, false)
+                    .into_iter()
+                    .filter(|key| !claimed.contains(key));
+                let keys: BTreeSet<_> = own[light].iter().copied().chain(unclaimed).collect();
                 for key in keys {
                     let (id, index) = link_indices[key];
                     trace.link_as(
@@ -6039,6 +6059,46 @@ mod tests {
                 .map(|connection| format!("tls:j_x/{}", connection["linkIndex"]))
                 .collect();
         assert!(!expected.is_empty());
+        assert_eq!(traced, expected);
+    }
+
+    #[test]
+    fn a_light_answers_for_the_approaches_its_rule_gives_it_that_no_light_stands_over() {
+        // One light on the northern approach, its rule over the eastern one too.
+        let map = crossroads_controlled(TrafficHandedness::RightHand, |builder, roads| {
+            let north = builder
+                .add_traffic_light(&LaneRef::new(roads[0].clone(), 0), LaneEnd::End, 5.0)
+                .unwrap();
+            builder.add_traffic_light_rule(
+                vec![north],
+                None,
+                vec![
+                    LaneRef::new(roads[0].clone(), 0),
+                    LaneRef::new(roads[1].clone(), 0),
+                ],
+            );
+        });
+        let network = to_plain_xml(&map).unwrap();
+        let light = map
+            .objects
+            .iter()
+            .find(|object| object.kind.is_traffic_light())
+            .unwrap();
+        let traced: BTreeSet<String> = network
+            .trace
+            .links_of(&IrRef::Object(light.id.clone()))
+            .filter(|link| link.role.as_deref() == Some("link"))
+            .map(|link| link.local.clone())
+            .collect();
+        let expected: BTreeSet<String> =
+            elements(network.traffic_lights.as_deref().unwrap(), "connection")
+                .iter()
+                .filter(|connection| {
+                    ["north.fwd", "east.fwd"].contains(&connection["from"].as_str())
+                })
+                .map(|connection| format!("tls:j_x/{}", connection["linkIndex"]))
+                .collect();
+        assert_eq!(expected.len(), 6);
         assert_eq!(traced, expected);
     }
 

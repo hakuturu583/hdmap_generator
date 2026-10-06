@@ -970,8 +970,12 @@ impl PyMap {
     /// Writes the trace of the file this map was read from: which element of the map
     /// each road, lane, junction, signal, object and controller of the file became,
     /// in the kinds the OpenDRIVE export's own trace uses (`road:12`,
-    /// `lane:12/0/-1`, `signal:949`, `controller:964`). To `<file>.trace.json`
-    /// beside the file unless `path` says otherwise; returns where it went.
+    /// `lane:12/0/-1`, `signal:949`, `controller:964`). To `<file>.read.trace.json`
+    /// beside the file unless `path` says otherwise -- not `<file>.trace.json`, which
+    /// is what an export of the same file is traced by -- and returns where it went.
+    ///
+    /// Its format is `opendrive`, as an export's is, so a `Trace` holds one of the
+    /// two.
     ///
     /// With the IR dump and an export's trace, it follows a signal of the file into
     /// the export — a CARLA traffic light to the SUMO links it switches:
@@ -981,7 +985,7 @@ impl PyMap {
     /// m.export_ir("town.ir.json")
     /// m.write_read_trace()
     /// m.export_sumo("sumo/")
-    /// t = roadgen.Trace.load("town.ir.json", "town.xodr.trace.json",
+    /// t = roadgen.Trace.load("town.ir.json", "town.xodr.read.trace.json",
     ///                        "sumo/town.sumo.trace.json")
     /// t.translate("opendrive", "signal:949", to="sumo")
     /// ```
@@ -995,7 +999,12 @@ impl PyMap {
                 ))
             }
         };
-        let path = match path.or_else(|| trace.files.first().map(roadgen_trace::sidecar_path)) {
+        let read_sidecar = |file: &PathBuf| {
+            let mut name = file.as_os_str().to_owned();
+            name.push(".read.trace.json");
+            PathBuf::from(name)
+        };
+        let path = match path.or_else(|| trace.files.first().map(read_sidecar)) {
             Some(path) => path,
             None => {
                 return Err(PyValueError::new_err(

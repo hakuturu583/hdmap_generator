@@ -1466,11 +1466,11 @@ def test_a_signal_of_a_file_read_is_followed_into_the_sumo_export(tmp_path):
 
     back = roadgen.read_opendrive(str(tmp_path / "town.xodr"))
     back.export_ir(tmp_path / "town.ir.json")
-    assert back.write_read_trace() == tmp_path / "town.xodr.trace.json"
+    assert back.write_read_trace() == tmp_path / "town.xodr.read.trace.json"
     prefix = back.export_sumo(tmp_path / "sumo")
     trace = roadgen.Trace.load(
         tmp_path / "town.ir.json",
-        tmp_path / "town.xodr.trace.json",
+        tmp_path / "town.xodr.read.trace.json",
         tmp_path / "sumo" / f"{prefix}.sumo.trace.json",
     )
     switched = {

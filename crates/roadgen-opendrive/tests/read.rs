@@ -380,7 +380,12 @@ fn the_reader_traces_what_each_element_was_read_from() {
         .iter()
         .find(|object| object.kind.is_traffic_light())
         .expect("the light is read");
-    assert_eq!(read_from(IrRef::Object(light.id.clone())), ["signal:42"]);
+    let signal: Vec<&str> = trace
+        .links_of(&IrRef::Object(light.id.clone()))
+        .filter(|link| link.role.is_none())
+        .map(|link| link.local.as_str())
+        .collect();
+    assert_eq!(signal, ["signal:42"]);
     let stop_line = map
         .objects
         .iter()
@@ -388,8 +393,13 @@ fn the_reader_traces_what_each_element_was_read_from() {
         .expect("the stop line is read");
     assert_eq!(read_from(IrRef::Object(stop_line.id.clone())), ["object:7"]);
 
-    // And the controller, as the rule it became.
+    // And the controller, as the rule it became and with its light part of it.
     assert_eq!(read_from(IrRef::Rule(0)), ["controller:c1"]);
+    assert!(trace
+        .links_of(&IrRef::Object(light.id.clone()))
+        .any(|link| link.local == "controller:c1"
+            && link.relation == Relation::Merged
+            && link.role.as_deref() == Some("controller")));
 }
 
 #[test]

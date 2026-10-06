@@ -26,7 +26,8 @@
 - IR ダンプの読込時には中身から fingerprint を再計算し、埋め込まれた値と違えば拒否する。
 - GPUDrive の agent は、軌跡が実際に届いた lane（role `route`）と、届かなかった場合のゴールの lane（role `goal`）にだけ結び付ける。
 - 読み込み側（`read_opendrive`）のトレースは §5.3 のとおり実装した（`Map.write_read_trace`）。lane・road・junction に加えて `signal:` / `object:` / `controller:` も載せる。CLI、Web デモのハイライトはフェーズ 2 のまま。
-- SUMO のトレースで信号機を link に結び付けるときは、まずその信号機自身の lane から出る movement を使い、それで 1 本も無いときだけ規則（rule）の lane を使う。OpenDRIVE の controller は同時に切り替わる信号の組で、リーダはそれを全信号の lane をまとめた 1 つの rule にするため、そのままだと同じ controller の信号同士が互いの movement を名乗ってしまう。
+- 読み込み側トレースの既定のファイル名は `<入力>.read.trace.json`（エクスポート側の `<file>.trace.json` を上書きしないため）。
+- SUMO のトレースで信号機を link に結び付けるときは、その信号機自身の lane から出る movement と、規則（rule）がその信号機に与える movement のうちどの信号機の lane からも出ていないものを使う。OpenDRIVE の controller は同時に切り替わる信号の組で、リーダはそれを全信号の lane をまとめた 1 つの rule にするため、そのままだと同じ controller の信号同士が互いの movement を名乗ってしまう。
 
 ## 1. 何を解きたいか
 

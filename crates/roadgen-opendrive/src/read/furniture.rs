@@ -139,6 +139,15 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
             format!("controller:{}", controller.id),
             Relation::Exact,
         );
+        // And each of its lights as part of it, as the exporter records them.
+        for light in &lights {
+            reader.trace.link_as(
+                light.clone(),
+                format!("controller:{}", controller.id),
+                Relation::Merged,
+                "controller",
+            );
+        }
         reader.map.rules.push(TrafficRule::TrafficLight {
             lights,
             stop_line,
