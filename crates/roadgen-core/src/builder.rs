@@ -17,8 +17,8 @@ use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::layout::{self, RoadGeometry, SectionLayout};
 use crate::map::{CrossSection, Lane, Map, MapMetadata, Road};
 use crate::semantics::{
-    BoundaryMarking, LaneType, MapObject, MapObjectKind, ObjectGeometry, RoadMarking, RoadType,
-    TrafficRule,
+    BoundaryMarking, LaneType, LightHead, MapObject, MapObjectKind, ObjectGeometry, RoadMarking,
+    RoadType, TrafficRule,
 };
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
@@ -749,8 +749,9 @@ impl MapBuilder {
         self.add_traffic_light_at(lane, end, height, 0.0)
     }
 
-    /// Adds a traffic light bar above `lane`, `setback` metres back from one of its
-    /// ends.
+    /// Adds a traffic light over the middle of `lane`, `setback` metres back from
+    /// one of its ends: a standard head ([`LightHead::standard`]) whose bar -- the
+    /// housing's bottom edge -- is `height` above the road.
     pub fn add_traffic_light_at(
         &mut self,
         lane: &LaneRef,
@@ -2079,13 +2080,24 @@ impl Generator {
                         .ok_or_else(|| BuildError::UnknownRoad(lane.road.clone()))
                         .and_then(|road| Ok(road.frame_at(station, config)?.up.scaled(height)))?;
                     let raise = |point: Point3| point + up;
+                    let (mut left, mut right) = (raise(left), raise(right));
+                    let mut kind = kind;
+                    if let MapObjectKind::TrafficLight { head } = &mut kind {
+                        if *head == LightHead::default() {
+                            // A light is a head hung over the middle of its lane,
+                            // and its bar is that head's bottom edge -- the
+                            // housing every export draws, not the lane's width.
+                            let middle = left.lerp(right, 0.5);
+                            let across = (right - left).normalize()?;
+                            let half = across.scaled(LightHead::STANDARD_WIDTH / 2.0);
+                            (left, right) = (middle - half, middle + half);
+                            *head = LightHead::standard(middle, up.normalize()?);
+                        }
+                    }
                     MapObject {
                         id: id.clone(),
                         kind,
-                        geometry: ObjectGeometry::Line(Curve3::polyline([
-                            raise(left),
-                            raise(right),
-                        ])?),
+                        geometry: ObjectGeometry::Line(Curve3::polyline([left, right])?),
                         lanes: self.lane_ids(&lanes)?,
                     }
                 }

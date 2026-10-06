@@ -686,8 +686,9 @@ impl PyMap {
         Ok(id.to_string())
     }
 
-    /// Adds a traffic light bar above a lane, `setback` metres back from the end
-    /// named.
+    /// Adds a traffic light over the middle of a lane, `setback` metres back from
+    /// the end named: a standard three-lamp head whose housing's bottom edge is
+    /// `height` metres above the road.
     #[pyo3(signature = (lane, end = "end", height = 5.0, setback = 0.0))]
     fn add_traffic_light(
         &mut self,

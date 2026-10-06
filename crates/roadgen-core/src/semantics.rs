@@ -4,7 +4,7 @@
 //! `RegulatoryElement` appears here; each exporter maps these onto its own format's
 //! vocabulary, and a format that cannot express one simply drops it.
 
-use crate::geometry::{Curve3, Point3};
+use crate::geometry::{Curve3, Point3, UnitVector3};
 use crate::id::{LaneId, ObjectId};
 use crate::units::SpeedLimit;
 
@@ -284,6 +284,36 @@ pub struct LightHead {
     pub height: Option<f64>,
     /// The lamps, in the order they are listed.
     pub bulbs: Vec<LightBulb>,
+}
+
+impl LightHead {
+    /// The width of a standard head: a vertical housing with three round lamps.
+    pub const STANDARD_WIDTH: f64 = 0.38;
+    /// The diameter of each of a standard head's lamps.
+    pub const STANDARD_LAMP: f64 = 0.30;
+    /// How much taller a standard housing is than its column of lamps.
+    pub const STANDARD_MARGIN: f64 = 0.15;
+
+    /// A standard head whose housing's bottom edge is centred on `bottom`: three
+    /// lamps one above the other, green at the bottom and red at the top, as a
+    /// builder-placed light is built in every export that draws one.
+    pub fn standard(bottom: Point3, up: UnitVector3) -> LightHead {
+        let lamp = Self::STANDARD_LAMP;
+        let margin = Self::STANDARD_MARGIN / 2.0;
+        let bulbs = [LightColor::Green, LightColor::Yellow, LightColor::Red]
+            .into_iter()
+            .enumerate()
+            .map(|(row, color)| LightBulb {
+                position: bottom + up.scaled(margin + lamp / 2.0 + row as f64 * lamp),
+                color,
+                arrow: None,
+            })
+            .collect();
+        LightHead {
+            height: Some(3.0 * lamp + Self::STANDARD_MARGIN),
+            bulbs,
+        }
+    }
 }
 
 /// Kinds of physical furniture the IR knows about.

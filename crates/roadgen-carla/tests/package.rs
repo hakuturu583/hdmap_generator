@@ -610,6 +610,81 @@ fn a_light_stands_on_the_pavement_with_an_arm_that_reaches_its_lane() {
 }
 
 #[test]
+fn a_lights_housing_and_lamps_are_where_the_ir_and_so_lanelet2_put_them() {
+    use roadgen_core::semantics::{LightColor, MapObjectKind, ObjectGeometry};
+
+    let map = signalised("Town01");
+    let config = PackageConfig::for_map(&map);
+    let furniture = roadgen_carla::furniture::build(
+        &map,
+        &config.map,
+        &config.surfaces,
+        &config.furniture.unwrap(),
+    );
+    for light in &furniture.lights {
+        let object = map
+            .objects
+            .iter()
+            .find(|object| object.id == light.object)
+            .unwrap();
+        let (MapObjectKind::TrafficLight { head }, ObjectGeometry::Line(bar)) =
+            (&object.kind, &object.geometry)
+        else {
+            panic!("{} is not a light with a bar", object.id);
+        };
+        // The builder gave it a standard head: a bar as wide as the housing, over
+        // the middle of the lane, and three lamps standing on it.
+        let (from, to) = (bar.start_point(), bar.end_point());
+        assert!((from.distance_to(to) - 0.38).abs() < 1e-6, "{}", object.id);
+        assert_eq!(head.height.map(|h| (h * 100.0).round()), Some(105.0));
+        assert_eq!(
+            head.bulbs.iter().map(|bulb| bulb.color).collect::<Vec<_>>(),
+            [LightColor::Green, LightColor::Yellow, LightColor::Red]
+        );
+
+        // The lamps CARLA switches, in the world: each bulb has a lamp round it,
+        // on the face of the housing towards the traffic.
+        let (sin, cos) = light.heading.sin_cos();
+        let world: Vec<Point3> = light
+            .lamps
+            .as_ref()
+            .unwrap()
+            .positions
+            .iter()
+            .map(|p| {
+                Point3::new(
+                    light.position.x + p.x * cos - p.y * sin,
+                    light.position.y + p.x * sin + p.y * cos,
+                    light.position.z + p.z,
+                )
+            })
+            .collect();
+        for bulb in &head.bulbs {
+            let near = world
+                .iter()
+                .filter(|p| {
+                    (p.z - bulb.position.z).abs() <= 0.15 + 1e-6
+                        && p.horizontal_distance_to(bulb.position) <= 0.15 + 0.2
+                })
+                .count();
+            assert!(
+                near >= 12,
+                "no lamp at {:?} for {}",
+                bulb.position,
+                object.id
+            );
+        }
+        // And the housing stands on the bar: nothing of the head hangs below it.
+        let bottom = from.z.min(to.z);
+        let lowest_lamp = world.iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        assert!(
+            lowest_lamp > bottom,
+            "a lamp at {lowest_lamp} below the bar at {bottom}"
+        );
+    }
+}
+
+#[test]
 fn the_furniture_is_props_the_xodr_agrees_with_and_map_logic_ties_together() {
     let map = signalised("Town01");
     let directory = tempfile::tempdir().expect("a temporary directory");

@@ -71,7 +71,7 @@ use std::f64::consts::{PI, TAU};
 use roadgen_core::geometry::{Point3, Vector3};
 use roadgen_core::id::{LaneId, ObjectId, RoadId};
 use roadgen_core::map::{Map, Road};
-use roadgen_core::semantics::{MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
+use roadgen_core::semantics::{LightColor, MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
 use roadgen_core::topology::{Direction, LateralSide};
 use roadgen_opendrive::road_coordinates;
 use roadgen_opendrive::{SignalCatalogue, SignalPlacement};
@@ -472,18 +472,71 @@ fn light(
         .ok()?;
     let local = Local::new(stand.foot, stand.heading);
 
-    // The arm is at the bar's height above the road, which is where the IR put
-    // the bar; the heads hang below it over the middle of each governed lane.
-    let arm_height = (site.height - stand.rise).max(config.lamp_diameter * 4.0);
-    let mut heads: Vec<[f64; 3]> = Vec::new();
+    // The IR's bar is the bottom edge of the light's housing and its bulbs are
+    // the lamps, so the head is built where they are -- the housing standing on
+    // the bar, the lamps at the bulbs -- and the arm runs above it. Every export
+    // then agrees on where the light is: a Lanelet2 map's traffic_light and
+    // light_bulbs ways are the very housing and lamps CARLA shows.
+    let head = object.kind.light_head().cloned().unwrap_or_default();
+    let (bar_middle, bar_width) = match &object.geometry {
+        ObjectGeometry::Line(bar) => (
+            bar.start_point().lerp(bar.end_point(), 0.5),
+            bar.start_point().distance_to(bar.end_point()),
+        ),
+        _ => (frame.to_global([0.0, 0.0, site.height]), config.head_width),
+    };
+    let head_width = if bar_width > 1e-3 {
+        bar_width
+    } else {
+        config.head_width
+    };
+    let head_height = head
+        .height
+        .unwrap_or(config.lamp_diameter * 3.0 + 0.15)
+        .max(config.lamp_diameter);
+    let bar_local = local.of(bar_middle);
+    let bottom = bar_local[2].max(config.lamp_diameter);
+    let head_top = bottom + head_height;
+    let arm_height = head_top + 0.05 + config.arm_radius;
+    // The lamps relative to the middle of the bar, across the road and up: the
+    // bulbs the IR gave, or a column of three when it gave none.
+    let lamp_offsets: Vec<(f64, f64, usize)> = if head.bulbs.is_empty() {
+        (0..3)
+            .map(|row| {
+                let up = head_height
+                    - 0.075
+                    - config.lamp_diameter / 2.0
+                    - row as f64 * config.lamp_diameter;
+                (0.0, up, lamp_material(row))
+            })
+            .collect()
+    } else {
+        head.bulbs
+            .iter()
+            .map(|bulb| {
+                let at = local.of(bulb.position);
+                (
+                    at[1] - bar_local[1],
+                    at[2] - bottom,
+                    bulb_material(bulb.color),
+                )
+            })
+            .collect()
+    };
+    let mut heads: Vec<f64> = Vec::new();
     for lane in &site.lanes {
         let Some(centre) = layout.lane_centre(stand.station, &lane.id) else {
             continue;
         };
-        let over = frame.to_global([0.0, centre, 0.0]);
-        let mut point = local.of(over);
-        point[2] = arm_height;
-        heads.push(point);
+        heads.push(local.of(frame.to_global([0.0, centre, 0.0]))[1]);
+    }
+    // The bar's own lane hangs its head where the bar is, to the centimetre.
+    if let Some(nearest) = heads.iter_mut().min_by(|a, b| {
+        (**a - bar_local[1])
+            .abs()
+            .total_cmp(&(**b - bar_local[1]).abs())
+    }) {
+        *nearest = bar_local[1];
     }
     if heads.is_empty() {
         return None;
@@ -492,11 +545,11 @@ fn light(
     // heads are all abeam of the pole, so the arm's direction is theirs.
     let farthest = heads
         .iter()
-        .max_by(|a, b| a[1].abs().total_cmp(&b[1].abs()))
         .copied()
-        .unwrap_or([0.0, 1.0, 0.0]);
-    let side = if farthest[1] < 0.0 { -1.0 } else { 1.0 };
-    let arm_length = farthest[1].abs() + config.arm_overhang;
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .unwrap_or(1.0);
+    let side = if farthest < 0.0 { -1.0 } else { 1.0 };
+    let arm_length = farthest.abs() + config.arm_overhang;
 
     let ordinal = ordinals.take(Role::TrafficLight);
     let mut mesh = Mesh::new(
@@ -511,11 +564,14 @@ fn light(
         Role::TrafficLight,
         materials::LAMP_RED,
     );
-    let lamp_slots = [
-        lamps.slot_for(materials::LAMP_RED),
-        lamps.slot_for(materials::LAMP_AMBER),
-        lamps.slot_for(materials::LAMP_GREEN),
-    ];
+    // Every head has the three, in this order, whatever its bulbs show.
+    for material in [
+        materials::LAMP_RED,
+        materials::LAMP_AMBER,
+        materials::LAMP_GREEN,
+    ] {
+        lamps.slot_for(material);
+    }
     let top = arm_height + config.pole_radius * 3.0;
     cylinder(
         &mut mesh,
@@ -533,10 +589,7 @@ fn light(
         8,
         steel,
     );
-    let head_height = config.lamp_diameter * 3.0 + 0.15;
-    for head in &heads {
-        let y = head[1];
-        let head_top = arm_height - config.arm_radius - 0.05;
+    for &y in &heads {
         // The bracket the head hangs by.
         cylinder(
             &mut mesh,
@@ -546,24 +599,22 @@ fn light(
             6,
             steel,
         );
-        let centre_z = head_top - head_height / 2.0;
         cuboid(
             &mut mesh,
-            [0.0, y, centre_z],
-            [config.head_depth, config.head_width, head_height],
+            [0.0, y, bottom + head_height / 2.0],
+            [config.head_depth, head_width, head_height],
             housing,
         );
-        // Three lamps on the face towards the traffic, red at the top.
+        // The lamps on the face towards the traffic.
         let face_x = config.head_depth / 2.0 + 0.005;
-        for (row, slot) in lamp_slots.iter().enumerate() {
-            let z =
-                head_top - 0.075 - config.lamp_diameter / 2.0 - row as f64 * config.lamp_diameter;
+        for (across, up, material) in &lamp_offsets {
+            let slot = lamps.slot_for(*material);
             disc(
                 &mut lamps,
-                [face_x, y, z],
+                [face_x, y + across, bottom + up],
                 config.lamp_diameter / 2.0,
                 12,
-                *slot,
+                slot,
             );
         }
     }
@@ -669,6 +720,23 @@ fn sign(
             catalogue: kind.catalogue(),
         },
     })
+}
+
+/// The material of a lamp in a column of three, counted from the top.
+fn lamp_material(row: usize) -> usize {
+    match row {
+        0 => materials::LAMP_RED,
+        1 => materials::LAMP_AMBER,
+        _ => materials::LAMP_GREEN,
+    }
+}
+
+fn bulb_material(color: LightColor) -> usize {
+    match color {
+        LightColor::Red => materials::LAMP_RED,
+        LightColor::Yellow => materials::LAMP_AMBER,
+        LightColor::Green => materials::LAMP_GREEN,
+    }
 }
 
 /// Where a light applies: the middle of the stop line of the first rule that
