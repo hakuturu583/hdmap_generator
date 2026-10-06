@@ -27,6 +27,10 @@ use crate::topology::{
 use crate::units::{PositiveWidth, SpeedLimit};
 use crate::validation::UnvalidatedMap;
 
+/// How far a crossing reaches onto the pavement each side of the carriageway, so
+/// that it meets the walkways rather than stopping short of them.
+pub const CROSSWALK_OVERLAP: f64 = 0.3;
+
 /// One lane of a road's cross-section, as the caller describes it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaneSpec {
@@ -2121,19 +2125,16 @@ impl Generator {
                     let station = station.clamp(half, length - half);
                     let frame = entry.frame_at(station, config)?;
                     let lateral = frame.left.get();
-                    // How far the road reaches at *this* station, which a tapering
-                    // cross-section makes a different question at every one.
-                    let extent = self.layouts[&road]
-                        .iter()
-                        .filter(|layout| {
-                            station >= layout.station_range.0 && station <= layout.station_range.1
-                        })
-                        .map(|layout| layout.extent(station))
-                        .fold(0.0_f64, f64::max);
+                    // Kerb to kerb at *this* station -- a tapering cross-section
+                    // makes it a different question at every one -- and
+                    // CROSSWALK_OVERLAP onto the pavement each side, so that a
+                    // crossing meets the walkways without lying along them. (A
+                    // road with no pavement is crossed edge to edge.)
+                    let (lo, hi) = self.crossing_span(&road, station);
                     let along = frame.tangent.scaled(width / 2.0);
                     let edge = |sign: f64| -> Result<Curve3, GeometryError> {
                         let center = frame.origin + along * sign;
-                        Curve3::polyline([center + lateral * extent, center - lateral * extent])
+                        Curve3::polyline([center + lateral * hi, center + lateral * lo])
                     };
                     MapObject {
                         id: id.clone(),
@@ -2152,6 +2153,46 @@ impl Generator {
                 .map_err(|duplicate| BuildError::DuplicateId(duplicate.0.to_string()))?;
         }
         Ok(())
+    }
+
+    /// The lateral span a crossing at `station` covers: the carriageway (every
+    /// lane but the pavements) and [`CROSSWALK_OVERLAP`] past it on a side with a
+    /// pavement, never beyond the road's edge.
+    fn crossing_span(&self, road: &RoadId, station: f64) -> (f64, f64) {
+        let layouts = &self.layouts[road];
+        let in_section = |range: (f64, f64)| station >= range.0 && station <= range.1;
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        let (mut road_lo, mut road_hi) = (f64::MAX, f64::MIN);
+        for lane in self.map.lanes_of(road) {
+            if !in_section(lane.station_range) {
+                continue;
+            }
+            let Some(layout) = layouts.get(lane.section) else {
+                continue;
+            };
+            let edges = [
+                layout.edge_offset(lane.left_edge, station),
+                layout.edge_offset(lane.right_edge, station),
+            ];
+            for offset in edges {
+                road_lo = road_lo.min(offset);
+                road_hi = road_hi.max(offset);
+                if lane.lane_type != LaneType::Sidewalk {
+                    lo = lo.min(offset);
+                    hi = hi.max(offset);
+                }
+            }
+        }
+        if road_lo > road_hi {
+            return (0.0, 0.0);
+        }
+        if lo > hi {
+            return (road_lo, road_hi);
+        }
+        (
+            (lo - CROSSWALK_OVERLAP).max(road_lo),
+            (hi + CROSSWALK_OVERLAP).min(road_hi),
+        )
     }
 
     fn lane_ids(&self, lanes: &[LaneRef]) -> Result<Vec<LaneId>, BuildError> {
@@ -2446,6 +2487,43 @@ mod tests {
         builder
             .add_road(RoadSpec::line(from, to, two_way()).unwrap().with_name(name))
             .unwrap()
+    }
+
+    #[test]
+    fn a_crossing_spans_the_carriageway_and_just_reaches_the_pavements() {
+        // Two 3.5 m lanes and a 2.5 m pavement each side: the carriageway is 7 m,
+        // the road 12 m. The crossing covers the 7 m and 0.3 m of each pavement.
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    vec![
+                        LaneSpec::new(width(3.5), Direction::Backward),
+                        LaneSpec::new(width(2.5), Direction::Backward)
+                            .with_type(LaneType::Sidewalk),
+                        LaneSpec::new(width(3.5), Direction::Forward),
+                        LaneSpec::new(width(2.5), Direction::Forward).with_type(LaneType::Sidewalk),
+                    ],
+                )
+                .unwrap()
+                .with_name("main"),
+            )
+            .unwrap();
+        let crossing = builder.add_crosswalk(&road, 0.5, 4.0).unwrap();
+        let map = builder.finish().unwrap().into_map();
+        let object = map.objects.iter().find(|o| o.id == crossing).unwrap();
+        let ObjectGeometry::Band { left, .. } = &object.geometry else {
+            panic!("a crossing is a band");
+        };
+        let (a, b) = (left.start_point(), left.end_point());
+        let (lo, hi) = (a.y.min(b.y), a.y.max(b.y));
+        let reach = 3.5 + CROSSWALK_OVERLAP;
+        assert!(
+            (lo + reach).abs() < 1e-9 && (hi - reach).abs() < 1e-9,
+            "{lo}..{hi}"
+        );
     }
 
     #[test]
