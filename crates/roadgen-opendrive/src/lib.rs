@@ -158,6 +158,9 @@ pub use controllers::{signal_groups, SignalGroup};
 pub use error::{ExportError, ImportError};
 pub use options::{Options, SignalCatalogue, SignalPlacement};
 pub use read::{from_xml, from_xml_with, read, read_with, Imported, ReadOptions};
+
+/// The format name of the traces this crate writes and reads.
+pub const TRACE_FORMAT: &str = "opendrive";
 pub use road_coordinates::RoadPosition;
 
 /// Width of a painted lane marking, metres. OpenDRIVE wants a number; this is the
@@ -522,7 +525,7 @@ impl<'a> Exporter<'a> {
             buildings,
             options,
             map,
-            trace: RefCell::new(Trace::new("opendrive")),
+            trace: RefCell::new(Trace::new(TRACE_FORMAT)),
         }
     }
 

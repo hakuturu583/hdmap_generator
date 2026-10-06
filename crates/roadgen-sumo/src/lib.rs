@@ -2952,21 +2952,41 @@ impl<'a> Exporter<'a> {
                 trace.link_as(light.clone(), local, Relation::Merged, "traffic_light");
                 // And of the slot of every movement off a lane it governs. A light on
                 // a connector governs the movements that run over it.
+                //
+                // The lanes the light stands over come first. A rule hands each of its
+                // lights every lane of the rule — an OpenDRIVE controller lists the
+                // signals that switch together, and the reader makes it one rule over
+                // all their lanes — which is right for the program, but traced that way
+                // two lights of one controller would each claim the other's movements,
+                // and a simulator that does switch them apart could not tell which
+                // light a movement follows. Only a light whose own lanes reach no
+                // movement here is traced by the rule's.
                 let Some(signal) = signal else { continue };
+                let own = self.map.objects.get(light).map(|object| &object.lanes);
                 let governed = self.governed.get(light);
-                let governs = |lane: &LaneId| governed.is_some_and(|lanes| lanes.contains(lane));
-                for key in &signal.links {
-                    let from = &self.edges[key.0].lanes[key.1].lane;
-                    let movement = &self.movements[key];
-                    if governs(from) || movement.connectors.iter().any(governs) {
-                        let (id, index) = link_indices[key];
-                        trace.link_as(
-                            light.clone(),
-                            format!("tls:{id}/{index}"),
-                            Relation::Merged,
-                            "link",
-                        );
-                    }
+                let movements =
+                    |governs: &dyn Fn(&LaneId) -> bool| -> Vec<&(usize, usize, usize, usize)> {
+                        signal
+                            .links
+                            .iter()
+                            .filter(|key| {
+                                let from = &self.edges[key.0].lanes[key.1].lane;
+                                governs(from) || self.movements[*key].connectors.iter().any(governs)
+                            })
+                            .collect()
+                    };
+                let mut keys = movements(&|lane| own.is_some_and(|lanes| lanes.contains(lane)));
+                if keys.is_empty() {
+                    keys = movements(&|lane| governed.is_some_and(|lanes| lanes.contains(lane)));
+                }
+                for key in keys {
+                    let (id, index) = link_indices[key];
+                    trace.link_as(
+                        light.clone(),
+                        format!("tls:{id}/{index}"),
+                        Relation::Merged,
+                        "link",
+                    );
                 }
             }
         }
@@ -5935,6 +5955,91 @@ mod tests {
                 .collect();
         assert_eq!(expected.len(), 3);
         assert_eq!(slots, expected);
+    }
+
+    #[test]
+    fn lights_switched_together_are_traced_to_their_own_approaches() {
+        // An OpenDRIVE controller over two lights, read as one rule over both their
+        // approaches: each light still answers for the movements off its own.
+        let map = crossroads_controlled(TrafficHandedness::RightHand, |builder, roads| {
+            let north = builder
+                .add_traffic_light(&LaneRef::new(roads[0].clone(), 0), LaneEnd::End, 5.0)
+                .unwrap();
+            let east = builder
+                .add_traffic_light(&LaneRef::new(roads[1].clone(), 0), LaneEnd::End, 5.0)
+                .unwrap();
+            builder.add_traffic_light_rule(
+                vec![north, east],
+                None,
+                vec![
+                    LaneRef::new(roads[0].clone(), 0),
+                    LaneRef::new(roads[1].clone(), 0),
+                ],
+            );
+        });
+        let network = to_plain_xml(&map).unwrap();
+        let connections = elements(network.traffic_lights.as_deref().unwrap(), "connection");
+        let off = |edge: &str| -> BTreeSet<String> {
+            connections
+                .iter()
+                .filter(|connection| connection["from"] == edge)
+                .map(|connection| format!("tls:j_x/{}", connection["linkIndex"]))
+                .collect()
+        };
+        let lights: Vec<&ObjectId> = map
+            .objects
+            .iter()
+            .filter(|object| object.kind.is_traffic_light())
+            .map(|object| &object.id)
+            .collect();
+        let traced = |light: &ObjectId| -> BTreeSet<String> {
+            network
+                .trace
+                .links_of(&IrRef::Object(light.clone()))
+                .filter(|link| link.role.as_deref() == Some("link"))
+                .map(|link| link.local.clone())
+                .collect()
+        };
+        assert_eq!(lights.len(), 2);
+        assert_eq!(traced(lights[0]), off("north.fwd"));
+        assert_eq!(traced(lights[1]), off("east.fwd"));
+        assert!(!off("north.fwd").is_empty() && !off("east.fwd").is_empty());
+    }
+
+    #[test]
+    fn a_light_whose_own_lane_reaches_no_movement_is_traced_by_its_rule() {
+        // A light standing on the far side of the junction, on a lane that leaves it,
+        // governs the approach only through its rule.
+        let map = crossroads_controlled(TrafficHandedness::RightHand, |builder, roads| {
+            let light = builder
+                .add_traffic_light(&LaneRef::new(roads[2].clone(), 1), LaneEnd::Start, 5.0)
+                .unwrap();
+            builder.add_traffic_light_rule(
+                vec![light],
+                None,
+                vec![LaneRef::new(roads[0].clone(), 0)],
+            );
+        });
+        let network = to_plain_xml(&map).unwrap();
+        let light = map
+            .objects
+            .iter()
+            .find(|object| object.kind.is_traffic_light())
+            .unwrap();
+        let traced: BTreeSet<String> = network
+            .trace
+            .links_of(&IrRef::Object(light.id.clone()))
+            .filter(|link| link.role.as_deref() == Some("link"))
+            .map(|link| link.local.clone())
+            .collect();
+        let expected: BTreeSet<String> =
+            elements(network.traffic_lights.as_deref().unwrap(), "connection")
+                .iter()
+                .filter(|connection| connection["from"] == "north.fwd")
+                .map(|connection| format!("tls:j_x/{}", connection["linkIndex"]))
+                .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(traced, expected);
     }
 
     #[test]

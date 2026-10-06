@@ -35,6 +35,7 @@ use roadgen_core::id::{BuildingId, BuildingPartId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::Road;
 use roadgen_core::semantics::{LightHead, MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
 use roadgen_core::topology::{Direction, LateralSide};
+use roadgen_core::trace::{IrRef, Relation};
 
 use super::Reader;
 use crate::bulbs::{self, BULB_CODE};
@@ -133,6 +134,11 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
             continue;
         }
         let stop_line = reader.stop_line_across(&stop_lines, &lanes);
+        reader.trace.link(
+            IrRef::Rule(reader.map.rules.len()),
+            format!("controller:{}", controller.id),
+            Relation::Exact,
+        );
         reader.map.rules.push(TrafficRule::TrafficLight {
             lights,
             stop_line,
@@ -295,6 +301,14 @@ impl Reader<'_> {
         let id = ObjectId::new(unique_name(name, ObjectId::PREFIX, od_id, |candidate| {
             self.map.objects.contains(&ObjectId::new(candidate))
         }));
+        // The exporter writes a light or a sign as a `<signal>` and the rest as an
+        // `<object>`, and so does this trace, in the same kinds.
+        let source = match kind {
+            MapObjectKind::TrafficLight { .. } | MapObjectKind::TrafficSign { .. } => "signal",
+            _ => "object",
+        };
+        self.trace
+            .link(id.clone(), format!("{source}:{od_id}"), Relation::Exact);
         let object = MapObject {
             id: id.clone(),
             kind,
@@ -597,6 +611,8 @@ impl Reader<'_> {
                 station: object.s.get::<meter>(),
             }),
         };
+        self.trace
+            .link(id.clone(), format!("object:{}", object.id), Relation::Exact);
         self.map.buildings.insert(id, building).ok();
         for part in parts {
             self.map.building_parts.insert(part.id.clone(), part).ok();

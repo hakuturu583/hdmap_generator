@@ -865,15 +865,15 @@ fn parse_net(text: &str) -> Result<Net, String> {
                     last.lanes.push(id);
                 }
             }
-            b"junction" => {
-                if attributes.get(b"type".as_slice()).map(String::as_str) != Some("internal") {
-                    let position = (
-                        coordinate(&attributes, b"x")?,
-                        coordinate(&attributes, b"y")?,
-                    );
-                    if let Some(id) = attributes.remove(b"id".as_slice()) {
-                        net.junctions.insert(id, position);
-                    }
+            b"junction"
+                if attributes.get(b"type".as_slice()).map(String::as_str) != Some("internal") =>
+            {
+                let position = (
+                    coordinate(&attributes, b"x")?,
+                    coordinate(&attributes, b"y")?,
+                );
+                if let Some(id) = attributes.remove(b"id".as_slice()) {
+                    net.junctions.insert(id, position);
                 }
             }
             b"tlLogic" => {

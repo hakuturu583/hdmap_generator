@@ -1446,6 +1446,48 @@ def test_a_map_read_from_a_file_cannot_be_added_to(joined, tmp_path):
         back.add_junction()
 
 
+def test_a_signal_of_a_file_read_is_followed_into_the_sumo_export(tmp_path):
+    """What a simulator running both needs: a light of the file, by the file's id,
+    to the SUMO movements it switches."""
+    m = roadgen.Map()
+    north = m.add_road(
+        start=(0.0, 70.0, 0.0), end=(0.0, 14.0, 0.0), lanes=two_way(), name="north",
+    )
+    east = m.add_road(
+        start=(70.0, 0.0, 0.0), end=(14.0, 0.0, 0.0), lanes=two_way(), name="east",
+    )
+    junction = m.add_junction("x")
+    m.connect_lanes(north.lane(0), east.lane(1), junction=junction)
+    m.connect_lanes(east.lane(0), north.lane(1), junction=junction)
+    light = m.add_traffic_light(north.lane(0), height=5.0)
+    m.add_traffic_light_rule([light], [north.lane(0)])
+    m.export_opendrive(tmp_path / "town.xodr", trace=False)
+    signal = ET.parse(tmp_path / "town.xodr").getroot().find("road/signals/signal")
+
+    back = roadgen.read_opendrive(str(tmp_path / "town.xodr"))
+    back.export_ir(tmp_path / "town.ir.json")
+    assert back.write_read_trace() == tmp_path / "town.xodr.trace.json"
+    prefix = back.export_sumo(tmp_path / "sumo")
+    trace = roadgen.Trace.load(
+        tmp_path / "town.ir.json",
+        tmp_path / "town.xodr.trace.json",
+        tmp_path / "sumo" / f"{prefix}.sumo.trace.json",
+    )
+    switched = {
+        answer["ref"]
+        for answer in trace.translate("opendrive", f"signal:{signal.get('id')}", to="sumo")
+        if answer["role"] == "link"
+    }
+    assert switched and all(ref.startswith("tls:") for ref in switched)
+    # The roads too, by the file's own ids.
+    assert trace.to_ir("opendrive", "road:0")
+
+
+def test_only_a_map_read_from_a_file_has_a_read_trace(joined, tmp_path):
+    with pytest.raises(ValueError, match="not read from a file"):
+        joined.write_read_trace(tmp_path / "trace.json")
+
+
 def test_a_built_map_has_nothing_to_warn_about_reading(joined):
     assert joined.read_warnings() == []
 

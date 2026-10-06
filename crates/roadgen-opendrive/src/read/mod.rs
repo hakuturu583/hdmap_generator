@@ -31,6 +31,13 @@
 //! identifiers — which is what the exporter writes there — gets that identifier
 //! back, so a map that goes out and comes in keeps its object names. Lanes are
 //! numbered by position, as the builder numbers them.
+//!
+//! None of that is a promise to rely on: a name can clash, and an object takes its
+//! name over its id. [`Imported::trace`] is the record — which IR element each
+//! `<road>`, lane, `<junction>`, `<signal>`, `<object>` and `<controller>` became,
+//! in the kinds the exporter's own trace uses (`road:12`, `lane:12/0/-1`,
+//! `signal:949`, `object:31`, `controller:964`) — so a signal in the file can be
+//! followed to whatever another export made of it.
 
 mod furniture;
 mod geometry;
@@ -53,6 +60,7 @@ use roadgen_core::layout::{self, RoadGeometry, SectionLayout};
 use roadgen_core::map::{CrossSection, Map, MapMetadata, Projection, Road, TrafficHandedness};
 use roadgen_core::semantics::RoadType;
 use roadgen_core::topology::{Junction, RoadEnd};
+use roadgen_core::trace::{Relation, Trace};
 use roadgen_core::units::{GeoOrigin, SpeedLimit};
 use roadgen_core::validation::UnvalidatedMap;
 
@@ -80,6 +88,9 @@ pub struct Imported {
     /// Everything the map says less exactly than the document did, one entry each.
     /// Empty for a document roadgen wrote from a map the IR could hold.
     pub approximations: Vec<String>,
+    /// What each element of the map was read from (format `opendrive`, direction
+    /// import). Lists the file when the document was read from one.
+    pub trace: Trace,
 }
 
 /// Reads an OpenDRIVE document from a string.
@@ -104,7 +115,9 @@ pub fn read_with(path: impl AsRef<Path>, options: &ReadOptions) -> Result<Import
     let path = path.as_ref();
     let xml = std::fs::read_to_string(path)
         .map_err(|error| ImportError::Io(format!("{}: {error}", path.display())))?;
-    from_xml_with(&xml, options)
+    let mut imported = from_xml_with(&xml, options)?;
+    imported.trace.files.push(path.to_path_buf());
+    Ok(imported)
 }
 
 /// Reads a parsed document.
@@ -142,6 +155,7 @@ struct Reader<'a> {
     /// The IR lane at each OpenDRIVE (road, lane section, lane id).
     lanes: HashMap<(RoadId, usize, i64), LaneId>,
     approximations: Approximations,
+    trace: Trace,
 }
 
 /// What the reading could not keep, collected as it goes.
@@ -201,6 +215,7 @@ impl<'a> Reader<'a> {
             map: Map::new(metadata),
             lanes: HashMap::new(),
             approximations,
+            trace: Trace::imported(crate::TRACE_FORMAT),
         }
     }
 
@@ -218,6 +233,11 @@ impl<'a> Reader<'a> {
                 .map_err(|duplicate| {
                     ImportError::Inconsistent(format!("two junctions are numbered {}", duplicate.0))
                 })?;
+            self.trace.link(
+                JunctionId::new(&junction.id),
+                format!("junction:{}", junction.id),
+                Relation::Exact,
+            );
         }
         for road in &self.document.road {
             self.read_road(road)?;
@@ -227,6 +247,7 @@ impl<'a> Reader<'a> {
         Ok(Imported {
             map: UnvalidatedMap::from_map(self.map),
             approximations: self.approximations.finish(),
+            trace: self.trace,
         })
     }
 
@@ -340,6 +361,11 @@ impl<'a> Reader<'a> {
             for (lane, number) in built.iter().zip(&section.opendrive_ids) {
                 self.lanes
                     .insert((id.clone(), index, *number), lane.id.clone());
+                self.trace.link(
+                    lane.id.clone(),
+                    format!("lane:{}/{index}/{number}", road.id),
+                    Relation::Exact,
+                );
             }
             cross_sections.push(CrossSection {
                 station: section.station,
@@ -368,6 +394,8 @@ impl<'a> Reader<'a> {
             .map_err(|duplicate| {
                 ImportError::Inconsistent(format!("two roads are numbered {}", duplicate.0))
             })?;
+        self.trace
+            .link(id.clone(), format!("road:{}", road.id), Relation::Exact);
         for lane in all_lanes {
             self.map
                 .lanes

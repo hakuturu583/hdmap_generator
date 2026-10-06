@@ -469,6 +469,8 @@ enum Source {
     Read {
         map: Box<UnvalidatedMap>,
         notes: Vec<String>,
+        /// What each element was read from.
+        trace: Box<roadgen_core::trace::Trace>,
     },
 }
 
@@ -963,6 +965,47 @@ impl PyMap {
             Source::Read { notes, .. } => notes.clone(),
             Source::Built(_) => Vec::new(),
         }
+    }
+
+    /// Writes the trace of the file this map was read from: which element of the map
+    /// each road, lane, junction, signal, object and controller of the file became,
+    /// in the kinds the OpenDRIVE export's own trace uses (`road:12`,
+    /// `lane:12/0/-1`, `signal:949`, `controller:964`). To `<file>.trace.json`
+    /// beside the file unless `path` says otherwise; returns where it went.
+    ///
+    /// With the IR dump and an export's trace, it follows a signal of the file into
+    /// the export — a CARLA traffic light to the SUMO links it switches:
+    ///
+    /// ```text
+    /// m = roadgen.read_opendrive("town.xodr")
+    /// m.export_ir("town.ir.json")
+    /// m.write_read_trace()
+    /// m.export_sumo("sumo/")
+    /// t = roadgen.Trace.load("town.ir.json", "town.xodr.trace.json",
+    ///                        "sumo/town.sumo.trace.json")
+    /// t.translate("opendrive", "signal:949", to="sumo")
+    /// ```
+    #[pyo3(signature = (path = None))]
+    fn write_read_trace(&mut self, path: Option<PathBuf>) -> PyResult<PathBuf> {
+        let trace = match &self.source {
+            Source::Read { trace, .. } => (**trace).clone(),
+            Source::Built(_) => {
+                return Err(PyValueError::new_err(
+                    "this map was built here, not read from a file, so nothing was read",
+                ))
+            }
+        };
+        let path = match path.or_else(|| trace.files.first().map(roadgen_trace::sidecar_path)) {
+            Some(path) => path,
+            None => {
+                return Err(PyValueError::new_err(
+                    "the map was not read from a file; say where to write the trace",
+                ))
+            }
+        };
+        self.ensure_built()?;
+        self.write_sidecar(&trace, path.clone())?;
+        Ok(path)
     }
 
     /// Constraints OpenDRIVE and Lanelet2 impose beyond validation.
@@ -1928,6 +1971,7 @@ fn read_opendrive(
         source: Source::Read {
             map: Box::new(imported.map),
             notes: imported.approximations,
+            trace: Box::new(imported.trace),
         },
         built: None,
         fingerprint: None,

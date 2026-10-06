@@ -174,12 +174,33 @@ pub struct TraceLink {
     pub role: Option<String>,
 }
 
-/// What an exporter wrote for each element of the IR.
+/// Which way a [`Trace`] was made: by an exporter writing the IR out, or by a reader
+/// making the IR from a file. The links read the same way either way — IR element,
+/// written element — so only what made them differs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TraceDirection {
+    #[default]
+    Export,
+    Import,
+}
+
+impl TraceDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraceDirection::Export => "export",
+            TraceDirection::Import => "import",
+        }
+    }
+}
+
+/// What an exporter wrote for each element of the IR, or what a reader made each
+/// element of the IR from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Trace {
     /// The format's name: `opendrive`, `lanelet2`, `sumo`, ….
     pub format: String,
-    /// The files the export wrote, when it wrote any.
+    pub direction: TraceDirection,
+    /// The files the export wrote, or the reader read, when there are any.
     pub files: Vec<PathBuf>,
     /// In the order the exporter wrote them.
     pub links: Vec<TraceLink>,
@@ -190,6 +211,15 @@ impl Trace {
         Trace {
             format: format.into(),
             ..Trace::default()
+        }
+    }
+
+    /// The trace of a reader: what each IR element was made from in a file of
+    /// `format`.
+    pub fn imported(format: impl Into<String>) -> Self {
+        Trace {
+            direction: TraceDirection::Import,
+            ..Trace::new(format)
         }
     }
 
