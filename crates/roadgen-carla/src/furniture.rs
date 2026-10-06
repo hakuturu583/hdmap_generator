@@ -495,9 +495,16 @@ fn light(
     // A point says how high, not across which lane: a signal written at the foot
     // of its post stands on the pavement, and its heads still hang over the lanes.
     let is_bar = matches!(object.geometry, ObjectGeometry::Line(_));
-    let (mut across, mut bottom) = match bar_middle.map(|p| local.of(p)) {
-        Some(at) => (is_bar.then_some(at[1]), at[2]),
-        None => (None, site.height - stand.rise),
+    // `along` is how far down the road from the pole the heads hang: nothing
+    // when the pole stands abeam of the bar, but a pole moved back to keep clear
+    // of another still hangs its heads over the bar, not abeam of itself.
+    let (mut across, mut bottom, mut along) = match bar_middle.map(|p| local.of(p)) {
+        Some(at) => (
+            is_bar.then_some(at[1]),
+            at[2],
+            if is_bar { at[0] } else { 0.0 },
+        ),
+        None => (None, site.height - stand.rise, 0.0),
     };
     if !bulbs_local.is_empty() {
         let lowest = bulbs_local.iter().map(|b| b[2]).fold(f64::MAX, f64::min);
@@ -507,6 +514,7 @@ fn light(
         if !is_bar || bottom > lowest {
             bottom = lowest - lamp_margin;
             across = Some(mean);
+            along = bulbs_local.iter().map(|b| b[0]).sum::<f64>() / bulbs_local.len() as f64;
         }
     }
     let bottom = bottom.max(0.0);
@@ -610,10 +618,17 @@ fn light(
         12,
         steel,
     );
+    // Straight from the pole through every head (they are all `along` down the
+    // road at their own offset across it) to just past the farthest.
+    let reach = if farthest.abs() > 1e-6 {
+        along * arm_length / farthest.abs()
+    } else {
+        along
+    };
     cylinder(
         &mut mesh,
         [0.0, 0.0, arm_height],
-        [0.0, side * arm_length, arm_height],
+        [reach, side * arm_length, arm_height],
         config.arm_radius,
         8,
         steel,
@@ -622,20 +637,20 @@ fn light(
         // The bracket the head hangs by.
         cylinder(
             &mut mesh,
-            [0.0, y, head_top],
-            [0.0, y, arm_height],
+            [along, y, head_top],
+            [along, y, arm_height],
             config.arm_radius * 0.6,
             6,
             steel,
         );
         cuboid(
             &mut mesh,
-            [0.0, y, bottom + head_height / 2.0],
+            [along, y, bottom + head_height / 2.0],
             [config.head_depth, head_width, head_height],
             housing,
         );
         // The lamps on the face towards the traffic.
-        let face_x = config.head_depth / 2.0 + 0.005;
+        let face_x = along + config.head_depth / 2.0 + 0.005;
         for (across, up, material) in &lamp_offsets {
             let slot = lamps.slot_for(*material);
             disc(
