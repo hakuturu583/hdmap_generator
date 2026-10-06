@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "roadgen"
 # Bumped by tools/bump_version.py together with Cargo.toml and Cargo.lock; the
 # release workflow refuses to publish unless the three agree with the tag.
-version = "0.16.1"
+version = "0.16.2"
 description = "Generate 3D road networks and write them as OpenDRIVE, Autoware Lanelet2, OpenStreetMap, SUMO, CARLA, ClipGT and GPUDrive"
 readme = "README.md"
 requires-python = ">=3.9"
