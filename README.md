@@ -1581,12 +1581,17 @@ the navigation comes out as `Content/<Package>/Maps/<name>/Nav/<name>.bin`, whic
 server hands to clients and `world.get_random_location_from_navigation()` draws on.
 
 Two things about that `.obj` are not obvious and both were found the hard way. The
-loader labels triangles in file order and the last label wins, so the meshes are
-written in order of precedence — buildings and kerbs first, then the land, the
-roads, the sidewalks and last the markings — so that where two meet along an edge
-the one a walker should be on wins the voxels there. And the crosswalk bands in it are not the
-painted stripes: they are one quad per crossing, `crosswalk` from kerb to kerb,
-because the stripes are what a camera sees and the band is what a walker needs.
+rasterizer does not let the last label win: where two surfaces lie within a climb
+(0.3 m) of each other it keeps the *higher area id* — sidewalk 1, crosswalk 2, road
+3, grass 4 — whatever the order. A crosswalk laid over the road it crosses would
+become road, which a walker that does not cross roads is never routed over: so the
+road under each crossing is cut out of the `.obj`, and there only the crossing is
+left. And the crosswalk bands in it are not the painted stripes: they are one quad
+per crossing, `crosswalk` from kerb to kerb and `CROSSWALK_OVERLAP` (0.3 m) onto
+each pavement, because the stripes are what a camera sees and the band is what a
+walker needs. Only that far onto the pavement: CARLA's walkers stop and look for a
+light wherever their route steps from a pavement onto a crossing, and a band over the
+whole width of the pavement would stop everyone walking along it.
 
 Crosswalks *are* painted, too — a bar and a gap of half a metre each, across the
 carriageway, from the crossing objects in the IR — and so are stop lines, as a bar
