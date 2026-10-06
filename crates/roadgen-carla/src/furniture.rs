@@ -400,10 +400,9 @@ fn frame_and_facing(
     Some((frame, wrap(facing)))
 }
 
-/// Where a post ends up: its station along the road, its foot, the way it faces
-/// and how far above the road plane the foot is.
+/// Where a post ends up: its foot, the way it faces and how far above the road
+/// plane the foot is.
 struct Stand {
-    station: f64,
     foot: Point3,
     heading: f64,
     rise: f64,
@@ -439,7 +438,6 @@ fn stand(
             .all(|post| horizontal_distance(*post, foot) >= config.clearance);
         let at_end = (station - wanted).abs() > 1e-9;
         found = Some(Stand {
-            station,
             foot,
             heading,
             rise,
