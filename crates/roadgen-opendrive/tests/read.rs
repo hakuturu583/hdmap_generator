@@ -338,3 +338,77 @@ fn a_light_governs_the_lanes_that_refer_to_it() {
     assert!(stop_line.is_some());
     assert_eq!(lanes.len(), 2);
 }
+
+#[test]
+fn the_reader_traces_what_each_element_was_read_from() {
+    use roadgen_core::trace::{IrRef, Relation, TraceDirection};
+
+    let imported = from_xml(&by_reference()).expect("the document should read");
+    let trace = &imported.trace;
+    assert_eq!(trace.format, roadgen_opendrive::TRACE_FORMAT);
+    assert_eq!(trace.direction, TraceDirection::Import);
+    assert!(trace.files.is_empty(), "read from a string, not a file");
+    let map = imported.map.validate().expect("the map should validate");
+
+    let read_from = |ir: IrRef| -> Vec<&str> {
+        trace
+            .links_of(&ir)
+            .map(|link| {
+                assert_eq!(link.relation, Relation::Exact);
+                link.local.as_str()
+            })
+            .collect()
+    };
+    assert_eq!(read_from(IrRef::Road(RoadId::new("1"))), ["road:1"]);
+    assert_eq!(
+        read_from(IrRef::Junction(JunctionId::new("10"))),
+        ["junction:10"]
+    );
+    assert_eq!(
+        read_from(IrRef::Lane(lane_of(&map, "1", LateralSide::Right, 1))),
+        ["lane:1/0/-1"]
+    );
+    assert_eq!(
+        read_from(IrRef::Lane(lane_of(&map, "1", LateralSide::Left, 1))),
+        ["lane:1/0/1"]
+    );
+
+    // The light and the stop line by the kinds the exporter writes them as, whatever
+    // the IR named them.
+    let light = map
+        .objects
+        .iter()
+        .find(|object| object.kind.is_traffic_light())
+        .expect("the light is read");
+    let signal: Vec<&str> = trace
+        .links_of(&IrRef::Object(light.id.clone()))
+        .filter(|link| link.role.is_none())
+        .map(|link| link.local.as_str())
+        .collect();
+    assert_eq!(signal, ["signal:42"]);
+    let stop_line = map
+        .objects
+        .iter()
+        .find(|object| object.kind == MapObjectKind::StopLine)
+        .expect("the stop line is read");
+    assert_eq!(read_from(IrRef::Object(stop_line.id.clone())), ["object:7"]);
+
+    // And the controller, as the rule it became and with its light part of it.
+    assert_eq!(read_from(IrRef::Rule(0)), ["controller:c1"]);
+    assert!(trace
+        .links_of(&IrRef::Object(light.id.clone()))
+        .any(|link| link.local == "controller:c1"
+            && link.relation == Relation::Merged
+            && link.role.as_deref() == Some("controller")));
+}
+
+#[test]
+fn a_file_read_is_listed_by_its_trace() {
+    let dir = std::env::temp_dir().join(format!("roadgen-read-trace-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("foreign.xodr");
+    std::fs::write(&path, by_reference()).unwrap();
+    let imported = roadgen_opendrive::read(&path).expect("the file should read");
+    assert_eq!(imported.trace.files, [path]);
+    std::fs::remove_dir_all(&dir).ok();
+}

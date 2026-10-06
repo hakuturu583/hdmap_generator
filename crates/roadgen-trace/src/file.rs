@@ -27,6 +27,7 @@ pub const TRACE_SCHEMA: &str = "roadgen-trace/1";
 /// Which way a trace runs: from the IR to a file an exporter wrote, or from a file a
 /// reader read to the IR it made.
 pub const EXPORT: &str = "export";
+pub const IMPORT: &str = "import";
 
 /// A trace file as it is written to disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +84,7 @@ impl TraceFile {
             schema: TRACE_SCHEMA.into(),
             generator: Generator::this(),
             format: trace.format.clone(),
-            direction: EXPORT.into(),
+            direction: trace.direction.as_str().into(),
             ir_fingerprint,
             files,
             links: trace
@@ -148,6 +149,12 @@ impl TraceFile {
                 stated: file.digest,
                 actual,
             });
+        }
+        if file.direction != EXPORT && file.direction != IMPORT {
+            return Err(TraceError::Parse(
+                name.to_owned(),
+                format!("unknown direction `{}`", file.direction),
+            ));
         }
         for link in &file.links {
             if Relation::parse(&link.rel).is_none() {

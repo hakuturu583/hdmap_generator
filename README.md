@@ -2291,6 +2291,32 @@ one more trace and changes none.
 | GPUDrive | `<file>.trace.json` | `road:42`, `agent:1` |
 | CARLA | `<dir>/<name>.carla.trace.json` | the package's `.xodr` as OpenDRIVE, and `actor:<name>` for each light and sign; the meshes are not traced |
 
+**A file read has a trace too.** `read_opendrive` records which element of the map
+each road, lane, junction, signal, object and controller of the file became, in the
+same kinds as the OpenDRIVE export, and `write_read_trace` writes it beside the file
+(`direction: "import"`). That is how a signal of somebody else's OpenDRIVE — a CARLA
+traffic light, by its OpenDRIVE id — is followed to the SUMO movements it switches:
+
+```python
+m = roadgen.read_opendrive("Town10HD_Opt.xodr")
+m.export_ir("town.ir.json")
+m.write_read_trace()                         # + Town10HD_Opt.xodr.read.trace.json
+prefix = m.export_sumo("sumo/")
+
+t = roadgen.Trace.load("town.ir.json", "Town10HD_Opt.xodr.read.trace.json",
+                       f"sumo/{prefix}.sumo.trace.json")
+t.translate("opendrive", "signal:949", to="sumo")   # [{"ref": "tls:j_189/12", ...}, ...]
+```
+
+The read trace is format `opendrive` too, so one `Trace` holds either it or an
+OpenDRIVE export's trace, not both. A document that gives two signals one id has
+both traced to that `signal:`.
+
+A light is traced to the movements off the lanes it stands over. The lights of one
+OpenDRIVE `<controller>` are read as one rule over all their lanes, which is right
+for the program, but each light still answers only for its own movements, and for
+those its rule gives it that no light stands over.
+
 A bare element takes the kind that format is usually asked about — a lanelet id is a
 lanelet, a SUMO id a lane — so `1000123` and `"lanelet:1000123"` are the same question.
 

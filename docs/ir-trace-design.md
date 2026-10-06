@@ -25,7 +25,9 @@
 - IR ダンプは形状を載せないが、fingerprint は形状も含めて計算する。カタログの `geometry` 欄に IR 全体（形状・sampling・建物の形など）の digest を入れ、それも fingerprint の対象にした。ID とつながりが同じでも形状の違う地図（例: 停止線を動かすと OSM でのノード統合が変わる）は別の地図として扱われ、トレースが突き合わされない。
 - IR ダンプの読込時には中身から fingerprint を再計算し、埋め込まれた値と違えば拒否する。
 - GPUDrive の agent は、軌跡が実際に届いた lane（role `route`）と、届かなかった場合のゴールの lane（role `goal`）にだけ結び付ける。
-- 読み込み側（`read_opendrive`）のトレース、CLI、Web デモのハイライトはフェーズ 2 のまま。
+- 読み込み側（`read_opendrive`）のトレースは §5.3 のとおり実装した（`Map.write_read_trace`）。lane・road・junction に加えて `signal:` / `object:` / `controller:` も載せる。CLI、Web デモのハイライトはフェーズ 2 のまま。
+- 読み込み側トレースの既定のファイル名は `<入力>.read.trace.json`（エクスポート側の `<file>.trace.json` を上書きしないため）。
+- SUMO のトレースで信号機を link に結び付けるときは、その信号機自身の lane から出る movement と、規則（rule）がその信号機に与える movement のうちどの信号機の lane からも出ていないものを使う。OpenDRIVE の controller は同時に切り替わる信号の組で、リーダはそれを全信号の lane をまとめた 1 つの rule にするため、そのままだと同じ controller の信号同士が互いの movement を名乗ってしまう。
 
 ## 1. 何を解きたいか
 
@@ -453,7 +455,7 @@ SUMO 1.18 / 1.26 で確認、警告なし）。追加されたスロットは ne
 | フェーズ | 内容 |
 | --- | --- |
 | 1 | `roadgen-core::trace` 型、IR ダンプ（カタログ）、上表の全フォーマットのトレースファイル（既定で書き出し、`trace=False` で抑止）、`TraceIndex`、Python `export_ir` / `Trace.load` / `translate`。core には serde を入れず、JSON 化は専用の小 crate（`roadgen-trace`）に置く |
-| 2 | `read_opendrive` の読み込み側トレース、CLI、Web デモでの対応要素ハイライト |
+| 2 | `read_opendrive` の読み込み側トレース（済）、CLI、Web デモでの対応要素ハイライト |
 | 3 | 完全 IR ダンプ（幾何込み）。`roadgen-core` に `serde` feature を足し、`Curve3` / `WidthProfile` 等まで derive、`Map` を JSON から復元 → `validate()`。スキーマ維持コストが大きいので需要を見てから |
 
 ## 9. 決めてほしいこと
