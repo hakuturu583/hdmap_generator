@@ -464,12 +464,6 @@ fn light(
 ) -> Option<Placed> {
     let site = site(map, object)?;
     let stand = stand(map, &site, surfaces, config, site.station, posts)?;
-    let section = site.road.section_at(stand.station)?;
-    let layout = Layout::of(map, site.road, section, surfaces)?;
-    let frame = site
-        .road
-        .frame_at(stand.station, map.metadata.sampling)
-        .ok()?;
     let local = Local::new(stand.foot, stand.heading);
 
     // The IR's bar is the bottom edge of the light's housing and its bulbs are
@@ -559,11 +553,23 @@ fn light(
             .collect()
     };
     let mut heads: Vec<f64> = Vec::new();
+    // Each lane's middle where the heads hang -- at the bar, not at the pole,
+    // which may stand further back where the lanes are not the same.
+    let bar_layout = Layout::of(
+        map,
+        site.road,
+        site.road.section_at(site.station)?,
+        surfaces,
+    )?;
+    let bar_frame = site
+        .road
+        .frame_at(site.station, map.metadata.sampling)
+        .ok()?;
     for lane in &site.lanes {
-        let Some(centre) = layout.lane_centre(stand.station, &lane.id) else {
+        let Some(centre) = bar_layout.lane_centre(site.station, &lane.id) else {
             continue;
         };
-        heads.push(local.of(frame.to_global([0.0, centre, 0.0]))[1]);
+        heads.push(local.of(bar_frame.to_global([0.0, centre, 0.0]))[1]);
     }
     // The head the IR placed hangs where it placed it, to the centimetre; the
     // others over the middle of their lanes.
@@ -578,8 +584,8 @@ fn light(
     if heads.is_empty() {
         return None;
     }
-    // The arm runs from the pole to the farthest head and a little past it. The
-    // heads are all abeam of the pole, so the arm's direction is theirs.
+    // The arm runs across the road to the farthest head and a little past it;
+    // the heads are all `along` down the road from the pole.
     let farthest = heads
         .iter()
         .copied()
@@ -618,17 +624,22 @@ fn light(
         12,
         steel,
     );
-    // Straight from the pole through every head (they are all `along` down the
-    // road at their own offset across it) to just past the farthest.
-    let reach = if farthest.abs() > 1e-6 {
-        along * arm_length / farthest.abs()
-    } else {
-        along
-    };
+    // A pole that stood back first reaches along the road to abeam of the
+    // heads; from there the arm runs straight across, over every one of them.
+    if along.abs() > 1e-3 {
+        cylinder(
+            &mut mesh,
+            [0.0, 0.0, arm_height],
+            [along, 0.0, arm_height],
+            config.arm_radius,
+            8,
+            steel,
+        );
+    }
     cylinder(
         &mut mesh,
-        [0.0, 0.0, arm_height],
-        [reach, side * arm_length, arm_height],
+        [along, 0.0, arm_height],
+        [along, side * arm_length, arm_height],
         config.arm_radius,
         8,
         steel,

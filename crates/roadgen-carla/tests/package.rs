@@ -722,9 +722,24 @@ fn a_pole_moved_back_to_keep_clear_still_hangs_its_head_over_the_bar() {
             .expect("a light");
         builder.add_traffic_light_rule(vec![light], None, vec![lane]);
     }
-    let map = builder
-        .finish()
-        .expect("a map")
+
+    // The second light also governs the first lane, as a light read from
+    // OpenDRIVE may: two heads on one arm, from the pole that stood back.
+    let mut map = builder.finish().expect("a map").into_map();
+    let lanes: Vec<_> = map
+        .objects
+        .iter()
+        .filter(|o| o.kind.is_traffic_light())
+        .flat_map(|o| o.lanes.clone())
+        .collect();
+    let second = map
+        .objects
+        .iter_mut()
+        .filter(|o| o.kind.is_traffic_light())
+        .nth(1)
+        .unwrap();
+    second.lanes = lanes;
+    let map = roadgen_core::validation::UnvalidatedMap::from_map(map)
         .validate()
         .expect("a valid map");
     let config = PackageConfig::for_map(&map);
@@ -735,6 +750,10 @@ fn a_pole_moved_back_to_keep_clear_still_hangs_its_head_over_the_bar() {
         &config.furniture.unwrap(),
     );
     assert_eq!(furniture.lights.len(), 2);
+    assert_eq!(
+        furniture.lights.iter().map(|l| l.lanes.len()).max(),
+        Some(2)
+    );
     let feet: Vec<_> = furniture.lights.iter().map(|l| l.position).collect();
     assert!(
         (feet[0].y - feet[1].y).abs() > 0.5,
@@ -750,6 +769,61 @@ fn a_pole_moved_back_to_keep_clear_still_hangs_its_head_over_the_bar() {
                     && p.horizontal_distance_to(bulb.position) < 0.35),
                 "no lamp at {:?} for {}",
                 bulb.position,
+                object.id
+            );
+        }
+        // Every head hangs from the arm: between the outermost heads the arm runs
+        // straight across at their station, not off on a slant from the pole.
+        if light.lanes.len() > 1 {
+            let lamps = &light.lamps.as_ref().unwrap().positions;
+            let (lo, hi) = lamps.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+                (lo.min(p.y), hi.max(p.y))
+            });
+            let head_x = lamps.iter().map(|p| p.x).sum::<f64>() / lamps.len() as f64;
+            let top = light
+                .mesh
+                .positions
+                .iter()
+                .map(|p| p.z)
+                .fold(f64::MIN, f64::max);
+            // A cylinder is its two end rings: the cross arm starts abeam of the
+            // pole and ends past the farthest head, both at the heads' station.
+            let far = if lo.abs() > hi.abs() { lo } else { hi };
+            let near_arm = |p: &&Point3| (p.x - head_x).abs() < 0.35 && p.z > top - 1.0;
+            assert!(
+                light
+                    .mesh
+                    .positions
+                    .iter()
+                    .filter(near_arm)
+                    .any(|p| p.y.abs() < 0.3),
+                "the arm does not start at the heads' station for {}",
+                object.id
+            );
+            assert!(
+                light
+                    .mesh
+                    .positions
+                    .iter()
+                    .filter(near_arm)
+                    .any(|p| p.y.abs() > far.abs()),
+                "the arm does not end at the heads' station for {}",
+                object.id
+            );
+        }
+        // Above each lamp there is part of the post (bracket or arm).
+        let post = &light.mesh.positions;
+        let lamps = &light.lamps.as_ref().unwrap().positions;
+        let (min_y, max_y) = lamps.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+            (lo.min(p.y), hi.max(p.y))
+        });
+        let top = post.iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        for y in [min_y, max_y] {
+            let x = lamps.iter().find(|p| (p.y - y).abs() < 1e-9).unwrap().x;
+            assert!(
+                post.iter()
+                    .any(|p| (p.y - y).abs() < 0.3 && (p.x - x).abs() < 0.5 && p.z > top - 1.0),
+                "nothing holds the head at y = {y} up for {}",
                 object.id
             );
         }
