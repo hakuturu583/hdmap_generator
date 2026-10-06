@@ -644,21 +644,7 @@ fn a_lights_housing_and_lamps_are_where_the_ir_and_so_lanelet2_put_them() {
 
         // The lamps CARLA switches, in the world: each bulb has a lamp round it,
         // on the face of the housing towards the traffic.
-        let (sin, cos) = light.heading.sin_cos();
-        let world: Vec<Point3> = light
-            .lamps
-            .as_ref()
-            .unwrap()
-            .positions
-            .iter()
-            .map(|p| {
-                Point3::new(
-                    light.position.x + p.x * cos - p.y * sin,
-                    light.position.y + p.x * sin + p.y * cos,
-                    light.position.z + p.z,
-                )
-            })
-            .collect();
+        let world = lamps_in_the_world(light);
         for bulb in &head.bulbs {
             let near = world
                 .iter()
@@ -681,6 +667,71 @@ fn a_lights_housing_and_lamps_are_where_the_ir_and_so_lanelet2_put_them() {
             lowest_lamp > bottom,
             "a lamp at {lowest_lamp} below the bar at {bottom}"
         );
+    }
+}
+
+/// The lamps CARLA switches, in the world.
+fn lamps_in_the_world(light: &roadgen_carla::furniture::Placed) -> Vec<Point3> {
+    let (sin, cos) = light.heading.sin_cos();
+    light
+        .lamps
+        .as_ref()
+        .unwrap()
+        .positions
+        .iter()
+        .map(|p| {
+            Point3::new(
+                light.position.x + p.x * cos - p.y * sin,
+                light.position.y + p.x * sin + p.y * cos,
+                light.position.z + p.z,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_signal_read_as_a_point_at_its_post_keeps_its_lamps_where_its_bulbs_are() {
+    use roadgen_core::semantics::{MapObjectKind, ObjectGeometry};
+    use roadgen_core::validation::UnvalidatedMap;
+
+    // As CARLA's own `.xodr` reads back: each light a point at the foot of its
+    // post, on the pavement, its bulbs where the lamps are.
+    let mut map = signalised("Town01").into_map();
+    for object in map.objects.iter_mut() {
+        if let (MapObjectKind::TrafficLight { .. }, ObjectGeometry::Line(bar)) =
+            (&object.kind, &object.geometry)
+        {
+            let middle = bar.start_point().lerp(bar.end_point(), 0.5);
+            let foot = if middle.x.abs() < middle.y.abs() {
+                Point3::new(-4.1, middle.y, 0.15)
+            } else {
+                Point3::new(middle.x, 4.1, 0.15)
+            };
+            object.geometry = ObjectGeometry::Point(foot);
+        }
+    }
+    let map = UnvalidatedMap::from_map(map).validate().unwrap();
+    let config = PackageConfig::for_map(&map);
+    let furniture = roadgen_carla::furniture::build(
+        &map,
+        &config.map,
+        &config.surfaces,
+        &config.furniture.unwrap(),
+    );
+    assert_eq!(furniture.lights.len(), 2);
+    for light in &furniture.lights {
+        let object = map.objects.iter().find(|o| o.id == light.object).unwrap();
+        let head = object.kind.light_head().unwrap();
+        let world = lamps_in_the_world(light);
+        for bulb in &head.bulbs {
+            assert!(
+                world.iter().any(|p| (p.z - bulb.position.z).abs() < 0.16
+                    && p.horizontal_distance_to(bulb.position) < 0.35),
+                "no lamp at {:?} for {}",
+                bulb.position,
+                object.id
+            );
+        }
     }
 }
 

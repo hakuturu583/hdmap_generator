@@ -478,45 +478,72 @@ fn light(
     // then agrees on where the light is: a Lanelet2 map's traffic_light and
     // light_bulbs ways are the very housing and lamps CARLA shows.
     let head = object.kind.light_head().cloned().unwrap_or_default();
+    let default_height = config.lamp_diameter * 3.0 + 0.15;
+    // Where the housing's bottom edge is: the bar, or a signal's own position, or
+    // -- for a signal written at the foot of its post, as CARLA's own `.xodr`
+    // has them -- just under its lowest lamp.
+    let bulbs_local: Vec<[f64; 3]> = head.bulbs.iter().map(|b| local.of(b.position)).collect();
+    let lamp_margin = 0.075 + config.lamp_diameter / 2.0;
     let (bar_middle, bar_width) = match &object.geometry {
         ObjectGeometry::Line(bar) => (
-            bar.start_point().lerp(bar.end_point(), 0.5),
+            Some(bar.start_point().lerp(bar.end_point(), 0.5)),
             bar.start_point().distance_to(bar.end_point()),
         ),
-        _ => (frame.to_global([0.0, 0.0, site.height]), config.head_width),
+        ObjectGeometry::Point(position) => (Some(*position), 0.0),
+        ObjectGeometry::Band { .. } => (None, 0.0),
     };
+    // A point says how high, not across which lane: a signal written at the foot
+    // of its post stands on the pavement, and its heads still hang over the lanes.
+    let is_bar = matches!(object.geometry, ObjectGeometry::Line(_));
+    let (mut across, mut bottom) = match bar_middle.map(|p| local.of(p)) {
+        Some(at) => (is_bar.then_some(at[1]), at[2]),
+        None => (None, site.height - stand.rise),
+    };
+    if !bulbs_local.is_empty() {
+        let lowest = bulbs_local.iter().map(|b| b[2]).fold(f64::MAX, f64::min);
+        let mean = bulbs_local.iter().map(|b| b[1]).sum::<f64>() / bulbs_local.len() as f64;
+        // A position under the lamps is the housing's bottom; one that is not
+        // (a signal at the foot of its post) says nothing about the head.
+        if !is_bar || bottom > lowest {
+            bottom = lowest - lamp_margin;
+            across = Some(mean);
+        }
+    }
+    let bottom = bottom.max(0.0);
     let head_width = if bar_width > 1e-3 {
         bar_width
     } else {
         config.head_width
     };
+    // As tall as the head says, and tall enough for every lamp it has.
+    let highest = bulbs_local
+        .iter()
+        .map(|b| b[2] + lamp_margin - bottom)
+        .fold(0.0_f64, f64::max);
     let head_height = head
         .height
-        .unwrap_or(config.lamp_diameter * 3.0 + 0.15)
+        .unwrap_or(default_height)
+        .max(highest)
         .max(config.lamp_diameter);
-    let bar_local = local.of(bar_middle);
-    let bottom = bar_local[2].max(config.lamp_diameter);
     let head_top = bottom + head_height;
     let arm_height = head_top + 0.05 + config.arm_radius;
-    // The lamps relative to the middle of the bar, across the road and up: the
+    let bar_across = across.unwrap_or(0.0);
+    // The lamps relative to the middle of the head, across the road and up: the
     // bulbs the IR gave, or a column of three when it gave none.
     let lamp_offsets: Vec<(f64, f64, usize)> = if head.bulbs.is_empty() {
         (0..3)
             .map(|row| {
-                let up = head_height
-                    - 0.075
-                    - config.lamp_diameter / 2.0
-                    - row as f64 * config.lamp_diameter;
+                let up = head_height - lamp_margin - row as f64 * config.lamp_diameter;
                 (0.0, up, lamp_material(row))
             })
             .collect()
     } else {
         head.bulbs
             .iter()
-            .map(|bulb| {
-                let at = local.of(bulb.position);
+            .zip(&bulbs_local)
+            .map(|(bulb, at)| {
                 (
-                    at[1] - bar_local[1],
+                    at[1] - bar_across,
                     at[2] - bottom,
                     bulb_material(bulb.color),
                 )
@@ -530,13 +557,15 @@ fn light(
         };
         heads.push(local.of(frame.to_global([0.0, centre, 0.0]))[1]);
     }
-    // The bar's own lane hangs its head where the bar is, to the centimetre.
-    if let Some(nearest) = heads.iter_mut().min_by(|a, b| {
-        (**a - bar_local[1])
-            .abs()
-            .total_cmp(&(**b - bar_local[1]).abs())
-    }) {
-        *nearest = bar_local[1];
+    // The head the IR placed hangs where it placed it, to the centimetre; the
+    // others over the middle of their lanes.
+    if let Some(across) = across {
+        if let Some(nearest) = heads
+            .iter_mut()
+            .min_by(|a, b| (**a - across).abs().total_cmp(&(**b - across).abs()))
+        {
+            *nearest = across;
+        }
     }
     if heads.is_empty() {
         return None;
