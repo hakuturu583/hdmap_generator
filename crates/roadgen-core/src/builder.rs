@@ -2177,7 +2177,8 @@ impl Generator {
             for offset in edges {
                 road_lo = road_lo.min(offset);
                 road_hi = road_hi.max(offset);
-                if lane.lane_type != LaneType::Sidewalk {
+                // Pavements are walked, and a `None` lane is not surfaced at all.
+                if !matches!(lane.lane_type, LaneType::Sidewalk | LaneType::None) {
                     lo = lo.min(offset);
                     hi = hi.max(offset);
                 }

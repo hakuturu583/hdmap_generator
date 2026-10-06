@@ -56,6 +56,11 @@ pub fn document(meshes: &[Mesh], map: &Map) -> String {
         })
         .collect();
 
+    let holes: Vec<Hole> = crossings
+        .iter()
+        .map(|(_, corners)| Hole::new(corners))
+        .collect();
+
     // Ground first, then the road, then the pavement: the order changes nothing
     // where Recast merges (see above) and keeps the file readable.
     let mut ordered: Vec<&Mesh> = meshes.iter().collect();
@@ -64,8 +69,8 @@ pub fn document(meshes: &[Mesh], map: &Map) -> String {
         let Some(material) = material_of(mesh.role) else {
             continue;
         };
-        if material == "road" && !crossings.is_empty() {
-            let (positions, triangles) = cut_away(mesh, &crossings);
+        if material == "road" && !holes.is_empty() {
+            let (positions, triangles) = cut_away(mesh, &holes);
             out.object(&mesh.name, &positions, &triangles, material);
         } else {
             out.object(&mesh.name, &mesh.positions, &mesh.triangles, material);
@@ -78,27 +83,82 @@ pub fn document(meshes: &[Mesh], map: &Map) -> String {
     out.text
 }
 
+/// A crossing's footprint, counter-clockwise in plan, with its extent.
+struct Hole {
+    ring: Vec<Point3>,
+    min: Point3,
+    max: Point3,
+}
+
+impl Hole {
+    fn new(corners: &[Point3; 4]) -> Hole {
+        let ring = counter_clockwise(corners.to_vec());
+        let fold = |f: fn(f64, f64) -> f64, init: f64| {
+            Point3::new(
+                ring.iter().map(|p| p.x).fold(init, f),
+                ring.iter().map(|p| p.y).fold(init, f),
+                ring.iter().map(|p| p.z).fold(init, f),
+            )
+        };
+        Hole {
+            min: fold(f64::min, f64::MAX),
+            max: fold(f64::max, f64::MIN),
+            ring,
+        }
+    }
+
+    /// Whether the hole can touch a surface within `min`..`max`: overlapping in
+    /// plan, and at about its height -- a crossing on a bridge is no reason to cut
+    /// the road below it.
+    fn reaches(&self, min: Point3, max: Point3) -> bool {
+        const HEIGHT: f64 = 2.0;
+        self.min.x < max.x
+            && self.max.x > min.x
+            && self.min.y < max.y
+            && self.max.y > min.y
+            && self.min.z - HEIGHT < max.z
+            && self.max.z + HEIGHT > min.z
+    }
+}
+
+fn bounds(points: impl IntoIterator<Item = Point3>) -> (Point3, Point3) {
+    points.into_iter().fold(
+        (
+            Point3::new(f64::MAX, f64::MAX, f64::MAX),
+            Point3::new(f64::MIN, f64::MIN, f64::MIN),
+        ),
+        |(lo, hi), p| {
+            (
+                Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z)),
+                Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z)),
+            )
+        },
+    )
+}
+
 /// `mesh`'s triangles with every crossing's footprint (in plan) cut out of them.
-fn cut_away(
-    mesh: &Mesh,
-    crossings: &[(&roadgen_core::id::ObjectId, [Point3; 4])],
-) -> (Vec<Point3>, Vec<[u32; 3]>) {
-    let holes: Vec<Vec<Point3>> = crossings
-        .iter()
-        .map(|(_, corners)| counter_clockwise(corners.to_vec()))
-        .collect();
+fn cut_away(mesh: &Mesh, holes: &[Hole]) -> (Vec<Point3>, Vec<[u32; 3]>) {
+    // Only the crossings this mesh can touch, and per triangle only those that
+    // reach it: most triangles meet none and are passed through as they are.
+    let (lo, hi) = bounds(mesh.positions.iter().copied());
+    let near: Vec<&Hole> = holes.iter().filter(|h| h.reaches(lo, hi)).collect();
+    if near.is_empty() {
+        return (mesh.positions.clone(), mesh.triangles.clone());
+    }
     let mut positions = Vec::new();
     let mut triangles = Vec::new();
     for [a, b, c] in &mesh.triangles {
-        let mut pieces = vec![vec![
+        let corners = [
             mesh.positions[*a as usize],
             mesh.positions[*b as usize],
             mesh.positions[*c as usize],
-        ]];
-        for hole in &holes {
+        ];
+        let (lo, hi) = bounds(corners);
+        let mut pieces = vec![corners.to_vec()];
+        for hole in near.iter().filter(|h| h.reaches(lo, hi)) {
             pieces = pieces
                 .into_iter()
-                .flat_map(|piece| subtract(&piece, hole))
+                .flat_map(|piece| subtract(&piece, &hole.ring))
                 .collect();
         }
         for piece in pieces {
@@ -129,15 +189,6 @@ fn counter_clockwise(mut ring: Vec<Point3>) -> Vec<Point3> {
 /// The convex polygon `piece` minus the convex, counter-clockwise `hole`, in plan:
 /// convex pieces, heights carried along the edges they are cut from.
 fn subtract(piece: &[Point3], hole: &[Point3]) -> Vec<Vec<Point3>> {
-    let outside_box = |axis: fn(&Point3) -> f64| {
-        let (lo, hi) = hole.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
-            (lo.min(axis(p)), hi.max(axis(p)))
-        });
-        piece.iter().all(|p| axis(p) <= lo) || piece.iter().all(|p| axis(p) >= hi)
-    };
-    if outside_box(|p| p.x) || outside_box(|p| p.y) {
-        return vec![piece.to_vec()];
-    }
     let mut out = Vec::new();
     let mut rest = piece.to_vec();
     for i in 0..hole.len() {
