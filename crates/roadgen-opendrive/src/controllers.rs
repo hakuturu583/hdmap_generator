@@ -19,9 +19,9 @@
 //! controller with no junction, which a consumer runs on its own.
 
 use roadgen_core::id::{JunctionId, ObjectId, RoadId};
-use roadgen_core::map::Map;
+use roadgen_core::map::{Lane, Map};
 use roadgen_core::semantics::{MapObject, TrafficRule};
-use roadgen_core::topology::{LaneEnd, RoadEnd, RoadLinkTarget};
+use roadgen_core::topology::{RoadEndpoint, RoadLinkTarget};
 
 /// One `<controller>`: the lights that switch together, and the junction they do
 /// it at.
@@ -117,12 +117,22 @@ pub fn junction_ahead(map: &Map, object: &MapObject) -> Option<JunctionId> {
     if let Some(junction) = &road.junction {
         return Some(junction.clone());
     }
-    let end = match lane.direction.exit_end() {
-        LaneEnd::Start => RoadEnd::Start,
-        LaneEnd::End => RoadEnd::End,
-    };
+    junction_mouth(map, lane).map(|(_, junction)| junction)
+}
+
+/// The mouth by which a lane outside any junction enters one — its road's end
+/// at the lane's exit, when that end is linked to a junction — and the junction.
+/// `None` for a lane inside a junction, or one that runs on into another road.
+pub fn junction_mouth(map: &Map, lane: &Lane) -> Option<(RoadEndpoint, JunctionId)> {
+    let road = map.road(&lane.road)?;
+    if road.is_connector() {
+        return None;
+    }
+    let end = lane.direction.exit_end().as_road_end();
     match road.link.at(end)? {
-        RoadLinkTarget::Junction(junction) => Some(junction.clone()),
+        RoadLinkTarget::Junction(junction) => {
+            Some((RoadEndpoint::new(road.id.clone(), end), junction.clone()))
+        }
         RoadLinkTarget::Road(_) => None,
     }
 }

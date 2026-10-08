@@ -1542,10 +1542,7 @@ impl<'a> Exporter<'a> {
             // A control on a connector is a control inside the junction itself.
             return Some(junction.clone());
         }
-        let end = match lane.direction.exit_end() {
-            LaneEnd::Start => RoadEnd::Start,
-            LaneEnd::End => RoadEnd::End,
-        };
+        let end = lane.direction.exit_end().as_road_end();
         match road.link.at(end) {
             Some(RoadLinkTarget::Junction(junction)) => Some(junction.clone()),
             _ => None,
@@ -2539,19 +2536,31 @@ impl<'a> Exporter<'a> {
         let map = self.map;
         let mut governed: HashMap<&ObjectId, BTreeSet<&LaneId>> = HashMap::new();
         for rule in &map.rules {
-            let (stop_line, lanes) = match rule {
+            // A line is measured against the lanes of its rule that stop at it —
+            // all of them for a rule with one line, the line's own for a rule
+            // with one per mouth (`Map::traffic_light_stops`, as Lanelet2 has it)
+            // — and which of those it actually crosses is found below.
+            match rule {
                 TrafficRule::RightOfWay {
-                    stop_line,
+                    stop_line: Some(stop_line),
                     yielding,
                     ..
-                } => (stop_line, yielding),
+                } => governed.entry(stop_line).or_default().extend(yielding),
                 TrafficRule::TrafficLight {
-                    stop_line, lanes, ..
-                } => (stop_line, lanes),
-                TrafficRule::SpeedLimit { .. } => continue,
-            };
-            if let Some(stop_line) = stop_line {
-                governed.entry(stop_line).or_default().extend(lanes);
+                    stop_lines, lanes, ..
+                } => {
+                    for (stop_line, stopped) in map.traffic_light_stops(stop_lines, lanes) {
+                        let Some(id) = stop_lines.iter().find(|id| Some(*id) == stop_line.as_ref())
+                        else {
+                            continue;
+                        };
+                        governed
+                            .entry(id)
+                            .or_default()
+                            .extend(lanes.iter().filter(|lane| stopped.contains(lane)));
+                    }
+                }
+                _ => {}
             }
         }
 

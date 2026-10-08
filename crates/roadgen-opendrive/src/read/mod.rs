@@ -37,13 +37,17 @@
 //! `<road>`, lane, `<junction>`, `<signal>`, `<object>` and `<controller>` became,
 //! in the kinds the exporter's own trace uses (`road:12`, `lane:12/0/-1`,
 //! `signal:949`, `object:31`, `controller:964`) — so a signal in the file can be
-//! followed to whatever another export made of it.
+//! followed to whatever another export made of it. A stop line the reader drew
+//! where the document has none (`object/stopline/<road>/<end>`, at a junction
+//! mouth its lights stop) is traced, as `collapsed` with the role `stop_line`, to
+//! the controller it was drawn for.
 
 mod furniture;
 mod geometry;
 mod lanes;
 mod links;
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -156,6 +160,9 @@ struct Reader<'a> {
     lanes: HashMap<(RoadId, usize, i64), LaneId>,
     approximations: Approximations,
     trace: Trace,
+    /// The lanes each lane is entered from by the map's connections, built the
+    /// first time furniture asks (see `furniture::Reader::predecessors`).
+    predecessors: OnceCell<HashMap<LaneId, Vec<LaneId>>>,
 }
 
 /// What the reading could not keep, collected as it goes.
@@ -216,6 +223,7 @@ impl<'a> Reader<'a> {
             lanes: HashMap::new(),
             approximations,
             trace: Trace::imported(crate::TRACE_FORMAT),
+            predecessors: OnceCell::new(),
         }
     }
 

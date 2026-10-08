@@ -37,9 +37,17 @@ pub fn redraw_opendrive(map: &ValidatedMap) -> roadgen_viewer::Drawing {
 
 /// Exports to Lanelet2 and reads the result back with `simple_lanelet2`'s loader.
 pub fn reload_lanelet2(map: &ValidatedMap) -> Arc<LaneletMap> {
-    let xml = roadgen_lanelet2::to_osm_xml(map).expect("the map should export as Lanelet2");
+    reload_lanelet2_traced(map).0
+}
+
+/// [`reload_lanelet2`], with the export's trace from the IR to what it wrote.
+pub fn reload_lanelet2_traced(map: &ValidatedMap) -> (Arc<LaneletMap>, roadgen_core::trace::Trace) {
+    let (xml, trace) =
+        roadgen_lanelet2::to_osm_xml_traced(map).expect("the map should export as Lanelet2");
     let projector = roadgen_lanelet2::projector_for(map).expect("a projector");
-    ll2_io::load_str(&xml, projector.as_ref()).expect("a Lanelet2 loader should accept the export")
+    let loaded = ll2_io::load_str(&xml, projector.as_ref())
+        .expect("a Lanelet2 loader should accept the export");
+    (loaded, trace)
 }
 
 /// Exports a clip into a fresh directory and hands back both, so the directory lives

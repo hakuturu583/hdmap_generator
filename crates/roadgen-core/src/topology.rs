@@ -95,6 +95,14 @@ impl LaneEnd {
         }
     }
 
+    /// The road's end this lane end lies at; the inverse of [`RoadEnd::as_lane_end`].
+    pub fn as_road_end(self) -> RoadEnd {
+        match self {
+            LaneEnd::Start => RoadEnd::Start,
+            LaneEnd::End => RoadEnd::End,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             LaneEnd::Start => "start",

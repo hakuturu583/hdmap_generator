@@ -374,10 +374,12 @@ pub struct MapObject {
 /// A rule that governs movement, expressed over IR objects and lanes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrafficRule {
-    /// Lanes controlled by one or more traffic lights, optionally with a stop line.
+    /// Lanes controlled by one or more traffic lights, with the stop lines they
+    /// stop at: none, one, or — when the lanes reach their junction by more than
+    /// one mouth — one per mouth, each across the rule's lanes it crosses.
     TrafficLight {
         lights: Vec<ObjectId>,
-        stop_line: Option<ObjectId>,
+        stop_lines: Vec<ObjectId>,
         lanes: Vec<LaneId>,
     },
     /// `yielding` gives way to `right_of_way`.

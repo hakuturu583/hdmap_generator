@@ -625,14 +625,8 @@ impl MapBuilder {
     ) -> Result<ConnectionId, BuildError> {
         let from_direction = self.lane_spec(from)?.direction;
         let to_direction = self.lane_spec(to)?.direction;
-        let from_end = match from_direction.exit_end() {
-            LaneEnd::Start => RoadEnd::Start,
-            LaneEnd::End => RoadEnd::End,
-        };
-        let to_end = match to_direction.entry_end() {
-            LaneEnd::Start => RoadEnd::Start,
-            LaneEnd::End => RoadEnd::End,
-        };
+        let from_end = from_direction.exit_end().as_road_end();
+        let to_end = to_direction.entry_end().as_road_end();
         self.set_link(&from.road, from_end, &to.road, to_end, junction)?;
         self.push_operation(from.clone(), to.clone(), junction)?;
         Ok(ConnectionId::between(
@@ -1849,8 +1843,8 @@ impl Generator {
     ) -> Result<(), BuildError> {
         let from_lane = self.lane(from)?.clone();
         let to_lane = self.lane(to)?.clone();
-        let from_end = road_end_of(from_lane.direction.exit_end());
-        let to_end = road_end_of(to_lane.direction.entry_end());
+        let from_end = from_lane.direction.exit_end().as_road_end();
+        let to_end = to_lane.direction.entry_end().as_road_end();
         self.build_junction_road(junction, &from_lane, from_end, &to_lane, to_end)
     }
 
@@ -2212,7 +2206,7 @@ impl Generator {
                     lanes,
                 } => TrafficRule::TrafficLight {
                     lights,
-                    stop_line,
+                    stop_lines: stop_line.into_iter().collect(),
                     lanes: self.lane_ids(&lanes)?,
                 },
                 RuleSpec::RightOfWay {
@@ -2232,13 +2226,6 @@ impl Generator {
             self.map.rules.push(rule);
         }
         Ok(())
-    }
-}
-
-fn road_end_of(end: LaneEnd) -> RoadEnd {
-    match end {
-        LaneEnd::Start => RoadEnd::Start,
-        LaneEnd::End => RoadEnd::End,
     }
 }
 
