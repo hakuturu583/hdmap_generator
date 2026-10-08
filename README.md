@@ -2216,7 +2216,26 @@ Python, one line per thing the map now says less exactly than the file did:
   the nearest it does, and a road type likewise;
 - a building's roof is flat, because an outline has one height per corner;
 - a signal or object that names no lanes is read as governing every lane of its
-  section that runs the way it faces.
+  section that runs the way it faces;
+- a traffic light that names the lanes *inside* a junction — CARLA's Town maps
+  stand a junction's light on a post valid on no lane of its own road and refer to
+  it with a `<signalReference>` from each connecting road — is read as governing
+  the approaches that feed those lanes instead: the IR's traffic light, like
+  Autoware's, is about the lanes that stop for it, and a regulatory element on the
+  lanelets inside the junction is one a vehicle on the approach never sees. A sign
+  keeps the lanes it names, since what a sign means is its code, which the reader
+  passes through without reading;
+- a `<controller>` whose lanes no stop line in the document crosses is given one:
+  `object/stopline/<road>/<end>`, a line across the lanes where they enter the
+  junction, from the driver's left to the right, one per junction mouth however
+  many controllers stop there. A rule holds one stop line, so a controller whose
+  lanes reach the junction by more than one road is read as one rule per mouth,
+  each naming all of the controller's lights — they switch together, which is
+  what the controller says, and the OpenDRIVE export still writes them as one
+  controller. The Lanelet2 export then gives each approach lanelet the
+  `traffic_light` regulatory element with the line as its `ref_line`. A map
+  roadgen wrote with a traffic-light rule that has no stop line gains one the same
+  way when it is read back.
 
 What is an error rather than a note is a document that is not a road network: a
 reference line with a gap in it wider than 10 cm (a narrower one is closed and
@@ -2322,10 +2341,14 @@ The read trace is format `opendrive` too, so one `Trace` holds either it or an
 OpenDRIVE export's trace, not both. A document that gives two signals one id has
 both traced to that `signal:`.
 
-A light is traced to the movements off the lanes it stands over. The lights of one
-OpenDRIVE `<controller>` are read as one rule over all their lanes, which is right
-for the program, but each light still answers only for its own movements, and for
-those its rule gives it that no light stands over.
+A light is traced to the movements off the lanes it stands over — the approaches,
+for a CARLA light the file names over its junction's connecting roads. The lights
+of one OpenDRIVE `<controller>` are read as one rule over all their lanes (or one
+per junction mouth, each traced `merged` to the controller), which is right for the
+program, but each light still answers only for its own movements, and for those
+its rule gives it that no light stands over. A stop line the reader drew, having
+no element in the file, is traced `collapsed` to the controller it was drawn for,
+with the role `stop_line`.
 
 A bare element takes the kind that format is usually asked about — a lanelet id is a
 lanelet, a SUMO id a lane — so `1000123` and `"lanelet:1000123"` are the same question.

@@ -37,7 +37,10 @@
 //! `<road>`, lane, `<junction>`, `<signal>`, `<object>` and `<controller>` became,
 //! in the kinds the exporter's own trace uses (`road:12`, `lane:12/0/-1`,
 //! `signal:949`, `object:31`, `controller:964`) — so a signal in the file can be
-//! followed to whatever another export made of it.
+//! followed to whatever another export made of it. A stop line the reader drew
+//! where the document has none (`object/stopline/<road>/<end>`, at a junction
+//! mouth its lights stop) is traced, as `collapsed` with the role `stop_line`, to
+//! the controller it was drawn for.
 
 mod furniture;
 mod geometry;
