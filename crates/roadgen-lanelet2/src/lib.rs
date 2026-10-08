@@ -844,45 +844,33 @@ impl<'a> Exporter<'a> {
                 } => {
                     // A Lanelet2 traffic light has one `ref_line`, so a rule that
                     // stops at several lines — one per junction mouth — is one
-                    // element per line, on the rule's lanes that line crosses and
-                    // referring to the lights over them. A rule with no line is one
+                    // element per line, on the rule's lanes that stop at it
+                    // (`Map::traffic_light_stops`, as the SUMO export has it) and
+                    // referring to the lights over them, or to all the rule's
+                    // lights when none is. A rule with no line, or one, is one
                     // element over all its lanes.
-                    let groups: Vec<(Option<ObjectId>, Vec<LaneId>, Vec<ObjectId>)> =
-                        if stop_lines.is_empty() {
-                            vec![(None, lanes.clone(), lights.clone())]
-                        } else {
-                            stop_lines
+                    let groups: Vec<(Option<ObjectId>, Vec<LaneId>, Vec<ObjectId>)> = self
+                        .map
+                        .traffic_light_stops(&stop_lines, &lanes)
+                        .into_iter()
+                        .map(|(line, at)| {
+                            let over: Vec<ObjectId> = lights
                                 .iter()
-                                .map(|line| {
-                                    let crossed = self
-                                        .map
-                                        .objects
-                                        .get(line)
-                                        .map(|object| object.lanes.as_slice())
-                                        .unwrap_or_default();
-                                    let at: Vec<LaneId> = lanes
-                                        .iter()
-                                        .filter(|lane| crossed.contains(lane))
-                                        .cloned()
-                                        .collect();
-                                    let over: Vec<ObjectId> = lights
-                                        .iter()
-                                        .filter(|light| {
-                                            self.map.objects.get(light).is_some_and(|object| {
-                                                object.lanes.iter().any(|lane| at.contains(lane))
-                                            })
-                                        })
-                                        .cloned()
-                                        .collect();
-                                    let over = if over.is_empty() {
-                                        lights.clone()
-                                    } else {
-                                        over
-                                    };
-                                    (Some(line.clone()), at, over)
+                                .filter(|light| {
+                                    self.map.objects.get(light).is_some_and(|object| {
+                                        object.lanes.iter().any(|lane| at.contains(lane))
+                                    })
                                 })
-                                .collect()
-                        };
+                                .cloned()
+                                .collect();
+                            let over = if over.is_empty() {
+                                lights.clone()
+                            } else {
+                                over
+                            };
+                            (line, at, over)
+                        })
+                        .collect();
                     let mut elements = Vec::new();
                     for (stop_line, at, lights) in groups {
                         if let Some(element) =
@@ -963,13 +951,17 @@ impl<'a> Exporter<'a> {
 
     /// One `traffic_light` element: `lights` stopping `lanes` at `stop_line`.
     /// `None` when none of the lights has a way to refer to, since Lanelet2's
-    /// TrafficLight refuses to exist without one.
+    /// TrafficLight refuses to exist without one, and when none of the lanes was
+    /// written as a lanelet, since an element no lanelet holds governs nothing.
     fn traffic_light_element(
         &mut self,
         lights: &[ObjectId],
         stop_line: Option<&ObjectId>,
         lanes: &[LaneId],
     ) -> Result<Option<Id>, ExportError> {
+        if !lanes.iter().any(|lane| self.lanelets.contains_key(lane)) {
+            return Ok(None);
+        }
         let mut parameters = RuleParameterMap::new();
         let refers: Vec<RuleParameter> = lights
             .iter()

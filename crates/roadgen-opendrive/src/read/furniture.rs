@@ -36,7 +36,7 @@ use uom::si::length::meter;
 
 use roadgen_core::buildings::{Building, BuildingPart, Footprint, Frontage, Solid};
 use roadgen_core::geometry::{Curve3, Frame3, Point3};
-use roadgen_core::id::{BuildingId, BuildingPartId, LaneId, ObjectId, RoadId};
+use roadgen_core::id::{BuildingId, BuildingPartId, JunctionId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::Road;
 use roadgen_core::semantics::{LightHead, MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
 use roadgen_core::topology::{Direction, LateralSide, RoadEnd, RoadEndpoint};
@@ -157,7 +157,10 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
                 );
                 continue;
             }
-            let stop_line = reader.stop_line_across(&stop_lines, &yielding);
+            let stop_line = reader
+                .stop_lines_across(&stop_lines, &yielding)
+                .into_iter()
+                .next();
             reader.map.rules.push(TrafficRule::RightOfWay {
                 right_of_way,
                 yielding,
@@ -184,7 +187,8 @@ struct PendingRule {
     controller: String,
     lights: Vec<ObjectId>,
     lanes: Vec<LaneId>,
-    /// Where it stops traffic, one per mouth of its lanes that the map can say.
+    /// Where it stops traffic: the document's lines across each mouth, or the
+    /// mouth itself with the lanes that stop there.
     stops: Vec<(StopAt, Vec<LaneId>)>,
 }
 
@@ -194,10 +198,11 @@ struct PendingRule {
 /// The lanes of one controller can reach their junction by more than one mouth —
 /// one light whose references fan out over two incoming roads, or a controller
 /// of several lights — and each mouth stops traffic at its own line. So each
-/// mouth is resolved on its own: at the stop line the document draws across its
-/// lanes, as a map roadgen wrote comes back, or — where it draws none, as
-/// CARLA's Town maps draw none at all — at one the reader draws across the mouth
-/// (`mouth_line`). A light stops traffic *somewhere*, and Lanelet2's `ref_line`
+/// mouth is resolved on its own: at the stop lines the document draws across its
+/// lanes (the one across most of them first), as a map roadgen wrote comes back,
+/// or — where it draws none, as CARLA's Town maps draw none at all — at one the
+/// reader draws across the mouth (`mouth_line`). A mouth lane no document line
+/// names stops at no line, as `Map::traffic_light_stops` reads a rule of several. A light stops traffic *somewhere*, and Lanelet2's `ref_line`
 /// is how Autoware knows where; the place is not in doubt, since by now every
 /// lane a light governs is an approach (see `read_signal`), and it stops where it
 /// enters the junction. Lanes that run into no junction stop at a document's line
@@ -243,17 +248,19 @@ fn read_controllers(
                 "controller",
             );
         }
-        let stops = reader
-            .mouths(&lanes)
-            .into_iter()
-            .filter_map(|(mouth, lanes)| {
-                let stop = match reader.stop_line_across(stop_lines, &lanes) {
-                    Some(line) => StopAt::Drawn(line),
-                    None => StopAt::Mouth(mouth?),
-                };
-                Some((stop, lanes))
-            })
-            .collect();
+        let mut stops: Vec<(StopAt, Vec<LaneId>)> = Vec::new();
+        for (mouth, lanes) in reader.mouths(&lanes) {
+            let across = reader.stop_lines_across(stop_lines, &lanes);
+            if !across.is_empty() {
+                stops.extend(
+                    across
+                        .into_iter()
+                        .map(|line| (StopAt::Drawn(line), Vec::new())),
+                );
+            } else if let Some(mouth) = mouth {
+                stops.push((StopAt::Mouth(mouth), lanes));
+            }
+        }
         pending.push(PendingRule {
             controller,
             lights,
@@ -779,17 +786,23 @@ impl Reader<'_> {
         Ok(())
     }
 
-    /// The first stop line that lies across any of `lanes`.
-    fn stop_line_across(&self, stop_lines: &[ObjectId], lanes: &[LaneId]) -> Option<ObjectId> {
-        stop_lines
+    /// The document's stop lines that lie across any of `lanes`, the one across
+    /// most of them first, and in the document's order among equals.
+    fn stop_lines_across(&self, stop_lines: &[ObjectId], lanes: &[LaneId]) -> Vec<ObjectId> {
+        let mut across: Vec<(usize, &ObjectId)> = stop_lines
             .iter()
-            .find(|id| {
-                self.map
-                    .objects
-                    .get(id)
-                    .is_some_and(|object| object.lanes.iter().any(|lane| lanes.contains(lane)))
+            .filter_map(|id| {
+                let object = self.map.objects.get(id)?;
+                let crossed = object
+                    .lanes
+                    .iter()
+                    .filter(|lane| lanes.contains(lane))
+                    .count();
+                (crossed > 0).then_some((crossed, id))
             })
-            .cloned()
+            .collect();
+        across.sort_by_key(|(crossed, _)| std::cmp::Reverse(*crossed));
+        across.into_iter().map(|(_, id)| id.clone()).collect()
     }
 
     /// The lanes that feed a connecting road from outside its junction.
@@ -803,13 +816,18 @@ impl Reader<'_> {
         found
     }
 
-    /// Whether `lane` is a lane of a junction's connecting road.
-    fn is_inside_junction(&self, lane: &LaneId) -> bool {
+    /// The junction `lane` is inside, when it is a lane of a connecting road.
+    fn junction_of(&self, lane: &LaneId) -> Option<&JunctionId> {
         self.map
             .lanes
             .get(lane)
             .and_then(|entry| self.map.roads.get(&entry.road))
-            .is_some_and(Road::is_connector)
+            .and_then(|road| road.junction.as_ref())
+    }
+
+    /// Whether `lane` is a lane of a junction's connecting road.
+    fn is_inside_junction(&self, lane: &LaneId) -> bool {
+        self.junction_of(lane).is_some()
     }
 
     /// The lanes the map's connections lead into `lane` from, worked out for
@@ -833,9 +851,11 @@ impl Reader<'_> {
 
     /// The lanes outside any junction that lead into `lane`, which is a lane of a
     /// connecting road: its predecessors, and theirs in turn while they are
-    /// inside the junction too — a document may chain two connecting roads
-    /// through one junction.
+    /// inside the same junction too — a document may chain two connecting roads
+    /// through one junction. A predecessor inside another junction is not
+    /// followed: what enters that junction stops at its own mouth, not this one's.
     fn feeding(&self, lane: &LaneId) -> Vec<LaneId> {
+        let junction = self.junction_of(lane);
         let mut found: Vec<LaneId> = Vec::new();
         let mut seen: Vec<LaneId> = vec![lane.clone()];
         let mut queue: Vec<LaneId> = vec![lane.clone()];
@@ -845,10 +865,10 @@ impl Reader<'_> {
                     continue;
                 }
                 seen.push(from.clone());
-                if self.is_inside_junction(from) {
-                    queue.push(from.clone());
-                } else {
-                    push_unique(&mut found, from.clone());
+                match self.junction_of(from) {
+                    None => push_unique(&mut found, from.clone()),
+                    Some(other) if Some(other) == junction => queue.push(from.clone()),
+                    Some(_) => {}
                 }
             }
         }

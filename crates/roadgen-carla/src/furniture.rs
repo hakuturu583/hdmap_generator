@@ -793,35 +793,35 @@ fn bulb_material(color: LightColor) -> usize {
 }
 
 /// Where a light applies: the middle of the stop line it stops traffic at, if
-/// any — of the lines of the rules that name it, the one across the lanes the
-/// light governs, or the first of them where none is. CARLA builds a light's stop
-/// boxes from the signal's `s`, so a light whose rule has a stop line stops
-/// traffic there rather than under its own heads.
+/// any — of the lines the rules that name it stop their lanes at
+/// ([`Map::traffic_light_stops`]), the one a lane of the light's own stops at, or
+/// the first of them where none does. CARLA builds a light's stop boxes from the
+/// signal's `s`, so a light whose rule has a stop line stops traffic there rather
+/// than under its own heads.
 fn stop_line_of(map: &Map, light: &ObjectId) -> Option<Point3> {
     let governs = map
         .objects
         .get(light)
         .map(|object| object.lanes.as_slice())
         .unwrap_or_default();
-    let lines: Vec<&ObjectId> = map
+    let stops: Vec<(ObjectId, Vec<LaneId>)> = map
         .rules
         .iter()
         .filter_map(|rule| match rule {
             TrafficRule::TrafficLight {
-                lights, stop_lines, ..
-            } if lights.contains(light) => Some(stop_lines),
+                lights,
+                stop_lines,
+                lanes,
+            } if lights.contains(light) => Some(map.traffic_light_stops(stop_lines, lanes)),
             _ => None,
         })
         .flatten()
+        .filter_map(|(line, lanes)| Some((line?, lanes)))
         .collect();
-    let stop_line = lines
+    let (stop_line, _) = stops
         .iter()
-        .find(|line| {
-            map.objects
-                .get(line)
-                .is_some_and(|object| object.lanes.iter().any(|lane| governs.contains(lane)))
-        })
-        .or(lines.first())?;
+        .find(|(_, lanes)| lanes.iter().any(|lane| governs.contains(lane)))
+        .or(stops.first())?;
     let object = map.objects.get(stop_line)?;
     Some(match &object.geometry {
         ObjectGeometry::Point(position) => *position,

@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use ll2_core::map::as_lanelet;
+use ll2_core::map::{as_lanelet, as_regulatory_element};
 use ll2_core::regelem::RuleParameter;
 use roadgen_core::prelude::*;
 use roadgen_core::trace::{IrRef, Relation, Trace};
@@ -155,10 +155,14 @@ const CARLA_SHAPED: &str = r#"<?xml version="1.0" standalone="yes"?>
 </OpenDRIVE>"#;
 
 fn lane_of(map: &ValidatedMap, road: &str, ordinal: usize) -> LaneId {
+    lane_on(map, road, LateralSide::Right, ordinal)
+}
+
+fn lane_on(map: &ValidatedMap, road: &str, side: LateralSide, ordinal: usize) -> LaneId {
     map.lanes_of(&RoadId::new(road))
         .into_iter()
-        .find(|lane| lane.side == LateralSide::Right && lane.ordinal == ordinal)
-        .unwrap_or_else(|| panic!("{road} has a right lane {ordinal}"))
+        .find(|lane| lane.side == side && lane.ordinal == ordinal)
+        .unwrap_or_else(|| panic!("{road} has a {side:?} lane {ordinal}"))
         .id
         .clone()
 }
@@ -181,6 +185,8 @@ struct Reached {
     lanes_carrying: usize,
     with_ref_line: usize,
     narrowed: usize,
+    /// Traffic-light elements in the file that no lanelet holds.
+    orphans: usize,
 }
 
 /// Exports `map` as Lanelet2, reads the file back with `simple_lanelet2`'s loader
@@ -211,7 +217,21 @@ fn reach_lanelet2(map: &ValidatedMap) -> Reached {
         lanes_carrying: 0,
         with_ref_line: 0,
         narrowed: 0,
+        orphans: 0,
     };
+    let held: BTreeSet<i64> = lanelets
+        .values()
+        .flat_map(|lanelet| lanelet.regulatory_elements())
+        .map(|element| element.id())
+        .collect();
+    reached.orphans = loaded
+        .regulatory_elements
+        .all()
+        .iter()
+        .filter_map(as_regulatory_element)
+        .filter(|element| element.attributes().read()["subtype"].value() == "traffic_light")
+        .filter(|element| !held.contains(&element.id()))
+        .count();
     for (index, rule) in map.rules.iter().enumerate() {
         let TrafficRule::TrafficLight { lights, lanes, .. } = rule else {
             continue;
@@ -388,6 +408,7 @@ fn a_carla_junction_light_governs_the_approaches_and_stops_them_at_the_mouth() {
             lanes_carrying: 3,
             with_ref_line: 3,
             narrowed: 0,
+            orphans: 0,
         }
     );
     assert!(roadgen_lanelet2::check(&map).is_empty());
@@ -459,7 +480,304 @@ fn each_mouth_of_a_controller_refers_to_the_lights_over_it() {
             lanes_carrying: 3,
             with_ref_line: 3,
             narrowed: 2,
+            orphans: 0,
         }
+    );
+}
+
+/// A driving lane 3.5 m wide, for an OpenDRIVE `<left>`/`<right>`.
+fn od_lane(id: i64, links: &str) -> String {
+    format!(
+        r#"<lane id="{id}" type="driving" level="false">{links}<width sOffset="0.0" a="3.5" b="0.0" c="0.0" d="0.0"/></lane>"#
+    )
+}
+
+/// The pavement road with the light's post, as in [`CARLA_SHAPED`].
+const POST: &str = r#"<road name="post" length="10.0" id="4" junction="-1">
+    <planView><geometry s="0.0" x="-10.0" y="-12.0" hdg="0.0" length="10.0"><line/></geometry></planView>
+    <lanes><laneSection s="0.0"><center><lane id="0" type="none" level="false"/></center>
+      <right><lane id="-1" type="sidewalk" level="false"><width sOffset="0.0" a="2.0" b="0.0" c="0.0" d="0.0"/></lane></right>
+    </laneSection></lanes>
+    <signals>
+      <signal s="9.0" t="-1.0" id="42" name="Signal_3Light_Post01" dynamic="yes" orientation="-" zOffset="0.0" type="1000001" subtype="-1" country="OpenDRIVE" height="5.0">
+        <validity fromLane="0" toLane="0"/>
+      </signal>
+    </signals>
+  </road>"#;
+
+/// A straight road along x from `x`, `length` long, with `lanes` on `side` and the
+/// given link and extras.
+fn od_road(
+    id: &str,
+    junction: &str,
+    (x, length): (f64, f64),
+    link: &str,
+    side: &str,
+    lanes: &[String],
+    extra: &str,
+) -> String {
+    format!(
+        r#"<road name="" length="{length}" id="{id}" junction="{junction}">
+    <link>{link}</link>
+    <planView><geometry s="0.0" x="{x}" y="0.0" hdg="0.0" length="{length}"><line/></geometry></planView>
+    <lanes><laneSection s="0.0"><center><lane id="0" type="none" level="false"/></center>
+      <{side}>{}</{side}>
+    </laneSection></lanes>
+    {extra}
+  </road>"#,
+        lanes.concat()
+    )
+}
+
+fn od_document(body: &[String]) -> String {
+    format!(
+        r#"<?xml version="1.0" standalone="yes"?>
+<OpenDRIVE>
+  <header revMajor="1" revMinor="4" name="fixture" version="1.00" date="2026-10-08" north="0" south="0" east="0" west="0"/>
+  {POST}
+  {}
+  <controller name="ctrl7" id="7" sequence="0"><control signalId="42" type=""/></controller>
+</OpenDRIVE>"#,
+        body.concat()
+    )
+}
+
+/// A rule the builder makes over two lanes with a stop line across one of them
+/// stops both there, as it says: Lanelet2 hangs its one element, with the line as
+/// `ref_line`, on both lanelets.
+#[test]
+fn a_stop_line_across_one_lane_of_a_rule_stops_all_of_its_lanes() {
+    let mut builder = MapBuilder::new(roadgen_integration_tests::scenarios::metadata("two"));
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(100.0, 0.0, 0.0),
+                roadgen_integration_tests::scenarios::one_way(2),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let (first, second) = (LaneRef::new(road.clone(), 0), LaneRef::new(road, 1));
+    let stop = builder.add_stop_line(&first, LaneEnd::End).unwrap();
+    let light = builder
+        .add_traffic_light(&first, LaneEnd::End, 5.0)
+        .unwrap();
+    builder.add_traffic_light_rule(vec![light], Some(stop), vec![first, second]);
+    let map = builder.finish().unwrap().validate().unwrap();
+    assert_eq!(
+        reach_lanelet2(&map),
+        Reached {
+            rules: 1,
+            elements: 1,
+            lanes: 2,
+            lanes_carrying: 2,
+            with_ref_line: 2,
+            narrowed: 0,
+            orphans: 0,
+        }
+    );
+}
+
+/// A document's line across one lane of one mouth is that mouth's line — the
+/// reader draws none beside it — and the mouth's other lane, which no line of a
+/// rule with several names, still gets the rule's element, without a `ref_line`.
+#[test]
+fn a_document_line_across_part_of_a_mouth_is_kept_and_no_lane_goes_bare() {
+    let line = r#"<objects><object type="roadMark" subtype="stopLine" name="stopLine" id="900" s="98.0" t="-1.75" zOffset="0.0" hdg="0.0" orientation="+" width="3.5" length="0.3"><validity fromLane="-1" toLane="-1"/></object></objects>
+  </road>
+  <road name="east""#;
+    let document = CARLA_SHAPED.replacen("</road>\n  <road name=\"east\"", line, 1);
+    let map = from_xml(&document)
+        .expect("the document reads")
+        .map
+        .validate()
+        .unwrap_or_else(|error| panic!("{error}"));
+    let rules = light_rules(&map);
+    assert_eq!(rules.len(), 1, "{:#?}", map.rules);
+    assert_eq!(
+        rules[0].1,
+        &vec![ObjectId::new("900"), ObjectId::new("stopline/3/end")]
+    );
+    assert!(map.objects.get(&ObjectId::new("stopline/1/end")).is_none());
+    assert_eq!(
+        reach_lanelet2(&map),
+        Reached {
+            rules: 1,
+            elements: 3,
+            lanes: 3,
+            lanes_carrying: 3,
+            with_ref_line: 2,
+            narrowed: 0,
+            orphans: 0,
+        }
+    );
+}
+
+/// An approach whose *start* meets the junction — its lanes on the left, running
+/// against the road — entered by a connecting road from its end: the light moves
+/// onto it, and the line is drawn at the road's start from the driver's left,
+/// which is the road's centre line, to the right.
+#[test]
+fn a_mouth_at_the_start_of_a_road_is_crossed_from_the_drivers_left() {
+    let left = |id: i64| {
+        od_lane(
+            id,
+            &format!(r#"<link><predecessor id="{id}"/><successor id="{id}"/></link>"#),
+        )
+    };
+    let document = od_document(&[
+        od_road(
+            "1",
+            "-1",
+            (20.0, 100.0),
+            r#"<predecessor elementType="junction" elementId="10"/>"#,
+            "left",
+            &[od_lane(2, ""), od_lane(1, "")],
+            "",
+        ),
+        od_road(
+            "2",
+            "-1",
+            (-100.0, 100.0),
+            r#"<successor elementType="junction" elementId="10"/>"#,
+            "left",
+            &[od_lane(2, ""), od_lane(1, "")],
+            "",
+        ),
+        od_road(
+            "100",
+            "10",
+            (0.0, 20.0),
+            r#"<predecessor elementType="road" elementId="2" contactPoint="end"/><successor elementType="road" elementId="1" contactPoint="start"/>"#,
+            "left",
+            &[left(2), left(1)],
+            r#"<signals><signalReference s="20.0" t="0.0" id="42" orientation="-"><validity fromLane="1" toLane="2"/></signalReference></signals>"#,
+        ),
+        r#"<junction id="10" name="junction">
+    <connection id="0" incomingRoad="1" connectingRoad="100" contactPoint="end">
+      <laneLink from="1" to="1"/><laneLink from="2" to="2"/>
+    </connection>
+  </junction>"#
+            .to_owned(),
+    ]);
+    let Imported {
+        map,
+        approximations: notes,
+        ..
+    } = from_xml(&document).expect("the document reads");
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
+    let approach = vec![
+        lane_on(&map, "1", LateralSide::Left, 1),
+        lane_on(&map, "1", LateralSide::Left, 2),
+    ];
+    let light = map
+        .objects
+        .iter()
+        .find(|object| object.kind.is_traffic_light())
+        .unwrap();
+    assert_eq!(sorted(&light.lanes), sorted(&approach), "{notes:#?}");
+    let rules = light_rules(&map);
+    assert_eq!(rules[0].1, &vec![ObjectId::new("stopline/1/start")]);
+    let line = map.objects.get(&ObjectId::new("stopline/1/start")).unwrap();
+    assert_eq!(sorted(&line.lanes), sorted(&approach));
+    let ObjectGeometry::Line(curve) = &line.geometry else {
+        panic!("a stop line is a line");
+    };
+    let (from, to) = (curve.start_point(), curve.end_point());
+    assert!(
+        from.distance_to(Point3::new(20.0, 0.0, 0.0)) < 1e-6,
+        "{from:?}"
+    );
+    assert!(to.distance_to(Point3::new(20.0, 7.0, 0.0)) < 1e-6, "{to:?}");
+    let reached = reach_lanelet2(&map);
+    assert_eq!(reached.lanes_carrying, 2);
+    assert_eq!(reached.with_ref_line, 2);
+    assert_eq!(reached.orphans, 0);
+}
+
+/// Two junctions joined connector to connector: a light the document names over
+/// the second junction's connector is not walked back through the first junction
+/// onto the road that enters *it* — that road stops at the first junction's mouth.
+/// With no approach of its own junction to move to, it governs its lane as named.
+/// (Before, the walk crossed into the first junction and put the light on road 1.)
+#[test]
+fn a_light_is_not_moved_onto_the_approaches_of_another_junction() {
+    let right = |id: i64| {
+        od_lane(
+            id,
+            &format!(r#"<link><predecessor id="{id}"/><successor id="{id}"/></link>"#),
+        )
+    };
+    let document = od_document(&[
+        od_road(
+            "1",
+            "-1",
+            (0.0, 100.0),
+            r#"<successor elementType="junction" elementId="20"/>"#,
+            "right",
+            &[od_lane(-1, "")],
+            "",
+        ),
+        od_road(
+            "200",
+            "20",
+            (100.0, 10.0),
+            r#"<predecessor elementType="road" elementId="1" contactPoint="end"/><successor elementType="road" elementId="100" contactPoint="start"/>"#,
+            "right",
+            &[right(-1)],
+            "",
+        ),
+        od_road(
+            "100",
+            "10",
+            (110.0, 10.0),
+            r#"<predecessor elementType="road" elementId="200" contactPoint="end"/><successor elementType="road" elementId="2" contactPoint="start"/>"#,
+            "right",
+            &[right(-1)],
+            r#"<signals><signalReference s="0.0" t="0.0" id="42" orientation="+"><validity fromLane="-1" toLane="-1"/></signalReference></signals>"#,
+        ),
+        od_road(
+            "2",
+            "-1",
+            (120.0, 100.0),
+            r#"<predecessor elementType="junction" elementId="10"/>"#,
+            "right",
+            &[od_lane(-1, "")],
+            "",
+        ),
+        r#"<junction id="20" name="first">
+    <connection id="0" incomingRoad="1" connectingRoad="200" contactPoint="start"><laneLink from="-1" to="-1"/></connection>
+  </junction>
+  <junction id="10" name="second">
+    <connection id="0" incomingRoad="200" connectingRoad="100" contactPoint="start"><laneLink from="-1" to="-1"/></connection>
+  </junction>"#
+            .to_owned(),
+    ]);
+    // The IR validates no connection from one junction's connector into another's,
+    // so the reading itself is what is checked.
+    let Imported {
+        map,
+        approximations: notes,
+        ..
+    } = from_xml(&document).expect("the document reads");
+    let map = map.as_map();
+    let light = map
+        .objects
+        .iter()
+        .find(|object| object.kind.is_traffic_light())
+        .unwrap_or_else(|| panic!("the light is read: {notes:#?}"));
+    let inside: Vec<LaneId> = map
+        .lanes_of(&RoadId::new("100"))
+        .into_iter()
+        .map(|lane| lane.id.clone())
+        .collect();
+    assert_eq!(light.lanes, inside, "{notes:#?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("no lane outside it leads into")),
+        "{notes:#?}"
     );
 }
 
@@ -553,6 +871,10 @@ fn a_carla_town_hands_autoware_every_light_on_its_approaches() {
         reached.narrowed,
         reached.lanes_carrying,
         reached.with_ref_line
+    );
+    assert_eq!(
+        reached.orphans, 0,
+        "every traffic-light element is on a lanelet"
     );
     assert_eq!(light_inside, 0);
     assert_eq!(rules_inside, 0);

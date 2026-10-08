@@ -28,7 +28,8 @@
 - 読み込み側（`read_opendrive`）のトレースは §5.3 のとおり実装した（`Map.write_read_trace`）。lane・road・junction に加えて `signal:` / `object:` / `controller:` も載せる。CLI、Web デモのハイライトはフェーズ 2 のまま。
 - 読み込み側トレースの既定のファイル名は `<入力>.read.trace.json`（エクスポート側の `<file>.trace.json` を上書きしないため）。
 - SUMO のトレースで信号機を link に結び付けるときは、その信号機自身の lane から出る movement と、規則（rule）がその信号機に与える movement のうちどの信号機の lane からも出ていないものを使う。OpenDRIVE の controller は同時に切り替わる信号の組で、リーダはそれを全信号の lane をまとめた 1 つの rule にするため、そのままだと同じ controller の信号同士が互いの movement を名乗ってしまう。
-- 読み込み側で、交差点内の connecting road の lane を指す信号機（CARLA の Town マップは `<signalReference>` を connecting road に置く）は、その lane へ入る交差点外の進入 lane を規制するものとして読む。文書に停止線がない controller には、リーダが交差点の入口に停止線 `object/stopline/<road>/<end>` を描き、`controller:<id>` へ `collapsed`（role `stop_line`）でリンクする。controller は 1 つの rule（`exact`）で、入口ごとに停止線を持つ（`TrafficLight.stop_lines`）。Lanelet2 出力では停止線ごとに regulatory element を分け、rule から各 element へ `part` でリンクする。
+- 読み込み側で、交差点内の connecting road の lane を指す信号機（CARLA の Town マップは `<signalReference>` を connecting road に置く）は、その lane へ入る交差点外の進入 lane を規制するものとして読む。文書に停止線がない controller には、リーダが交差点の入口に停止線 `object/stopline/<road>/<end>` を描き、`controller:<id>` へ `collapsed`（role `stop_line`）でリンクする。controller は 1 つの rule（`exact`）で、入口ごとに停止線を持つ（`TrafficLight.stop_lines`）。
+- Lanelet2 出力では、停止線が複数ある `TrafficLight` rule は停止線ごとに regulatory element を分け（どの停止線にも名指されない lane は `ref_line` なしの element にまとめる）、rule から各 element へ `part` でリンクする。element が 1 つだけのとき（停止線が 0 本か 1 本の rule を含む）は `exact`。
 
 ## 1. 何を解きたいか
 

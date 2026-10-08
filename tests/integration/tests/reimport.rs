@@ -336,3 +336,65 @@ fn a_map_of_buildings_comes_back_with_its_town() {
         .iter()
         .any(|note| note.contains("flat roofs")));
 }
+
+/// A map roadgen wrote with a traffic-light rule that has no stop line does not
+/// come back as itself: the reader draws the line the rule stops at, at the mouth
+/// of its lanes, and says so. That is the one object the round trip adds.
+#[test]
+fn a_light_rule_without_a_stop_line_comes_back_with_one_drawn_at_its_mouth() {
+    let mut builder = MapBuilder::new(scenarios::metadata("unlined"));
+    let mut roads = Vec::new();
+    for (start, end) in [
+        (Point3::new(0.0, 70.0, 0.0), Point3::new(0.0, 14.0, 0.0)),
+        (Point3::new(70.0, 0.0, 0.0), Point3::new(14.0, 0.0, 0.0)),
+    ] {
+        roads.push(
+            builder
+                .add_road(RoadSpec::line(start, end, scenarios::two_way()).unwrap())
+                .unwrap(),
+        );
+    }
+    let junction = builder.add_junction(Some("x"));
+    builder
+        .connect_ends(
+            &roads[0],
+            RoadEnd::End,
+            &roads[1],
+            RoadEnd::End,
+            Some(&junction),
+        )
+        .unwrap();
+    let approach = LaneRef::new(roads[0].clone(), 0);
+    let light = builder
+        .add_traffic_light(&approach, LaneEnd::End, 5.0)
+        .unwrap();
+    builder.add_traffic_light_rule(vec![light], None, vec![approach]);
+    let map = builder.finish().unwrap().validate().unwrap();
+
+    let imported = from_xml(&to_xml(&map).unwrap()).unwrap();
+    assert!(
+        imported
+            .approximations
+            .iter()
+            .any(|note| note.contains("no stop line, and are read with one drawn")),
+        "{:#?}",
+        imported.approximations
+    );
+    let reread = imported.map.validate().unwrap();
+    let lines = |map: &ValidatedMap| -> Vec<ObjectId> {
+        map.objects
+            .iter()
+            .filter(|object| object.kind == MapObjectKind::StopLine)
+            .map(|object| object.id.clone())
+            .collect()
+    };
+    assert!(lines(&map).is_empty());
+    let drawn = lines(&reread);
+    assert_eq!(drawn.len(), 1);
+    assert!(drawn[0].local_name().starts_with("stopline/"), "{drawn:?}");
+    assert_eq!(reread.objects.len(), map.objects.len() + 1);
+    let TrafficRule::TrafficLight { stop_lines, .. } = &reread.rules[0] else {
+        panic!("a traffic light rule");
+    };
+    assert_eq!(stop_lines, &drawn);
+}

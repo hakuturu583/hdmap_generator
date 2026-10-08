@@ -579,6 +579,49 @@ impl Map {
             .collect()
     }
 
+    /// Where a traffic-light rule with `stop_lines` stops each of its `lanes`, as
+    /// groups of lanes with the line they stop at — every lane in exactly one
+    /// group, and no group empty.
+    ///
+    /// A rule with no line stops all its lanes at none, and one with a single line
+    /// stops them all at it, whichever lanes the line itself names: that is what
+    /// such a rule says. A rule with several — one per junction mouth — stops each
+    /// lane at the first of them that names it, and a lane none names at no line,
+    /// rather than at a line drawn across some other mouth.
+    pub fn traffic_light_stops(
+        &self,
+        stop_lines: &[ObjectId],
+        lanes: &[LaneId],
+    ) -> Vec<(Option<ObjectId>, Vec<LaneId>)> {
+        if lanes.is_empty() {
+            return Vec::new();
+        }
+        match stop_lines {
+            [] => return vec![(None, lanes.to_vec())],
+            [line] => return vec![(Some(line.clone()), lanes.to_vec())],
+            _ => {}
+        }
+        let mut rest: Vec<LaneId> = lanes.to_vec();
+        let mut groups = Vec::new();
+        for line in stop_lines {
+            let named = self
+                .objects
+                .get(line)
+                .map(|object| object.lanes.as_slice())
+                .unwrap_or_default();
+            let (crossed, others): (Vec<LaneId>, Vec<LaneId>) =
+                rest.into_iter().partition(|lane| named.contains(lane));
+            rest = others;
+            if !crossed.is_empty() {
+                groups.push((Some(line.clone()), crossed));
+            }
+        }
+        if !rest.is_empty() {
+            groups.push((None, rest));
+        }
+        groups
+    }
+
     /// Lanes that reach `lane` in one step.
     pub fn predecessors(&self, lane: &LaneId) -> Vec<LaneId> {
         self.connections_to(lane)

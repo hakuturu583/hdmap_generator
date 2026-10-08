@@ -2536,22 +2536,31 @@ impl<'a> Exporter<'a> {
         let map = self.map;
         let mut governed: HashMap<&ObjectId, BTreeSet<&LaneId>> = HashMap::new();
         for rule in &map.rules {
-            // A line is measured against every lane of its rule; which of them it
-            // actually crosses — one mouth's, for a rule that stops at several —
-            // is found below.
-            let (stop_lines, lanes) = match rule {
+            // A line is measured against the lanes of its rule that stop at it —
+            // all of them for a rule with one line, the line's own for a rule
+            // with one per mouth (`Map::traffic_light_stops`, as Lanelet2 has it)
+            // — and which of those it actually crosses is found below.
+            match rule {
                 TrafficRule::RightOfWay {
-                    stop_line,
+                    stop_line: Some(stop_line),
                     yielding,
                     ..
-                } => (stop_line.as_slice(), yielding),
+                } => governed.entry(stop_line).or_default().extend(yielding),
                 TrafficRule::TrafficLight {
                     stop_lines, lanes, ..
-                } => (stop_lines.as_slice(), lanes),
-                TrafficRule::SpeedLimit { .. } => continue,
-            };
-            for stop_line in stop_lines {
-                governed.entry(stop_line).or_default().extend(lanes);
+                } => {
+                    for (stop_line, stopped) in map.traffic_light_stops(stop_lines, lanes) {
+                        let Some(id) = stop_lines.iter().find(|id| Some(*id) == stop_line.as_ref())
+                        else {
+                            continue;
+                        };
+                        governed
+                            .entry(id)
+                            .or_default()
+                            .extend(lanes.iter().filter(|lane| stopped.contains(lane)));
+                    }
+                }
+                _ => {}
             }
         }
 
