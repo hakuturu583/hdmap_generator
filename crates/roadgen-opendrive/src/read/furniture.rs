@@ -202,8 +202,9 @@ struct PendingRule {
 /// lanes (the one across most of them first), as a map roadgen wrote comes back,
 /// or — where it draws none, as CARLA's Town maps draw none at all — at one the
 /// reader draws across the mouth (`mouth_line`). A mouth lane no document line
-/// names stops at no line, as `Map::traffic_light_stops` reads a rule of several. A light stops traffic *somewhere*, and Lanelet2's `ref_line`
-/// is how Autoware knows where; the place is not in doubt, since by now every
+/// names stops at no line, as `Map::traffic_light_stops` reads a rule of
+/// several. A light stops traffic *somewhere*, and Lanelet2's `ref_line` is how
+/// Autoware knows where; the place is not in doubt, since by now every
 /// lane a light governs is an approach (see `read_signal`), and it stops where it
 /// enters the junction. Lanes that run into no junction stop at a document's line
 /// if one crosses them, and nowhere otherwise.
