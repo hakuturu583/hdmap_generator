@@ -190,8 +190,8 @@ fn signature(map: &Map) -> BTreeSet<String> {
         lanes.sort();
         let detail = match rule {
             TrafficRule::TrafficLight {
-                lights, stop_line, ..
-            } => format!("lights={lights:?} stop_line={stop_line:?}"),
+                lights, stop_lines, ..
+            } => format!("lights={lights:?} stop_lines={stop_lines:?}"),
             TrafficRule::RightOfWay { stop_line, .. } => format!("stop_line={stop_line:?}"),
             TrafficRule::SpeedLimit { limit, .. } => format!("limit={}", limit.mps()),
         };

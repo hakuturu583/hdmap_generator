@@ -792,19 +792,36 @@ fn bulb_material(color: LightColor) -> usize {
     }
 }
 
-/// Where a light applies: the middle of the stop line of the first rule that
-/// names it, if any. CARLA builds a light's stop boxes from the signal's `s`, so
-/// a light whose rule has a stop line stops traffic there rather than under its
-/// own heads.
+/// Where a light applies: the middle of the stop line it stops traffic at, if
+/// any — of the lines of the rules that name it, the one across the lanes the
+/// light governs, or the first of them where none is. CARLA builds a light's stop
+/// boxes from the signal's `s`, so a light whose rule has a stop line stops
+/// traffic there rather than under its own heads.
 fn stop_line_of(map: &Map, light: &ObjectId) -> Option<Point3> {
-    let stop_line = map.rules.iter().find_map(|rule| match rule {
-        TrafficRule::TrafficLight {
-            lights,
-            stop_line: Some(stop_line),
-            ..
-        } if lights.contains(light) => Some(stop_line),
-        _ => None,
-    })?;
+    let governs = map
+        .objects
+        .get(light)
+        .map(|object| object.lanes.as_slice())
+        .unwrap_or_default();
+    let lines: Vec<&ObjectId> = map
+        .rules
+        .iter()
+        .filter_map(|rule| match rule {
+            TrafficRule::TrafficLight {
+                lights, stop_lines, ..
+            } if lights.contains(light) => Some(stop_lines),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let stop_line = lines
+        .iter()
+        .find(|line| {
+            map.objects
+                .get(line)
+                .is_some_and(|object| object.lanes.iter().any(|lane| governs.contains(lane)))
+        })
+        .or(lines.first())?;
     let object = map.objects.get(stop_line)?;
     Some(match &object.geometry {
         ObjectGeometry::Point(position) => *position,

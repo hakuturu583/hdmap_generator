@@ -400,10 +400,10 @@ fn endpoint_entry(endpoint: &LaneEndpoint) -> EndpointEntry {
 fn rule_objects(rule: &TrafficRule) -> Vec<String> {
     match rule {
         TrafficRule::TrafficLight {
-            lights, stop_line, ..
+            lights, stop_lines, ..
         } => lights
             .iter()
-            .chain(stop_line)
+            .chain(stop_lines)
             .map(ToString::to_string)
             .collect(),
         TrafficRule::RightOfWay { stop_line, .. } => {

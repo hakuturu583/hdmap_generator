@@ -1542,10 +1542,7 @@ impl<'a> Exporter<'a> {
             // A control on a connector is a control inside the junction itself.
             return Some(junction.clone());
         }
-        let end = match lane.direction.exit_end() {
-            LaneEnd::Start => RoadEnd::Start,
-            LaneEnd::End => RoadEnd::End,
-        };
+        let end = lane.direction.exit_end().as_road_end();
         match road.link.at(end) {
             Some(RoadLinkTarget::Junction(junction)) => Some(junction.clone()),
             _ => None,
@@ -2539,18 +2536,21 @@ impl<'a> Exporter<'a> {
         let map = self.map;
         let mut governed: HashMap<&ObjectId, BTreeSet<&LaneId>> = HashMap::new();
         for rule in &map.rules {
-            let (stop_line, lanes) = match rule {
+            // A line is measured against every lane of its rule; which of them it
+            // actually crosses — one mouth's, for a rule that stops at several —
+            // is found below.
+            let (stop_lines, lanes) = match rule {
                 TrafficRule::RightOfWay {
                     stop_line,
                     yielding,
                     ..
-                } => (stop_line, yielding),
+                } => (stop_line.as_slice(), yielding),
                 TrafficRule::TrafficLight {
-                    stop_line, lanes, ..
-                } => (stop_line, lanes),
+                    stop_lines, lanes, ..
+                } => (stop_lines.as_slice(), lanes),
                 TrafficRule::SpeedLimit { .. } => continue,
             };
-            if let Some(stop_line) = stop_line {
+            for stop_line in stop_lines {
                 governed.entry(stop_line).or_default().extend(lanes);
             }
         }

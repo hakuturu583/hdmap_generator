@@ -424,9 +424,10 @@ struct Exporter<'a> {
     objects: HashMap<ObjectId, Vec<LineString>>,
     /// The lanelet a crosswalk object became, besides its two linestrings.
     crosswalks: HashMap<ObjectId, Id>,
-    /// The regulatory element each traffic rule became, by its index in
-    /// [`Map::rules`]. A rule missing here was written as nothing at all.
-    regulatory_elements: BTreeMap<usize, Id>,
+    /// The regulatory elements each traffic rule became, by its index in
+    /// [`Map::rules`]: one, or one per stop line of a traffic light that stops at
+    /// several. A rule missing here was written as nothing at all.
+    regulatory_elements: BTreeMap<usize, Vec<Id>>,
     /// The lanelets a speed limit was written onto as a tag, by rule index.
     speed_limits: BTreeMap<usize, Vec<Id>>,
     /// The `light_bulbs` way of each traffic light that has lamps.
@@ -564,12 +565,20 @@ impl<'a> Exporter<'a> {
             }
         }
 
-        for (index, element) in &self.regulatory_elements {
-            trace.link(
-                IrRef::Rule(*index),
-                format!("regulatory_element:{element}"),
-                Relation::Exact,
-            );
+        // A rule written as several elements is a part of each.
+        for (index, elements) in &self.regulatory_elements {
+            let relation = if elements.len() == 1 {
+                Relation::Exact
+            } else {
+                Relation::Part
+            };
+            for element in elements {
+                trace.link(
+                    IrRef::Rule(*index),
+                    format!("regulatory_element:{element}"),
+                    relation,
+                );
+            }
         }
         // A speed limit is a tag on each lanelet it covers, and no lanelet is only
         // the limit, so each is a part of how the rule was written.
@@ -830,47 +839,61 @@ impl<'a> Exporter<'a> {
             match rule {
                 TrafficRule::TrafficLight {
                     lights,
-                    stop_line,
+                    stop_lines,
                     lanes,
                 } => {
-                    let mut parameters = RuleParameterMap::new();
-                    let refers: Vec<RuleParameter> = lights
-                        .iter()
-                        .map(|light| self.object_lines(light))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .flatten()
-                        .map(RuleParameter::LineString)
-                        .collect();
-                    if refers.is_empty() {
-                        // Lanelet2's TrafficLight refuses to exist without one.
-                        continue;
+                    // A Lanelet2 traffic light has one `ref_line`, so a rule that
+                    // stops at several lines — one per junction mouth — is one
+                    // element per line, on the rule's lanes that line crosses and
+                    // referring to the lights over them. A rule with no line is one
+                    // element over all its lanes.
+                    let groups: Vec<(Option<ObjectId>, Vec<LaneId>, Vec<ObjectId>)> =
+                        if stop_lines.is_empty() {
+                            vec![(None, lanes.clone(), lights.clone())]
+                        } else {
+                            stop_lines
+                                .iter()
+                                .map(|line| {
+                                    let crossed = self
+                                        .map
+                                        .objects
+                                        .get(line)
+                                        .map(|object| object.lanes.as_slice())
+                                        .unwrap_or_default();
+                                    let at: Vec<LaneId> = lanes
+                                        .iter()
+                                        .filter(|lane| crossed.contains(lane))
+                                        .cloned()
+                                        .collect();
+                                    let over: Vec<ObjectId> = lights
+                                        .iter()
+                                        .filter(|light| {
+                                            self.map.objects.get(light).is_some_and(|object| {
+                                                object.lanes.iter().any(|lane| at.contains(lane))
+                                            })
+                                        })
+                                        .cloned()
+                                        .collect();
+                                    let over = if over.is_empty() {
+                                        lights.clone()
+                                    } else {
+                                        over
+                                    };
+                                    (Some(line.clone()), at, over)
+                                })
+                                .collect()
+                        };
+                    let mut elements = Vec::new();
+                    for (stop_line, at, lights) in groups {
+                        if let Some(element) =
+                            self.traffic_light_element(&lights, stop_line.as_ref(), &at)?
+                        {
+                            elements.push(element);
+                        }
                     }
-                    parameters.insert(roles::REFERS.to_owned(), refers);
-                    let bulbs: Vec<RuleParameter> = lights
-                        .iter()
-                        .filter_map(|light| self.bulbs.get(light).cloned())
-                        .map(RuleParameter::LineString)
-                        .collect();
-                    if !bulbs.is_empty() {
-                        parameters.insert(LIGHT_BULBS.to_owned(), bulbs);
+                    if !elements.is_empty() {
+                        self.regulatory_elements.insert(index, elements);
                     }
-                    if let Some(stop_line) = stop_line {
-                        parameters.insert(
-                            roles::REF_LINE.to_owned(),
-                            self.object_lines(&stop_line)?
-                                .into_iter()
-                                .map(RuleParameter::LineString)
-                                .collect(),
-                        );
-                    }
-                    let element = self.attach(
-                        RegElemKind::TrafficLight,
-                        "traffic_light",
-                        parameters,
-                        &lanes,
-                    )?;
-                    self.regulatory_elements.insert(index, element);
                 }
                 TrafficRule::RightOfWay {
                     right_of_way,
@@ -912,7 +935,7 @@ impl<'a> Exporter<'a> {
                         parameters,
                         &attached,
                     )?;
-                    self.regulatory_elements.insert(index, element);
+                    self.regulatory_elements.insert(index, vec![element]);
                 }
                 // Lanelet2's `SpeedLimit` is a kind of traffic sign and needs one to
                 // refer to. A limit with no sign behind it belongs on the lanelet,
@@ -936,6 +959,54 @@ impl<'a> Exporter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// One `traffic_light` element: `lights` stopping `lanes` at `stop_line`.
+    /// `None` when none of the lights has a way to refer to, since Lanelet2's
+    /// TrafficLight refuses to exist without one.
+    fn traffic_light_element(
+        &mut self,
+        lights: &[ObjectId],
+        stop_line: Option<&ObjectId>,
+        lanes: &[LaneId],
+    ) -> Result<Option<Id>, ExportError> {
+        let mut parameters = RuleParameterMap::new();
+        let refers: Vec<RuleParameter> = lights
+            .iter()
+            .map(|light| self.object_lines(light))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .map(RuleParameter::LineString)
+            .collect();
+        if refers.is_empty() {
+            return Ok(None);
+        }
+        parameters.insert(roles::REFERS.to_owned(), refers);
+        let bulbs: Vec<RuleParameter> = lights
+            .iter()
+            .filter_map(|light| self.bulbs.get(light).cloned())
+            .map(RuleParameter::LineString)
+            .collect();
+        if !bulbs.is_empty() {
+            parameters.insert(LIGHT_BULBS.to_owned(), bulbs);
+        }
+        if let Some(stop_line) = stop_line {
+            parameters.insert(
+                roles::REF_LINE.to_owned(),
+                self.object_lines(stop_line)?
+                    .into_iter()
+                    .map(RuleParameter::LineString)
+                    .collect(),
+            );
+        }
+        self.attach(
+            RegElemKind::TrafficLight,
+            "traffic_light",
+            parameters,
+            lanes,
+        )
+        .map(Some)
     }
 
     fn attach(

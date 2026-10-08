@@ -221,14 +221,14 @@ fn a_foreign_document_is_read_approximated_and_reported() {
     assert_eq!(map.rules.len(), 1);
     let TrafficRule::TrafficLight {
         lights,
-        stop_line: across,
+        stop_lines: across,
         ..
     } = &map.rules[0]
     else {
         panic!("a traffic light rule");
     };
     assert_eq!(lights, &vec![light.id.clone()]);
-    assert_eq!(across.as_ref(), Some(&stop_line.id));
+    assert_eq!(across, &vec![stop_line.id.clone()]);
 
     // What could not be kept is said.
     assert!(says(&notes, "no `<geoReference>`"), "{notes:#?}");
@@ -328,14 +328,14 @@ fn a_light_governs_the_lanes_that_refer_to_it() {
     // The controller's rule is over the approach, with its stop line.
     let TrafficRule::TrafficLight {
         lights,
-        stop_line,
+        stop_lines,
         lanes,
     } = &map.rules[0]
     else {
         panic!("a traffic light rule");
     };
     assert_eq!(lights, &vec![light.id.clone()]);
-    assert!(stop_line.is_some());
+    assert_eq!(stop_lines.len(), 1);
     assert_eq!(lanes.len(), 2);
 }
 

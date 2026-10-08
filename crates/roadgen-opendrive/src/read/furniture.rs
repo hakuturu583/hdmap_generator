@@ -17,10 +17,10 @@
 //! it. A `roadMark` object named as a stop line is one; a `crosswalk` object with
 //! an outline is a band; a `building` object with outlines is a building of as
 //! many parts. A `<controller>` is the lights that switch together, which is what
-//! a [`TrafficRule::TrafficLight`] says — one rule, or one per junction mouth when
-//! the document draws no stop line and the reader draws one at each; a junction's
-//! `<priority>` is one connecting road over another, which the IR says as the
-//! approach lanes that feed them.
+//! a [`TrafficRule::TrafficLight`] says — one rule, stopping at a line for each
+//! junction mouth its lanes enter by, drawn by the reader where the document
+//! draws none; a junction's `<priority>` is one connecting road over another,
+//! which the IR says as the approach lanes that feed them.
 
 use std::collections::HashMap;
 
@@ -39,11 +39,12 @@ use roadgen_core::geometry::{Curve3, Frame3, Point3};
 use roadgen_core::id::{BuildingId, BuildingPartId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::Road;
 use roadgen_core::semantics::{LightHead, MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
-use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd, RoadLinkTarget};
+use roadgen_core::topology::{Direction, LateralSide, RoadEnd, RoadEndpoint};
 use roadgen_core::trace::{IrRef, Relation};
 
 use super::Reader;
 use crate::bulbs::{self, BULB_CODE};
+use crate::controllers::junction_mouth;
 use crate::error::ImportError;
 use crate::{lane_number, STOP_LINE_SUBTYPE, TRAFFIC_LIGHT_TYPE};
 
@@ -114,164 +115,7 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
         }
     }
 
-    // A controller is the lights that switch together: a traffic-light rule over
-    // the lanes those lights govern, with the stop line across them.
-    //
-    // Where the document draws a stop line across any of those lanes, the rule is
-    // one, with that line, exactly as the document has it — which is what a map
-    // roadgen wrote comes back as. Where it draws none — CARLA's Town maps draw
-    // none at all — the rule still needs one: a light stops traffic *somewhere*,
-    // and Lanelet2's `ref_line` is how Autoware knows where. The place is not in
-    // doubt, since by now every lane a light governs is an approach (see
-    // `read_signal`): it is the approach's mouth, the end it enters the junction
-    // by. So the reader draws a line there (`mouth_line`).
-    //
-    // A rule holds one stop line, and the approaches of one controller can lie on
-    // more than one road — one light whose references fan out over two incoming
-    // roads, or a controller of several lights. One line cannot cross two
-    // mouths, and a rule whose line crossed only one of them would leave the other
-    // lanes stopping nowhere; so such a controller is read as one rule per mouth,
-    // each over that mouth's lanes with that mouth's line. Every one of them names
-    // *all* the controller's lights, because that is what a controller says: they
-    // show one aspect together. Splitting the lights by mouth as well would read
-    // finer, but it would lose that: the OpenDRIVE writer makes one controller per
-    // rule, so a map read that way and written again would come out with its
-    // controller broken up, where naming every light lets the first rule claim
-    // them all and the rest add none. A consumer that cares which head faces which
-    // lane has each head's own position and `lanes` for that.
-    //
-    // The lines are drawn after every controller is read, one per mouth over every
-    // lane that stops there, whichever controllers those lanes belong to: two
-    // controllers over the lanes of one mouth — a turn arrow and the straight
-    // ahead — share one painted line, as they do on the street.
-    let mut pending: Vec<PendingRule> = Vec::new();
-    for controller in &document.controller {
-        let mut lights: Vec<ObjectId> = Vec::new();
-        let mut lanes: Vec<LaneId> = Vec::new();
-        for control in controller.control.iter() {
-            let Some(light) = signal_ids
-                .get(control.signal_id.as_str())
-                .and_then(|id| reader.map.objects.get(id))
-                .filter(|object| object.kind.is_traffic_light())
-            else {
-                continue;
-            };
-            // CARLA lists one signal several times in one controller.
-            if !lights.contains(&light.id) {
-                lights.push(light.id.clone());
-            }
-            for lane in &light.lanes {
-                if !lanes.contains(lane) {
-                    lanes.push(lane.clone());
-                }
-            }
-        }
-        if lights.is_empty() {
-            continue;
-        }
-        let controller = format!("controller:{}", controller.id);
-        if let Some(stop_line) = reader.stop_line_across(&stop_lines, &lanes) {
-            pending.push(PendingRule {
-                controller,
-                lights,
-                lanes,
-                stop_line: StopAt::Drawn(stop_line),
-                relation: Relation::Exact,
-            });
-            continue;
-        }
-        let mouths = reader.mouths(&lanes);
-        let relation = Relation::shared_by(mouths.len());
-        for (mouth, lanes) in mouths {
-            pending.push(PendingRule {
-                controller: controller.clone(),
-                lights: lights.clone(),
-                lanes,
-                stop_line: match mouth {
-                    Some(mouth) => StopAt::Mouth(mouth),
-                    None => StopAt::Nowhere,
-                },
-                relation,
-            });
-        }
-    }
-
-    // One line across every mouth some rule stops at, over all the lanes that stop
-    // there.
-    let mut at_mouth: Vec<(Mouth, Vec<LaneId>)> = Vec::new();
-    for rule in &pending {
-        let StopAt::Mouth(mouth) = &rule.stop_line else {
-            continue;
-        };
-        let index = match at_mouth.iter().position(|(held, _)| held == mouth) {
-            Some(index) => index,
-            None => {
-                at_mouth.push((mouth.clone(), Vec::new()));
-                at_mouth.len() - 1
-            }
-        };
-        for lane in &rule.lanes {
-            if !at_mouth[index].1.contains(lane) {
-                at_mouth[index].1.push(lane.clone());
-            }
-        }
-    }
-    let mut drawn: Vec<(Mouth, Option<ObjectId>)> = Vec::new();
-    for (mouth, lanes) in at_mouth {
-        let line = reader.mouth_line(&mouth, lanes)?;
-        drawn.push((mouth, line));
-    }
-
-    for rule in pending {
-        let stop_line = match &rule.stop_line {
-            StopAt::Drawn(id) => Some(id.clone()),
-            StopAt::Mouth(mouth) => drawn
-                .iter()
-                .find(|(held, _)| held == mouth)
-                .and_then(|(_, line)| line.clone()),
-            StopAt::Nowhere => None,
-        };
-        if let (StopAt::Mouth(_), Some(line)) = (&rule.stop_line, &stop_line) {
-            // A line the reader drew has no element of the document behind it; it
-            // is what the controller implies, so it is traced to the controller as
-            // something folded into it — the way a SUMO export traces a connector,
-            // which SUMO has no element for, to the connection it became.
-            reader.trace.link_as(
-                line.clone(),
-                rule.controller.clone(),
-                Relation::Collapsed,
-                "stop_line",
-            );
-        }
-        reader.trace.link(
-            IrRef::Rule(reader.map.rules.len()),
-            rule.controller.clone(),
-            rule.relation,
-        );
-        // And each of its lights as part of it, as the exporter records them —
-        // once, however many rules the controller was read as.
-        for light in &rule.lights {
-            let already = reader
-                .trace
-                .links_of(&IrRef::Object(light.clone()))
-                .any(|link| {
-                    link.local == rule.controller && link.role.as_deref() == Some("controller")
-                });
-            if !already {
-                reader.trace.link_as(
-                    light.clone(),
-                    rule.controller.clone(),
-                    Relation::Merged,
-                    "controller",
-                );
-            }
-        }
-        reader.map.rules.push(TrafficRule::TrafficLight {
-            lights: rule.lights,
-            stop_line,
-            lanes: rule.lanes,
-        });
-    }
+    read_controllers(reader, &signal_ids, &stop_lines)?;
 
     // A priority is one connecting road over another; the IR says it as the lanes
     // that approach each. The pairs a junction states over one road with priority
@@ -295,9 +139,7 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
             match grouped.iter_mut().find(|(held, _)| *held == high.as_str()) {
                 Some((_, held)) => {
                     for lane in yielding {
-                        if !held.contains(&lane) {
-                            held.push(lane);
-                        }
+                        push_unique(held, lane);
                     }
                 }
                 None => grouped.push((high, yielding)),
@@ -326,35 +168,169 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
     Ok(())
 }
 
-/// The end of a road where its lanes enter a junction, which is where a light on
-/// them stops traffic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Mouth {
-    road: RoadId,
-    end: RoadEnd,
-}
-
-/// Where a traffic-light rule being read stops traffic.
+/// Where one junction mouth of a controller's lanes stops traffic.
 enum StopAt {
     /// At a stop line the document draws.
     Drawn(ObjectId),
-    /// At a junction mouth, where the reader draws the line.
-    Mouth(Mouth),
-    /// Nowhere the reader can say: lanes that run into no junction.
-    Nowhere,
+    /// At a junction mouth the document draws no line across, where the reader
+    /// draws one.
+    Mouth(RoadEndpoint),
 }
 
-/// A traffic-light rule worked out from a controller, before the stop lines it
-/// needs are drawn.
+/// A traffic-light rule read from a controller, before the stop lines it needs
+/// are drawn.
 struct PendingRule {
     /// The controller it was read from, as the trace names it.
     controller: String,
     lights: Vec<ObjectId>,
     lanes: Vec<LaneId>,
-    stop_line: StopAt,
-    /// How the rule relates to the controller: exactly it, or one of the rules it
-    /// was read as.
-    relation: Relation,
+    /// Where it stops traffic, one per mouth of its lanes that the map can say.
+    stops: Vec<(StopAt, Vec<LaneId>)>,
+}
+
+/// A controller is the lights that switch together: one traffic-light rule over
+/// the lanes those lights govern, with the stop lines across them.
+///
+/// The lanes of one controller can reach their junction by more than one mouth —
+/// one light whose references fan out over two incoming roads, or a controller
+/// of several lights — and each mouth stops traffic at its own line. So each
+/// mouth is resolved on its own: at the stop line the document draws across its
+/// lanes, as a map roadgen wrote comes back, or — where it draws none, as
+/// CARLA's Town maps draw none at all — at one the reader draws across the mouth
+/// (`mouth_line`). A light stops traffic *somewhere*, and Lanelet2's `ref_line`
+/// is how Autoware knows where; the place is not in doubt, since by now every
+/// lane a light governs is an approach (see `read_signal`), and it stops where it
+/// enters the junction. Lanes that run into no junction stop at a document's line
+/// if one crosses them, and nowhere otherwise.
+///
+/// The lines are drawn after every controller is read, one per mouth over every
+/// lane that stops there, whichever controllers those lanes belong to: two
+/// controllers over the lanes of one mouth — a turn arrow and the straight
+/// ahead — share one painted line, as they do on the street.
+fn read_controllers(
+    reader: &mut Reader<'_>,
+    signal_ids: &HashMap<&str, ObjectId>,
+    stop_lines: &[ObjectId],
+) -> Result<(), ImportError> {
+    let mut pending: Vec<PendingRule> = Vec::new();
+    for controller in &reader.document.controller {
+        let mut lights: Vec<ObjectId> = Vec::new();
+        let mut lanes: Vec<LaneId> = Vec::new();
+        for control in controller.control.iter() {
+            let Some(light) = signal_ids
+                .get(control.signal_id.as_str())
+                .and_then(|id| reader.map.objects.get(id))
+                .filter(|object| object.kind.is_traffic_light())
+            else {
+                continue;
+            };
+            // CARLA lists one signal several times in one controller.
+            push_unique(&mut lights, light.id.clone());
+            for lane in &light.lanes {
+                push_unique(&mut lanes, lane.clone());
+            }
+        }
+        if lights.is_empty() {
+            continue;
+        }
+        let controller = format!("controller:{}", controller.id);
+        // Each light is a part of its controller, as the exporter records them.
+        for light in &lights {
+            reader.trace.link_as(
+                light.clone(),
+                controller.clone(),
+                Relation::Merged,
+                "controller",
+            );
+        }
+        let stops = reader
+            .mouths(&lanes)
+            .into_iter()
+            .filter_map(|(mouth, lanes)| {
+                let stop = match reader.stop_line_across(stop_lines, &lanes) {
+                    Some(line) => StopAt::Drawn(line),
+                    None => StopAt::Mouth(mouth?),
+                };
+                Some((stop, lanes))
+            })
+            .collect();
+        pending.push(PendingRule {
+            controller,
+            lights,
+            lanes,
+            stops,
+        });
+    }
+
+    // One line across every mouth some rule stops at, over all the lanes that stop
+    // there.
+    let mut at_mouth: Vec<(RoadEndpoint, Vec<LaneId>)> = Vec::new();
+    for (stop, lanes) in pending.iter().flat_map(|rule| &rule.stops) {
+        let StopAt::Mouth(mouth) = stop else {
+            continue;
+        };
+        let index = match at_mouth.iter().position(|(held, _)| held == mouth) {
+            Some(index) => index,
+            None => {
+                at_mouth.push((mouth.clone(), Vec::new()));
+                at_mouth.len() - 1
+            }
+        };
+        for lane in lanes {
+            push_unique(&mut at_mouth[index].1, lane.clone());
+        }
+    }
+    let mut drawn: Vec<(RoadEndpoint, ObjectId)> = Vec::new();
+    for (mouth, lanes) in at_mouth {
+        if let Some(line) = reader.mouth_line(&mouth, lanes)? {
+            drawn.push((mouth, line));
+        }
+    }
+
+    for rule in pending {
+        let mut lines: Vec<ObjectId> = Vec::new();
+        for (stop, _) in &rule.stops {
+            let line = match stop {
+                StopAt::Drawn(line) => line.clone(),
+                StopAt::Mouth(mouth) => {
+                    let Some((_, line)) = drawn.iter().find(|(held, _)| held == mouth) else {
+                        continue;
+                    };
+                    // A line the reader drew has no element of the document behind
+                    // it; it is what the controller implies, so it is traced to the
+                    // controller as something folded into it — the way a SUMO export
+                    // traces a connector, which SUMO has no element for, to the
+                    // connection it became.
+                    reader.trace.link_as(
+                        line.clone(),
+                        rule.controller.clone(),
+                        Relation::Collapsed,
+                        "stop_line",
+                    );
+                    line.clone()
+                }
+            };
+            push_unique(&mut lines, line);
+        }
+        reader.trace.link(
+            IrRef::Rule(reader.map.rules.len()),
+            rule.controller,
+            Relation::Exact,
+        );
+        reader.map.rules.push(TrafficRule::TrafficLight {
+            lights: rule.lights,
+            stop_lines: lines,
+            lanes: rule.lanes,
+        });
+    }
+    Ok(())
+}
+
+/// Adds `item` to `items` unless it is there already, keeping the first order.
+fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
+    if !items.contains(&item) {
+        items.push(item);
+    }
 }
 
 /// Whether a `roadMark` object is a stop line: the subtype the exporter writes,
@@ -447,7 +423,8 @@ impl Reader<'_> {
             .collect()
     }
 
-    /// Adds a map object under a name of its own, and hands the name back.
+    /// Adds a map object read from the document's `od_id` under a name of its
+    /// own, traced to that element, and hands the name back.
     fn place(
         &mut self,
         kind: MapObjectKind,
@@ -456,9 +433,7 @@ impl Reader<'_> {
         name: Option<&str>,
         od_id: &str,
     ) -> ObjectId {
-        let id = ObjectId::new(unique_name(name, ObjectId::PREFIX, od_id, |candidate| {
-            self.map.objects.contains(&ObjectId::new(candidate))
-        }));
+        let id = self.unique_object_id(name, od_id);
         // The exporter writes a light or a sign as a `<signal>` and the rest as an
         // `<object>`, and so does this trace, in the same kinds.
         let source = match kind {
@@ -467,14 +442,32 @@ impl Reader<'_> {
         };
         self.trace
             .link(id.clone(), format!("{source}:{od_id}"), Relation::Exact);
+        self.insert_object(id.clone(), kind, geometry, lanes);
+        id
+    }
+
+    /// The name for an object: its `name` when the exporter wrote one of the IR's
+    /// own identifiers there, else `fallback`, made unique among the map's objects.
+    fn unique_object_id(&self, name: Option<&str>, fallback: &str) -> ObjectId {
+        ObjectId::new(unique_name(name, ObjectId::PREFIX, fallback, |candidate| {
+            self.map.objects.contains(&ObjectId::new(candidate))
+        }))
+    }
+
+    fn insert_object(
+        &mut self,
+        id: ObjectId,
+        kind: MapObjectKind,
+        geometry: ObjectGeometry,
+        lanes: Vec<LaneId>,
+    ) {
         let object = MapObject {
             id: id.clone(),
             kind,
             geometry,
             lanes,
         };
-        self.map.objects.insert(id.clone(), object).ok();
-        id
+        self.map.objects.insert(id, object).ok();
     }
 
     /// A signal or a stop line: something across the road at one station, over
@@ -565,9 +558,7 @@ impl Reader<'_> {
                 Some(&reference.orientation),
             );
             for lane in governed {
-                if !lanes.contains(&lane) {
-                    lanes.push(lane);
-                }
+                push_unique(&mut lanes, lane);
             }
         }
         // A light names the lanes it stops, which are the approaches to the
@@ -806,41 +797,58 @@ impl Reader<'_> {
         let mut found: Vec<LaneId> = Vec::new();
         for lane in self.map.lanes_of(connector) {
             for from in self.feeding(&lane.id) {
-                if !found.contains(&from) {
-                    found.push(from);
-                }
+                push_unique(&mut found, from);
             }
         }
         found
     }
 
+    /// Whether `lane` is a lane of a junction's connecting road.
+    fn is_inside_junction(&self, lane: &LaneId) -> bool {
+        self.map
+            .lanes
+            .get(lane)
+            .and_then(|entry| self.map.roads.get(&entry.road))
+            .is_some_and(Road::is_connector)
+    }
+
+    /// The lanes the map's connections lead into `lane` from, worked out for
+    /// every lane at once the first time one is asked for: the connections are
+    /// all read by the time furniture is.
+    fn predecessors(&self, lane: &LaneId) -> &[LaneId] {
+        self.predecessors
+            .get_or_init(|| {
+                let mut index: HashMap<LaneId, Vec<LaneId>> = HashMap::new();
+                for connection in self.map.connections.iter() {
+                    index
+                        .entry(connection.to.lane.clone())
+                        .or_default()
+                        .push(connection.from.lane.clone());
+                }
+                index
+            })
+            .get(lane)
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// The lanes outside any junction that lead into `lane`, which is a lane of a
-    /// connecting road: its predecessors by the map's connections, and theirs in
-    /// turn while they are inside the junction too — a document may chain two
-    /// connecting roads through one junction.
+    /// connecting road: its predecessors, and theirs in turn while they are
+    /// inside the junction too — a document may chain two connecting roads
+    /// through one junction.
     fn feeding(&self, lane: &LaneId) -> Vec<LaneId> {
         let mut found: Vec<LaneId> = Vec::new();
         let mut seen: Vec<LaneId> = vec![lane.clone()];
         let mut queue: Vec<LaneId> = vec![lane.clone()];
         while let Some(inside) = queue.pop() {
-            for connection in self.map.connections_to(&inside) {
-                let from = &connection.from.lane;
-                if seen.contains(from) {
+            for from in self.predecessors(&inside) {
+                if seen.contains(from) || !self.map.lanes.contains(from) {
                     continue;
                 }
                 seen.push(from.clone());
-                let Some(road) = self
-                    .map
-                    .lanes
-                    .get(from)
-                    .and_then(|lane| self.map.roads.get(&lane.road))
-                else {
-                    continue;
-                };
-                if road.is_connector() {
+                if self.is_inside_junction(from) {
                     queue.push(from.clone());
-                } else if !found.contains(from) {
-                    found.push(from.clone());
+                } else {
+                    push_unique(&mut found, from.clone());
                 }
             }
         }
@@ -868,34 +876,22 @@ impl Reader<'_> {
         let mut onto: Vec<LaneId> = Vec::new();
         let mut moved = false;
         for lane in lanes {
-            let inside = self
-                .map
-                .lanes
-                .get(&lane)
-                .and_then(|entry| self.map.roads.get(&entry.road))
-                .is_some_and(Road::is_connector);
-            let instead = if inside {
-                self.feeding(&lane)
-            } else {
-                Vec::new()
-            };
-            if inside && instead.is_empty() {
+            if !self.is_inside_junction(&lane) {
+                push_unique(&mut onto, lane);
+                continue;
+            }
+            let instead = self.feeding(&lane);
+            if instead.is_empty() {
                 self.approximations.count(
                     "{n} traffic lights govern a lane inside a junction that no lane outside \
                      it leads into, and govern that lane as written",
                 );
-            }
-            if instead.is_empty() {
-                if !onto.contains(&lane) {
-                    onto.push(lane);
-                }
+                push_unique(&mut onto, lane);
                 continue;
             }
             moved = true;
             for approach in instead {
-                if !onto.contains(&approach) {
-                    onto.push(approach);
-                }
+                push_unique(&mut onto, approach);
             }
         }
         if moved {
@@ -907,28 +903,20 @@ impl Reader<'_> {
         onto
     }
 
-    /// `lanes` gathered by where they stop: one group for each junction mouth —
-    /// a road's end that enters a junction — over the lanes that leave the road
-    /// there, in the order they are first named, and one group with no mouth for
-    /// the rest, which run into no junction and stop nowhere the map can say.
-    fn mouths(&self, lanes: &[LaneId]) -> Vec<(Option<Mouth>, Vec<LaneId>)> {
-        let mut groups: Vec<(Option<Mouth>, Vec<LaneId>)> = Vec::new();
+    /// `lanes` gathered by where they stop: one group for each junction mouth
+    /// they enter by (see [`junction_mouth`]), over its lanes in the order they
+    /// are first named, and one group with no mouth for the rest, which run into
+    /// no junction and stop nowhere the map can say.
+    fn mouths(&self, lanes: &[LaneId]) -> Vec<(Option<RoadEndpoint>, Vec<LaneId>)> {
+        let mut groups: Vec<(Option<RoadEndpoint>, Vec<LaneId>)> = Vec::new();
         let mut elsewhere: Vec<LaneId> = Vec::new();
         for id in lanes {
-            let mouth = self.map.lanes.get(id).and_then(|lane| {
-                let road = self.map.roads.get(&lane.road)?;
-                if road.is_connector() {
-                    return None;
-                }
-                let end = match lane.direction.exit_end() {
-                    LaneEnd::Start => RoadEnd::Start,
-                    LaneEnd::End => RoadEnd::End,
-                };
-                matches!(road.link.at(end), Some(RoadLinkTarget::Junction(_))).then(|| Mouth {
-                    road: road.id.clone(),
-                    end,
-                })
-            });
+            let mouth = self
+                .map
+                .lanes
+                .get(id)
+                .and_then(|lane| junction_mouth(&self.map, lane))
+                .map(|(mouth, _)| mouth);
             let Some(mouth) = mouth else {
                 elsewhere.push(id.clone());
                 continue;
@@ -960,68 +948,60 @@ impl Reader<'_> {
     /// lanes', so a mouth whose lanes are not side by side is crossed as a whole.
     fn mouth_line(
         &mut self,
-        mouth: &Mouth,
+        mouth: &RoadEndpoint,
         lanes: Vec<LaneId>,
     ) -> Result<Option<ObjectId>, ImportError> {
         let Some(road) = self.map.roads.get(&mouth.road) else {
             return Ok(None);
         };
-        let station = match mouth.end {
-            RoadEnd::Start => 0.0,
-            RoadEnd::End => road.horizontal_length()?,
+        let frame = match mouth.end {
+            RoadEnd::Start => road.frame_at(0.0, self.sampling())?,
+            RoadEnd::End => road.frame_at(road.horizontal_length()?, self.sampling())?,
         };
-        let frame = road.frame_at(station, self.sampling())?;
-        // Every boundary's end at the mouth, with how far across the road it is.
-        let mut ends: Vec<(f64, Point3)> = Vec::new();
-        let mut forward = true;
+        // The lanes leave the road here, so in travel order each boundary's last
+        // point is at the mouth, with the driver's left and right already sorted
+        // out; the outermost of each is how far across the road it is.
+        let mut lefts: Vec<(f64, Point3)> = Vec::new();
+        let mut rights: Vec<(f64, Point3)> = Vec::new();
         for id in &lanes {
             let Some(lane) = self.map.lanes.get(id) else {
                 continue;
             };
-            forward = lane.direction == Direction::Forward;
-            for boundary in [&lane.left_boundary, &lane.right_boundary] {
-                let point = match mouth.end {
-                    RoadEnd::Start => boundary.start_point(),
-                    RoadEnd::End => boundary.end_point(),
-                };
+            let travel = lane.travel_geometry(self.sampling())?;
+            for (boundary, ends) in [(&travel.left, &mut lefts), (&travel.right, &mut rights)] {
+                let point = boundary.end_point();
                 ends.push((frame.to_local(point)[1], point));
             }
         }
-        let leftmost = ends.iter().max_by(|a, b| a.0.total_cmp(&b.0));
-        let rightmost = ends.iter().min_by(|a, b| a.0.total_cmp(&b.0));
-        let (Some(&(_, left)), Some(&(_, right))) = (leftmost, rightmost) else {
-            return Ok(None);
+        // Lanes leaving at the start run against the road, so their driver's left
+        // is the road's right: the outermost on the driver's left is the furthest
+        // that way.
+        let leftward = |a: &(f64, Point3), b: &(f64, Point3)| match mouth.end {
+            RoadEnd::End => a.0.total_cmp(&b.0),
+            RoadEnd::Start => b.0.total_cmp(&a.0),
         };
-        // The driver's left: the road's left on a lane that runs with it, its
-        // right on one that runs against it, which is the lanes leaving at the
-        // start.
-        let (from, to) = if forward {
-            (left, right)
-        } else {
-            (right, left)
+        let (Some(&(_, from)), Some(&(_, to))) = (
+            lefts.iter().max_by(|a, b| leftward(a, b)),
+            rights.iter().min_by(|a, b| leftward(a, b)),
+        ) else {
+            return Ok(None);
         };
         let name = format!(
             "stopline/{}/{}",
             mouth.road.local_name(),
-            match mouth.end {
-                RoadEnd::Start => "start",
-                RoadEnd::End => "end",
-            }
+            mouth.end.as_str()
         );
-        let id = ObjectId::new(unique_name(None, ObjectId::PREFIX, &name, |candidate| {
-            self.map.objects.contains(&ObjectId::new(candidate))
-        }));
         self.approximations.count(
             "{n} junction mouths have traffic lights and no stop line, and are read with \
              one drawn across the end of the lanes that stop there",
         );
-        let object = MapObject {
-            id: id.clone(),
-            kind: MapObjectKind::StopLine,
-            geometry: ObjectGeometry::Line(Curve3::polyline([from, to])?),
+        let id = self.unique_object_id(None, &name);
+        self.insert_object(
+            id.clone(),
+            MapObjectKind::StopLine,
+            ObjectGeometry::Line(Curve3::polyline([from, to])?),
             lanes,
-        };
-        self.map.objects.insert(id.clone(), object).ok();
+        );
         Ok(Some(id))
     }
 }

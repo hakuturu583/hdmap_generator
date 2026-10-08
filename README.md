@@ -506,7 +506,7 @@ govern — and both formats get them:
 | --- | --- | --- |
 | Traffic light | `<signal dynamic="true">` with `<validity>`, its housing's `height`, a `<userData>` per lamp | `traffic_light` way with its `height`, `light_bulbs` way + `traffic_light` regulatory element |
 | Traffic sign | `<signal>` carrying the caller's catalogue code | `traffic_sign` way, code as its subtype |
-| Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` |
+| Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` — a traffic-light rule with several (one per junction mouth) is one regulatory element per line, on the rule's lanelets it crosses, referring to the lights over them |
 | Crosswalk | `<object type="crosswalk">` with its outline as `<cornerLocal>` corners | a lanelet of subtype `crosswalk` |
 | Right of way | `<junction><priority high low>` | `right_of_way` regulatory element |
 
@@ -2225,17 +2225,15 @@ Python, one line per thing the map now says less exactly than the file did:
   lanelets inside the junction is one a vehicle on the approach never sees. A sign
   keeps the lanes it names, since what a sign means is its code, which the reader
   passes through without reading;
-- a `<controller>` whose lanes no stop line in the document crosses is given one:
-  `object/stopline/<road>/<end>`, a line across the lanes where they enter the
-  junction, from the driver's left to the right, one per junction mouth however
-  many controllers stop there. A rule holds one stop line, so a controller whose
-  lanes reach the junction by more than one road is read as one rule per mouth,
-  each naming all of the controller's lights — they switch together, which is
-  what the controller says, and the OpenDRIVE export still writes them as one
-  controller. The Lanelet2 export then gives each approach lanelet the
-  `traffic_light` regulatory element with the line as its `ref_line`. A map
-  roadgen wrote with a traffic-light rule that has no stop line gains one the same
-  way when it is read back.
+- a `<controller>` is one traffic-light rule, with a stop line for each junction
+  mouth its lanes enter by: the document's own where one crosses that mouth's
+  lanes, and otherwise `object/stopline/<road>/<end>`, a line the reader draws
+  across the lanes where they enter the junction, from the driver's left to the
+  right — one per mouth however many controllers stop there. The Lanelet2 export
+  then gives each approach lanelet a `traffic_light` regulatory element with its
+  mouth's line as the `ref_line`, one element per line. A map roadgen wrote with a
+  traffic-light rule that has no stop line gains one the same way when it is read
+  back.
 
 What is an error rather than a note is a document that is not a road network: a
 reference line with a gap in it wider than 10 cm (a narrower one is closed and
@@ -2343,9 +2341,8 @@ both traced to that `signal:`.
 
 A light is traced to the movements off the lanes it stands over — the approaches,
 for a CARLA light the file names over its junction's connecting roads. The lights
-of one OpenDRIVE `<controller>` are read as one rule over all their lanes (or one
-per junction mouth, each traced `merged` to the controller), which is right for the
-program, but each light still answers only for its own movements, and for those
+of one OpenDRIVE `<controller>` are read as one rule over all their lanes, which is
+right for the program, but each light still answers only for its own movements, and for those
 its rule gives it that no light stands over. A stop line the reader drew, having
 no element in the file, is traced `collapsed` to the controller it was drawn for,
 with the role `stop_line`.

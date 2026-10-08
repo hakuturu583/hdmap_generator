@@ -47,6 +47,7 @@ mod geometry;
 mod lanes;
 mod links;
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -159,6 +160,9 @@ struct Reader<'a> {
     lanes: HashMap<(RoadId, usize, i64), LaneId>,
     approximations: Approximations,
     trace: Trace,
+    /// The lanes each lane is entered from by the map's connections, built the
+    /// first time furniture asks (see `furniture::Reader::predecessors`).
+    predecessors: OnceCell<HashMap<LaneId, Vec<LaneId>>>,
 }
 
 /// What the reading could not keep, collected as it goes.
@@ -219,6 +223,7 @@ impl<'a> Reader<'a> {
             lanes: HashMap::new(),
             approximations,
             trace: Trace::imported(crate::TRACE_FORMAT),
+            predecessors: OnceCell::new(),
         }
     }
 

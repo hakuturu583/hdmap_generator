@@ -12,11 +12,12 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use ll2_core::map::{as_lanelet, LaneletMap};
+use ll2_core::map::as_lanelet;
 use ll2_core::regelem::RuleParameter;
 use roadgen_core::prelude::*;
 use roadgen_core::trace::{IrRef, Relation, Trace};
-use roadgen_opendrive::from_xml;
+use roadgen_integration_tests::reload_lanelet2_traced;
+use roadgen_opendrive::{from_xml, Imported};
 
 /// Two roads into one junction and one road out of it: road 1 from the west with
 /// two lanes straight across, road 3 from the south with one lane turning right
@@ -168,29 +169,32 @@ fn sorted(lanes: &[LaneId]) -> Vec<LaneId> {
     lanes
 }
 
-/// How each traffic-light rule of a map reached Lanelet2: the lanelets of its
-/// lanes that carry its regulatory element, and whether that element has a
-/// `ref_line` which is a `stop_line` way.
+/// How each traffic-light rule of a map reached Lanelet2: the elements it was
+/// written as, the lanelets of its lanes that carry one of them, whether that one
+/// has a `ref_line` which is a `stop_line` way, and how many elements refer to
+/// fewer of the rule's lights than all of them.
+#[derive(Debug, PartialEq, Eq)]
 struct Reached {
     rules: usize,
+    elements: usize,
     lanes: usize,
     lanes_carrying: usize,
     with_ref_line: usize,
+    narrowed: usize,
 }
 
 /// Exports `map` as Lanelet2, reads the file back with `simple_lanelet2`'s loader
 /// — which knows nothing of the IR — and follows each traffic-light rule through
 /// the export's trace to the lanelets of its lanes, asking each whether it holds
-/// the rule's regulatory element and whether that names its stop line.
+/// one of the rule's regulatory elements and whether that names its stop line.
 fn reach_lanelet2(map: &ValidatedMap) -> Reached {
-    let (xml, trace) = roadgen_lanelet2::to_osm_xml_traced(map).expect("Lanelet2 exports");
-    let projector = roadgen_lanelet2::projector_for(map).expect("a projector");
-    let loaded: std::sync::Arc<LaneletMap> =
-        ll2_io::load_str(&xml, projector.as_ref()).expect("the loader reads the export");
-    let written = |trace: &Trace, ir: IrRef, kind: &str| -> Option<i64> {
+    let (loaded, trace) = reload_lanelet2_traced(map);
+    let written = |ir: IrRef, kind: &str| -> Vec<i64> {
         trace
             .links_of(&ir)
-            .find_map(|link| link.local.strip_prefix(&format!("{kind}:"))?.parse().ok())
+            .filter(|link| link.role.as_deref() != Some("light_bulbs"))
+            .filter_map(|link| link.local.strip_prefix(&format!("{kind}:"))?.parse().ok())
+            .collect()
     };
     let lanelets: HashMap<i64, _> = loaded
         .lanelets
@@ -202,28 +206,39 @@ fn reach_lanelet2(map: &ValidatedMap) -> Reached {
 
     let mut reached = Reached {
         rules: 0,
+        elements: 0,
         lanes: 0,
         lanes_carrying: 0,
         with_ref_line: 0,
+        narrowed: 0,
     };
     for (index, rule) in map.rules.iter().enumerate() {
-        let TrafficRule::TrafficLight { lanes, .. } = rule else {
+        let TrafficRule::TrafficLight { lights, lanes, .. } = rule else {
             continue;
         };
         reached.rules += 1;
-        let element = written(&trace, IrRef::Rule(index), "regulatory_element");
+        let elements = written(IrRef::Rule(index), "regulatory_element");
+        reached.elements += elements.len();
+        let every_light: BTreeSet<i64> = lights
+            .iter()
+            .flat_map(|light| written(IrRef::Object(light.clone()), "linestring"))
+            .collect();
+        let mut seen: BTreeSet<i64> = BTreeSet::new();
         for lane in lanes {
             reached.lanes += 1;
-            let Some(lanelet) = written(&trace, IrRef::Lane(lane.clone()), "lanelet")
-                .and_then(|id| lanelets.get(&id))
+            let Some(lanelet) = written(IrRef::Lane(lane.clone()), "lanelet")
+                .first()
+                .and_then(|id| lanelets.get(id))
             else {
                 continue;
             };
-            let Some(held) = lanelet
+            let held: Vec<_> = lanelet
                 .regulatory_elements()
                 .into_iter()
-                .find(|held| Some(held.id()) == element)
-            else {
+                .filter(|held| elements.contains(&held.id()))
+                .collect();
+            assert!(held.len() <= 1, "a lane stops at one of its rule's lines");
+            let Some(held) = held.first() else {
                 continue;
             };
             assert_eq!(held.attributes().read()["subtype"].value(), "traffic_light");
@@ -235,20 +250,46 @@ fn reach_lanelet2(map: &ValidatedMap) -> Reached {
             if stops {
                 reached.with_ref_line += 1;
             }
+            if seen.insert(held.id()) {
+                let refers: BTreeSet<i64> = held
+                    .parameters_for("refers")
+                    .iter()
+                    .filter_map(|parameter| match parameter {
+                        RuleParameter::LineString(line) => Some(line.id()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(refers.is_subset(&every_light), "{refers:?} {every_light:?}");
+                reached.narrowed += usize::from(refers != every_light);
+            }
         }
     }
     reached
 }
 
+/// The traffic-light rules of a map, as `(lights, stop lines, lanes)`.
+fn light_rules(map: &ValidatedMap) -> Vec<(&Vec<ObjectId>, &Vec<ObjectId>, &Vec<LaneId>)> {
+    map.rules
+        .iter()
+        .filter_map(|rule| match rule {
+            TrafficRule::TrafficLight {
+                lights,
+                stop_lines,
+                lanes,
+            } => Some((lights, stop_lines, lanes)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn a_carla_junction_light_governs_the_approaches_and_stops_them_at_the_mouth() {
-    let imported = from_xml(CARLA_SHAPED).expect("the document reads");
-    let notes = imported.approximations.clone();
-    let trace = imported.trace.clone();
-    let map = imported
-        .map
-        .validate()
-        .unwrap_or_else(|error| panic!("{error}"));
+    let Imported {
+        map,
+        approximations: notes,
+        trace,
+    } = from_xml(CARLA_SHAPED).expect("the document reads");
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
 
     // The light stands where the post is, and governs the lanes that stop for it:
     // both of road 1's and road 3's, not the connecting roads the references are on.
@@ -268,29 +309,22 @@ fn a_carla_junction_light_governs_the_approaches_and_stops_them_at_the_mouth() {
         "{notes:#?}"
     );
 
-    // One controller over two mouths is one rule per mouth, each naming the
-    // controller's light and stopping at a line the reader drew there.
-    let rules: Vec<(&Vec<ObjectId>, &Option<ObjectId>, &Vec<LaneId>)> = map
-        .rules
-        .iter()
-        .filter_map(|rule| match rule {
-            TrafficRule::TrafficLight {
-                lights,
-                stop_line,
-                lanes,
-            } => Some((lights, stop_line, lanes)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(rules.len(), 2, "{:#?}", map.rules);
-    for ((lights, stop_line, lanes), (expected, road)) in
-        rules.iter().zip([(&west, "1"), (&south, "3")])
-    {
-        assert_eq!(*lights, &vec![light.id.clone()]);
-        assert_eq!(sorted(lanes), sorted(expected));
-        let id = (*stop_line).clone().expect("a stop line at the mouth");
-        assert_eq!(id, ObjectId::new(format!("stopline/{road}/end")));
-        let line = map.objects.get(&id).unwrap();
+    // One controller is one rule, over both mouths, stopping at a line the reader
+    // drew at each.
+    let rules = light_rules(&map);
+    assert_eq!(rules.len(), 1, "{:#?}", map.rules);
+    let (lights, stop_lines, lanes) = rules[0];
+    assert_eq!(lights, &vec![light.id.clone()]);
+    assert_eq!(sorted(lanes), sorted(&approaches));
+    assert_eq!(
+        stop_lines,
+        &vec![
+            ObjectId::new("stopline/1/end"),
+            ObjectId::new("stopline/3/end")
+        ]
+    );
+    for (id, (expected, road)) in stop_lines.iter().zip([(&west, "1"), (&south, "3")]) {
+        let line = map.objects.get(id).unwrap();
         assert_eq!(line.kind, MapObjectKind::StopLine);
         assert_eq!(sorted(&line.lanes), sorted(expected));
         // Across the lanes where they leave the road: at its end, from the
@@ -319,77 +353,120 @@ fn a_carla_junction_light_governs_the_approaches_and_stops_them_at_the_mouth() {
         assert!((frame.to_local(to)[1] + width).abs() < 1e-6, "{to:?}");
     }
 
-    // The trace says where they came from: both rules and the drawn lines from the
-    // controller, the rules as two of what one controller became, the lines as
-    // what it implied and the document has no element for.
-    for index in 0..2 {
-        let links: Vec<_> = trace.links_of(&IrRef::Rule(index)).collect();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].local, "controller:7");
-        assert_eq!(links[0].relation, Relation::Merged);
-    }
-    for road in ["1", "3"] {
-        let id = ObjectId::new(format!("stopline/{road}/end"));
-        let links: Vec<_> = trace.links_of(&IrRef::Object(id)).collect();
+    // The trace says where they came from: the rule is the controller, the drawn
+    // lines what it implied and the document has no element for, and the light a
+    // part of it.
+    let links: Vec<_> = trace.links_of(&IrRef::Rule(0)).collect();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].local, "controller:7");
+    assert_eq!(links[0].relation, Relation::Exact);
+    for id in stop_lines {
+        let links: Vec<_> = trace.links_of(&IrRef::Object(id.clone())).collect();
         assert_eq!(links.len(), 1, "{links:?}");
         assert_eq!(links[0].local, "controller:7");
         assert_eq!(links[0].relation, Relation::Collapsed);
         assert_eq!(links[0].role.as_deref(), Some("stop_line"));
     }
-    // The light is traced once to its controller, however many rules it is in.
-    let controller: BTreeSet<_> = trace
-        .links_of(&IrRef::Object(light.id.clone()))
-        .filter(|link| link.role.as_deref() == Some("controller"))
-        .map(|link| link.local.clone())
-        .collect();
-    assert_eq!(controller.len(), 1);
     assert_eq!(
         trace
             .links_of(&IrRef::Object(light.id.clone()))
             .filter(|link| link.role.as_deref() == Some("controller"))
             .count(),
-        1
+        1,
+        "the light is traced once to its controller, though it is listed twice"
     );
 
     // And Autoware gets it the way it looks for it: every approach lanelet holds
-    // the regulatory element, with the stop line as its ref_line.
-    let reached = reach_lanelet2(&map);
-    assert_eq!(reached.rules, 2);
-    assert_eq!(reached.lanes, 3);
-    assert_eq!(reached.lanes_carrying, 3);
-    assert_eq!(reached.with_ref_line, 3);
+    // a regulatory element, one per mouth, with that mouth's stop line as its
+    // ref_line — and the light over both mouths is referred to by both.
+    assert_eq!(
+        reach_lanelet2(&map),
+        Reached {
+            rules: 1,
+            elements: 2,
+            lanes: 3,
+            lanes_carrying: 3,
+            with_ref_line: 3,
+            narrowed: 0,
+        }
+    );
     assert!(roadgen_lanelet2::check(&map).is_empty());
 
     // The other formats take the map as they take any other.
     let document = roadgen_opendrive::to_xml(&map).expect("OpenDRIVE writes");
     let again = opendrive::core::OpenDrive::from_xml_str(&document).unwrap();
-    assert_eq!(
-        again.controller.len(),
-        1,
-        "the controller is still one: the second rule adds no light to it"
-    );
-    let stop_lines = again
+    assert_eq!(again.controller.len(), 1);
+    let written_lines = again
         .road
         .iter()
         .filter_map(|road| road.objects.as_ref())
         .flat_map(|objects| objects.object.iter())
         .count();
-    assert_eq!(stop_lines, 2);
+    assert_eq!(written_lines, 2);
     let reread = from_xml(&document).unwrap().map.validate().unwrap();
-    assert_eq!(
-        reread.rules.len(),
-        1,
-        "written with one controller, read as one rule"
-    );
-    every_other_export(&map, true);
-    let sumo = roadgen_sumo::to_plain_xml(&map).unwrap();
+    let rules = light_rules(&reread);
+    assert_eq!(rules.len(), 1, "read back as one rule");
+    // The writer puts a light's validity on the road of its first lane and writes
+    // no `<signalReference>`, so the light comes back over road 1's lanes only —
+    // and its rule, stopping them at the line the document now draws there.
+    assert_eq!(rules[0].1, &vec![ObjectId::new("stopline/1/end")]);
+    let sumo = roadgen_sumo::to_plain_xml(&map).expect("SUMO writes");
     assert!(sumo.traffic_lights.is_some(), "the junction is signalised");
+    every_other_export(&map, true);
 }
 
-/// Every export but Lanelet2's and OpenDRIVE's, which have checks of their own:
-/// each takes the map as it takes any other. CARLA's meshes too, when `carla`.
+/// Two lights in one controller, one over each mouth: the rule still names both,
+/// and each mouth's regulatory element refers to the light over it.
+#[test]
+fn each_mouth_of_a_controller_refers_to_the_lights_over_it() {
+    let document = CARLA_SHAPED
+        .replace(
+            r#"<signalReference s="0.0" t="0.0" id="42" orientation="+"><validity fromLane="-1" toLane="-1"/>"#,
+            r#"<signalReference s="0.0" t="0.0" id="43" orientation="+"><validity fromLane="-1" toLane="-1"/>"#,
+        )
+        .replace(
+            "    </signals>\n  </road>\n  <road name=\"\" length=\"20.0\" id=\"100\"",
+            "      <signal s=\"5.0\" t=\"-1.0\" id=\"43\" name=\"Signal_3Light_Post02\" dynamic=\"yes\" \
+             orientation=\"-\" zOffset=\"0.0\" type=\"1000001\" subtype=\"-1\" country=\"OpenDRIVE\" \
+             height=\"5.0\">\n        <validity fromLane=\"0\" toLane=\"0\"/>\n      </signal>\n    \
+             </signals>\n  </road>\n  <road name=\"\" length=\"20.0\" id=\"100\"",
+        )
+        .replace(
+            "<control signalId=\"42\" type=\"\"/>\n  </controller>",
+            "<control signalId=\"43\" type=\"\"/>\n  </controller>",
+        );
+    let map = from_xml(&document)
+        .expect("the document reads")
+        .map
+        .validate()
+        .unwrap_or_else(|error| panic!("{error}"));
+    let lights = map
+        .objects
+        .iter()
+        .filter(|object| object.kind.is_traffic_light())
+        .count();
+    assert_eq!(lights, 2);
+    let rules = light_rules(&map);
+    assert_eq!(rules.len(), 1, "{:#?}", map.rules);
+    assert_eq!(rules[0].0.len(), 2);
+    assert_eq!(rules[0].1.len(), 2);
+    assert_eq!(
+        reach_lanelet2(&map),
+        Reached {
+            rules: 1,
+            elements: 2,
+            lanes: 3,
+            lanes_carrying: 3,
+            with_ref_line: 3,
+            narrowed: 2,
+        }
+    );
+}
+
+/// Every export but Lanelet2's, OpenDRIVE's and SUMO's, which have checks of
+/// their own: each takes the map as it takes any other. CARLA's meshes too, when
+/// `carla`.
 fn every_other_export(map: &ValidatedMap, carla: bool) {
-    roadgen_sumo::to_plain_xml(map).expect("SUMO writes");
     roadgen_osm::to_xml(map).expect("OpenStreetMap writes");
     let clip = roadgen_clipgt::ClipConfig::default();
     roadgen_clipgt::to_layers(map, &clip).expect("ClipGT writes");
@@ -421,12 +498,15 @@ fn imported_trace_names(trace: &Trace, object: &ObjectId) -> Vec<String> {
 #[ignore = "needs a CARLA town's OpenDRIVE in ROADGEN_CARLA_TOWN"]
 fn a_carla_town_hands_autoware_every_light_on_its_approaches() {
     let path = std::env::var("ROADGEN_CARLA_TOWN").expect("ROADGEN_CARLA_TOWN names the town");
-    let imported = roadgen_opendrive::read(&path).expect("the town reads");
-    for note in &imported.approximations {
+    let Imported {
+        map,
+        approximations,
+        trace,
+    } = roadgen_opendrive::read(&path).expect("the town reads");
+    for note in &approximations {
         println!("note: {note}");
     }
-    let trace = imported.trace.clone();
-    let map = imported.map.validate().expect("the town validates");
+    let map = map.validate().expect("the town validates");
 
     let lights: Vec<&roadgen_core::semantics::MapObject> = map
         .objects
@@ -448,17 +528,12 @@ fn a_carla_town_hands_autoware_every_light_on_its_approaches() {
     let mut ruled: BTreeSet<&ObjectId> = BTreeSet::new();
     let mut rules_inside = 0;
     let mut without_stop_line = 0;
-    for rule in &map.rules {
-        if let TrafficRule::TrafficLight {
-            lights,
-            stop_line,
-            lanes,
-        } = rule
-        {
-            ruled.extend(lights);
-            rules_inside += on_connectors(lanes);
-            without_stop_line += usize::from(stop_line.is_none());
-        }
+    let mut stop_lines = 0;
+    for (lights, lines, lanes) in light_rules(&map) {
+        ruled.extend(lights);
+        rules_inside += on_connectors(lanes);
+        without_stop_line += usize::from(lines.is_empty());
+        stop_lines += lines.len();
     }
     let reached = reach_lanelet2(&map);
     println!(
@@ -468,10 +543,16 @@ fn a_carla_town_hands_autoware_every_light_on_its_approaches() {
         ruled.len()
     );
     println!(
-        "traffic-light rules {} (without a stop line {without_stop_line}), rule lanes {} \
-         (inside a junction {rules_inside}); lanelets holding their regulatory element {}, \
-         of which with a stop_line ref_line {}",
-        reached.rules, reached.lanes, reached.lanes_carrying, reached.with_ref_line
+        "traffic-light rules {} (without a stop line {without_stop_line}, stop lines \
+         {stop_lines}), rule lanes {} (inside a junction {rules_inside}); regulatory elements \
+         {} (referring to fewer than all their rule's lights {}), lanelets holding one {}, of \
+         which with a stop_line ref_line {}",
+        reached.rules,
+        reached.lanes,
+        reached.elements,
+        reached.narrowed,
+        reached.lanes_carrying,
+        reached.with_ref_line
     );
     assert_eq!(light_inside, 0);
     assert_eq!(rules_inside, 0);
