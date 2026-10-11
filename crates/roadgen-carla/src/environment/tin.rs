@@ -178,6 +178,11 @@ fn thinned(points: &[Point3], closed: bool) -> Vec<Point3> {
     if closed && out.len() > 3 && out[0].horizontal_distance_to(out[out.len() - 1]) < CLOSEST {
         out.pop();
     }
+    // A ring smaller across than that — a heap's crest round a narrow top — is
+    // kept as it is: thinned, it would be a segment, and no ring at all.
+    if closed && out.len() < 3 {
+        return points.to_vec();
+    }
     out
 }
 
@@ -242,6 +247,14 @@ mod tests {
         // Closed, the last gives way to the first it joins back to.
         let ring = [at(0.0), at(5.0), Point3::new(5.0, 5.0, 0.0), at(0.5)];
         assert_eq!(thinned(&ring, true).len(), 3);
+        // A ring under a metre across stays a ring.
+        let small: Vec<Point3> = (0..12)
+            .map(|k| {
+                let angle = std::f64::consts::TAU * k as f64 / 12.0;
+                Point3::new(0.3 * angle.cos(), 0.3 * angle.sin(), 0.0)
+            })
+            .collect();
+        assert_eq!(thinned(&small, true).len(), 12);
     }
 
     #[test]

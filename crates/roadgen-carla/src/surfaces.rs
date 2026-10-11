@@ -408,7 +408,7 @@ fn rungs(map: &Map, road: &Road, spacing: Option<f64>) -> Option<Vec<Rung>> {
     // one: the curve's own sample a hand's breadth from one a width's taper asked
     // for is a strip of road too short to change across, and every land triangle
     // on its edge a sliver. Not where something does change, though — a section,
-    // a structure's end, the pavement — and not within that of either end of the
+    // a structure's end, the pavement, a lane's width or height — and not within that of either end of the
     // road, where its outline meets the next road's: moved there, the two cross
     // so nearly along each other that the land's triangulation cannot split them.
     let fixed: Vec<f64> = road
@@ -422,6 +422,14 @@ fn rungs(map: &Map, road: &Road, spacing: Option<f64>) -> Option<Vec<Rung>> {
                 .flat_map(|span| [span.from, span.to]),
         )
         .chain(road.pavement.spans().iter().map(|&(station, _)| station))
+        .chain(map.lanes_of(&road.id).into_iter().flat_map(|lane| {
+            lane.width
+                .knots()
+                .iter()
+                .map(|knot| knot.0)
+                .chain(lane.height.knots().iter().map(|knot| knot.0))
+                .collect::<Vec<_>>()
+        }))
         .collect();
     let is_fixed = |station: f64| fixed.iter().any(|&at| (at - station).abs() < 1e-6);
     let closest = crate::environment::tin::CLOSEST;
@@ -1371,6 +1379,43 @@ mod tests {
         stations.sort_by(f64::total_cmp);
         stations.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
         stations
+    }
+
+    #[test]
+    fn a_taper_shorter_than_the_land_keeps_two_vertices_apart_still_ends_where_it_says() {
+        // Rungs a hand's breadth apart are one, but not the two ends of a lane's
+        // width changing: the road would widen to the next rung instead.
+        use roadgen_core::prelude::*;
+        let taper = WidthProfile::tapered(
+            100.0,
+            0.6,
+            PositiveWidth::new(3.5).unwrap(),
+            PositiveWidth::new(4.0).unwrap(),
+            Taper::Linear,
+        )
+        .unwrap();
+        let mut builder = MapBuilder::default();
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 10.0),
+                    Point3::new(300.0, 0.0, 10.0),
+                    vec![
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward)
+                            .with_width_profile(taper),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let at = stations(&build(&map, "m", &SurfaceConfig::default()));
+        for knot in [100.0, 100.6] {
+            assert!(
+                at.iter().any(|x| (x - knot).abs() < 1e-6),
+                "no rung at {knot}: {at:?}"
+            );
+        }
     }
 
     #[test]
