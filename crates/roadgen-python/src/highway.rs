@@ -131,7 +131,10 @@ impl PyCorridor {
     /// movement free-flowing round one loop; `cloverleaf`, a loop in each
     /// quadrant and a collector–distributor road beside each carriageway; or
     /// `directional` with `side` saying which side another motorway, drawn by
-    /// `crossroad`, comes from to end at this one on stacked flyovers.
+    /// `crossroad`, comes from to end at this one on stacked flyovers; or
+    /// `stack`, where another motorway drawn by `crossroad` crosses right
+    /// through on a viaduct and every turn has a slip road of its own, four
+    /// levels high.
     #[pyo3(signature = (
         name,
         at,
@@ -162,6 +165,7 @@ impl PyCorridor {
             ("diamond", _) => InterchangeKind::Diamond,
             ("parclo", _) => InterchangeKind::Parclo,
             ("cloverleaf", _) => InterchangeKind::Cloverleaf,
+            ("stack", _) => InterchangeKind::Stack,
             ("directional", Some(text)) => InterchangeKind::Directional {
                 side: self::side(text)?,
             },
@@ -190,7 +194,7 @@ impl PyCorridor {
             (other, _) => {
                 return Err(PyValueError::new_err(format!(
                     "unknown interchange {other:?}; diamond, half_diamond, parclo, trumpet, \
-                     cloverleaf or directional"
+                     cloverleaf, directional or stack"
                 )))
             }
         };

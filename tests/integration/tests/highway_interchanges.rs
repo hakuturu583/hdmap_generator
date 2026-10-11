@@ -1,15 +1,16 @@
 //! The interchanges a corridor plans beyond the diamond: a partial cloverleaf,
 //! whose turns on across the crossroad are loops; a trumpet, whose crossroad
 //! stops at the motorway and splits round a loop; a full cloverleaf with its
-//! collector–distributor roads; and a directional T, where another motorway ends
-//! at this one on flyovers.
+//! collector–distributor roads; a directional T, where another motorway ends at
+//! this one on flyovers; and a four-level stack, where another motorway crosses
+//! it and every turn between the two has a slip road of its own.
 
 use roadgen_carla::environment::{
     self, CorridorSpec, InterchangeKind, InterchangeSite, Places, Side,
 };
 use roadgen_core::map::Road;
 use roadgen_core::prelude::*;
-use roadgen_core::FormOfWay;
+use roadgen_core::{FormOfWay, LaneType};
 use roadgen_integration_tests::highway::street_lanes;
 
 fn corridor(kind: InterchangeKind, terminal: f64) -> CorridorSpec {
@@ -555,4 +556,292 @@ fn a_terminal_with_no_room_for_a_loop_is_refused_with_how_far_out_to_put_it() {
             .unwrap_or_else(|error| panic!("{speed} km/h at {least} m: {error}"));
         assert!(plan.notes.is_empty(), "{:#?}", plan.notes);
     }
+}
+
+/// How far from the middle a stack's flyovers leave and join each motorway,
+/// metres: as near as climbing to the fourth level at 6 % lets them.
+const STACK_REACH: f64 = 450.0;
+
+fn stack_spec() -> CorridorSpec {
+    // The other motorway crosses right through, south to north.
+    let mut spec = corridor(InterchangeKind::Stack, 80.0);
+    spec.interchanges[0].crossroad = vec![
+        Point3::new(0.0, -1300.0, 0.0),
+        Point3::new(0.0, 1300.0, 0.0),
+    ];
+    spec.interchanges[0].reach = STACK_REACH;
+    spec
+}
+
+/// The roads one movement on from `road`'s lanes.
+fn next_roads(map: &ValidatedMap, road: &RoadId) -> Vec<RoadId> {
+    map.connections
+        .iter()
+        .filter(|c| map.lanes.get(&c.from.lane).is_some_and(|l| &l.road == road))
+        .filter_map(|c| map.lanes.get(&c.to.lane).map(|l| l.road.clone()))
+        .collect()
+}
+
+/// The roads before and after `road`, past the junction's connectors.
+fn neighbours(map: &ValidatedMap, road: &RoadId, forward: bool) -> Vec<RoadId> {
+    let step = |from: &RoadId| -> Vec<RoadId> {
+        if forward {
+            next_roads(map, from)
+        } else {
+            map.connections
+                .iter()
+                .filter(|c| map.lanes.get(&c.to.lane).is_some_and(|l| &l.road == from))
+                .filter_map(|c| map.lanes.get(&c.from.lane).map(|l| l.road.clone()))
+                .collect()
+        }
+    };
+    let mut out = Vec::new();
+    for next in step(road) {
+        if map.road(&next).is_some_and(|r| r.is_connector()) {
+            out.extend(step(&next));
+        } else {
+            out.push(next);
+        }
+    }
+    out
+}
+
+/// Every road a vehicle on `from` can drive on to.
+fn reachable(map: &ValidatedMap, from: &str) -> std::collections::HashSet<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = vec![RoadId::new(from)];
+    while let Some(road) = queue.pop() {
+        if seen.insert(road.as_str().to_owned()) {
+            queue.extend(next_roads(map, &road));
+        }
+    }
+    seen
+}
+
+/// A carriageway's pieces, in the order its traffic meets them.
+fn pieces(map: &ValidatedMap, carriageway: &str) -> Vec<String> {
+    let mut pieces: Vec<(usize, String)> = map
+        .roads
+        .iter()
+        .filter_map(|r| {
+            let rest =
+                r.id.as_str()
+                    .strip_prefix(&format!("road/{carriageway}_"))?;
+            Some((rest.parse().ok()?, r.id.as_str().to_owned()))
+        })
+        .collect();
+    pieces.sort();
+    pieces.into_iter().map(|(_, name)| name).collect()
+}
+
+/// The steepest grade along a road's reference line, read every 5 m or so.
+fn steepest_grade(road: &Road) -> f64 {
+    let points = road
+        .reference_line
+        .to_polyline(SamplingConfig::default())
+        .unwrap();
+    let mut spaced = vec![points.points()[0]];
+    for p in points.points() {
+        if spaced.last().unwrap().horizontal_distance_to(*p) >= 5.0 {
+            spaced.push(*p);
+        }
+    }
+    spaced
+        .windows(2)
+        .map(|w| (w[1].z - w[0].z).abs() / w[0].horizontal_distance_to(w[1]))
+        .fold(0.0, f64::max)
+}
+
+fn driving_lanes(map: &ValidatedMap, road: &RoadId) -> usize {
+    map.lanes_of(road)
+        .iter()
+        .filter(|lane| lane.lane_type == LaneType::Driving)
+        .count()
+}
+
+#[test]
+fn a_stack_turns_every_way_on_four_levels() {
+    for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+        let (map, notes) = generate_spec(stack_spec(), handedness);
+        assert!(notes.is_empty(), "{handedness:?}: {notes:#?}");
+        let [interchange] = map.interchanges.iter().collect::<Vec<_>>()[..] else {
+            panic!("one interchange");
+        };
+        assert_eq!(interchange.kind, "stack");
+        // Eight slip roads: a quarter turn off and on each carriageway, and a
+        // flyover off and on each. The other motorway is a motorway through.
+        assert_eq!(
+            slip_roads(&map),
+            [
+                "left_flyover_off",
+                "left_flyover_on",
+                "left_off",
+                "left_on",
+                "right_flyover_off",
+                "right_flyover_on",
+                "right_off",
+                "right_on"
+            ]
+        );
+        for side in ["left", "right"] {
+            for piece in pieces(&map, &format!("minami_ic_branch_{side}")) {
+                let road = map
+                    .road(&RoadId::new(piece.trim_start_matches("road/")))
+                    .unwrap();
+                assert_eq!(road.form, FormOfWay::Motorway, "{piece}");
+            }
+        }
+        assert!(!controlled(&map));
+
+        // Every turn: from each carriageway on to both carriageways of the
+        // other motorway, and on along its own; never back the other way.
+        let carriageways = [
+            ("e5_left", "e5_right"),
+            ("e5_right", "e5_left"),
+            ("minami_ic_branch_left", "minami_ic_branch_right"),
+            ("minami_ic_branch_right", "minami_ic_branch_left"),
+        ];
+        for (from, back) in carriageways {
+            let first = &pieces(&map, from)[0];
+            let reached = reachable(&map, first.trim_start_matches("road/"));
+            let last = |carriageway: &str| pieces(&map, carriageway).last().unwrap().clone();
+            let crosses = if from.starts_with("e5") {
+                ["minami_ic_branch_left", "minami_ic_branch_right"]
+            } else {
+                ["e5_left", "e5_right"]
+            };
+            for to in crosses.into_iter().chain([from]) {
+                assert!(
+                    reached.contains(&last(to)),
+                    "{handedness:?}: {from} does not reach {to}"
+                );
+            }
+            assert!(
+                !reached.contains(&last(back)),
+                "{handedness:?}: {from} turns back"
+            );
+        }
+
+        // Each slip road leaves on a deceleration lane and joins on an
+        // acceleration lane, both carriageways having a lane more there.
+        for ramp in slip_roads(&map) {
+            let id = RoadId::new(format!("minami_ic_{ramp}"));
+            for forward in [false, true] {
+                let [piece] = &neighbours(&map, &id, forward)[..] else {
+                    panic!("{ramp}: one carriageway each end");
+                };
+                assert!(driving_lanes(&map, piece) > 2, "{ramp}: {piece}");
+            }
+        }
+
+        // Every crossing is carried on a structure, with the clearance under it.
+        let crossings = roadgen_core::structure::crossings(map.as_map());
+        assert!(crossings.len() >= 16, "{}", crossings.len());
+        for crossing in &crossings {
+            let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
+            assert!(
+                crossing.carried_by(map.as_map()).is_some(),
+                "{upper} at {us:.0} m over {lower} at {ls:.0} m"
+            );
+            let clear = uz - lz - roadgen_core::structure::depth_at(map.as_map(), upper, us);
+            assert!(
+                clear >= roadgen_core::structure::CLEARANCE - 0.01,
+                "{upper} at {us:.0} m clears {lower} by {clear:.2} m"
+            );
+        }
+        // Four levels: the other motorway over this one, the flyovers on to it
+        // over both, and the flyovers off it over those. The two of a level
+        // pass each other.
+        assert!(separated(&map, "minami_ic_branch_", "e5_"));
+        for flyover in ["left_flyover_on", "right_flyover_on"] {
+            let name = format!("minami_ic_{flyover}");
+            assert!(separated(&map, &name, "e5_"), "{flyover}");
+            assert!(separated(&map, &name, "minami_ic_branch_"), "{flyover}");
+        }
+        for over in ["left_flyover_off", "right_flyover_off"] {
+            for under in ["left_flyover_on", "right_flyover_on"] {
+                assert!(
+                    separated(
+                        &map,
+                        &format!("minami_ic_{over}"),
+                        &format!("minami_ic_{under}")
+                    ),
+                    "{over} over {under}"
+                );
+            }
+        }
+        for (a, b) in [
+            ("left_flyover_on", "right_flyover_on"),
+            ("left_flyover_off", "right_flyover_off"),
+        ] {
+            for (a, b) in [(a, b), (b, a)] {
+                assert!(!separated(
+                    &map,
+                    &format!("minami_ic_{a}"),
+                    &format!("minami_ic_{b}")
+                ));
+            }
+        }
+        assert!(
+            map.structures
+                .iter()
+                .filter(|s| s.kind.form() == "viaduct")
+                .count()
+                >= 5
+        );
+
+        // No slip road steeper than a slip road may be, and the other motorway
+        // no steeper than a motorway.
+        let ramp_grade = environment::DesignStandard::for_speed(40.0)
+            .unwrap()
+            .max_grade;
+        for ramp in slip_roads(&map) {
+            let road = road(&map, &format!("minami_ic_{ramp}")).unwrap();
+            let grade = steepest_grade(road);
+            assert!(grade <= ramp_grade + 1e-3, "{ramp}: {:.1} %", grade * 100.0);
+        }
+        let grade = stack_spec().standard.max_grade;
+        for side in ["left", "right"] {
+            for piece in pieces(&map, &format!("minami_ic_branch_{side}")) {
+                let road = map
+                    .road(&RoadId::new(piece.trim_start_matches("road/")))
+                    .unwrap();
+                let steepest = steepest_grade(road);
+                assert!(
+                    steepest <= grade + 1e-3,
+                    "{piece}: {:.1} %",
+                    steepest * 100.0
+                );
+            }
+        }
+
+        let meshes = roadgen_carla::to_meshes(&map, &roadgen_carla::PackageConfig::new("e5"));
+        assert!(meshes.iter().any(|m| m.role == roadgen_carla::Role::Road));
+    }
+}
+
+#[test]
+fn a_stack_says_how_much_reach_its_flyovers_need() {
+    let mut spec = stack_spec();
+    spec.interchanges[0].reach = 320.0;
+    let error = spec.plan(TrafficHandedness::RightHand).unwrap_err();
+    let least: f64 = error
+        .split("reach of ")
+        .nth(1)
+        .and_then(|rest| rest.split(" m").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{error}"));
+    assert!(least > 320.0 && least <= STACK_REACH, "{least}");
+    spec.interchanges[0].reach = least;
+    let plan = spec
+        .plan(TrafficHandedness::RightHand)
+        .unwrap_or_else(|error| panic!("{least}: {error}"));
+    assert!(plan.notes.is_empty(), "{:#?}", plan.notes);
+    // A crossroad too short for the quarter turns is refused, saying how far
+    // it has to reach.
+    let mut spec = stack_spec();
+    spec.interchanges[0].crossroad =
+        vec![Point3::new(0.0, -600.0, 0.0), Point3::new(0.0, 600.0, 0.0)];
+    let error = spec.plan(TrafficHandedness::RightHand).unwrap_err();
+    assert!(error.contains("each side of the corridor"), "{error}");
 }

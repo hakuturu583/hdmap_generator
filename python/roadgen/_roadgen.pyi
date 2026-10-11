@@ -132,10 +132,16 @@ class Corridor:
         crossroad stops beyond the motorway on `side` and splits there round a
         loop with nothing at grade, `cloverleaf` — a loop in each quadrant, off
         and on to a collector–distributor road beside each carriageway, which
-        needs a `reach` of about 300 m — or `directional` (with `side`), where
+        needs a `reach` of about 300 m — `directional` (with `side`), where
         another motorway drawn by `crossroad` comes from `side` and ends at this
-        one on flyovers stacked three levels high; it is built as two
-        carriageways of this corridor's standard, `crossroad_lanes` unused. A
+        one on flyovers stacked three levels high — or `stack`, where another
+        motorway drawn by `crossroad` crosses right through, a level over this
+        one on a viaduct, and every one of the eight turns has a slip road of
+        its own: four quarter turns outside and four flyovers round the middle
+        on the third and fourth levels. It needs a `reach` of about 450 m at
+        100 km/h, and the crossroad about 860 m each side. Either other
+        motorway is built as two carriageways of this corridor's standard,
+        `crossroad_lanes` unused. A
         loop is 30 m round whatever the terminal; it needs the terminal about
         76 m out or more (79 m beside three lanes each way), and the default 80 m
         will do. A trumpet's junction on the side its crossroad comes from, and
