@@ -568,7 +568,7 @@ PR 1 と 2 だけでも、利用者が手で描いた道路に橋・トンネル
 | GPUDrive | 上の道路の `road_edge` を切る | **両方の道路**の `road_edge` を、交差する相手の外形の中で切る（下の道路の縁も上の車線を平面上で横切るため） |
 | OpenDRIVE | — | `viaduct` / `overpass` / `cut_and_cover` は OpenDRIVE に属性がないので `<userData code="structureForm">` に書く。読み戻しでは同じ名前の要素を 1 つの構造物にまとめる |
 | fingerprint | 既存の地図は不変 | IR ダンプの項目は空なら出さないので不変。ただし `geometry` ダイジェストは `Road` / `Junction` の `Debug` 表現に新しいフィールドが入るため、**同じ地図でも以前の版とは値が変わる**（ダイジェストは版をまたいで比べるものではない、という既存の方針の範囲内） |
-| トレース | — | 構造物は OpenDRIVE / OSM のトレースに載らない（`IrRef` に構造物の種類がない） |
+| トレース | — | 実装済み。`IrRef` に `Structure` / `GradeSeparation` / `Interchange` を加えた。OpenDRIVE は道路ごとの `<bridge>` / `<tunnel>` を `bridge:<id>` / `tunnel:<id>` として構造物に対応させる（1 区間だけを載せる構造物は `exact`、上下線など複数区間なら各要素が `part`）。OSM は構造物の区間で切った道路の way に `merged`（role は `bridge` / `tunnel`）、橋の床版の `man_made=bridge` に `exact`（role `outline`）で対応させ、橋の way の `layer` のもとになる立体交差をその way に `collapsed`（role `layer`）で、インターチェンジの名前を付けた `motorway_junction` のノードに `merged`（role `motorway_junction`）で対応させる。IR ダンプの近傍表では、構造物から載せる道路へ、立体交差から上の道路と構造物へ、インターチェンジから交差点・道路・構造物へ一段たどれる（道路から構造物へはたどらない）。構造物のない地図のトレースと IR ダンプは変わらない。OpenDRIVE の読み戻しのトレースには構造物はまだ載らない |
 | 設計基準 | 道路構造令を参考にした既定値（要照合） | §4.2 の表どおり実装。政令の値（半径・勾配・縦断曲線・車線・路肩・中央帯）は国交省の表と照合済み。120 km/h の車線幅は特例値 3.75 m だったので標準値 3.5 m にした。**加減速車線長（減速 90 m・加速 180 m・テーパー 60 m @100 km/h）は未照合**（『解説と運用』の表） |
 
 その他の既知の制約：

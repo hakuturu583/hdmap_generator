@@ -351,9 +351,9 @@ furniture manifest（IR object ↔ xodr signal ↔ actor 名）で追える。
 
 | フォーマット | ref の単位 | 注意点 |
 | --- | --- | --- |
-| OpenDRIVE | road / section 内 lane / junction / connection / signal / object / building / controller | `Numbering` を流用。純関数 |
+| OpenDRIVE | road / section 内 lane / junction / connection / signal / object / building / controller / bridge / tunnel | `Numbering` を流用。純関数 |
 | Lanelet2 | lanelet / linestring / regulatory_element | 連番。exporter の private 表を返すだけ |
-| OSM | node / way / relation | 信号等はノードに統合（`merged`）、restriction は腕のペア単位で複数 connection に対応 |
+| OSM | node / way / relation | 信号等はノードに統合（`merged`）、restriction は腕のペア単位で複数 connection に対応。構造物は橋・トンネルの区間の way に `merged`、床版の outline に `exact` |
 | SUMO | node / edge / lane / connection / tls | plain XML の ID を記録。信号は `tls:<id>` とスロット `tls:<id>/<linkIndex>`（§8.2）。netconvert が作る内部 lane（`:j_x_0_0`）は、`.net.xml` の `<connection from to fromLane toLane via>` を読んで connection 経由で解決する（§8.1） |
 | ClipGT | `<layer>:<row>` | 行番号が唯一の ID。走行不可 lane は出力されない（リンク無し）、lane_line は重複排除で `merged` |
 | GPUDrive | `road:<index>` / `agent:<id>` | 行番号。edge/line は重複排除で `merged`。agent は走行ルートの lane 列に `part` で対応 |

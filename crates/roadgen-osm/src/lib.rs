@@ -83,7 +83,12 @@
 //!   as the role, and a crossing is also the footway across the road;
 //! - a restriction is a `part` of its junction: it says what the junction forbids,
 //!   and the IR has no element for a movement that does not exist;
-//! - a building is its outline way, and each of its parts the way drawn for it.
+//! - a building is its outline way, and each of its parts the way drawn for it;
+//! - a structure is `merged` into each piece of road way it carries, with its tag —
+//!   `bridge` or `tunnel` — as the role, and a bridge is also its deck's outline
+//!   way; a grade separation is `collapsed` into the way of the bridge it raises,
+//!   as the `layer` it counts toward, and an interchange is `merged` into each
+//!   `motorway_junction` node it names.
 
 pub mod error;
 pub mod tags;
@@ -97,7 +102,7 @@ use ll2_projection::{GpsPoint, LocalCartesian, Origin, Projector, Utm};
 use roadgen_core::geometry::Point3;
 use roadgen_core::map::{Map, Projection, Road};
 use roadgen_core::semantics::{FormOfWay, MapObject, MapObjectKind, ObjectGeometry};
-use roadgen_core::structure::{StructureKind, StructureSpan, Underneath};
+use roadgen_core::structure::{Structure, StructureKind, StructureSpan, Underneath};
 use roadgen_core::topology::{RoadEnd, RoadLinkTarget};
 // OSM has a relation of its own, which is the one this file means by the bare name.
 use roadgen_core::trace::Relation as Link;
@@ -499,8 +504,7 @@ impl<'a> Exporter<'a> {
     /// Each bridge's deck as a closed way tagged `man_made=bridge`, which is how
     /// OSM draws the structure as opposed to the roads on it.
     ///
-    /// Not traced: the trace has no kind for a structure, and the ways of the roads
-    /// it carries are traced already.
+    /// Traced as the structure's outline, the way a building's outline is.
     fn add_bridge_outlines(&mut self) -> Result<(), ExportError> {
         for structure in self.map.structures.iter() {
             if structure.kind.bridge().is_none() {
@@ -513,7 +517,12 @@ impl<'a> Exporter<'a> {
                 .max()
                 .unwrap_or(1);
             let ring = structure.outline.points().to_vec();
-            self.add_closed_way(&ring, tags::bridge_outline_tags(structure, layer))?;
+            if let Some(way) =
+                self.add_closed_way(&ring, tags::bridge_outline_tags(structure, layer))?
+            {
+                self.trace
+                    .link_as(structure.id.clone(), way_ref(way), Link::Exact, "outline");
+            }
         }
         Ok(())
     }
@@ -556,6 +565,14 @@ impl<'a> Exporter<'a> {
                     .insert("highway".into(), "motorway_junction".into());
                 if let Some(name) = name {
                     node.tags.insert("name".into(), name);
+                    if let Some(interchange) = &junction.interchange {
+                        self.trace.link_as(
+                            interchange.clone(),
+                            node_ref(node.id),
+                            Link::Merged,
+                            "motorway_junction",
+                        );
+                    }
                 }
             }
         }
@@ -745,13 +762,15 @@ impl<'a> Exporter<'a> {
             piece.dedup();
 
             let mut tags = tags::road_tags(self.map, road);
-            if let Some(span) = span {
-                if let Some(structure) = self.map.structures.get(&span.structure) {
-                    let layer = level(self.map, &road.id, (span.from + span.to) / 2.0);
-                    tags::structure_tags(&mut tags, structure, layer);
-                }
+            let structure = span.and_then(|span| self.map.structures.get(&span.structure));
+            if let (Some(span), Some(structure)) = (span, structure) {
+                let layer = level(self.map, &road.id, (span.from + span.to) / 2.0);
+                tags::structure_tags(&mut tags, structure, layer);
             }
             let id = self.take_id();
+            if let (Some(span), Some(structure)) = (span, structure) {
+                self.trace_structure_piece(road, span, structure, id);
+            }
             self.document.ways.insert(
                 id,
                 Way {
@@ -763,6 +782,43 @@ impl<'a> Exporter<'a> {
             ways.push(id);
         }
         Ok(ways)
+    }
+
+    /// Notes that the way `way`, the piece of `road` over `span`, is tagged for
+    /// `structure`: the structure is merged into it under the tag that says so, and
+    /// each grade separation the bridge makes is collapsed into the `layer` it
+    /// raises. Those are the separations [`level`] reads off for the piece; one
+    /// further down, under the road this one passes over, counts toward the number
+    /// too, but is written on that road's way as well and is traced there.
+    fn trace_structure_piece(
+        &mut self,
+        road: &Road,
+        span: &StructureSpan,
+        structure: &Structure,
+        way: i64,
+    ) {
+        let tag = match structure.kind {
+            StructureKind::Bridge(_) => "bridge",
+            StructureKind::Tunnel(_) => "tunnel",
+        };
+        self.trace
+            .link_as(structure.id.clone(), way_ref(way), Link::Merged, tag);
+        if structure.kind.bridge().is_none() {
+            return;
+        }
+        for separation in self.map.grade_separations.iter() {
+            if separation.over.road == road.id
+                && separation.over.from < span.to
+                && span.from < separation.over.to
+            {
+                self.trace.link_as(
+                    separation.id.clone(),
+                    way_ref(way),
+                    Link::Collapsed,
+                    "layer",
+                );
+            }
+        }
     }
 
     /// Furniture goes on a way's own nodes, which is how OSM places it: a traffic

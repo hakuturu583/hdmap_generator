@@ -2485,7 +2485,7 @@ one more trace and changes none.
 
 | Format | Trace file | What an element is called |
 | --- | --- | --- |
-| OpenDRIVE | `<file>.trace.json` | `road:4`, `lane:4/0/-1` (road / section / lane), `junction:16`, `connection:16/2`, `signal:3`, `object:5`, `outline:9/0`, `controller:0` |
+| OpenDRIVE | `<file>.trace.json` | `road:4`, `lane:4/0/-1` (road / section / lane), `junction:16`, `connection:16/2`, `signal:3`, `object:5`, `outline:9/0`, `controller:0`, `bridge:7`, `tunnel:8` |
 | Lanelet2 | `<file>.trace.json` | `lanelet:1001004`, `linestring:1001000`, `regulatory_element:1001050` |
 | OpenStreetMap | `<file>.trace.json` | `way:-12`, `node:-3`, `relation:-40` |
 | SUMO | `<dir>/<prefix>.sumo.trace.json` | `edge:north.fwd`, `lane:north.fwd_0`, `node:j_x`, `connection:north.fwd_0>west.bwd_0` |
