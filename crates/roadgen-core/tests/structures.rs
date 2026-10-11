@@ -391,3 +391,255 @@ fn a_deck_over_two_carriageways_running_opposite_ways_sits_on_its_supports() {
         );
     }
 }
+
+/// A motorway along x at grade, and a street at grade alongside it from x = -100
+/// to 100 whose centre lies `apart` metres to the right of the motorway's.
+fn alongside(apart: f64) -> MapBuilder {
+    let mut builder = MapBuilder::default();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 0.0),
+                Point3::new(300.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-100.0, -apart, 0.0),
+                Point3::new(100.0, -apart, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    builder
+}
+
+#[test]
+fn a_street_that_runs_into_the_edge_of_a_motorway_is_refused() {
+    // The reference lines are 6 m apart and never cross, but each road is 3.5 m
+    // wide to each side: the street's outer lane runs a metre into the motorway.
+    let error = alongside(6.0).finish().unwrap().validate().unwrap_err();
+    let unseparated: Vec<_> = error
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. }))
+        .collect();
+    assert_eq!(unseparated.len(), 1, "{unseparated:?}");
+}
+
+#[test]
+fn a_street_alongside_a_motorway_with_room_between_is_still_a_map() {
+    alongside(7.5).finish().unwrap().validate().unwrap();
+}
+
+#[test]
+fn a_bridge_over_a_street_that_ends_beneath_its_edge_is_a_grade_separation() {
+    let mut builder = MapBuilder::default();
+    let motorway = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 9.0),
+                Point3::new(300.0, 0.0, 9.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    // The street stops 2 m short of the motorway's centre: its reference line
+    // never reaches the motorway's, but its lanes run under the motorway's.
+    let street = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -200.0, 0.0),
+                Point3::new(0.0, -2.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway.clone(), 200.0, 400.0)],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let separation = map.grade_separations.iter().next().unwrap();
+    assert_eq!(separation.over.road, motorway);
+    assert!(matches!(&separation.under, Underneath::Road(span) if span.road == street));
+}
+
+#[test]
+fn two_motorways_that_meet_at_a_junction_do_not_cross_where_they_meet() {
+    let mut builder = MapBuilder::default();
+    let motorway = |name: &str, start: Point3, end: Point3| {
+        RoadSpec::line(start, end, two_way())
+            .unwrap()
+            .with_name(name)
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway)
+    };
+    let a = builder
+        .add_road(motorway(
+            "a",
+            Point3::new(-200.0, 0.0, 0.0),
+            Point3::new(0.0, 0.0, 0.0),
+        ))
+        .unwrap();
+    // Leaving at a narrow angle from right beside the first one's end, the second
+    // starts with its outline over the first's.
+    let b = builder
+        .add_road(motorway(
+            "b",
+            Point3::new(-2.0, 5.0, 0.0),
+            Point3::new(200.0, 45.0, 0.0),
+        ))
+        .unwrap();
+    let junction = builder.add_junction(Some("fork"));
+    builder.connect_via(&junction, &a, &b).unwrap();
+    builder.finish().unwrap().validate().unwrap();
+}
+
+#[test]
+fn a_street_that_runs_into_where_a_motorway_widens_is_refused() {
+    let mut builder = MapBuilder::default();
+    let lane = |direction| LaneSpec::new(PositiveWidth::new(3.5).unwrap(), direction);
+    // A straight motorway that gains a third lane, on its right, from x = -50 to
+    // 50: its right edge is 3.5 m out at either end and 7 m out there.
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 0.0),
+                Point3::new(300.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_cross_section(
+                250.0,
+                vec![
+                    lane(Direction::Forward),
+                    lane(Direction::Forward),
+                    lane(Direction::Backward),
+                ],
+            )
+            .with_cross_section(350.0, two_way())
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    // A street 9 m off it reaches 5.5 m towards it: into the third lane only.
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-40.0, -9.0, 0.0),
+                Point3::new(40.0, -9.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    let unseparated: Vec<_> = error
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. }))
+        .collect();
+    assert_eq!(unseparated.len(), 1, "{unseparated:?}");
+}
+
+#[test]
+fn a_street_drawn_over_the_length_of_a_motorway_is_refused() {
+    let mut builder = MapBuilder::default();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 0.0),
+                Point3::new(300.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    // End to end with the motorway and 3 m to its side: no edge of the one crosses
+    // an edge of the other, but the two share 4 m of their width all along.
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, -3.0, 0.0),
+                Point3::new(300.0, -3.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    let unseparated: Vec<_> = error
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. }))
+        .collect();
+    assert_eq!(unseparated.len(), 1, "{unseparated:?}");
+}
+
+#[test]
+fn a_street_drawn_wholly_inside_a_motorway_is_refused() {
+    let mut builder = MapBuilder::default();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 0.0),
+                Point3::new(300.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    // Narrow, short and alongside the motorway's centre line: every edge of it is
+    // inside the motorway's, so none crosses one.
+    let narrow = || {
+        vec![
+            LaneSpec::new(PositiveWidth::new(1.5).unwrap(), Direction::Forward),
+            LaneSpec::new(PositiveWidth::new(1.5).unwrap(), Direction::Backward),
+        ]
+    };
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-100.0, -1.0, 0.0),
+                Point3::new(100.0, -1.0, 0.0),
+                narrow(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    let unseparated: Vec<_> = error
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. }))
+        .collect();
+    assert_eq!(unseparated.len(), 1, "{unseparated:?}");
+}
