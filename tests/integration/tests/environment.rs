@@ -318,9 +318,13 @@ fn a_town_builds_its_land_the_way_a_mine_does() {
     };
     builder
         .add_road(
-            RoadSpec::line(Point3::new(0.0, 0.0, 10.0), Point3::new(300.0, 0.0, 16.0), lanes())
-                .unwrap()
-                .with_name("high_street"),
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 10.0),
+                Point3::new(300.0, 0.0, 16.0),
+                lanes(),
+            )
+            .unwrap()
+            .with_name("high_street"),
         )
         .unwrap();
     let town = Environment::Urban(UrbanSpec {
@@ -352,7 +356,10 @@ fn a_town_builds_its_land_the_way_a_mine_does() {
     }
     // CARLA draws the land from the TIN, as it does a mine's.
     let warnings = roadgen_carla::check(&map, &PackageConfig::new("Town"));
-    assert!(warnings.iter().any(|w| w.contains("TIN surfaces")), "{warnings:#?}");
+    assert!(
+        warnings.iter().any(|w| w.contains("TIN surfaces")),
+        "{warnings:#?}"
+    );
 }
 
 #[test]
