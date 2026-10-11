@@ -121,13 +121,12 @@ impl Land {
         // so that an outline vertex that lands on the same spot as a grid or toe
         // point keeps its own height: the road's edge is the one height here that
         // is not negotiable.
-        let mut points: Vec<Vertex> = Vec::new();
+        let mut points: Vec<Point3> = Vec::new();
         if let Some(field) = field {
             points.extend(
-                field
-                    .vertices()
-                    .filter(|point| !roads.contains(point.x, point.y) && !edges.within(point, None))
-                    .map(Vertex::free),
+                field.vertices().filter(|point| {
+                    !roads.contains(point.x, point.y) && !edges.within(point, None)
+                }),
             );
         }
         for (index, section) in self.sections.iter().enumerate() {
@@ -136,12 +135,9 @@ impl Land {
                     continue;
                 }
                 let z = field.map_or(toe.z, |field| field.height(toe.x, toe.y, toe.z));
-                points.push(Vertex::free(Point3::new(toe.x, toe.y, z)));
+                points.push(Point3::new(toe.x, toe.y, z));
             }
         }
-        let mut cdt: ConstrainedDelaunayTriangulation<Vertex> =
-            ConstrainedDelaunayTriangulation::bulk_load(points).ok()?;
-
         // The lines the land is built along: every road's outline, and the lines a
         // stated terrain breaks along — the crest and toe of every bench and heap —
         // kept as edges here too, or a triangle across a crest would round it off.
@@ -167,8 +163,13 @@ impl Land {
                 }
             }
         }
-        knit(&mut lines, self.sections.len());
+        knit(&mut lines, self.sections.len(), &mut points);
         let (rings, breaklines) = lines.split_at(self.sections.len());
+        let mut cdt: ConstrainedDelaunayTriangulation<Vertex> =
+            ConstrainedDelaunayTriangulation::bulk_load(
+                points.into_iter().map(Vertex::free).collect(),
+            )
+            .ok()?;
 
         for ring in rings {
             let mut handles = Vec::with_capacity(ring.len());
@@ -279,52 +280,98 @@ impl Land {
     }
 }
 
-/// How near two points of the land's lines are to be taken for one, and a point
-/// for one on a line, metres, at most.
+/// How near two points are to be one point, metres: the same point worked out
+/// twice, by two roads that meet there.
+const SAME: f64 = 1e-6;
+
+/// How near a point of a stated terrain's breakline is to be taken for another
+/// point of the land's lines, or a free point for one of those, and how near a
+/// point is to be taken for one on a line, metres, at most.
 const NEAR: f64 = 0.05;
 
 /// The share of a line's length a point off it is nearer than to be taken for one
 /// on it, when that is less than [`NEAR`].
 const SLIVER: f64 = 0.01;
 
+/// A point [`knit`] files: one of the lines' points, or a free one.
+#[derive(Clone, Copy)]
+enum Node {
+    Line(usize),
+    Free(usize),
+}
+
 /// The land's lines made to agree where they all but meet: the first `closed` of
-/// them rings, closed back on themselves, the rest open.
+/// them roads' outlines, closed back on themselves, the rest a stated terrain's
+/// breaklines, open; and `free`, the points the land is triangulated through
+/// besides, rid of every one the lines stand in for.
 ///
 /// Two roads that meet at a junction each bring their own edge to it, and the two
 /// are the same line worked out twice — their points a hair apart, or a few
 /// millimetres where one road's edge runs along another's. The triangulation takes
 /// every one of those points as a point of its own, and between a pair of them, or
 /// between a point and the edge it all but lies on, the only triangle there is is
-/// one with next to no area. So points within [`NEAR`] of one another are made the
-/// first of them — a road's edge before a breakline, so the road's height wins —
-/// and a line that passes nearer a point than [`NEAR`], or than [`SLIVER`] of its
-/// own length, goes through it. The land then meets each road at every point of
-/// its edge, or at a point no farther than [`NEAR`] from it where two roads' edges
-/// were already that far apart; and two lines that run along one another share
-/// their points rather than leaving a strip of slivers between them.
-fn knit(lines: &mut [Vec<Point3>], closed: usize) {
-    // Every point once, and each line's points as the first point near them.
+/// one with next to no area. So:
+///
+/// - Points within [`SAME`] of one another are the first of them, whatever lines
+///   they are on. A road's edge is never moved further than that: the road's own
+///   surface ends on it, and the land is to meet it there, whatever road is near.
+/// - A breakline's point within [`NEAR`] of an earlier point is that point: no
+///   road surface ends on a breakline, and the roads come first, so it is a
+///   breakline that moves to a road and never the other way.
+/// - A free point within [`NEAR`] of a line's point, or as near a line as a
+///   line's point would be put on it, is left out: the line stands for it. A stated terrain's nodes are its breaklines' points
+///   too, and one left behind where its breakline was moved would be the point
+///   a hair off the line all over again.
+/// - A line that passes nearer one of the lines' points than [`NEAR`], or than
+///   [`SLIVER`] of its own length, goes through it. That moves no point: two
+///   roads' edges that run along one another a few millimetres apart then share
+///   their points, and the land meets each road at every point of its edge.
+///
+/// What is left is two roads' points within [`NEAR`] of one another and not the
+/// same: each road keeps its own, and the land between them is as thin as the
+/// gap between the roads is.
+fn knit(lines: &mut [Vec<Point3>], closed: usize, free: &mut Vec<Point3>) {
+    // Every point of the lines once, and each line's points as the point they
+    // are taken for.
     let mut kept: Vec<Point3> = Vec::new();
-    let mut index: Grid<usize> = Grid::new(1.0);
-    for line in lines.iter_mut() {
+    let mut index: Grid<Node> = Grid::new(1.0);
+    for (number, line) in lines.iter_mut().enumerate() {
+        let near = if number < closed { SAME } else { NEAR };
         for point in line.iter_mut() {
-            let near = index
+            let found = index
                 .around(point.x, point.y)
-                .copied()
-                .find(|&k| kept[k].horizontal_distance_to(*point) < NEAR);
-            match near {
+                .filter_map(|&node| match node {
+                    Node::Line(k) => Some(k),
+                    Node::Free(_) => None,
+                })
+                .find(|&k| kept[k].horizontal_distance_to(*point) < near);
+            match found {
                 Some(k) => *point = kept[k],
                 None => {
-                    index.insert([point.x, point.y], [point.x, point.y], kept.len());
+                    index.insert(
+                        [point.x, point.y],
+                        [point.x, point.y],
+                        Node::Line(kept.len()),
+                    );
                     kept.push(*point);
                 }
             }
         }
         line.dedup();
     }
-    // Then every stretch through the points it all but passes through, in order
-    // along it. The points are at least `NEAR` apart now, so none of them is all
-    // but either end of a stretch.
+    // The free points not within reach of a line's point.
+    let mut dropped = vec![false; free.len()];
+    for (k, point) in free.iter().enumerate() {
+        dropped[k] = index.around(point.x, point.y).any(|&node| match node {
+            Node::Line(j) => kept[j].horizontal_distance_to(*point) < NEAR,
+            Node::Free(_) => false,
+        });
+        if !dropped[k] {
+            index.insert([point.x, point.y], [point.x, point.y], Node::Free(k));
+        }
+    }
+    // Then every stretch through the lines' points it all but passes through, in
+    // order along it, and every free point it all but passes through left out.
     for (number, line) in lines.iter_mut().enumerate() {
         let count = line.len();
         let stretches = if number < closed {
@@ -346,29 +393,38 @@ fn knit(lines: &mut [Vec<Point3>], closed: usize) {
             // would be a field of empty cells for a long diagonal one.
             let cell = index.cell();
             let steps = (length / cell).ceil().max(1.0) as usize;
-            let mut on: Vec<(f64, usize)> = (0..=steps)
-                .flat_map(|step| {
-                    let f = step as f64 / steps as f64;
-                    let (x, y) = (a.x + dx * f, a.y + dy * f);
-                    let half = reach + cell / 2.0;
-                    index.covering([x - half, y - half], [x + half, y + half])
-                })
-                .filter_map(|&k| {
-                    let p = kept[k];
+            let mut on: Vec<(f64, usize)> = Vec::new();
+            for step in 0..=steps {
+                let f = step as f64 / steps as f64;
+                let (x, y) = (a.x + dx * f, a.y + dy * f);
+                let half = reach + cell / 2.0;
+                for &node in index.covering([x - half, y - half], [x + half, y + half]) {
+                    let p = match node {
+                        Node::Line(j) => kept[j],
+                        Node::Free(j) => free[j],
+                    };
                     let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / (length * length);
                     let off = ((p.x - a.x) * dy - (p.y - a.y) * dx).abs() / length;
-                    (t > 0.0 && t < 1.0 && off < reach && p != a && p != b).then_some((t, k))
-                })
-                .collect();
+                    if !(t > 0.0 && t < 1.0 && off < reach && p != a && p != b) {
+                        continue;
+                    }
+                    match node {
+                        Node::Line(j) => on.push((t, j)),
+                        Node::Free(j) => dropped[j] = true,
+                    }
+                }
+            }
             on.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
-            on.dedup_by_key(|(_, k)| *k);
-            knitted.extend(on.into_iter().map(|(_, k)| kept[k]));
+            on.dedup_by_key(|(_, j)| *j);
+            knitted.extend(on.into_iter().map(|(_, j)| kept[j]));
         }
         if number >= closed {
             knitted.extend(line.last());
         }
         *line = knitted;
     }
+    let mut keep = dropped.iter().map(|dropped| !dropped);
+    free.retain(|_| keep.next().unwrap_or(true));
 }
 
 /// The triangles of the land surfaced with one material: the material, the
@@ -684,6 +740,99 @@ mod tests {
                     "the land misses the road's edge at {edge:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn two_roads_a_few_centimetres_apart_each_keep_their_own_edge() {
+        // Two roads side by side 3 cm apart, sharing no seam, and a third across
+        // their ends, so that the land between it and them runs up to the two
+        // roads' corners. Neither road's edge is the other's to move.
+        let along = |y: f64| -> Vec<Point3> {
+            (0..=4)
+                .map(|i| Point3::new(i as f64 * 10.0, y, 0.0))
+                .collect()
+        };
+        let across = |x: f64| -> Vec<Point3> {
+            (0..=6)
+                .map(|i| Point3::new(x, i as f64 * 8.0 - 24.0, 0.0))
+                .collect()
+        };
+        let mut land = Land::default();
+        land.section(
+            flank(along(8.03), along(16.03)),
+            flank(along(0.03), Vec::new()),
+        );
+        land.section(
+            flank(along(0.0), Vec::new()),
+            flank(along(-8.0), along(-16.0)),
+        );
+        land.section(
+            flank(across(-12.0), Vec::new()),
+            flank(across(-20.0), across(-28.0)),
+        );
+        let mesh = land
+            .mesh(None, 8.0, "t", &mut Ordinals::default())
+            .expect("a terrain");
+        for section in &land.sections[..2] {
+            for &corner in section.ring.iter().filter(|p| p.x == 0.0) {
+                assert!(
+                    mesh.positions.iter().any(|p| p.distance_to(corner) < 1e-9),
+                    "the land misses the road's own corner at {corner:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_node_of_a_stated_land_goes_where_its_breakline_does() {
+        // A stated land whose nodes include every breakline vertex, and one
+        // breakline starting 2 cm from a vertex of another: the triangulation
+        // keeps one point there, not the breakline's and its node's both.
+        let road = |y: f64| -> Vec<Point3> {
+            (0..=10)
+                .map(|i| Point3::new(i as f64 * 10.0, y, 0.0))
+                .collect()
+        };
+        let mut land = Land::default();
+        land.section(
+            flank(road(-52.0), Vec::new()),
+            flank(road(-60.0), Vec::new()),
+        );
+        let crest = vec![
+            Point3::new(20.0, 0.0, 1.0),
+            Point3::new(50.0, 0.0, 1.0),
+            Point3::new(80.0, 0.0, 1.0),
+        ];
+        let toe = vec![Point3::new(50.02, 0.0, 1.0), Point3::new(50.02, 30.0, 0.0)];
+        let mut nodes: Vec<Point3> = (0..=10)
+            .flat_map(|i| {
+                (0..=8).map(move |j| Point3::new(i as f64 * 10.0, j as f64 * 10.0 - 40.0, 0.0))
+            })
+            .filter(|p| p.y.abs() > 1.0 && p.x != 50.0)
+            .collect();
+        nodes.extend(crest.iter().chain(&toe).copied());
+        let ground = Ground::Stated(crate::ground::Stated::of_parts(nodes, vec![crest, toe]));
+        let mesh = land
+            .mesh(Some(&ground), 1.0, "t", &mut Ordinals::default())
+            .expect("a terrain");
+        let there: Vec<&Point3> = mesh
+            .positions
+            .iter()
+            .filter(|p| p.horizontal_distance_to(Point3::new(50.0, 0.0, 0.0)) < 0.5)
+            .collect();
+        assert_eq!(there.len(), 1, "{there:?}");
+        for triangle in &mesh.triangles {
+            let [a, b, c] = triangle.map(|i| mesh.positions[i as usize]);
+            let longest = [(a, b), (b, c), (c, a)]
+                .map(|(p, q)| p.horizontal_distance_to(q))
+                .into_iter()
+                .fold(0.0, f64::max);
+            let height = (b - a).cross(c - a).z.abs() / longest;
+            assert!(
+                height >= 0.01 * longest,
+                "a flat triangle at {a:?}, {b:?}, {c:?}"
+            );
         }
     }
 
