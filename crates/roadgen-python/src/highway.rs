@@ -121,8 +121,10 @@ impl PyCorridor {
     }
 
     /// Adds an interchange at centre-line station `at`, onto the crossroad drawn
-    /// by `crossroad` at ground level. `kind` is `diamond`, or `half_diamond` with
-    /// `side` saying which carriageway's slip roads it has.
+    /// by `crossroad` at ground level. `kind` is `diamond`; `half_diamond` with
+    /// `side` saying which carriageway's slip roads it has; `parclo`, a diamond
+    /// whose turns on across the crossroad are loops; or `trumpet` with `side`
+    /// saying which side the crossroad stops on, beyond the motorway.
     #[pyo3(signature = (
         name,
         at,
@@ -151,7 +153,11 @@ impl PyCorridor {
     ) -> PyResult<()> {
         let kind = match (kind, side) {
             ("diamond", _) => InterchangeKind::Diamond,
+            ("parclo", _) => InterchangeKind::Parclo,
             ("half_diamond", Some(text)) => InterchangeKind::HalfDiamond {
+                side: self::side(text)?,
+            },
+            ("trumpet", Some(text)) => InterchangeKind::Trumpet {
                 side: self::side(text)?,
             },
             ("half_diamond", None) => {
@@ -159,9 +165,14 @@ impl PyCorridor {
                     "a half diamond needs side= to say whose slip roads it has",
                 ))
             }
+            ("trumpet", None) => {
+                return Err(PyValueError::new_err(
+                    "a trumpet needs side= to say which side its crossroad stops on",
+                ))
+            }
             (other, _) => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown interchange {other:?}; diamond or half_diamond"
+                    "unknown interchange {other:?}; diamond, half_diamond, parclo or trumpet"
                 )))
             }
         };

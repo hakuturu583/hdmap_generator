@@ -558,7 +558,7 @@ PR 1 と 2 だけでも、利用者が手で描いた道路に橋・トンネル
 | 項目 | 設計 | 実装 |
 | --- | --- | --- |
 | 回廊の補助関数 | `Corridor.carriageway(side)` が上下線の点列を返し、利用者が `add_road` する | `Corridor.plan()` が全道路（上下線の区間・ランプ・交差道路）・交差点・接続・信号・構造物を含む計画を返し、`Map.add_plan(plan)` で入れる。上下線はランプの位置で区間に分ける必要があり、別々に返すと利用者が分割と接続を自分で書くことになるため。計画は点列と車線の集まりで、`set_points` で書き換えられる（道路の形を利用者が決める原則は保つ） |
-| インターチェンジの形式 | diamond / half_diamond / parclo / trumpet（cloverleaf / directional は後） | **diamond と half_diamond のみ**。parclo・trumpet・cloverleaf・directional は未実装。単独ランプ `Corridor.add_ramp()` を追加した（都市高速の出入口に使う） |
+| インターチェンジの形式 | diamond / half_diamond / parclo / trumpet（cloverleaf / directional は後） | diamond / half_diamond / parclo / trumpet。cloverleaf・directional は未実装。単独ランプ `Corridor.add_ramp()` を追加した（都市高速の出入口に使う）。**parclo** は各側で、交差道路の手前の象限に出口ランプとループ（180° のループ。交差道路の下をくぐって本線に合流する）を入れ、交差道路の先の象限に入口ランプを置く。ループは対向側から来た交通、入口ランプは手前側から来た交通が使い、交差道路を横切る右折（左側通行では左折）がなくなる。ランプ端は diamond と同じ平面交差で、信号または一時停止。**trumpet** は設計と違い、全方向を立体で処理する形ではない。交差道路は片側から来て本線を越え、反対側（`side`）の端末で終わる。来た側は出口・入口ランプの対（合流・分流だけなので信号なし、出口ランプは一時停止）、終わる側は出口ランプとループ（出口ランプは一時停止）。ループの半径は（端末の離れ − ランプ幅 − 本線の外縁）/2 で決まり、30 m 未満なら `notes` に書き、20 m 未満なら計画を拒否する（`terminal` を 100 m 以上にする） |
 | 都市部の既定（`urban="elevated"`） | 市街地の範囲を自動で判定して高架にする | 自動判定は未実装。`elevated=[(s0, s1)]` / `sunken=[(s0, s1)]` で区間を指定する（縦断に高さを足し、その区間を高架・開削トンネルにする） |
 | 上下線の床版 | 高架は 1 つの構造物が上下線を載せる | 規則で作る橋・高架は**上下線で別の床版**。builder の `add_bridge` に 2 区間を渡せば 1 枚にできる |
 | 終点の移行 | 100 → 80 → 60 km/h と段階的に下げる | 設計どおり、設計速度から 20 km/h ずつ 60 km/h まで下げる。`end_transition` の長さを段の数で等分し、各段を別の道路にして交差点なしで直接つなぐ（`ConnectionPlan::Follows`）。最後の段だけ `MultipleCarriageway`。加速・減速車線は設計速度の区間に残し、入りきらないときは `notes` に書く |

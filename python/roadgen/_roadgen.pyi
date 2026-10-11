@@ -126,7 +126,11 @@ class Corridor:
         control: str = "signal",
         terminal: float = 80.0,
         reach: float = 320.0,
-    ) -> None: ...
+    ) -> None:
+        """`kind` is `diamond`, `half_diamond` (with `side`), `parclo` — a diamond
+        whose turns on across the crossroad are loops — or `trumpet`, whose
+        crossroad stops beyond the motorway on `side`. A loop needs the terminal
+        well out: 100 m or more."""
     def add_ramp(
         self, name: str, at: float, end: Point, side: str = "right", on: bool = False
     ) -> None: ...
