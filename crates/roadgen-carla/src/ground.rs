@@ -302,6 +302,18 @@ impl<'a> Stated<'a> {
         })
     }
 
+    /// A stated land of bare nodes and breaklines, with no surface to read a
+    /// height from or land cover over it: what a test of the triangulation needs.
+    #[cfg(test)]
+    pub(crate) fn of_parts(nodes: Vec<Point3>, breaklines: Vec<Vec<Point3>>) -> Stated<'a> {
+        Stated {
+            locators: Vec::new(),
+            nodes,
+            breaklines,
+            covers: Vec::new(),
+        }
+    }
+
     pub fn height(&self, x: f64, y: f64) -> Option<f64> {
         self.locators
             .iter()
