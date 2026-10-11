@@ -418,15 +418,18 @@ pub(crate) fn choose_structures(
     }
     // Which of them stand on the ground, which the land beside each is read
     // from. A road read as off the ground leaves no slope for the others to
-    // stand clear of, so it has to be off the ground in the end: every stretch
-    // starts off it that stands far enough off the natural land — or over
-    // water — and is put back on it while it does not stand far enough off the
-    // land the others on the ground leave, or is too short a stretch to go on a
-    // structure. Each stretch put back can only bring the land up round the
-    // others, so this ends.
+    // stand clear of, so it has to be off the ground in the end — and a
+    // stretch on a structure leaves none, so whatever a structure carries is
+    // read as off it: a bridge reached out over the ground either side of
+    // what stands high, as much as the middle. Every stretch starts off the
+    // ground that stands far enough off the natural land to be on a structure
+    // or under one reaching out — or is over water — and is put back on it
+    // while no structure carries it, standing off the land the others on the
+    // ground leave. Each stretch put back can only bring the land up round
+    // the others, so this ends.
     let off_natural = |reading: &Reading, index: usize| {
         let d = reading.points[index].z - reading.natural[index];
-        !reading.fixed[index] && (reading.wet[index] || d > BRIDGE || d < -(deep + COVER))
+        !reading.fixed[index] && (reading.wet[index] || d > ABUTMENT || d < -(deep + PORTAL))
     };
     let mut off: Vec<Vec<bool>> = readings
         .iter()
@@ -436,11 +439,26 @@ pub(crate) fn choose_structures(
                 .collect()
         })
         .collect();
-    let mut rows: Vec<Vec<(f64, f64, Class)>>;
-    loop {
+    // The stations each road's rows put on a structure: inside a bridge or a
+    // tunnel as `runs_of` reaches it out, over the ground either side of what
+    // stands far enough off the land and over short stretches between.
+    let structured = |rows: &[(f64, f64, Class)]| -> Vec<bool> {
+        let mut on = vec![false; rows.len()];
+        for (kind, extend) in [(Class::Bridge, ABUTMENT), (Class::Tunnel, deep + PORTAL)] {
+            for (from, to) in runs_of(rows, kind, extend) {
+                for (index, row) in rows.iter().enumerate() {
+                    if row.0 >= from && row.0 <= to {
+                        on[index] = true;
+                    }
+                }
+            }
+        }
+        on
+    };
+    let classify = |off: &[Vec<bool>]| -> Vec<Vec<(f64, f64, Class)>> {
         let on_ground = readings
             .iter()
-            .zip(&off)
+            .zip(off)
             .enumerate()
             .flat_map(|(road, (reading, off))| {
                 (0..reading.stations.len())
@@ -454,32 +472,44 @@ pub(crate) fn choose_structures(
                     })
             });
         let beside = Beside::of(on_ground.chain(others.iter().copied()));
-        rows = readings
+        readings
             .iter()
             .enumerate()
             .map(|(road, reading)| reading.rows(road, &beside, deep))
-            .collect();
+            .collect()
+    };
+    let mut rows = classify(&off);
+    loop {
         let next: Vec<Vec<bool>> = rows
             .iter()
             .zip(&off)
             .map(|(rows, off)| {
-                let mut next = vec![false; rows.len()];
-                for (kind, extend) in [(Class::Bridge, ABUTMENT), (Class::Tunnel, deep + PORTAL)] {
-                    for (from, to) in runs_of(rows, kind, extend) {
-                        for (index, row) in rows.iter().enumerate() {
-                            if row.2 == kind && row.0 >= from && row.0 <= to {
-                                next[index] = off[index];
-                            }
-                        }
-                    }
-                }
-                next
+                structured(rows)
+                    .into_iter()
+                    .zip(off)
+                    .map(|(on, off)| on && *off)
+                    .collect()
             })
             .collect();
         if next == off {
             break;
         }
         off = next;
+        rows = classify(&off);
+    }
+    // A structure may carry a stretch too near the land to have started off
+    // it: a short stretch of ground between two bridges, joined. That is off
+    // the ground too: the ground beside it falls away, nothing stands any less
+    // far off the land, and the structures only reach further — so this ends
+    // too, with the stretches read as off the ground exactly those the
+    // structures carry.
+    loop {
+        let next: Vec<Vec<bool>> = rows.iter().map(|rows| structured(rows)).collect();
+        if next == off {
+            break;
+        }
+        off = next;
+        rows = classify(&off);
     }
 
     // The bridges of the carriageways that share a deck, kept back until every
@@ -1173,6 +1203,66 @@ mod tests {
         // Two both high enough, side by side, are both on bridges: neither has a
         // slope under the other.
         assert_eq!(bridges(&[("high", 0.0, 9.0), ("other", 10.0, 9.0)]), 2);
+    }
+
+    #[test]
+    fn a_bridge_reached_out_over_low_ground_leaves_no_slope_for_the_road_beside_it() {
+        use roadgen_core::geometry::Curve3;
+        use roadgen_core::prelude::*;
+        // `reached` is 9 m over the level land in the middle and 7 m either side:
+        // a bridge in the middle, reached out the whole way over the 7 m. Beside
+        // it, 8 m off, `beside` is 9 m over the land all along. Had `reached` an
+        // embankment either side of the middle, its slope would stand under
+        // `beside` too high for a deck; it has none, so `beside` is on a bridge
+        // all the way too.
+        let natural = Natural {
+            field: None,
+            rises: &[],
+        };
+        let mut builder = MapBuilder::default();
+        let lanes = || {
+            vec![
+                LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+                LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+            ]
+        };
+        let reached: Vec<Point3> = (0..=60)
+            .map(|i| {
+                let x = i as f64 * 5.0;
+                let z = if (100.0..=200.0).contains(&x) {
+                    9.0
+                } else {
+                    7.0
+                };
+                Point3::new(x, 0.0, z)
+            })
+            .collect();
+        builder
+            .add_road(
+                RoadSpec::new(Curve3::polyline(reached).unwrap(), lanes()).with_name("reached"),
+            )
+            .unwrap();
+        level_road(&mut builder, "beside", 8.0, 9.0);
+        let mut map = builder.finish().unwrap().into_map();
+        let chosen: Vec<(RoadId, Option<String>)> = ["reached", "beside"]
+            .iter()
+            .map(|name| (RoadId::new(*name), None))
+            .collect();
+        let notes = choose_structures(&mut map, &chosen, &[], &natural, &[]);
+        assert!(notes.is_empty(), "{notes:#?}");
+        for name in ["reached", "beside"] {
+            let spans: Vec<(f64, f64)> = map
+                .structures
+                .iter()
+                .flat_map(|s| s.carries.iter())
+                .filter(|span| span.road.as_str() == format!("road/{name}"))
+                .map(|span| (span.from, span.to))
+                .collect();
+            assert!(
+                matches!(spans[..], [(from, to)] if from < 1.0 && to > 299.0),
+                "{name}: {spans:?}"
+            );
+        }
     }
 
     /// A carriageway 300 m long along `y`, drawn east (`east`) or west, 12 m off
