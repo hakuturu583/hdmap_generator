@@ -424,6 +424,31 @@ fn a_river_falls_along_its_length_and_its_water_with_it() {
         assert!(p.z > bed && p.z < bed + 4.0, "{p:?} over a bed at {bed:.2}");
     }
     assert!(along.first().unwrap().z - along.last().unwrap().z > 8.0);
+
+    // The same hollow as a lake: standing water, one level all over.
+    let mut lake = (*map).clone();
+    let ids: Vec<_> = lake
+        .land_covers
+        .iter()
+        .map(|cover| cover.id.clone())
+        .collect();
+    for id in ids {
+        if let Some(cover) = lake.land_covers.get_mut(&id) {
+            if cover.kind == "water" {
+                cover.kind = "lake".into();
+            }
+        }
+    }
+    let lake = UnvalidatedMap::from_map(lake)
+        .validate()
+        .unwrap_or_else(|error| panic!("{error}"));
+    let meshes = roadgen_carla::to_meshes(&lake, &PackageConfig::new("tama"));
+    let water = meshes
+        .iter()
+        .find(|mesh| mesh.materials == [materials::WATER])
+        .expect("water");
+    let level = water.positions[0].z;
+    assert!(water.positions.iter().all(|p| (p.z - level).abs() < 1e-9));
 }
 
 #[test]

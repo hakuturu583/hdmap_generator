@@ -2,8 +2,8 @@
 //!
 //! The land under a river is its bed and banks, surfaced as a riverbed. Over it,
 //! across the whole of the land cover, lies a sheet of water two thirds of the
-//! channel's depth over its bed — level across the river, and falling along it
-//! with the bed: where the banks rise above it the land hides it, so its edge is
+//! channel's depth over its bed — level across a river, and falling along it
+//! with the bed; level all over a lake or a pond: where the banks rise above it the land hides it, so its edge is
 //! wherever the banks cross that height, with nothing to compute. The sheet
 //! is terrain to CARLA, like everything else of the land, and is surfaced with
 //! [`materials::WATER`](crate::materials::WATER), its texture coordinates in plan.
@@ -24,6 +24,12 @@ const FILL: f64 = 2.0 / 3.0;
 /// Whether a land cover of `kind` is open water.
 pub fn is_water(kind: &str) -> bool {
     matches!(kind, "water" | "river" | "canal" | "lake" | "pond")
+}
+
+/// Whether water of `kind` runs downhill along its length, rather than standing
+/// level.
+fn is_flowing(kind: &str) -> bool {
+    matches!(kind, "water" | "river" | "canal")
 }
 
 /// The surface of every body of water the map's land states, each a mesh.
@@ -50,12 +56,17 @@ pub fn meshes(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh> {
         if !bed.is_finite() || top <= bed {
             continue;
         }
-        // The water stands the same depth over the bed all along, and the bed
-        // may fall along the river: at each point of the outline the bed is the
-        // lowest the land goes within a river's width of it.
+        // The water stands the same depth over the bed all along, and a river's
+        // bed may fall along it: at each point of the outline the bed is the
+        // lowest the land goes within the river's width of it. Standing water —
+        // a lake, a pond — is one level, whatever its bed does.
         let depth = (top - bed) * FILL;
         let reach = width(&ring);
+        let flows = is_flowing(&cover.kind);
         let level = |at: PlanPoint| {
+            if !flows {
+                return bed + depth;
+            }
             let local = inside
                 .iter()
                 .filter(|p| (p.x - at[0]).hypot(p.y - at[1]) <= reach)
