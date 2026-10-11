@@ -123,8 +123,12 @@ impl PyCorridor {
     /// Adds an interchange at centre-line station `at`, onto the crossroad drawn
     /// by `crossroad` at ground level. `kind` is `diamond`; `half_diamond` with
     /// `side` saying which carriageway's slip roads it has; `parclo`, a diamond
-    /// whose turns on across the crossroad are loops; or `trumpet` with `side`
-    /// saying which side the crossroad stops on, beyond the motorway.
+    /// whose turns on across the crossroad are loops; `trumpet` with `side`
+    /// saying which side the crossroad stops on, beyond the motorway, every
+    /// movement free-flowing round one loop; `cloverleaf`, a loop in each
+    /// quadrant and a collector–distributor road beside each carriageway; or
+    /// `directional` with `side` saying which side another motorway, drawn by
+    /// `crossroad`, comes from to end at this one on stacked flyovers.
     #[pyo3(signature = (
         name,
         at,
@@ -154,6 +158,10 @@ impl PyCorridor {
         let kind = match (kind, side) {
             ("diamond", _) => InterchangeKind::Diamond,
             ("parclo", _) => InterchangeKind::Parclo,
+            ("cloverleaf", _) => InterchangeKind::Cloverleaf,
+            ("directional", Some(text)) => InterchangeKind::Directional {
+                side: self::side(text)?,
+            },
             ("half_diamond", Some(text)) => InterchangeKind::HalfDiamond {
                 side: self::side(text)?,
             },
@@ -170,9 +178,16 @@ impl PyCorridor {
                     "a trumpet needs side= to say which side its crossroad stops on",
                 ))
             }
+            ("directional", None) => {
+                return Err(PyValueError::new_err(
+                    "a directional junction needs side= to say which side the other motorway \
+                     comes from",
+                ))
+            }
             (other, _) => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown interchange {other:?}; diamond, half_diamond, parclo or trumpet"
+                    "unknown interchange {other:?}; diamond, half_diamond, parclo, trumpet, \
+                     cloverleaf or directional"
                 )))
             }
         };

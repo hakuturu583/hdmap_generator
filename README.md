@@ -888,6 +888,17 @@ terminals. Nothing in it is fixed: it is points and lanes, and the caller can mo
 any of them before adding it. A road drawn outside the standard is noted, not
 refused.
 
+`kind=` says what the interchange is built as: a `diamond` (the default) or a
+`half_diamond`, whose ramp terminals are signalled; a `parclo`, whose turns on
+across the crossroad are loops; or one of the free-flowing kinds, where every slip
+road merges or diverges and nothing is signalled — a `trumpet`, whose crossroad
+crosses on its overpass and splits round a loop on the far `side`; a `cloverleaf`,
+a loop in each quadrant, its slip roads off and on to a collector–distributor road
+beside each carriageway so the weaving stays off the through lanes; and a
+`directional` T, where another motorway, drawn by `crossroad`, comes from `side`
+and ends at this one, its flyovers to and from the far carriageway stacked three
+levels high on viaducts.
+
 When the map is built, the rest follows from the land. The **natural** land — the
 country, the hills, the rivers, the parts — is worked out before the motorway is
 fitted to it, and every corridor road is classified along its length: far above the
