@@ -15,6 +15,7 @@ use roadgen_core::map::Map;
 use roadgen_core::structure::{
     self, BridgeForm, BridgeSpec, RoadSpan, StructureSpec, TunnelForm, TunnelSpec,
 };
+use roadgen_core::FormOfWay;
 
 use super::corridor::StructureMode;
 use super::land::{at_grade_edges, plan_of, Line, Rise};
@@ -63,36 +64,107 @@ enum Class {
     Fixed,
 }
 
+/// A corridor's rules, as [`choose_structures`] reads them: its name, how its
+/// structures are chosen, and whether its carriageways share a deck.
+pub(crate) type Modes = [(String, StructureMode, bool)];
+
+/// A stretch of a carriageway the rules put on a bridge, kept back to be put on a
+/// deck shared with the other carriageway's.
+struct Run {
+    road: RoadId,
+    corridor: String,
+    from: f64,
+    to: f64,
+    /// The road at each of its vertices: station, point, height off the land,
+    /// class.
+    rows: Vec<(f64, Point3, f64, Class)>,
+    /// Whether any of it is over water.
+    wet: bool,
+}
+
+impl Run {
+    /// The sample nearest `point` in plan: its index and how far off it is.
+    fn nearest(&self, point: Point3) -> (usize, f64) {
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (index, row.1.horizontal_distance_to(point)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((0, f64::INFINITY))
+    }
+
+    /// The point at `station`, the nearest sample's.
+    fn point_at(&self, station: f64) -> Point3 {
+        self.rows
+            .iter()
+            .min_by(|a, b| (a.0 - station).abs().total_cmp(&(b.0 - station).abs()))
+            .map_or(Point3::new(0.0, 0.0, 0.0), |row| row.1)
+    }
+
+    /// Whether `other`, on another road, runs beside this run for some of its
+    /// length: a point of its run passes within [`BESIDE`] of a point inside this
+    /// one, not off past either end of it.
+    fn beside(&self, other: &Run) -> bool {
+        if self.road == other.road {
+            return false;
+        }
+        let inside = |run: &Run, index: usize| {
+            let station = run.rows[index].0;
+            station > run.from + 1e-6 && station < run.to - 1e-6
+        };
+        other
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| inside(other, *index))
+            .any(|(_, row)| {
+                let (near, distance) = self.nearest(row.1);
+                distance <= BESIDE && inside(self, near)
+            })
+    }
+}
+
+/// How far apart two carriageways' reference lines may be and still share a deck,
+/// metres: a median and a carriageway's width, about.
+const BESIDE: f64 = 2.0 * structure::MEDIAN;
+
 /// Chooses the structures of every corridor road whose corridor leaves them to the
 /// land. Returns the notes worth telling the caller.
 pub(crate) fn choose_structures(
     map: &mut Map,
     roads: &[(RoadId, String)],
-    modes: &[(String, StructureMode)],
+    modes: &Modes,
     natural: &Natural,
     water: &[Vec<PlanPoint>],
 ) -> Vec<String> {
     let mut notes = Vec::new();
     let tunnel = TunnelSpec::default();
     let deep = tunnel.clear_height + tunnel.lining;
+    // The bridges of the carriageways that share a deck, kept back until every
+    // road's are known.
+    let mut kept: Vec<Run> = Vec::new();
     for (id, corridor) in roads {
-        let auto = modes
-            .iter()
-            .find(|(name, _)| name == corridor)
-            .is_none_or(|(_, mode)| *mode == StructureMode::Auto);
+        let mode = modes.iter().find(|(name, _, _)| name == corridor);
+        let auto = mode.is_none_or(|(_, mode, _)| *mode == StructureMode::Auto);
         if !auto {
             continue;
         }
+        let shared = mode.is_some_and(|(_, _, shared)| *shared);
         let Some(road) = map.road(id) else { continue };
         if road.is_connector() {
             continue;
         }
+        let carriageway = matches!(
+            road.form,
+            FormOfWay::Motorway | FormOfWay::MultipleCarriageway
+        );
         // The road at each of its own vertices, sampled once: classified, and
         // whether it is over water.
         let Ok(samples) = road.reference_line.samples(map.metadata.sampling) else {
             continue;
         };
         let mut rows: Vec<(f64, f64, Class)> = Vec::with_capacity(samples.len());
+        let mut points: Vec<Point3> = Vec::with_capacity(samples.len());
         let mut wet: Vec<f64> = Vec::new();
         for sample in samples {
             let (station, p) = (sample.station, sample.point);
@@ -111,21 +183,30 @@ pub(crate) fn choose_structures(
                 Class::Ground
             };
             rows.push((station, d, class));
+            points.push(p);
         }
         let over_water = |from: f64, to: f64| wet.iter().any(|s| *s >= from && *s <= to);
         for (kind, extend) in [(Class::Bridge, ABUTMENT), (Class::Tunnel, deep + PORTAL)] {
             let runs = runs_of(&rows, kind, extend);
             for (from, to) in runs {
+                if kind == Class::Bridge && shared && carriageway {
+                    kept.push(Run {
+                        road: id.clone(),
+                        corridor: corridor.clone(),
+                        from,
+                        to,
+                        rows: rows
+                            .iter()
+                            .zip(&points)
+                            .map(|(row, p)| (row.0, *p, row.1, row.2))
+                            .collect(),
+                        wet: over_water(from, to),
+                    });
+                    continue;
+                }
                 let spans = [RoadSpan::new(id.clone(), from, to)];
                 let spec = match kind {
-                    Class::Bridge => StructureSpec::Bridge(BridgeSpec {
-                        form: if to - from >= 100.0 && !over_water(from, to) {
-                            BridgeForm::Viaduct
-                        } else {
-                            BridgeForm::Bridge
-                        },
-                        ..BridgeSpec::default()
-                    }),
+                    Class::Bridge => bridge_spec(to - from, over_water(from, to)),
                     _ => StructureSpec::Tunnel(TunnelSpec {
                         form: TunnelForm::Bored,
                         ..TunnelSpec::default()
@@ -137,7 +218,138 @@ pub(crate) fn choose_structures(
             }
         }
     }
+    for deck in shared_decks(&kept) {
+        let spans: Vec<RoadSpan> = deck
+            .iter()
+            .map(|(index, from, to)| RoadSpan::new(kept[*index].road.clone(), *from, *to))
+            .collect();
+        let longest = spans.iter().map(RoadSpan::length).fold(0.0, f64::max);
+        let wet = deck.iter().any(|(index, _, _)| kept[*index].wet);
+        if spans.len() > 1 && structure::place(map, &spans, &bridge_spec(longest, wet)).is_ok() {
+            continue;
+        }
+        // On a deck of its own, as it would be without one to share.
+        for (index, _, _) in &deck {
+            let run = &kept[*index];
+            let spans = [RoadSpan::new(run.road.clone(), run.from, run.to)];
+            if let Err(error) =
+                structure::place(map, &spans, &bridge_spec(run.to - run.from, run.wet))
+            {
+                notes.push(format!(
+                    "{} {:.0}–{:.0} m: no structure: {error}",
+                    run.road, run.from, run.to
+                ));
+            }
+        }
+    }
     notes
+}
+
+/// A bridge `length` long: a viaduct if it is long and not over water.
+fn bridge_spec(length: f64, over_water: bool) -> StructureSpec {
+    StructureSpec::Bridge(BridgeSpec {
+        form: if length >= 100.0 && !over_water {
+            BridgeForm::Viaduct
+        } else {
+            BridgeForm::Bridge
+        },
+        ..BridgeSpec::default()
+    })
+}
+
+/// The bridges of carriageways that share a deck, gathered: each deck is the runs
+/// that run beside one another — of one corridor, on different roads — as
+/// `(run, from, to)`, the longest first, since a deck is laid out along its first
+/// road.
+///
+/// Every run of a deck is reached out to the **union** of the deck: to the
+/// stations beside the far ends of the others, so both carriageways' halves of
+/// the deck begin and end together, across from each other — as far as the
+/// road stands clear of the land by a deck's depth, and never on to another
+/// structure or another of its own road's bridges. A run with nothing beside it is
+/// a deck of its own.
+fn shared_decks(runs: &[Run]) -> Vec<Vec<(usize, f64, f64)>> {
+    // Which deck each run is on: the runs beside one another, joined.
+    let mut deck: Vec<usize> = (0..runs.len()).collect();
+    fn root(deck: &mut [usize], mut index: usize) -> usize {
+        while deck[index] != index {
+            deck[index] = deck[deck[index]];
+            index = deck[index];
+        }
+        index
+    }
+    for a in 0..runs.len() {
+        for b in a + 1..runs.len() {
+            if runs[a].corridor == runs[b].corridor && runs[a].beside(&runs[b]) {
+                let (ra, rb) = (root(&mut deck, a), root(&mut deck, b));
+                deck[ra] = rb;
+            }
+        }
+    }
+    let depth = BridgeSpec::default().deck_depth;
+    let mut out: Vec<Vec<(usize, f64, f64)>> = Vec::new();
+    let mut seen: Vec<usize> = Vec::new();
+    for first in 0..runs.len() {
+        let key = root(&mut deck, first);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let members: Vec<usize> = (0..runs.len())
+            .filter(|index| root(&mut deck, *index) == key)
+            .collect();
+        let mut spans: Vec<(usize, f64, f64)> = members
+            .iter()
+            .map(|&index| {
+                let run = &runs[index];
+                let (mut from, mut to) = (run.from, run.to);
+                // The stations beside the others' ends, on this road.
+                for &other in members.iter().filter(|other| **other != index) {
+                    for end in [runs[other].from, runs[other].to] {
+                        let (near, distance) = run.nearest(runs[other].point_at(end));
+                        if distance <= BESIDE {
+                            from = from.min(run.rows[near].0);
+                            to = to.max(run.rows[near].0);
+                        }
+                    }
+                }
+                // Out only over rows that may be bridged: clear of the land, not
+                // on another structure, not another run of the same road.
+                let others: Vec<(f64, f64)> = runs
+                    .iter()
+                    .enumerate()
+                    .filter(|(o, r)| *o != index && r.road == run.road)
+                    .map(|(_, r)| (r.from, r.to))
+                    .collect();
+                let open = |row: &(f64, Point3, f64, Class)| {
+                    row.3 != Class::Fixed
+                        && row.2 > depth
+                        && !others.iter().any(|(a, b)| row.0 >= *a && row.0 <= *b)
+                };
+                let start = run.rows.iter().position(|row| row.0 >= run.from);
+                let end = run.rows.iter().rposition(|row| row.0 <= run.to);
+                let (mut low, mut high) = (run.from, run.to);
+                if let (Some(start), Some(end)) = (start, end) {
+                    for row in run.rows[..start].iter().rev() {
+                        if row.0 < from - 1e-6 || !open(row) {
+                            break;
+                        }
+                        low = row.0;
+                    }
+                    for row in &run.rows[end + 1..] {
+                        if row.0 > to + 1e-6 || !open(row) {
+                            break;
+                        }
+                        high = row.0;
+                    }
+                }
+                (index, low, high)
+            })
+            .collect();
+        spans.sort_by(|a, b| (b.2 - b.1).total_cmp(&(a.2 - a.1)));
+        out.push(spans);
+    }
+    out
 }
 
 /// The stretches of `rows` of class `kind`: each long enough, those close together
@@ -464,5 +676,68 @@ mod tests {
             })
             .collect();
         assert_eq!(runs_of(&rows, Class::Bridge, ABUTMENT), vec![(50.0, 175.0)]);
+    }
+
+    /// A carriageway 300 m long along `y`, drawn east (`east`) or west, 12 m off
+    /// the land, bridged from `from` to `to`; and `fixed`, a stretch of it already
+    /// on another structure.
+    fn run(name: &str, y: f64, east: bool, from: f64, to: f64, fixed: (f64, f64)) -> Run {
+        Run {
+            road: RoadId::new(name),
+            corridor: "E1".into(),
+            from,
+            to,
+            rows: (0..=60)
+                .map(|i| {
+                    let s = i as f64 * 5.0;
+                    let x = if east { s } else { 300.0 - s };
+                    let class = if (fixed.0..=fixed.1).contains(&s) {
+                        Class::Fixed
+                    } else {
+                        Class::Bridge
+                    };
+                    (s, Point3::new(x, y, 12.0), 12.0, class)
+                })
+                .collect(),
+            wet: false,
+        }
+    }
+
+    #[test]
+    fn two_carriageways_bridged_beside_each_other_share_a_deck_reaching_over_both() {
+        // The east carriageway bridged from x 100 to 200, the west from 110 to 220.
+        let runs = [
+            run("east", -3.0, true, 100.0, 200.0, (-1.0, -1.0)),
+            run("west", 3.0, false, 80.0, 190.0, (-1.0, -1.0)),
+        ];
+        let decks = shared_decks(&runs);
+        assert_eq!(decks.len(), 1);
+        let mut deck = decks[0].clone();
+        deck.sort_by_key(|(index, _, _)| *index);
+        // Each reaches out to x 100–220: the union.
+        assert_eq!(deck, vec![(0, 100.0, 220.0), (1, 80.0, 200.0)]);
+    }
+
+    #[test]
+    fn a_shared_deck_stops_short_of_a_structure_already_there() {
+        // The west carriageway is on another structure from x 90 to 105.
+        let runs = [
+            run("east", -3.0, true, 100.0, 200.0, (-1.0, -1.0)),
+            run("west", 3.0, false, 80.0, 190.0, (195.0, 210.0)),
+        ];
+        let mut deck = shared_decks(&runs).remove(0);
+        deck.sort_by_key(|(index, _, _)| *index);
+        assert_eq!(deck, vec![(0, 100.0, 220.0), (1, 80.0, 190.0)]);
+    }
+
+    #[test]
+    fn carriageways_bridged_at_different_places_are_on_decks_of_their_own() {
+        let runs = [
+            run("east", -3.0, true, 20.0, 80.0, (-1.0, -1.0)),
+            run("west", 3.0, false, 20.0, 80.0, (-1.0, -1.0)),
+        ];
+        // x 20–80 and x 220–280: never beside each other.
+        let decks = shared_decks(&runs);
+        assert_eq!(decks, vec![vec![(0, 20.0, 80.0)], vec![(1, 20.0, 80.0)]]);
     }
 }

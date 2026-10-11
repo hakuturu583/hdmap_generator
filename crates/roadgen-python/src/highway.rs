@@ -326,6 +326,7 @@ pub(crate) fn corridor(
     sunken: Option<Vec<(f64, f64)>>,
     sunken_depth: f64,
     end_transition: Option<f64>,
+    shared_deck: bool,
 ) -> PyResult<CorridorSpec> {
     let mut spec = CorridorSpec::new(name, centre.into_iter().map(point).collect(), design_speed)
         .map_err(PyValueError::new_err)?;
@@ -342,6 +343,7 @@ pub(crate) fn corridor(
     };
     spec.elevated = elevated.unwrap_or_default();
     spec.elevated_height = elevated_height;
+    spec.shared_deck = shared_deck;
     spec.sunken = sunken.unwrap_or_default();
     spec.sunken_depth = sunken_depth;
     spec.end_transition = end_transition;

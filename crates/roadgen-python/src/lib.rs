@@ -2106,6 +2106,10 @@ impl PyMap {
     /// `profile` is its vertical alignment as `[(station, height), ...]`, `lanes`
     /// the driving lanes each way. `elevated` and `sunken` are centre-line
     /// stretches lifted onto a viaduct or dropped into a cut-and-cover tunnel.
+    /// `shared_deck` puts both carriageways on one deck wherever both are on a
+    /// bridge or a viaduct over the same stretch — the elevated stretches and the
+    /// bridges the land asks for — with its piers down the median; otherwise each
+    /// carriageway has a deck of its own.
     /// Nothing goes on the map until its `plan()` is added with `add_plan`.
     #[pyo3(signature = (
         name,
@@ -2119,6 +2123,7 @@ impl PyMap {
         sunken = None,
         sunken_depth = 10.0,
         end_transition = None,
+        shared_deck = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_corridor(
@@ -2134,6 +2139,7 @@ impl PyMap {
         sunken: Option<Vec<(f64, f64)>>,
         sunken_depth: f64,
         end_transition: Option<f64>,
+        shared_deck: bool,
     ) -> PyResult<highway::PyCorridor> {
         let spec = highway::corridor(
             name,
@@ -2147,6 +2153,7 @@ impl PyMap {
             sunken,
             sunken_depth,
             end_transition,
+            shared_deck,
         )?;
         let handedness = self.builder_mut()?.metadata().handedness;
         Ok(highway::PyCorridor { spec, handedness })

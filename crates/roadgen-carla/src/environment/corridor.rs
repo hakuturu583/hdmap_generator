@@ -247,6 +247,11 @@ pub struct CorridorSpec {
     /// Centre-line stretches lifted onto a viaduct, and how far above the profile.
     pub elevated: Vec<(f64, f64)>,
     pub elevated_height: f64,
+    /// Whether the two carriageways share one deck where both are on a bridge or a
+    /// viaduct over the same stretch — the elevated stretches, and the bridges the
+    /// land asks for — as an urban viaduct does: one structure carrying both, its
+    /// piers down the median. Otherwise each carriageway has a deck of its own.
+    pub shared_deck: bool,
     /// Centre-line stretches dropped into a cut-and-cover tunnel, and how far under.
     pub sunken: Vec<(f64, f64)>,
     pub sunken_depth: f64,
@@ -272,6 +277,7 @@ impl CorridorSpec {
             structures: StructureMode::Auto,
             elevated: Vec::new(),
             elevated_height: 9.0,
+            shared_deck: false,
             sunken: Vec::new(),
             sunken_depth: 10.0,
             interchanges: Vec::new(),
@@ -1766,6 +1772,8 @@ impl CorridorSpec {
                 if to - from < 20.0 {
                     continue;
                 }
+                // Each carried stretch, with the centre-line stretch it runs beside.
+                let mut stretches: Vec<((f64, f64), Span)> = Vec::new();
                 for (c, pieces) in carriageways.iter().zip(&piece_names) {
                     let (t0, t1) = {
                         let (a, b) = (travel(c, from), travel(c, to));
@@ -1783,22 +1791,59 @@ impl CorridorSpec {
                             .expect("planned");
                         // Travel stations to stations along the road's own points.
                         let scale = length_of(&road.points) / (piece.to - piece.from).max(1e-9);
-                        plan.structures.push(StructurePlan {
-                            spans: vec![(
+                        let (ca, cb) = (centre_of(c, a), centre_of(c, b));
+                        stretches.push((
+                            (ca.min(cb), ca.max(cb)),
+                            (
                                 name.clone(),
                                 (a - piece.from) * scale,
                                 (b - piece.from) * scale,
-                            )],
-                            bridge: bridge.then_some(BridgeForm::Viaduct),
-                            tunnel: (!bridge).then_some(TunnelForm::CutAndCover),
-                        });
+                            ),
+                        ));
                     }
+                }
+                let decks = if bridge && self.shared_deck {
+                    shared_decks(stretches)
+                } else {
+                    stretches.into_iter().map(|(_, span)| vec![span]).collect()
+                };
+                for spans in decks {
+                    plan.structures.push(StructurePlan {
+                        spans,
+                        bridge: bridge.then_some(BridgeForm::Viaduct),
+                        tunnel: (!bridge).then_some(TunnelForm::CutAndCover),
+                    });
                 }
             }
         }
 
         Ok(plan)
     }
+}
+
+/// A stretch of a road a structure carries: the road, and from and to along it.
+type Span = (String, f64, f64);
+
+/// The carried stretches of an elevated stretch gathered onto shared decks: the
+/// longest first, each deck taking in every other stretch that runs beside it —
+/// whose centre-line stretch lies within its own. A deck is laid out along its
+/// first stretch, so one that reached past the first's ends would leave the rest
+/// outside its outline; a carriageway broken by a slip road where the other is
+/// not is carried by the deck of the unbroken one, and two broken in different
+/// places by a deck for each pair of pieces that lie beside each other.
+fn shared_decks(mut stretches: Vec<((f64, f64), Span)>) -> Vec<Vec<Span>> {
+    stretches.sort_by(|a, b| (b.0 .1 - b.0 .0).total_cmp(&(a.0 .1 - a.0 .0)));
+    let mut decks: Vec<((f64, f64), Vec<Span>)> = Vec::new();
+    for (range, span) in stretches {
+        match decks
+            .iter_mut()
+            .find(|(first, _)| range.0 >= first.0 - 1.0 && range.1 <= first.1 + 1.0)
+        {
+            Some((_, spans)) => spans.push(span),
+            None => decks.push((range, vec![span])),
+        }
+    }
+    decks.into_iter().map(|(_, spans)| spans).collect()
 }
 
 impl CorridorPlan {
@@ -1991,6 +2036,63 @@ mod tests {
             .filter(|c| matches!(c, ConnectionPlan::Follows { .. }))
             .count();
         assert_eq!(follows, 6, "three joins on each carriageway");
+    }
+
+    /// The viaducts a corridor along y = 0, elevated from 200 m to 1400 m, asks
+    /// for: each as the roads it carries.
+    fn viaducts(shared_deck: bool, ramp: bool) -> Vec<Vec<String>> {
+        let mut spec = CorridorSpec::new(
+            "Shuto",
+            vec![Point3::new(-800.0, 0.0, 0.0), Point3::new(900.0, 0.0, 0.0)],
+            60.0,
+        )
+        .unwrap();
+        spec.elevated = vec![(200.0, 1400.0)];
+        spec.shared_deck = shared_deck;
+        if ramp {
+            // Off the right carriageway in the middle of the viaduct.
+            spec.ramps.push(RampSite {
+                name: "Off".into(),
+                on: false,
+                side: Side::Right,
+                at: 800.0,
+                end: Point3::new(100.0, -80.0, 9.0),
+            });
+        }
+        let plan = spec.plan(TrafficHandedness::RightHand).unwrap();
+        plan.structures
+            .iter()
+            .filter(|s| s.bridge == Some(BridgeForm::Viaduct))
+            .map(|s| s.spans.iter().map(|(road, _, _)| road.clone()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn each_carriageway_has_a_deck_of_its_own_unless_they_share_one() {
+        assert_eq!(
+            viaducts(false, false),
+            vec![
+                vec!["shuto_left_0".to_owned()],
+                vec!["shuto_right_0".to_owned()]
+            ]
+        );
+        assert_eq!(
+            viaducts(true, false),
+            vec![vec!["shuto_left_0".to_owned(), "shuto_right_0".to_owned()]]
+        );
+    }
+
+    #[test]
+    fn a_carriageway_broken_by_a_slip_road_shares_the_deck_of_the_unbroken_one() {
+        assert_eq!(viaducts(false, true).len(), 3);
+        assert_eq!(
+            viaducts(true, true),
+            vec![vec![
+                "shuto_left_0".to_owned(),
+                "shuto_right_0".to_owned(),
+                "shuto_right_1".to_owned()
+            ]]
+        );
     }
 
     #[test]

@@ -105,6 +105,26 @@ def test_an_elevated_corridor_crosses_a_town_on_viaducts():
         assert m.road_form(road) not in ("motorway", "slip_road")
 
 
+def test_an_elevated_corridor_on_a_shared_deck_is_one_viaduct_on_piers_down_the_median():
+    m = roadgen.Map(name="shuto")
+    corridor = urban_corridor(m, elevated=[(200.0, 1400.0)], shared_deck=True)
+    plan = corridor.plan()
+    # Both carriageways on one viaduct, said in the plan.
+    [(form, spans)] = [s for s in plan.structures if s[0] == "viaduct"]
+    assert sorted(road for road, _, _ in spans) == ["shuto_left_0", "shuto_right_0"]
+    m.add_plan(plan)
+    m.validate()
+    assert m.generation_notes() == []
+    [viaduct] = [s for s in m.structure_ids() if m.structure(s)["form"] == "viaduct"]
+    deck = m.structure(viaduct)
+    assert len(deck["carries"]) == 2
+    piers = [s for s in deck["supports"] if s["kind"] == "pier"]
+    assert piers
+    # The median is 3 m at 60 km/h: every pier stands within it.
+    for pier in piers:
+        assert all(abs(y) <= 1.5 for _, y, _ in pier["footprint"])
+
+
 def test_a_sunken_corridor_runs_under_the_town():
     m = roadgen.Map(name="shuto")
     corridor = urban_corridor(m, sunken=[(200.0, 1400.0)])

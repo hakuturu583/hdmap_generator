@@ -776,7 +776,9 @@ pub fn slug(name: &str) -> String {
 ///
 /// Piers are spaced evenly at no more than the spec's spacing and kept off the
 /// carriageway of every road below; one that has nowhere to stand within half a
-/// span of where it belongs is left out.
+/// span of where it belongs is left out. Where the deck carries roads side by
+/// side, no more than a [`MEDIAN`] apart, they stand in a single row down the
+/// middle of the gap between them rather than under each road.
 pub fn place(
     map: &mut Map,
     spans: &[RoadSpan],
@@ -971,6 +973,56 @@ fn place_with(
                     base: None,
                 });
             }
+            // The other carried roads running beside the first at a frame of it:
+            // `None` where there are none, or else the middle of each gap between
+            // two neighbours across the deck — the median — as offsets to its left.
+            let beside_here = |frame: &Frame3, left: f64, right: f64| -> Option<Vec<f64>> {
+                let mut bands = vec![(right, left)];
+                for (span, other) in spans[1..].iter().zip(&others) {
+                    // Another stretch of the same road is further along it.
+                    if span.road == spans[0].road {
+                        continue;
+                    }
+                    let (row, _) = other.locate(frame.origin);
+                    let (_, near, l, r) = other.rows[row];
+                    let (dx, dy) = (
+                        near.origin.x - frame.origin.x,
+                        near.origin.y - frame.origin.y,
+                    );
+                    // Only where it passes alongside, not off past its end.
+                    if (dx * frame.tangent.x() + dy * frame.tangent.y()).abs() > 3.0 {
+                        continue;
+                    }
+                    let across = frame.left.get();
+                    let norm = (across.x * across.x + across.y * across.y).sqrt().max(1e-9);
+                    let lateral = |p: Point3| {
+                        ((p.x - frame.origin.x) * across.x + (p.y - frame.origin.y) * across.y)
+                            / norm
+                    };
+                    let (a, b) = (lateral(near.offset(l)), lateral(near.offset(r)));
+                    bands.push((a.min(b), a.max(b)));
+                }
+                if bands.len() < 2 {
+                    return None;
+                }
+                bands.sort_by(|a, b| a.0.total_cmp(&b.0));
+                // Two roads further apart than a median are each at their own edge
+                // of the deck, not side by side.
+                let gaps: Vec<(f64, f64)> = bands
+                    .windows(2)
+                    .map(|pair| (pair[0].1, pair[1].0))
+                    .filter(|(from, to)| to - from <= MEDIAN)
+                    .collect();
+                if gaps.is_empty() {
+                    return None;
+                }
+                Some(
+                    gaps.into_iter()
+                        .filter(|(from, to)| to - from > 1e-6)
+                        .map(|(from, to)| (from + to) / 2.0)
+                        .collect(),
+                )
+            };
             // The piers, evenly between the abutments, off every road below.
             let length = spans[0].length();
             let bays = (length / bridge.pier_spacing).ceil() as usize;
@@ -997,10 +1049,14 @@ fn place_with(
                             let top = underside(candidate);
                             let heading = heading_at(&frame);
                             let width = high - low;
-                            let columns: Vec<f64> = if width <= 15.0 {
-                                vec![(high + low) / 2.0]
-                            } else {
-                                vec![low + 3.0, high - 3.0]
+                            let columns: Vec<f64> = match beside_here(&frame, left, right) {
+                                // Roads side by side on one deck: a single row of
+                                // columns down the median, one in each gap between
+                                // them, or under the deck's middle where they touch.
+                                Some(gaps) if gaps.is_empty() => vec![(high + low) / 2.0],
+                                Some(gaps) => gaps,
+                                None if width <= 15.0 => vec![(high + low) / 2.0],
+                                None => vec![low + 3.0, high - 3.0],
                             };
                             let rings: Vec<Vec<Point3>> = columns
                                 .iter()
