@@ -68,6 +68,7 @@ impl PadSpec {
                 points: edge,
                 closed: true,
             }],
+            ..Landforms::default()
         }
     }
 }

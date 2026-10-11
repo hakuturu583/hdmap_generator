@@ -556,8 +556,16 @@ impl Map {
             return Ok(Vec::new());
         };
         let lanes = self.lanes_of(road);
+        // A vertex where a bridge or tunnel begins and ends, too, so the road's
+        // edges stop meeting the land exactly there.
         let required = required_stations(
-            entry.sections.iter().map(|section| section.station),
+            entry.sections.iter().map(|section| section.station).chain(
+                entry
+                    .structure
+                    .spans()
+                    .iter()
+                    .flat_map(|span| [span.from, span.to]),
+            ),
             lanes.iter().map(|lane| &lane.width),
             lanes.iter().map(|lane| &lane.height),
             self.metadata.sampling,

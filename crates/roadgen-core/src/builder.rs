@@ -1117,12 +1117,22 @@ impl Generator {
     fn build_reference_geometry(&mut self) -> Result<(), BuildError> {
         let config = self.config();
         for draft in &self.builder.roads {
+            // The ends of every bridge and tunnel the caller put on the road are
+            // vertices of it, the way a section boundary is.
+            let structure_ends = self
+                .builder
+                .structures
+                .iter()
+                .flat_map(|(spans, _)| spans.iter())
+                .filter(|span| span.road == draft.id)
+                .flat_map(|span| [span.from, span.to]);
             let stations = crate::map::required_stations(
                 draft
                     .spec
                     .cross_sections
                     .iter()
-                    .map(|section| section.station),
+                    .map(|section| section.station)
+                    .chain(structure_ends),
                 draft.spec.all_lanes().map(|lane| &lane.width),
                 draft.spec.all_lanes().map(|lane| &lane.height),
                 config,
@@ -1309,6 +1319,12 @@ impl Generator {
             let draft = self.builder.draft_mut(&road.0)?;
             draft.spec.reference_line = reference_line;
             draft.spec.map_stations(&moved);
+            for (spans, _) in &mut self.builder.structures {
+                for span in spans.iter_mut().filter(|span| span.road == road.0) {
+                    span.from = moved(span.from);
+                    span.to = moved(span.to);
+                }
+            }
             for (_, object) in &mut self.builder.objects {
                 if let ObjectSpec::AcrossRoad {
                     road: at, station, ..
@@ -1357,6 +1373,13 @@ impl Generator {
             let draft = self.builder.draft_mut(&road)?;
             draft.spec.reference_line = reference_line;
             draft.spec.map_stations(&moved);
+            // A bridge or tunnel the caller put on the road moves with it too.
+            for (spans, _) in &mut self.builder.structures {
+                for span in spans.iter_mut().filter(|span| span.road == road) {
+                    span.from = moved(span.from);
+                    span.to = moved(span.to);
+                }
+            }
             for (_, object) in &mut self.builder.objects {
                 if let ObjectSpec::AcrossRoad {
                     road: at, station, ..

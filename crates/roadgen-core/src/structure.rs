@@ -605,6 +605,13 @@ impl Strip {
 
 /// The plan every carried stretch adds up to, with `curb` added round it: sampled
 /// along the first stretch, widened at each sample to take in the others.
+pub fn outline(map: &Map, spans: &[RoadSpan], curb: f64) -> Result<Vec<Point3>, StructureError> {
+    if spans.is_empty() {
+        return Err(StructureError::Span("an outline of nothing".into()));
+    }
+    outline_of(map, spans, curb)
+}
+
 fn outline_of(map: &Map, spans: &[RoadSpan], curb: f64) -> Result<Vec<Point3>, StructureError> {
     let primary = Strip::of(map, &spans[0])?;
     let mut bounds: Vec<(f64, f64)> = primary.rows.iter().map(|row| (row.2, row.3)).collect();
@@ -755,6 +762,11 @@ pub fn place(
             )));
         }
     }
+    // Each end moved onto the nearest vertex the road already has, so the road's
+    // lanes, built before the structure was known, have a vertex exactly where it
+    // begins and ends — which is where the land stops meeting them. A structure the
+    // builder was told of before the roads were built has its ends among the
+    // vertices already, and does not move.
     let spans: Vec<RoadSpan> = spans
         .iter()
         .map(|span| {
@@ -762,9 +774,30 @@ pub fn place(
                 .road(&span.road)
                 .and_then(|road| road.horizontal_length().ok())
                 .unwrap_or(span.to);
-            RoadSpan::new(span.road.clone(), span.from.max(0.0), span.to.min(length))
+            let stations = map.vertex_stations(&span.road).unwrap_or_default();
+            let snap = |station: f64| {
+                stations
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| (a - station).abs().total_cmp(&(b - station).abs()))
+                    .filter(|nearest| {
+                        (nearest - station).abs() <= map.metadata.sampling.max_segment_length
+                    })
+                    .unwrap_or(station)
+            };
+            RoadSpan::new(
+                span.road.clone(),
+                snap(span.from.max(0.0)),
+                snap(span.to.min(length)),
+            )
         })
         .collect();
+    if let Some(span) = spans.iter().find(|span| span.to - span.from < 1.0) {
+        return Err(StructureError::Span(format!(
+            "{} {:.1}–{:.1} is too short to carry",
+            span.road, span.from, span.to
+        )));
+    }
     let id = structure_id(map, &spans, spec);
     if map.structures.contains(&id) {
         return Err(StructureError::Duplicate(id.to_string()));
@@ -1088,7 +1121,7 @@ fn intersect(p: Point3, q: Point3, r: Point3, s: Point3) -> Option<(f64, f64)> {
 
 /// The stretch of `road` within half of `other`'s width (and `margin` more) of
 /// where it crosses `other` at `station`.
-fn span_across(
+pub fn span_across(
     map: &Map,
     road: &RoadId,
     station: f64,
@@ -1233,6 +1266,28 @@ pub fn refresh_interchanges(map: &mut Map) {
         entry.roads = roads;
         entry.structures = structures;
     }
+}
+
+/// Whether a movement through a junction is carried too: both the roads it joins
+/// are on a structure where it joins them — a junction on a viaduct.
+pub fn connector_carried(map: &Map, road: &crate::map::Road) -> bool {
+    if !road.is_connector() {
+        return false;
+    }
+    let carried_end = |target: &Option<crate::topology::RoadLinkTarget>| {
+        let Some(crate::topology::RoadLinkTarget::Road(endpoint)) = target else {
+            return false;
+        };
+        let Some(other) = map.road(&endpoint.road) else {
+            return false;
+        };
+        let station = match endpoint.end {
+            crate::topology::RoadEnd::Start => 0.0,
+            crate::topology::RoadEnd::End => other.horizontal_length().unwrap_or(0.0),
+        };
+        other.structure.at(station).is_some()
+    };
+    carried_end(&road.link.predecessor) && carried_end(&road.link.successor)
 }
 
 /// How far below the road surface the structure at a crossing reaches: a bridge's

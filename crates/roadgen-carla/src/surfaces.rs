@@ -146,10 +146,15 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             }
             layout.surfaces(&within, map_name, &mut ordinal, &mut meshes);
             layout.markings(&within, map_name, config, &mut ordinal, &mut meshes);
-            if let Some([left, right]) =
-                layout.flanks(&within, facing, map_name, &mut ordinal, &mut meshes)
-            {
-                land.section(left, right);
+            // The land meets the road only where the road is on the ground: a
+            // stretch on a bridge has the land under it, one in a tunnel the land
+            // over it, and neither has a verge.
+            for run in at_grade(map, road, &within) {
+                if let Some([left, right]) =
+                    layout.flanks(run, facing, map_name, &mut ordinal, &mut meshes)
+                {
+                    land.section(left, right);
+                }
             }
         }
     }
@@ -169,9 +174,62 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
     if let Some(terrain) = land.mesh(ground.as_ref(), verge, map_name, &mut ordinal) {
         meshes.push(terrain);
     }
+    meshes.extend(crate::structures::meshes(
+        map,
+        ground.as_ref(),
+        map_name,
+        &mut ordinal,
+    ));
     meshes.extend(crate::barriers::berms(map, map_name, &mut ordinal));
     meshes.retain(|mesh| !mesh.is_empty());
     meshes
+}
+
+/// The runs of `within` that are on the ground, each with at least two rungs: the
+/// whole of it for a road on no structure, the stretches between its bridges and
+/// tunnels otherwise. A rung on a span's boundary is in the run on either side.
+fn at_grade<'c, 'r>(map: &Map, road: &Road, within: &'c [Cross<'r>]) -> Vec<&'c [Cross<'r>]> {
+    if roadgen_core::structure::connector_carried(map, road) {
+        return Vec::new();
+    }
+    if road.structure.is_empty() {
+        return vec![within];
+    }
+    let carried = |station: f64| {
+        road.structure
+            .spans()
+            .iter()
+            .any(|span| station > span.from + 1e-6 && station < span.to - 1e-6)
+    };
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    for (index, cross) in within.iter().enumerate() {
+        let station = cross.rung.station;
+        if carried(station) {
+            if let Some(from) = start.take() {
+                runs.push(&within[from..index]);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+        // A rung on a boundary ends the run before a span and starts the one
+        // after it.
+        let boundary = road
+            .structure
+            .spans()
+            .iter()
+            .any(|span| (station - span.from).abs() <= 1e-6);
+        if boundary {
+            if let Some(from) = start {
+                runs.push(&within[from..=index]);
+            }
+            start = None;
+        }
+    }
+    if let Some(from) = start {
+        runs.push(&within[from..]);
+    }
+    runs.into_iter().filter(|run| run.len() >= 2).collect()
 }
 
 /// Where each junction is: the mean of the midpoints of the roads through it.
@@ -254,9 +312,22 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
     let mut samples = map.vertex_samples(&road.id).ok()?;
     // A rung wherever the pavement changes, too, so that the surface can change
     // material there rather than at the next vertex, which on a straight road is
-    // its far end.
+    // its far end; and wherever a bridge or a tunnel begins or ends, so the land
+    // stops meeting the road exactly there.
     let (first, last) = (samples.first()?.station, samples.last()?.station);
-    for &(station, _) in road.pavement.spans() {
+    let boundaries = road
+        .pavement
+        .spans()
+        .iter()
+        .map(|&(station, _)| station)
+        .chain(
+            road.structure
+                .spans()
+                .iter()
+                .flat_map(|span| [span.from, span.to]),
+        )
+        .collect::<Vec<f64>>();
+    for &station in &boundaries {
         if station > first + 1e-6
             && station < last - 1e-6
             && !samples

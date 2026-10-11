@@ -84,6 +84,16 @@ impl Field {
         if samples.is_empty() {
             return None;
         }
+        // Not a road on a bridge or in a tunnel: the ground is under the one and
+        // over the other, and neither says what height it is.
+        let carried = crate::structures::Carried::of(map);
+        let samples: Vec<Point3> = with_reference_lines(map, samples)
+            .into_iter()
+            .filter(|point| carried.is_empty() || !carried.contains(point))
+            .collect();
+        if samples.is_empty() {
+            return None;
+        }
         let buildings: Vec<Point3> = map
             .building_parts
             .iter()
@@ -91,7 +101,7 @@ impl Field {
             .collect();
         // The verge is what the ground is drawn up to, and it reaches past the road.
         Field::from_samples(
-            with_reference_lines(map, samples),
+            samples,
             &buildings,
             config.ground_extent + config.verge_width,
             config.ground_cell,

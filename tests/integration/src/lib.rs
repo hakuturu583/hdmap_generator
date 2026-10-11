@@ -4,6 +4,7 @@
 //! independent OpenDRIVE reader are written once and used by every test file.
 
 pub mod clipgt_read;
+pub mod highway;
 pub mod mine;
 pub mod opendrive_eval;
 pub mod scenarios;
