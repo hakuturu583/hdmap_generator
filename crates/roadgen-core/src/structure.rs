@@ -1189,10 +1189,10 @@ impl RoadPlan {
     fn of(map: &Map, road: &crate::map::Road) -> RoadPlan {
         let track = track(map, &road.id);
         let (mut lefts, mut rights) = (Vec::new(), Vec::new());
-        for (station, _) in &track {
-            if let Some((left, right)) = inset_edges(map, road, *station) {
-                lefts.push((*station, left));
-                rights.push((*station, right));
+        for station in rim_stations(map, road, &track) {
+            if let Some((left, right)) = inset_edges(map, road, station) {
+                lefts.push((station, left));
+                rights.push((station, right));
             }
         }
         rights.reverse();
@@ -1211,6 +1211,28 @@ impl RoadPlan {
     fn meets(&self, other: &RoadPlan) -> bool {
         boxes_meet(&self.bounds, &other.bounds)
     }
+}
+
+/// Where a road's outline turns: every vertex the road is drawn with — the
+/// reference line's, where a cross-section takes over, where a lane's width
+/// changes — and a hair before each cross-section, so that where lanes appear or
+/// end the outline steps out or in there rather than slanting from the vertex
+/// before. A straight road's reference line alone has only its two ends.
+fn rim_stations(map: &Map, road: &crate::map::Road, track: &[(f64, Point3)]) -> Vec<f64> {
+    let mut stations: Vec<f64> = track.iter().map(|(station, _)| *station).collect();
+    if let Ok(samples) = map.vertex_samples(&road.id) {
+        stations.extend(samples.iter().map(|sample| sample.station));
+    }
+    let length = track.last().map_or(0.0, |(station, _)| *station);
+    stations.extend(
+        road.sections
+            .iter()
+            .map(|section| section.station - 1e-6)
+            .filter(|station| *station > 0.0 && *station < length),
+    );
+    stations.sort_by(f64::total_cmp);
+    stations.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    stations
 }
 
 /// A road's outer edges at a station, each [`OUTLINE_INSET`] in from the edge.
@@ -1332,6 +1354,23 @@ fn overlap_outlines(
             ));
         }
     }
+    if hits.is_empty() {
+        // No edge crosses an edge, yet one outline may lie inside the other — the
+        // two run side by side end to end, or one is drawn wholly within the
+        // other. Where any point of either outline is inside the other's, the two
+        // share ground: one crossing, at the middle of those points.
+        if let Some(inside) = overlap_inside(pa, pb) {
+            out.push(Crossing {
+                a: a.id.clone(),
+                a_station: inside.0,
+                a_z: inside.2,
+                b: b.id.clone(),
+                b_station: inside.1,
+                b_z: inside.3,
+            });
+        }
+        return;
+    }
     hits.sort_by(|x, y| x.0.total_cmp(&y.0));
     let mut stretches: Vec<Vec<(f64, f64, f64, f64)>> = Vec::new();
     for hit in hits {
@@ -1357,6 +1396,69 @@ fn overlap_outlines(
             b_z: mean(|h| h.3),
         });
     }
+}
+
+/// Where two outlines whose edges never cross overlap: the points of each outline
+/// that are inside the other's — its vertices, and the middle of each edge, so a
+/// straight road drawn with only its ends is asked along its length too — as
+/// (station on a, station on b, height of a, height of b), averaged. Nothing when
+/// no point of either is inside the other.
+fn overlap_inside(pa: &RoadPlan, pb: &RoadPlan) -> Option<(f64, f64, f64, f64)> {
+    let mut inside: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for (own, other, flip) in [(pa, pb, false), (pb, pa, true)] {
+        let count = own.rim.len();
+        for k in 0..count {
+            let (p, q) = (own.rim[k], own.rim[(k + 1) % count]);
+            let middle = (
+                (p.0 + q.0) / 2.0,
+                Point3::new(
+                    (p.1.x + q.1.x) / 2.0,
+                    (p.1.y + q.1.y) / 2.0,
+                    (p.1.z + q.1.z) / 2.0,
+                ),
+            );
+            for (station, point) in [p, middle] {
+                if !ring_contains(&other.ring, [point.x, point.y]) {
+                    continue;
+                }
+                let Some((there, height)) = project(&other.track, point) else {
+                    continue;
+                };
+                inside.push(if flip {
+                    (there, station, height, point.z)
+                } else {
+                    (station, there, point.z, height)
+                });
+            }
+        }
+    }
+    if inside.is_empty() {
+        return None;
+    }
+    let n = inside.len() as f64;
+    let mean = |pick: fn(&(f64, f64, f64, f64)) -> f64| inside.iter().map(pick).sum::<f64>() / n;
+    Some((mean(|h| h.0), mean(|h| h.1), mean(|h| h.2), mean(|h| h.3)))
+}
+
+/// The station on a reference line nearest `point` in plan, and the line's height
+/// there.
+fn project(track: &[(f64, Point3)], point: Point3) -> Option<(f64, f64)> {
+    let mut best: Option<(f64, f64, f64)> = None;
+    for pair in track.windows(2) {
+        let ((s0, a), (s1, b)) = (pair[0], pair[1]);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let length = dx * dx + dy * dy;
+        let t = if length < 1e-18 {
+            0.0
+        } else {
+            (((point.x - a.x) * dx + (point.y - a.y) * dy) / length).clamp(0.0, 1.0)
+        };
+        let distance = (point.x - a.x - t * dx).hypot(point.y - a.y - t * dy);
+        if best.is_none_or(|(d, _, _)| distance < d) {
+            best = Some((distance, s0 + (s1 - s0) * t, a.z + (b.z - a.z) * t));
+        }
+    }
+    best.map(|(_, station, height)| (station, height))
 }
 
 /// Whether two plan bounds from [`bounds`] share any ground.
