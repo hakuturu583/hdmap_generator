@@ -101,9 +101,22 @@ impl Run {
             .map_or(Point3::new(0.0, 0.0, 0.0), |row| row.1)
     }
 
+    /// The direction of the road in plan at sample `index`, from its neighbours.
+    fn direction(&self, index: usize) -> [f64; 2] {
+        let a = self.rows[index.saturating_sub(1)].1;
+        let b = self.rows[(index + 1).min(self.rows.len() - 1)].1;
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let length = dx.hypot(dy).max(1e-9);
+        [dx / length, dy / length]
+    }
+
     /// Whether `other`, on another road, runs beside this run for some of its
-    /// length: a point of its run passes within [`BESIDE`] of a point inside this
-    /// one, not off past either end of it.
+    /// length: a point inside its run lies square to the side of a point inside
+    /// this one — projected onto this run, it falls within it, not off past
+    /// either end — no further off than [`BESIDE`] and not on the line itself,
+    /// with the two running the same way or opposite ways. Two pieces of one
+    /// carriageway end to end are never beside each other: one runs on from the
+    /// other along its line, not to its side.
     fn beside(&self, other: &Run) -> bool {
         if self.road == other.road {
             return false;
@@ -112,17 +125,38 @@ impl Run {
             let station = run.rows[index].0;
             station > run.from + 1e-6 && station < run.to - 1e-6
         };
-        other
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| inside(other, *index))
-            .any(|(_, row)| {
-                let (near, distance) = self.nearest(row.1);
-                distance <= BESIDE && inside(self, near)
+        (0..other.rows.len())
+            .filter(|index| inside(other, *index))
+            .any(|index| {
+                let p = other.rows[index].1;
+                let (near, _) = self.nearest(p);
+                if !inside(self, near) {
+                    return false;
+                }
+                let here = self.rows[near].1;
+                let [tx, ty] = self.direction(near);
+                let (dx, dy) = (p.x - here.x, p.y - here.y);
+                let along = dx * tx + dy * ty;
+                let lateral = (tx * dy - ty * dx).abs();
+                // Half the way to the next sample either side: square to this one.
+                let half = [near.saturating_sub(1), (near + 1).min(self.rows.len() - 1)]
+                    .iter()
+                    .map(|n| self.rows[*n].1.horizontal_distance_to(here))
+                    .fold(0.0, f64::max)
+                    / 2.0
+                    + 0.5;
+                let [ox, oy] = other.direction(index);
+                along.abs() <= half
+                    && lateral > 0.5
+                    && lateral <= BESIDE
+                    && (ox * tx + oy * ty).abs() >= PARALLEL
             })
     }
 }
+
+/// How nearly two carriageways have to run the same way, or opposite ways, to
+/// share a deck: the cosine of the angle between them.
+const PARALLEL: f64 = 0.94;
 
 /// How far apart two carriageways' reference lines may be and still share a deck,
 /// metres: a median and a carriageway's width, about.
@@ -728,6 +762,64 @@ mod tests {
         let mut deck = shared_decks(&runs).remove(0);
         deck.sort_by_key(|(index, _, _)| *index);
         assert_eq!(deck, vec![(0, 100.0, 220.0), (1, 80.0, 190.0)]);
+    }
+
+    /// A piece of a carriageway along `y` from x `x0` to `x0 + 300`, drawn east,
+    /// 12 m off the land, bridged from `from` to `to` along it.
+    fn piece(name: &str, y: f64, x0: f64, from: f64, to: f64) -> Run {
+        let mut run = run(name, y, true, from, to, (-1.0, -1.0));
+        for row in &mut run.rows {
+            row.1.x += x0;
+        }
+        run
+    }
+
+    #[test]
+    fn a_bridge_over_the_join_of_two_pieces_of_one_carriageway_is_not_one_deck() {
+        // Split at a slip-road nose: one piece ends at x 300, the next begins 20 m
+        // on; the land bridges the last 100 m of the one and the first of the next.
+        let runs = [
+            piece("left_0", -3.0, 0.0, 200.0, 300.0),
+            piece("left_1", -3.0, 320.0, 0.0, 100.0),
+        ];
+        assert!(!runs[0].beside(&runs[1]) && !runs[1].beside(&runs[0]));
+        assert_eq!(
+            shared_decks(&runs),
+            vec![vec![(0, 200.0, 300.0)], vec![(1, 0.0, 100.0)]]
+        );
+    }
+
+    #[test]
+    fn a_road_passing_across_a_bridge_nearby_does_not_share_its_deck() {
+        // Square across the first, 10 m to its side at the nearest.
+        let mut across = run("across", 0.0, true, 50.0, 250.0, (-1.0, -1.0));
+        for row in &mut across.rows {
+            row.1 = Point3::new(150.0, row.0 - 160.0, 12.0);
+        }
+        let runs = [run("east", -3.0, true, 100.0, 200.0, (-1.0, -1.0)), across];
+        assert!(!runs[0].beside(&runs[1]) && !runs[1].beside(&runs[0]));
+        assert_eq!(shared_decks(&runs).len(), 2);
+    }
+
+    #[test]
+    fn two_pieces_of_one_carriageway_share_the_deck_of_the_other_beside_both() {
+        // The other carriageway, drawn west along x 600 to 0, bridged from x 200
+        // to 420: beside both pieces.
+        let mut other = run("right_0", 3.0, false, 180.0, 400.0, (-1.0, -1.0));
+        other.rows = (0..=120)
+            .map(|i| {
+                let s = i as f64 * 5.0;
+                (s, Point3::new(600.0 - s, 3.0, 12.0), 12.0, Class::Bridge)
+            })
+            .collect();
+        let runs = [
+            piece("left_0", -3.0, 0.0, 200.0, 300.0),
+            piece("left_1", -3.0, 320.0, 0.0, 100.0),
+            other,
+        ];
+        let decks = shared_decks(&runs);
+        assert_eq!(decks.len(), 1, "{decks:?}");
+        assert_eq!(decks[0].len(), 3);
     }
 
     #[test]

@@ -311,3 +311,40 @@ fn an_elevated_motorway_on_a_shared_deck_is_one_viaduct_on_piers_down_the_median
         "a parapet over the median"
     );
 }
+
+#[test]
+fn carriageways_leaving_the_viaduct_at_different_places_share_its_deck_wherever_side_by_side() {
+    let mut spec = corridor(true);
+    spec.shared_deck = true;
+    // A slip road down off each carriageway, at different stations.
+    spec.ramps.push(RampSite {
+        name: "West Off".into(),
+        on: false,
+        side: Side::Right,
+        at: 700.0,
+        end: Point3::new(60.0, -90.0, 0.0),
+    });
+    spec.ramps.push(RampSite {
+        name: "East Off".into(),
+        on: false,
+        side: Side::Left,
+        at: 1000.0,
+        end: Point3::new(40.0, 90.0, 0.0),
+    });
+    let (map, notes) = generate(spec, |_| {});
+    assert!(notes.is_empty(), "{notes:#?}");
+    let viaducts: Vec<_> = map
+        .structures
+        .iter()
+        .filter(|s| s.kind.form() == "viaduct")
+        .collect();
+    // Before the first slip road, between the two and after the second: each a
+    // deck of both carriageways.
+    assert_eq!(viaducts.len(), 3, "{viaducts:#?}");
+    for viaduct in &viaducts {
+        let roads: Vec<&str> = viaduct.carries.iter().map(|s| s.road.as_str()).collect();
+        assert_eq!(roads.len(), 2, "{roads:?}");
+        assert_eq!(roads.iter().filter(|r| r.contains("_left_")).count(), 1);
+        assert_eq!(roads.iter().filter(|r| r.contains("_right_")).count(), 1);
+    }
+}
