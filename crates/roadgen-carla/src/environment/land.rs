@@ -302,17 +302,37 @@ pub fn at_grade_edges(
             .copied()
             .filter(|s| *s >= from - 1e-6 && *s <= to + 1e-6)
             .collect();
-        if within.len() != left.points().len() || within.len() != right.points().len() {
+        // The boundaries' vertices are the stations', one for one; should they ever
+        // not be, the edges are laid out again from the road's frames, which is
+        // where the boundaries came from.
+        let pairs: Vec<(Point3, Point3)> =
+            if within.len() == left.points().len() && within.len() == right.points().len() {
+                left.points()
+                    .iter()
+                    .copied()
+                    .zip(right.points().iter().copied())
+                    .collect()
+            } else {
+                within
+                    .iter()
+                    .filter_map(|&station| {
+                        let frame = road.frame_at(station, sampling).ok()?;
+                        let (l, r) = roadgen_core::structure::road_extent(map, &road.id, station)?;
+                        Some((frame.offset(l), frame.offset(r)))
+                    })
+                    .collect()
+            };
+        if pairs.len() != within.len() {
             continue;
         }
-        for ((station, a), b) in within.into_iter().zip(left.points()).zip(right.points()) {
+        for (station, (a, b)) in within.into_iter().zip(pairs) {
             if rows
                 .last()
                 .is_some_and(|last| (last.0 - station).abs() < 1e-6)
             {
                 continue;
             }
-            rows.push((station, *a, *b));
+            rows.push((station, a, b));
         }
     }
     let mut runs = Vec::new();

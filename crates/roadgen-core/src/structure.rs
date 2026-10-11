@@ -729,6 +729,25 @@ pub fn place(
     spans: &[RoadSpan],
     spec: &StructureSpec,
 ) -> Result<StructureId, StructureError> {
+    place_with(map, spans, spec, true)
+}
+
+/// [`place`], for a structure whose ends the roads were built with vertices at:
+/// the builder's own, which it was told of before it built the lanes.
+pub(crate) fn place_built(
+    map: &mut Map,
+    spans: &[RoadSpan],
+    spec: &StructureSpec,
+) -> Result<StructureId, StructureError> {
+    place_with(map, spans, spec, false)
+}
+
+fn place_with(
+    map: &mut Map,
+    spans: &[RoadSpan],
+    spec: &StructureSpec,
+    snapping: bool,
+) -> Result<StructureId, StructureError> {
     spec.check().map_err(StructureError::Spec)?;
     if spans.is_empty() {
         return Err(StructureError::Span(
@@ -776,6 +795,9 @@ pub fn place(
                 .unwrap_or(span.to);
             let stations = map.vertex_stations(&span.road).unwrap_or_default();
             let snap = |station: f64| {
+                if !snapping {
+                    return station;
+                }
                 stations
                     .iter()
                     .copied()

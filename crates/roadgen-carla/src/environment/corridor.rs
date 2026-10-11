@@ -881,6 +881,9 @@ impl CorridorSpec {
             } else {
                 motorway_z - 1.8 - 0.5 - 4.5
             };
+            // The overpass reaches out far enough for the land to come down from
+            // its abutments to the motorway at a fill's slope.
+            let half_corridor = half_corridor + (target - motorway_z).abs() * 1.8;
             let flat = half_corridor + 5.0;
             let mut cross_pvis = vec![(0.0, ground_at(0.0))];
             if c_station - flat > 1.0 {
@@ -1159,7 +1162,8 @@ impl CorridorSpec {
             for nose in &c.noses {
                 if nose.at - GAP / 2.0 - from < 30.0 {
                     return Err(format!(
-                        "{}: slip roads at {:.0} m are too close together on the {} carriageway",
+                        "{}: the slip road at {:.0} m on the {} carriageway is too close to another, \
+                         or to the corridor's start",
                         self.name,
                         centre_of(c, nose.at),
                         c.side.as_str()

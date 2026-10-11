@@ -256,13 +256,16 @@ pub(crate) fn separate(map: &mut Map) -> Vec<String> {
                 gap - OVERPASS_DECK
             ));
         }
+        // Over the lower road, and as far again past it as the land needs to come
+        // down from the abutments to it at a fill's slope.
+        let reach = 2.0 + (gap - OVERPASS_DECK).max(0.0) * FILL;
         let mut span = structure::span_across(map, &upper, us, &lower, ls);
-        span.from = (span.from - 2.0).max(0.0);
+        span.from = (span.from - reach).max(0.0);
         let length = map
             .road(&upper)
             .and_then(|road| road.horizontal_length().ok())
             .unwrap_or(span.to);
-        span.to = (span.to + 2.0).min(length);
+        span.to = (span.to + reach).min(length);
         let spec = StructureSpec::Bridge(BridgeSpec {
             form: BridgeForm::Overpass,
             deck_depth: OVERPASS_DECK,

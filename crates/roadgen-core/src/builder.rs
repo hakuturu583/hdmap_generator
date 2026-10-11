@@ -1089,7 +1089,7 @@ impl Generator {
 
     fn place_structures(&mut self) -> Result<(), BuildError> {
         for (spans, spec) in &self.builder.structures {
-            structure::place(&mut self.map, spans, spec)
+            structure::place_built(&mut self.map, spans, spec)
                 .map_err(|error| BuildError::Structure(error.to_string()))?;
         }
         Ok(())
