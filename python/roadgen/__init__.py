@@ -85,7 +85,11 @@ long enough to reach over the lanes it governs — and written as props, which
 `Import.py` imports but does not place. `roadgen.carla_furniture(carla_root, package,
 name)` places them, and does the bookkeeping that makes CARLA adopt them as its own
 lights and signs rather than spawn a second set over the middle of the road. The
-script written beside the package does both.
+water comes in flat colours; `roadgen.carla_water(carla_root, package, name)` gives
+it the Unreal materials the package's descriptor names, one for rivers — whose
+texture coordinates run downstream, for a material that pans its normals to flow
+— and one for lakes and ponds. The script written beside the package does all of
+it.
 
 Every export also writes a trace file beside what it wrote — which element of the
 file each road, lane, junction and object became — and `export_ir` writes the map's
@@ -124,6 +128,7 @@ from ._roadgen import (
 from .furniture import CarlaFurnitureError, carla_furniture
 from .sky import CarlaSkyError, carla_sky
 from .textures import TextureError, fetch_textures, texture_manifest
+from .water import CarlaWaterError, carla_water
 
 
 
@@ -147,6 +152,8 @@ __all__ = [
     "CarlaFurnitureError",
     "carla_sky",
     "CarlaSkyError",
+    "carla_water",
+    "CarlaWaterError",
     "render_carla",
     "render_clipgt",
     "render_gpudrive",

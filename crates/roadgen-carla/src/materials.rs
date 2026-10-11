@@ -381,9 +381,12 @@ pub const MATERIALS: &[Material] = &[
     },
     // A river: its bed and banks under the water, and the water's surface over
     // them. Poly Haven publishes no scan of open water — a water surface is a
-    // shader, not a photograph — so the surface is a colour and a gloss, with its
-    // texture coordinates laid in plan for an engine's water material to take over;
-    // the bed it is seen through is photographed.
+    // shader, not a photograph — so the surface is a colour and a gloss, for an
+    // engine's water material to take over; the bed it is seen through is
+    // photographed. Running water and standing water are two materials, so that
+    // the package's script can give each its own: a river's texture coordinates
+    // run down it and across it, for a material that pans its normals along `u`
+    // to flow downstream, and a lake's or a pond's lie in plan.
     Material {
         name: "M_Terrain_Riverbed",
         color: [0.35, 0.33, 0.28],
@@ -397,7 +400,13 @@ pub const MATERIALS: &[Material] = &[
         }),
     },
     Material {
-        name: "M_Water",
+        name: "M_Water_Still",
+        color: [0.10, 0.22, 0.24],
+        roughness: 0.05,
+        texture: None,
+    },
+    Material {
+        name: "M_Water_Flowing",
         color: [0.10, 0.22, 0.24],
         roughness: 0.05,
         texture: None,
@@ -446,7 +455,8 @@ pub const COBBLESTONE: usize = 23;
 pub const DIRT: usize = 24;
 pub const SAND: usize = 25;
 pub const RIVERBED: usize = 26;
-pub const WATER: usize = 27;
+pub const STILL_WATER: usize = 27;
+pub const FLOWING_WATER: usize = 28;
 
 /// One texture file the package expects, and where it comes from.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
