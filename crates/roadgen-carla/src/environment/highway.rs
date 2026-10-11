@@ -552,7 +552,10 @@ pub(crate) fn off_the_land(map: &Map, roads: &[RoadId], natural: &Natural) -> Ve
                 continue;
             };
             let p = sample.point;
-            let off = (p.z - natural.height(p.x, p.y)).abs() > FRONTAGE;
+            // A stretch on a structure is no cutting or embankment: a bored tunnel
+            // has the land whole over it, and a deck keeps the town out on its own.
+            let off = road.structure.at(station).is_none()
+                && (p.z - natural.height(p.x, p.y)).abs() > FRONTAGE;
             match (off, run) {
                 (true, None) => run = Some(station),
                 (false, Some(from)) => {
@@ -728,6 +731,52 @@ fn slopes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bored_tunnel_is_no_cutting_to_keep_the_town_off() {
+        use roadgen_core::prelude::*;
+        use roadgen_core::structure::{TunnelForm, TunnelSpec};
+        // 30 m under level land the whole way, in a bored tunnel from 100 to 300 m.
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, -30.0),
+                    Point3::new(400.0, 0.0, -30.0),
+                    vec![
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        builder
+            .add_tunnel(
+                vec![RoadSpan::new(road.clone(), 100.0, 300.0)],
+                TunnelSpec {
+                    form: TunnelForm::Bored,
+                    ..TunnelSpec::default()
+                },
+            )
+            .unwrap();
+        let map = builder.finish().unwrap();
+        let natural = Natural {
+            field: None,
+            rises: &[],
+        };
+        let rings = off_the_land(map.as_map(), &[road], &natural);
+        let inside = |p: PlanPoint| {
+            rings
+                .iter()
+                .any(|ring| roadgen_core::geometry::plan::ring_contains(ring, p))
+        };
+        assert!(
+            inside([50.0, 0.0]) && inside([350.0, 0.0]),
+            "the approaches are cut"
+        );
+        assert!(!inside([200.0, 0.0]), "but not the tunnel");
+    }
 
     #[test]
     fn a_stretch_high_above_the_land_is_a_bridge_reaching_to_its_abutments() {
