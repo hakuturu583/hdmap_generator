@@ -1,6 +1,23 @@
-# 高速道路環境 — トンネル・橋・高架の IR と生成 — 設計（レビュー用）
+# 高速道路環境 — トンネル・橋・高架の IR と生成 — 設計
 
-*2026-10 設計。実装前のレビュー用。§11 にレビューで決めてほしい点をまとめた。*
+*2026-10 設計・レビュー（§11 はすべて提案どおりで承認）・実装。実装で設計から変えた点は §12 にまとめた。*
+
+## 実装状況
+
+| 部品 | 場所 |
+| --- | --- |
+| 構造物・道の形態・立体交差・インターチェンジ（IR）、配置（外形・橋台・橋脚・坑口）、交差の検出、検証 | `crates/roadgen-core/src/structure.rs`、`semantics.rs`（`FormOfWay`）、`map.rs`、`topology.rs` |
+| 縦断曲線 `VerticalProfile`、`Curve3::draped` | `crates/roadgen-core/src/geometry/{vertical,curve}.rs` |
+| builder: `add_bridge` / `add_tunnel` / `add_interchange`、`RoadSpec::with_form` / `with_vertical` | `crates/roadgen-core/src/builder.rs` |
+| IR ダンプ（新しい地物は空なら出力しない） | `crates/roadgen-trace/src/ir.rs` |
+| 回廊と計画 `CorridorSpec::plan` / `CorridorPlan::apply`、設計基準 `DesignStandard` | `crates/roadgen-carla/src/environment/corridor.rs` |
+| 生成規則（自然地形、構造物の判定、跨道橋、土工） | `crates/roadgen-carla/src/environment/highway.rs` |
+| 丘・川 | `crates/roadgen-carla/src/environment/{hill,river}.rs` |
+| 地形 TIN の構造物対応（地表の区間だけ折れ線、トンネルの土被り・桁下の確保） | `crates/roadgen-carla/src/environment/{land,structures}.rs` |
+| CARLA: 床版の裏面・高欄・橋脚・橋台・トンネルの内壁・坑門、地面の構造物対応 | `crates/roadgen-carla/src/{structures,surfaces,ground,terrain}.rs` |
+| OpenDRIVE（書き出し・読み戻し）、OSM、Lanelet2、SUMO、GPUDrive、ClipGT、viewer | 各クレート（`roadgen-opendrive/src/read/structures.rs` など） |
+| Python: `add_bridge` / `add_tunnel` / `add_hill` / `add_river` / `add_corridor` → `Corridor.plan()` → `add_plan`、問い合わせ | `crates/roadgen-python/src/highway.rs`、`lib.rs` |
+| テスト: 参照用の高速道路（川の橋・尾根のトンネル・diamond IC・終点の移行）、都市部（高架・開削・単独ランプ・half diamond） | `tests/integration/{src,tests}/highway*.rs`、`tests/python/test_highway.py` |
 
 ## 0. 目的と範囲
 
@@ -533,3 +550,29 @@ PR 1 と 2 だけでも、利用者が手で描いた道路に橋・トンネル
 | Q7 | `FormOfWay` を `RoadType` と別に持つか | 別に持つ（地域の分類と網の中の役割は別の軸） | `RoadType` に `MotorwayLink` などを足す（OpenDRIVE の `<type>` の語彙から外れる） |
 | Q8 | インターチェンジの形式をどこまで最初に入れるか | diamond / half_diamond / parclo / trumpet。cloverleaf / directional は PR 5 の後半か別 PR | 全部を一度に入れる |
 | Q9 | 都市部の回廊の既定 | 高架（`urban="elevated"`） | 地表（市街地でも自動判定だけに任せる） |
+
+## 12. 実装で設計から変えた点・未実装
+
+| 項目 | 設計 | 実装 |
+| --- | --- | --- |
+| 回廊の補助関数 | `Corridor.carriageway(side)` が上下線の点列を返し、利用者が `add_road` する | `Corridor.plan()` が全道路（上下線の区間・ランプ・交差道路）・交差点・接続・信号・構造物を含む計画を返し、`Map.add_plan(plan)` で入れる。上下線はランプの位置で区間に分ける必要があり、別々に返すと利用者が分割と接続を自分で書くことになるため。計画は点列と車線の集まりで、`set_points` で書き換えられる（道路の形を利用者が決める原則は保つ） |
+| インターチェンジの形式 | diamond / half_diamond / parclo / trumpet（cloverleaf / directional は後） | **diamond と half_diamond のみ**。parclo・trumpet・cloverleaf・directional は未実装。単独ランプ `Corridor.add_ramp()` を追加した（都市高速の出入口に使う） |
+| 都市部の既定（`urban="elevated"`） | 市街地の範囲を自動で判定して高架にする | 自動判定は未実装。`elevated=[(s0, s1)]` / `sunken=[(s0, s1)]` で区間を指定する（縦断に高さを足し、その区間を高架・開削トンネルにする） |
+| 上下線の床版 | 高架は 1 つの構造物が上下線を載せる | 規則で作る橋・高架は**上下線で別の床版**。builder の `add_bridge` に 2 区間を渡せば 1 枚にできる |
+| 終点の移行 | 100 → 80 → 60 km/h と段階的に下げる | 最後の区間を `MultipleCarriageway`・60 km/h にする 1 段だけ |
+| 高欄 | `Barrier { kind: "parapet" }` を自動で置く | CARLA のメッシュとして床版と一緒に描く（IR の地物にはしない） |
+| 交差道路の土工 | — | 交差道路を持ち上げた場合、土地はその道路の高さを読まず、盛土で合わせる（`Places.fitted_roads`）。交差道路の元の地盤高は `Places.anchors` として渡す。ランプ端の交差点の接続道路も同じ扱い |
+| 跨道橋の長さ | 下の道路の全幅＋両側の余裕 | 下の道路の全幅＋2 m＋（高さの差）×1.8。橋台から下の道路まで盛土の勾配で下りられる長さにした（短いと桁下に地面が入る） |
+| GPUDrive | 上の道路の `road_edge` を切る | **両方の道路**の `road_edge` を、交差する相手の外形の中で切る（下の道路の縁も上の車線を平面上で横切るため） |
+| OpenDRIVE | — | `viaduct` / `overpass` / `cut_and_cover` は OpenDRIVE に属性がないので `<userData code="structureForm">` に書く。読み戻しでは同じ名前の要素を 1 つの構造物にまとめる |
+| fingerprint | 既存の地図は不変 | IR ダンプの項目は空なら出さないので不変。ただし `geometry` ダイジェストは `Road` / `Junction` の `Debug` 表現に新しいフィールドが入るため、**同じ地図でも以前の版とは値が変わる**（ダイジェストは版をまたいで比べるものではない、という既存の方針の範囲内） |
+| トレース | — | 構造物は OpenDRIVE / OSM のトレースに載らない（`IrRef` に構造物の種類がない） |
+| 設計基準 | 道路構造令を参考にした既定値（要照合） | §4.2 の表どおり実装。**原典との照合はまだ**。特に加減速車線長（減速 90 m・加速 180 m・テーパー 60 m @100 km/h）は要確認 |
+
+その他の既知の制約：
+
+- 規則が選ぶ構造物は回廊の道路だけ（`add_road(corridor=...)` と計画の道路）。それ以外の道路が他の道路の上を越える場合は、跨道橋だけが自動で付く。
+- 平面交差の検出は参照線どうしの交差で行う。参照線は交わらないが外形が重なる道路は検出しない。
+- 川の床は 1 つの高さ（中心線の最低点−深さ）。勾配のある川は表現しない。
+- 構造物の上の道路で、歩道のないものに標識・信号を置くと、柱が床版の外の空中に立つ。
+

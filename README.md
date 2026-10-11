@@ -66,6 +66,7 @@ m.export_gpudrive("scene.json")
               Canonical Road IR ◀──── roadgen_carla::environment::Places
                      │                 ├─ buildings ◀── roadgen-buildings ◀── CGA shape grammar
                      │                 ├─ pits, heaps, pads: parts the land is shaped into
+                     │                 ├─ corridors, hills, rivers: bridges, tunnels, earthworks
                      │                 └─ one land as a TIN round all of it (`spade`)
                  validate()
                      ▼
@@ -832,6 +833,90 @@ OpenDRIVE writes the gravel as `<lane><material>` and the berm as a `barrier`
 object; OpenStreetMap writes `landuse=quarry`, `man_made=spoil_heap` and `surface=`.
 The rest write the roads and say what they dropped. The design, and what is not
 done yet, is in [`docs/mine-design.md`](docs/mine-design.md).
+
+## Motorways
+
+A motorway is put together the way a mine is: from parts and roads. What is new is
+that a road can leave the ground. A **bridge** or a **tunnel** is a feature of its
+own, carrying stretches of road; a road says along its length which stretches are
+on one; and wherever one road passes over another, a **grade separation** says so
+and names the structure that does it.
+
+```python
+m = roadgen.Map(name="crossing")
+m.add_road(start=(-300.0, 0.0, 9.0), end=(300.0, 0.0, 9.0), lanes=two_way,
+           name="motorway", type_="motorway", form="motorway")
+m.add_road(start=(0.0, -200.0, 0.0), end=(0.0, 200.0, 0.0), lanes=two_way, name="street")
+m.add_bridge([("motorway", 200.0, 400.0)], form="viaduct", name="Street Viaduct")
+
+m.structure("structure/street_viaduct")   # {"form": "viaduct", "supports": [...], ...}
+m.grade_separations()                     # [{"over": ("road/motorway", ...), "under": ("road/street", ...), ...}]
+```
+
+`form=` is the road's form of way — `motorway`, `slip_road`, `multiple_carriageway`,
+`parallel_road`, … — kept apart from `type_`, which says what kind of place the road
+is in. A motorway or a slip road **crosses nothing on the level**: one that crosses
+another road away from a junction, with nothing carrying one over the other, fails
+validation. Two ordinary streets crossing without a junction are still a map.
+
+### A corridor plans the roads
+
+Drawing two carriageways, the slip roads, the speed-change lanes and the junctions
+by hand is a lot of points. A **corridor** is a part that knows the rules a motorway
+is built to — Japan's Road Structure Ordinance for the design speed asked for, as
+defaults — and draws a first plan of every road it needs:
+
+```python
+e1 = m.add_corridor("E1", [(-2000.0, 0.0, 0.0), (1000.0, 0.0, 0.0), (3000.0, 700.0, 0.0)],
+                    design_speed=100.0, profile=[(0.0, 0.0), (500.0, 10.0), (4900.0, 0.0)],
+                    end_transition=400.0)
+e1.add_interchange("Kita IC", at=1700.0, crossroad=[(-300.0, -450.0, 0.0), (-300.0, 450.0, 0.0)],
+                   crossroad_lanes=street)
+m.add_river(centre=[(-1450.0, -600.0, 0.0), (-1350.0, 600.0, 0.0)], width=80.0, depth=6.0)
+m.add_hill(crest=[(1650.0, 1350.0, 0.0), (2350.0, -650.0, 0.0)], width=700.0, height=50.0)
+
+plan = e1.plan()          # roads, junctions, movements, signals, structures — and notes
+plan.roads[0]["points"]   # every road's points, to look at or replace with set_points
+m.add_plan(plan)
+```
+
+The plan rounds the centre line's corners at the design speed's radius, rounds the
+profile's crests and sags with vertical curves, splits each carriageway where a slip
+road leaves or joins it with a deceleration or acceleration lane before the nose,
+lifts the crossroad over the motorway on an overpass, and signals the ramp
+terminals. Nothing in it is fixed: it is points and lanes, and the caller can move
+any of them before adding it. A road drawn outside the standard is noted, not
+refused.
+
+When the map is built, the rest follows from the land. The **natural** land — the
+country, the hills, the rivers, the parts — is worked out before the motorway is
+fitted to it, and every corridor road is classified along its length: far above the
+land or over water, a bridge (a viaduct when it is long); far below it, a bored
+tunnel; otherwise the ground, cut and filled to meet it, with the cutting's crest
+and the embankment's toe as breaklines. Anywhere one road crosses over another with
+nothing under it, an overpass is put there. Piers are spaced along every bridge and
+kept off every carriageway below. `elevated=` and `sunken=` stretches lift a
+corridor onto a viaduct or drop it into a cut-and-cover tunnel — through a town, say
+— and `add_ramp()` adds a lone slip road for a street to be joined to.
+
+The town keeps to its side: no building faces a motorway or a slip road, none
+stands under a deck or on a corridor's slopes.
+
+| IR | What it is |
+| --- | --- |
+| `Structure` | a bridge (`bridge`, `viaduct`, `overpass`) with its abutments and piers, or a tunnel (`bored`, `cut_and_cover`, `underpass`) with its portals |
+| `Road.structure` | which stretches of the road are on, or in, which structure |
+| `GradeSeparation` | "this road passes over that one (or over water) by way of this structure" |
+| `Road.form` | the road's form of way |
+| `Interchange` | the junctions, slip roads and structures of one interchange, as one feature |
+
+Every format gets what it can hold. OpenDRIVE writes `<bridge>` and `<tunnel>` and
+reads them back; OpenStreetMap splits a way at each structure and tags `bridge=`,
+`tunnel=`, `layer=` and `motorway_link`; Lanelet2 marks motorway lanelets `highway`;
+GPUDrive, which is flat, cuts the road edges where one road passes over another;
+CARLA draws the decks' undersides and parapets, the piers and abutments, the tunnel
+bores and portals, and lays the land under the bridges and over the tunnels. The
+design — and what is not done yet — is in [`docs/highway-design.md`](docs/highway-design.md).
 
 ## Coordinates
 
