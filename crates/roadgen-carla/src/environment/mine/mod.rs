@@ -696,6 +696,21 @@ pub fn lay_out(builder: &mut MapBuilder, spec: &MineSpec) -> Result<Plan, Error>
         )));
     }
     let layout = Layout::of(spec);
+    // The ramp winds at most four times round; a grade too gentle for the pit's
+    // depth leaves it short of the floor, and a ramp that stops halfway down a
+    // wall is not a way into the pit.
+    if layout
+        .ramp
+        .last()
+        .is_none_or(|end| (end.z - layout.bottom).abs() > 1e-6)
+    {
+        return Err(Error::Spec(format!(
+            "a ramp at grade {} cannot reach a floor {} m down in four turns of the \
+             pit; make it steeper or the pit shallower",
+            spec.ramp.grade,
+            layout.rim - layout.bottom
+        )));
+    }
     let pavement = PavementProfile::constant(spec.haul_road.surface);
     let limit = SpeedLimit::from_kph(spec.haul_road.speed_limit_kph)
         .map_err(|error| Error::Spec(error.to_string()))?;

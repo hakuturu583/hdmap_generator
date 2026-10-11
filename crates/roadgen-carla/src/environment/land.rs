@@ -351,8 +351,15 @@ pub fn generate(
 ) -> Result<(TinSurfaceId, Report), Error> {
     land.ground.check().map_err(Error::Spec)?;
     let surface_id = TinSurfaceId::new(&land.name);
-    if map.as_map().tin_surfaces.contains(&surface_id) {
-        return Err(Error::Duplicate(surface_id.to_string()));
+    // One land per map. Every land is built round every road on the map, so a
+    // second would lie over the first — and two TINs over one plan are two
+    // heights at a point, which nothing downstream can choose between.
+    if let Some(existing) = map.as_map().tin_surfaces.iter().next() {
+        return Err(Error::Spec(format!(
+            "the map already states its land as {}; a map states it once, and a \
+             second place's land would lie over it",
+            existing.id
+        )));
     }
     let ground = &land.ground;
     let source = map.as_map();

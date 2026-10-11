@@ -195,6 +195,20 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
     }
     problems.extend(merged_controls(map));
     problems.extend(building_losses(map));
+    let changing: Vec<&str> = map
+        .roads
+        .iter()
+        .filter(|road| !road.is_connector() && road.pavement.spans().len() > 1)
+        .map(|road| road.id.as_str())
+        .collect();
+    if !changing.is_empty() {
+        problems.push(format!(
+            "one way carries one `surface`, so the pavement of {} roads whose surface \
+             changes along them is written as their first stretch's: {}",
+            changing.len(),
+            changing.join(", ")
+        ));
+    }
     if !map.tin_surfaces.is_empty() {
         problems.push(format!(
             "OSM has no terrain: the {} TIN surfaces are dropped, and the land covers on \

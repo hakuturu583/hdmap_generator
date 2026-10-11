@@ -140,3 +140,36 @@ fn a_spec_no_pit_could_be_is_refused() {
     };
     assert!(lay_out(&mut builder, &spec).is_err());
 }
+
+#[test]
+fn a_ramp_too_gentle_to_reach_the_floor_is_refused() {
+    let mut builder = MapBuilder::default();
+    let spec = MineSpec {
+        ramp: roadgen_carla::environment::mine::RampSpec {
+            grade: 0.01,
+            ..Default::default()
+        },
+        ..MineSpec::default()
+    };
+    let error = lay_out(&mut builder, &spec).unwrap_err();
+    assert!(error.to_string().contains("cannot reach"), "{error}");
+}
+
+#[test]
+fn a_map_states_its_land_once() {
+    let mut builder = MapBuilder::default();
+    let first = lay_out(&mut builder, &MineSpec::default()).unwrap();
+    let second = lay_out(
+        &mut builder,
+        &MineSpec {
+            name: "South Pit".into(),
+            centre: Point3::new(0.0, -2000.0, 0.0),
+            ..MineSpec::default()
+        },
+    )
+    .unwrap();
+    let mut map = builder.finish().unwrap();
+    generate(&mut map, &first).unwrap();
+    let error = generate(&mut map, &second).unwrap_err();
+    assert!(error.to_string().contains("states it once"), "{error}");
+}

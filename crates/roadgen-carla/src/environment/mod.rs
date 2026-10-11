@@ -155,13 +155,6 @@ fn urban(map: &mut UnvalidatedMap, spec: &UrbanSpec) -> Result<Report, Error> {
     };
     let land = match &spec.ground {
         Some(ground) => {
-            if !map.as_map().tin_surfaces.is_empty() {
-                return Err(Error::Land(land::Error::Spec(
-                    "the map already states its land — a mine's — and a town's would \
-                     lie over it"
-                        .into(),
-                )));
-            }
             let name = if spec.name.trim().is_empty() {
                 "town".to_owned()
             } else {
