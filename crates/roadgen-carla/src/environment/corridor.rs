@@ -210,8 +210,9 @@ pub enum InterchangeKind {
     /// A junction of two motorways that cross — a four-level stack. The
     /// crossroad is the other motorway's line, drawn right across the corridor;
     /// the plan builds it as two carriageways of the corridor's standard and
-    /// lanes, its own `crossroad_lanes` unused, lifted on a viaduct over the
-    /// corridor. Every one of the eight turns has a slip road of its own, off
+    /// lanes, its own `crossroad_lanes` unused, lifted a level over the
+    /// corridor — or carried over as it is, standing higher already — and on a
+    /// viaduct where it crosses it. Every one of the eight turns has a slip road of its own, off
     /// one motorway with a deceleration lane and on to the other with an
     /// acceleration lane: the four turns that cross nothing a quarter turn in
     /// their quadrant, outside everything else; the four that cross both
