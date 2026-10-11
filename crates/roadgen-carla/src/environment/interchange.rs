@@ -26,7 +26,7 @@ use roadgen_core::builder::LaneSpec;
 use roadgen_core::geometry::{Point3, VerticalProfile};
 use roadgen_core::map::TrafficHandedness;
 use roadgen_core::semantics::{FormOfWay, LaneType, RoadType};
-use roadgen_core::structure::{BridgeForm, BridgeSpec, CLEARANCE, OVERPASS_DECK};
+use roadgen_core::structure::{BridgeForm, BridgeSpec, CLEARANCE};
 use roadgen_core::topology::{Direction, RoadEnd};
 
 use super::corridor::{
@@ -975,8 +975,11 @@ impl CorridorSpec {
         // out SWING beyond the far carriageway's slip-road line.
         let corner = rcw - merge - SWING;
         let motorway_z = (cx.z)(cx.centre_station);
-        let level_on = motorway_z + CLEARANCE + OVERPASS_DECK + 0.5;
-        let level_off = level_on + CLEARANCE + OVERPASS_DECK + 0.5;
+        // A level over another: the clearance under the flyovers' viaduct deck,
+        // and half a metre to spare.
+        let level = CLEARANCE + BridgeSpec::for_form(BridgeForm::Viaduct).deck_depth + 0.5;
+        let level_on = motorway_z + level;
+        let level_off = level_on + level;
         // Where the flyovers leave and join the far carriageway: the ends of the
         // junctions there, half a metre clear of it.
         let far_c = &carriageways[f];

@@ -303,6 +303,18 @@ fn a_directional_t_stacks_its_flyovers_over_the_motorway() {
             "minami_ic_right_on",
             "minami_ic_right_off"
         ));
+        // Under each viaduct, the clearance below its deck: the one off over the
+        // one on, and both over the motorway.
+        let crossings = roadgen_core::structure::crossings(map.as_map());
+        assert!(crossings.len() >= 3, "{}", crossings.len());
+        for crossing in &crossings {
+            let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
+            let clear = uz - lz - roadgen_core::structure::depth_at(map.as_map(), upper, us);
+            assert!(
+                clear >= roadgen_core::structure::CLEARANCE - 0.01,
+                "{handedness:?}: {upper} at {us:.0} m clears {lower} at {ls:.0} m by {clear:.2} m"
+            );
+        }
     }
 }
 

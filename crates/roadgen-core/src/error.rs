@@ -320,6 +320,17 @@ pub enum ValidationIssue {
         under: RoadId,
         detail: String,
     },
+    /// A road carried over another leaves too little room between them: the
+    /// underside of the upper road's deck comes down within [`CLEARANCE`] of the
+    /// lower road, or the upper road dips into the roof of the tunnel the lower
+    /// is in.
+    ///
+    /// [`CLEARANCE`]: crate::structure::CLEARANCE
+    InsufficientClearance {
+        over: RoadId,
+        under: RoadId,
+        detail: String,
+    },
     Geometry {
         detail: String,
     },
@@ -393,6 +404,11 @@ impl fmt::Display for ValidationIssue {
                 f,
                 "{detail}: a motorway, a slip road or a road on a structure crosses nothing \
                  on the level — carry one over the other with a bridge or a tunnel"
+            ),
+            ValidationIssue::InsufficientClearance { detail, .. } => write!(
+                f,
+                "{detail}: a road carried over another has to leave the lower one its \
+                 clear height"
             ),
             ValidationIssue::Geometry { detail } => write!(f, "geometry error: {detail}"),
         }

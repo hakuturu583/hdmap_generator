@@ -27,6 +27,12 @@ pub struct ValidationConfig {
     /// width. Junction connectors between curved arms miss it by a few millimetres at an
     /// end (the cross-section direction there is sampled), which no consumer can tell.
     pub width_tolerance: f64,
+    /// Metres; the clear height a road carried under another on a bridge keeps,
+    /// from its surface to the deck's underside, where the two cross. By default
+    /// [`crate::structure::CLEARANCE`], the standard the generators build to; a map
+    /// drawn to another — an imported one, from a country whose is lower — gives
+    /// its own, and `None` leaves only what a deck physically needs.
+    pub clearance: Option<f64>,
 }
 
 impl Default for ValidationConfig {
@@ -34,6 +40,7 @@ impl Default for ValidationConfig {
         ValidationConfig {
             position_tolerance: 1e-3,
             width_tolerance: 2e-2,
+            clearance: Some(crate::structure::CLEARANCE),
         }
     }
 }
@@ -77,7 +84,12 @@ impl UnvalidatedMap {
         check_terrain(&self.0, config, &mut issues);
         check_land_covers(&self.0, &mut issues);
         check_sites(&self.0, &mut issues);
-        crate::structure::check(&self.0, config.position_tolerance.max(1e-2), &mut issues);
+        crate::structure::check(
+            &self.0,
+            config.position_tolerance.max(1e-2),
+            config.clearance,
+            &mut issues,
+        );
         issues
     }
 

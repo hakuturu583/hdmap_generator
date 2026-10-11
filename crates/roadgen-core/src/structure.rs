@@ -1909,7 +1909,12 @@ const STEEPEST: f64 = 0.12;
 
 /// Everything about the map's structures, separations and interchanges that only
 /// becomes wrong once they are put together.
-pub(crate) fn check(map: &Map, tolerance: f64, issues: &mut Vec<ValidationIssue>) {
+pub(crate) fn check(
+    map: &Map,
+    tolerance: f64,
+    clearance: Option<f64>,
+    issues: &mut Vec<ValidationIssue>,
+) {
     let implausible =
         |feature: String, detail: String| ValidationIssue::ImplausibleFeature { feature, detail };
     let dangling = |referrer: String, feature: String| ValidationIssue::DanglingFeatureReference {
@@ -2129,7 +2134,7 @@ pub(crate) fn check(map: &Map, tolerance: f64, issues: &mut Vec<ValidationIssue>
         }
     }
 
-    check_crossings(map, issues);
+    check_crossings(map, clearance, issues);
 }
 
 /// A bridge's deck clears the land under it, and the land over a tunnel clears its
@@ -2201,7 +2206,10 @@ fn check_against_land(
 ///
 /// A crossing between two ordinary roads at grade is left alone. A map may draw
 /// streets that cross without a junction, and always could.
-fn check_crossings(map: &Map, issues: &mut Vec<ValidationIssue>) {
+///
+/// Where a structure does carry one over the other, the lower road keeps its clear
+/// height ([`check_clearance`]).
+fn check_crossings(map: &Map, clearance: Option<f64>, issues: &mut Vec<ValidationIssue>) {
     if !separates(map) {
         return;
     }
@@ -2234,7 +2242,77 @@ fn check_crossings(map: &Map, issues: &mut Vec<ValidationIssue>) {
                     )
                 },
             });
+        } else {
+            check_clearance(map, &crossing, clearance, issues);
         }
+    }
+}
+
+/// How far a clearance may fall short of what it should be, metres: what the
+/// heights of two roads are rounded to, not room anything could use.
+const CLEARANCE_TOLERANCE: f64 = 0.01;
+
+/// The room a road carried over another leaves it, measured where the two cross.
+///
+/// Under a bridge the upper road is on, from the lower road's surface up to the
+/// underside of the deck — the upper surface less the deck's depth — has to be at
+/// least `clearance`, [`CLEARANCE`] unless the validation says otherwise; with no
+/// clearance asked for, only the deck has to clear the road. Over a tunnel the lower road is in, the upper road (or the
+/// underside of its deck, if it is on a bridge too) has to stand clear of the
+/// tunnel's roof: the lower surface, the tunnel's clear height and its lining. A
+/// tunnel's own clear height is what the road in it has; [`CLEARANCE`] is not asked
+/// of it twice.
+fn check_clearance(
+    map: &Map,
+    crossing: &Crossing,
+    clearance: Option<f64>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
+    let at = |road: &RoadId, station: f64| {
+        map.road(road)
+            .and_then(|r| r.structure.at(station))
+            .and_then(|id| map.structures.get(id))
+    };
+    let (Some(_), upper_on, lower_in) = (
+        crossing.carried_by(map),
+        at(upper, us),
+        at(lower, ls).and_then(|s| s.kind.tunnel().map(|t| (s, t))),
+    ) else {
+        return;
+    };
+    let underside = match upper_on.map(|s| &s.kind) {
+        Some(StructureKind::Bridge(bridge)) => uz - bridge.deck_depth,
+        Some(StructureKind::Tunnel(tunnel)) => uz - tunnel.lining,
+        None => uz,
+    };
+    let top = match lower_in {
+        Some((_, tunnel)) => lz + tunnel.clear_height + tunnel.lining,
+        None => lz + clearance.unwrap_or(0.0),
+    };
+    if underside < top - CLEARANCE_TOLERANCE {
+        let what = match upper_on {
+            Some(structure) => format!("the underside of {} under {upper}", structure.id),
+            None => format!("{upper}"),
+        };
+        issues.push(ValidationIssue::InsufficientClearance {
+            over: upper.clone(),
+            under: lower.clone(),
+            detail: match lower_in {
+                Some((tunnel, _)) => format!(
+                    "{what} at {us:.1} m comes {:.2} m down into the roof of {} round \
+                     {lower} at {ls:.1} m",
+                    top - underside,
+                    tunnel.id
+                ),
+                None => format!(
+                    "{what} at {us:.1} m clears {lower} at {ls:.1} m by only {:.2} m, not \
+                     {:.1} m",
+                    underside - lz,
+                    clearance.unwrap_or(0.0)
+                ),
+            },
+        });
     }
 }
 
