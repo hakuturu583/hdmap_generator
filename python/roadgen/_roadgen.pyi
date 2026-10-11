@@ -129,8 +129,9 @@ class Corridor:
     ) -> None:
         """`kind` is `diamond`, `half_diamond` (with `side`), `parclo` — a diamond
         whose turns on across the crossroad are loops — or `trumpet`, whose
-        crossroad stops beyond the motorway on `side`. A loop needs the terminal
-        well out: 100 m or more."""
+        crossroad stops beyond the motorway on `side`. A loop is 30 m round
+        whatever the terminal; it needs the terminal about 76 m out or more (79 m
+        beside three lanes each way), and the default 80 m will do."""
     def add_ramp(
         self, name: str, at: float, end: Point, side: str = "right", on: bool = False
     ) -> None: ...

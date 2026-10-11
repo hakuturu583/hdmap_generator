@@ -10,7 +10,7 @@ use roadgen_core::prelude::*;
 use roadgen_core::FormOfWay;
 use roadgen_integration_tests::highway::street_lanes;
 
-fn corridor(kind: InterchangeKind) -> CorridorSpec {
+fn corridor(kind: InterchangeKind, terminal: f64) -> CorridorSpec {
     let mut spec = CorridorSpec::new(
         "E5",
         vec![
@@ -28,14 +28,26 @@ fn corridor(kind: InterchangeKind) -> CorridorSpec {
         crossroad_lanes: street_lanes(),
         over: true,
         control: environment::Control::Signal,
-        terminal: 100.0,
+        terminal,
         reach: 320.0,
     });
     spec
 }
 
 fn generate(kind: InterchangeKind, handedness: TrafficHandedness) -> (ValidatedMap, Vec<String>) {
-    let spec = corridor(kind);
+    generate_at(kind, 100.0, handedness)
+}
+
+/// The map with the terminals `terminal` out from the centre line.
+fn generate_at(
+    kind: InterchangeKind,
+    terminal: f64,
+    handedness: TrafficHandedness,
+) -> (ValidatedMap, Vec<String>) {
+    generate_spec(corridor(kind, terminal), handedness)
+}
+
+fn generate_spec(spec: CorridorSpec, handedness: TrafficHandedness) -> (ValidatedMap, Vec<String>) {
     let mut places = Places {
         corridors: vec![spec.clone()],
         ..Places::default()
@@ -199,5 +211,130 @@ fn two_corridors_each_keep_their_own_cuttings_and_embankments() {
             let p = cover.area.centroid();
             assert!((p.y - y).abs() < 200.0, "{name}: a slope at {p:?}");
         }
+    }
+}
+
+/// The tightest radius along a road's reference line, metres: the circle
+/// through each three points a few metres apart.
+fn tightest(road: &Road) -> f64 {
+    let points = road
+        .reference_line
+        .to_polyline(SamplingConfig::default())
+        .unwrap();
+    let points = points.points();
+    // Points about 3 m apart, so that sampling noise is not read as a bend.
+    let mut spaced = vec![points[0]];
+    for p in points {
+        let last = spaced.last().unwrap();
+        if (p.x - last.x).hypot(p.y - last.y) >= 3.0 {
+            spaced.push(*p);
+        }
+    }
+    spaced
+        .windows(3)
+        .map(|w| {
+            let (a, b, c) = (w[0], w[1], w[2]);
+            let ab = (b.x - a.x).hypot(b.y - a.y);
+            let bc = (c.x - b.x).hypot(c.y - b.y);
+            let ca = (a.x - c.x).hypot(a.y - c.y);
+            let cross = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs();
+            if cross < 1e-9 {
+                f64::INFINITY
+            } else {
+                ab * bc * ca / (2.0 * cross)
+            }
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The tightest a loop's reference line may bend, metres: a loop is 30 m round
+/// along the middle of its lane, and its reference line is its outer edge, the
+/// lane's middle 2.25 m in from it.
+const LOOP_REFERENCE: f64 = 32.0;
+
+#[test]
+fn loops_fit_with_the_terminals_at_the_default_80_m() {
+    for lanes in [2, 3] {
+        for kind in [
+            InterchangeKind::Parclo,
+            InterchangeKind::Trumpet { side: Side::Right },
+        ] {
+            for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+                let case = format!("{lanes} lanes, {kind:?}, {handedness:?}");
+                // Plans with no notes, lands, and validates: the loop's outline
+                // crosses neither the off slip road's nor the crossroad's.
+                let mut spec = corridor(kind, 80.0);
+                spec.lanes = lanes;
+                let (map, notes) = generate_spec(spec, handedness);
+                assert!(notes.is_empty(), "{case}: {notes:#?}");
+                let sides: &[&str] = match kind {
+                    InterchangeKind::Parclo => &["left", "right"],
+                    _ => &["right"],
+                };
+                for side in sides {
+                    let name = format!("minami_ic_{side}_loop");
+                    let looped = road(&map, &name).unwrap_or_else(|| panic!("no {name}"));
+                    // Still a loop, and no tighter than a loop may be.
+                    assert!(
+                        turn(looped).abs() > 2.6,
+                        "{case} {name}: {:.2}",
+                        turn(looped)
+                    );
+                    let radius = tightest(looped);
+                    assert!(radius >= LOOP_REFERENCE, "{case} {name}: {radius:.1} m");
+                }
+                let meshes =
+                    roadgen_carla::to_meshes(&map, &roadgen_carla::PackageConfig::new("e5"));
+                assert!(meshes.iter().any(|m| m.role == roadgen_carla::Role::Road));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_loops_radius_does_not_follow_the_terminal() {
+    // Farther out, the loop is no larger: its radius is what a loop is designed
+    // to, and the room is taken up by a straight towards the motorway.
+    for terminal in [80.0, 100.0, 130.0] {
+        let (map, notes) = generate_at(
+            InterchangeKind::Parclo,
+            terminal,
+            TrafficHandedness::RightHand,
+        );
+        assert!(notes.is_empty(), "{terminal}: {notes:#?}");
+        let looped = road(&map, "minami_ic_left_loop").unwrap();
+        let radius = tightest(looped);
+        assert!(
+            (LOOP_REFERENCE..LOOP_REFERENCE + 1.0).contains(&radius),
+            "{terminal}: {radius:.1} m"
+        );
+    }
+}
+
+#[test]
+fn a_terminal_with_no_room_for_a_loop_is_refused_with_how_far_out_to_put_it() {
+    // At 80 km/h the least distance falls between whole metres.
+    for speed in [100.0, 80.0] {
+        let spec = |terminal: f64| {
+            let mut spec = corridor(InterchangeKind::Parclo, terminal);
+            spec.standard = roadgen_carla::environment::DesignStandard::for_speed(speed).unwrap();
+            spec
+        };
+        let error = spec(60.0).plan(TrafficHandedness::RightHand).unwrap_err();
+        assert!(
+            error.contains("too near the motorway for a loop"),
+            "{error}"
+        );
+        // Where it says to put it is enough.
+        let least: f64 = error
+            .split("put it ")
+            .nth(1)
+            .and_then(|rest| rest.split(" m").next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{error}"));
+        let plan = spec(least)
+            .plan(TrafficHandedness::RightHand)
+            .unwrap_or_else(|error| panic!("{speed} km/h at {least} m: {error}"));
+        assert!(plan.notes.is_empty(), "{:#?}", plan.notes);
     }
 }
