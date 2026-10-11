@@ -15,8 +15,16 @@ use crate::geometry::{
     Curve3, Frame3, LaneHeight, Point3, Poly3Profile, Polyline3, Sample, SamplingConfig,
     WidthProfile,
 };
-use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
-use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
+use crate::id::{
+    BuildingId, BuildingPartId, ConnectionId, JunctionId, LandCoverId, LaneId, ObjectId, RoadId,
+    SiteId, TinBreaklineId, TinSurfaceId,
+};
+use crate::land_cover::LandCover;
+use crate::semantics::{
+    BoundaryMarking, LaneType, MapObject, PavementProfile, RoadType, TrafficRule,
+};
+use crate::site::Site;
+use crate::terrain::{TinBreakline, TinSurface};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLink, RoadLinkTarget,
 };
@@ -216,6 +224,9 @@ pub struct Road {
     /// Roll of the road surface about its reference line, radians against horizontal
     /// station. Zero everywhere for a road that is flat across.
     pub superelevation: Poly3Profile,
+    /// What the road is surfaced with along its length; unknown unless the caller
+    /// said.
+    pub pavement: PavementProfile,
 }
 
 impl Road {
@@ -441,6 +452,17 @@ pub struct Map {
     /// The massing parts those buildings are made of, held beside them the way lanes
     /// are held beside roads rather than inside them.
     pub building_parts: Arena<BuildingPartId, BuildingPart>,
+    /// The places made of several features — a mine, a works. Empty unless a
+    /// generator filled it.
+    pub sites: Arena<SiteId, Site>,
+    /// The shape of the land, where it was stated. Empty unless a generator filled
+    /// it: a road network on its own says nothing about the ground beside it.
+    pub tin_surfaces: Arena<TinSurfaceId, TinSurface>,
+    /// The breaklines of those surfaces, held beside them the way lanes are held
+    /// beside roads.
+    pub tin_breaklines: Arena<TinBreaklineId, TinBreakline>,
+    /// What the land is used for or covered with.
+    pub land_covers: Arena<LandCoverId, LandCover>,
 }
 
 impl Map {
@@ -455,6 +477,10 @@ impl Map {
             rules: Vec::new(),
             buildings: Arena::new(),
             building_parts: Arena::new(),
+            sites: Arena::new(),
+            tin_surfaces: Arena::new(),
+            tin_breaklines: Arena::new(),
+            land_covers: Arena::new(),
         }
     }
 
@@ -767,6 +793,7 @@ mod tests {
             road_type: RoadType::Town,
             speed_limit: None,
             superelevation: Poly3Profile::default(),
+            pavement: PavementProfile::unknown(),
         };
         assert_eq!(road.section_at(0.0), Some(0));
         assert_eq!(road.section_at(39.9), Some(0));

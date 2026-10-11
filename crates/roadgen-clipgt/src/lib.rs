@@ -237,6 +237,14 @@ fn write_camera_timestamps(
 /// the configuration to have the route and the rig checked as well.
 pub fn check(map: &ValidatedMap, config: Option<&ClipConfig>) -> Vec<String> {
     let mut problems = Vec::new();
+    if !map.tin_surfaces.is_empty() || !map.land_covers.is_empty() {
+        problems.push(format!(
+            "ClipGT's layers have no terrain and no land cover, so \
+             the map's {} TIN surfaces and {} land covers are not written",
+            map.tin_surfaces.len(),
+            map.land_covers.len()
+        ));
+    }
     if !map.buildings.is_empty() {
         problems.push(format!(
             "ClipGT's layers describe the road surface and its markings, so the map's \

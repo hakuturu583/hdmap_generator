@@ -44,6 +44,14 @@
 //! carriageway, the paint on it, the pavements beside it, the kerb faces between them,
 //! the gutters at the foot of those, and the grass beyond. See [`surfaces`].
 //!
+//! # What kind of place
+//!
+//! A town or a mine is one value, [`Environment`], and each is a branch of
+//! [`environment`]: it lays out the roads the place needs and generates, into the
+//! IR, what stands on and under them — a town's buildings, a mine's benches, heaps
+//! and land. The package is then written from the IR the same way for every kind
+//! of place, so this crate's export stays a lowering that pushes nothing back.
+//!
 //! # What stands beside it
 //!
 //! Traffic lights and signs, built to the cross-section — a pole on the pavement, an
@@ -64,7 +72,9 @@
 //! # }
 //! ```
 
+pub mod barriers;
 pub mod crosswalks;
+pub mod environment;
 pub mod error;
 pub mod facades;
 pub mod fbx;
@@ -89,6 +99,7 @@ use roadgen_core::semantics::MapObjectKind;
 use roadgen_core::trace::{Relation, Trace};
 use roadgen_core::ValidatedMap;
 
+pub use environment::{Environment, MineSpec};
 pub use error::ExportError;
 pub use furniture::{FurnitureConfig, SignKind};
 pub use materials::Material;
@@ -786,7 +797,18 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
         }
     }
 
-    if config.surfaces.ground_extent > 0.0 {
+    if !map.tin_surfaces.is_empty() {
+        let nodes: usize = map.tin_surfaces.iter().map(|s| s.tin.nodes().len()).sum();
+        warnings.push(format!(
+            "the land is the map's own terrain — {} TIN surfaces, {nodes} nodes, \
+             their breaklines kept as edges — re-triangulated round the roads as this \
+             exporter samples them, with at most a {:.0} m seam; it stops where the \
+             terrain does, and it is tagged `Terrain` ({}) throughout",
+            map.tin_surfaces.len(),
+            config.surfaces.verge_width.min(ground::STATED_VERGE),
+            Label::Terrain.stencil()
+        ));
+    } else if config.surfaces.ground_extent > 0.0 {
         warnings.push(format!(
             "the land past the {:.0} m verge is at the roads' own heights, out to \
              {:.0} m beyond the network: flat where the roads are flat and sloping \
@@ -809,6 +831,37 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
              and a vehicle that leaves a road there drives off the map"
                 .into(),
         );
+    }
+
+    let resurfaced = map
+        .roads
+        .iter()
+        .filter(|road| {
+            road.pavement
+                .spans()
+                .iter()
+                .any(|&(_, pavement)| materials::road(Some(pavement)) != materials::ASPHALT)
+        })
+        .count();
+    if resurfaced > 0 && config.use_carla_materials {
+        warnings.push(format!(
+            "{resurfaced} roads are surfaced in something other than asphalt — gravel, \
+             concrete, dirt — and drawn so here, but CARLA's own materials are on and \
+             will repaint every road surface as its asphalt; turn them off to keep \
+             what the map says"
+        ));
+    }
+    let berms = map
+        .objects
+        .iter()
+        .filter(|object| matches!(object.kind, MapObjectKind::Barrier { .. }))
+        .count();
+    if berms > 0 {
+        warnings.push(format!(
+            "{berms} barriers are ridges in the map's FBX, tagged `Terrain` ({}): CARLA \
+             has no class for a berm",
+            Label::Terrain.stencil()
+        ));
     }
 
     let connectors = map.roads.iter().filter(|road| road.is_connector()).count();

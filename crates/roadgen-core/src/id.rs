@@ -86,6 +86,20 @@ define_id!(
 define_id!(
     /// Identifies one massing part of a building, e.g. `part/north/left/3/0`.
     BuildingPartId, "part");
+define_id!(
+    /// Identifies a site: a complex feature that gathers the features one place is
+    /// made of, e.g. `site/north_pit`.
+    SiteId, "site");
+define_id!(
+    /// Identifies a TIN surface of the terrain, e.g. `tin/north_pit`.
+    TinSurfaceId, "tin");
+define_id!(
+    /// Identifies a breakline of a TIN surface, e.g.
+    /// `breakline/north_pit/bench/3/crest`.
+    TinBreaklineId, "breakline");
+define_id!(
+    /// Identifies a land cover feature, e.g. `landcover/north_pit/pit`.
+    LandCoverId, "landcover");
 
 impl LaneId {
     /// The identifier of lane number `index` of `road`.
@@ -139,6 +153,15 @@ impl BuildingPartId {
     /// The identifier of part number `index` of `building`.
     pub fn of_building(building: &BuildingId, index: usize) -> Self {
         BuildingPartId::new(format!("{}/{}", building.local_name(), index))
+    }
+}
+
+impl SiteId {
+    /// The part after the `site/` prefix.
+    pub fn local_name(&self) -> &str {
+        self.as_str()
+            .strip_prefix("site/")
+            .unwrap_or_else(|| self.as_str())
     }
 }
 

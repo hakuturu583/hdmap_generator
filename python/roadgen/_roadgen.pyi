@@ -104,6 +104,7 @@ class Map:
         speed_limit_kph: Optional[float] = None,
         superelevation: Optional[Sequence[tuple[float, float]]] = None,
         cross_sections: Optional[Sequence[tuple[float, Sequence[Lane]]]] = None,
+        pavement: Optional[Sequence[tuple[float, str]]] = None,
     ) -> Road: ...
     def add_junction(self, name: Optional[str] = None) -> Junction: ...
     def connect(
@@ -238,6 +239,58 @@ class Map:
         rules: Optional[str] = None,
         seed: int = 0,
     ) -> None: ...
+    def generate_mine(
+        self,
+        name: str = "mine",
+        centre: Point = (0.0, 0.0, 0.0),
+        heading: float = 0.0,
+        floor: tuple[float, float] = (220.0, 140.0),
+        benches: int = 6,
+        bench_height: float = 12.0,
+        bench_width: float = 10.0,
+        face_angle: float = 70.0,
+        ramp_grade: float = 0.1,
+        ramp_start: float = -90.0,
+        clockwise: bool = True,
+        lane_width: float = 7.5,
+        shoulder_width: float = 3.0,
+        berm_height: float = 1.5,
+        speed_limit_kph: float = 40.0,
+        surface: str = "gravel",
+        waste_dump: Optional[tuple[float, float, float, float]] = None,
+        stockpile: Optional[tuple[float, float, float, float]] = None,
+        ground_margin: float = 150.0,
+        ground_cell: float = 10.0,
+        relief: float = 6.0,
+        yard_buildings: bool = True,
+        seed: int = 0,
+    ) -> dict[str, Any]:
+        """Lays out an open-pit mine: benches, a ramp down the wall, haul roads to
+        a waste dump and a stockpile, and the land round them as one TIN.
+
+        A heap is `(bearing_degrees, distance, radius, height)` from the junction at
+        the top of the ramp. Returns `{"site", "ramp", "haul_roads", "junction"}`.
+        """
+    def generate_land(
+        self,
+        enabled: bool = True,
+        relief: float = 6.0,
+        cell: float = 10.0,
+        margin: float = 150.0,
+        wavelength: float = 180.0,
+        seed: int = 0,
+    ) -> None:
+        """States the land round the map's roads as a TIN — the same land a mine's
+        is built as, shaped by nothing but the roads."""
+    def site_ids(self) -> list[str]: ...
+    def site(self, site: str) -> dict[str, Any]: ...
+    def tin_surface_ids(self) -> list[str]: ...
+    def tin_mesh(self, surface: str) -> tuple[list[Point], list[tuple[int, int, int]]]: ...
+    def tin_breaklines(self, surface: str) -> list[tuple[str, str, list[Point]]]: ...
+    def terrain_height(self, x: float, y: float) -> Optional[float]: ...
+    def land_cover_ids(self) -> list[str]: ...
+    def land_cover(self, cover: str) -> dict[str, Any]: ...
+    def road_pavement(self, road: str) -> list[tuple[float, str]]: ...
     def building_ids(self) -> list[str]: ...
     def building_kind(self, building: str) -> str: ...
     def building_frontage(self, building: str) -> Optional[tuple[str, str, float]]: ...

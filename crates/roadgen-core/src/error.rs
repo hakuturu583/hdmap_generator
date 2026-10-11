@@ -298,6 +298,18 @@ pub enum ValidationIssue {
         object: ObjectId,
         detail: String,
     },
+    /// A feature names another feature that is not on the map. The two are named
+    /// by their printed identifiers, since they may be of any kind.
+    DanglingFeatureReference {
+        referrer: String,
+        feature: String,
+    },
+    /// A terrain surface, breakline, land cover, site, barrier or pavement is not
+    /// one the world could hold.
+    ImplausibleFeature {
+        feature: String,
+        detail: String,
+    },
     Geometry {
         detail: String,
     },
@@ -360,6 +372,12 @@ impl fmt::Display for ValidationIssue {
             }
             ValidationIssue::ImplausibleTrafficLight { object, detail } => {
                 write!(f, "traffic light {object}: {detail}")
+            }
+            ValidationIssue::DanglingFeatureReference { referrer, feature } => {
+                write!(f, "{referrer} refers to missing feature {feature}")
+            }
+            ValidationIssue::ImplausibleFeature { feature, detail } => {
+                write!(f, "{feature}: {detail}")
             }
             ValidationIssue::Geometry { detail } => write!(f, "geometry error: {detail}"),
         }

@@ -344,6 +344,14 @@ pub fn check(map: &ValidatedMap, config: Option<&SceneConfig>) -> Vec<String> {
             .to_owned(),
     ];
 
+    if !map.tin_surfaces.is_empty() || !map.land_covers.is_empty() {
+        problems.push(format!(
+            "a GPUDrive scene has no terrain and no land cover, so \
+             the map's {} TIN surfaces and {} land covers are not written",
+            map.tin_surfaces.len(),
+            map.land_covers.len()
+        ));
+    }
     if !map.buildings.is_empty() {
         problems.push(format!(
             "a GPUDrive scene is roads and agents, so the map's {} buildings ({} parts) \

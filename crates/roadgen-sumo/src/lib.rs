@@ -425,6 +425,14 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             .to_owned(),
     ];
 
+    if !map.tin_surfaces.is_empty() || !map.land_covers.is_empty() {
+        problems.push(format!(
+            "SUMO's network is roads and junctions, with no terrain and no land cover, so \
+             the map's {} TIN surfaces and {} land covers are not written",
+            map.tin_surfaces.len(),
+            map.land_covers.len()
+        ));
+    }
     if !map.buildings.is_empty() {
         problems.push(format!(
             "a SUMO network is a traffic network and holds no scenery, so the map's \

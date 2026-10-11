@@ -8,8 +8,10 @@
 use ll2_io::osm::Tags;
 
 use roadgen_core::buildings::{Building, BuildingPart, RoofShape};
+use roadgen_core::land_cover::LandCover;
 use roadgen_core::map::{Map, Road};
 use roadgen_core::semantics::{LaneType, RoadType};
+use roadgen_core::site::Site;
 use roadgen_core::topology::Direction;
 
 /// The `highway` value for a road.
@@ -33,6 +35,10 @@ pub fn road_tags(map: &Map, road: &Road) -> Tags {
     tags.insert("highway".into(), highway_value(road.road_type).into());
     if let Some(name) = &road.name {
         tags.insert("name".into(), name.clone());
+    }
+    // One way has one surface, so it is the road's first stretch's.
+    if let Some(&(_, pavement)) = road.pavement.spans().first() {
+        tags.insert("surface".into(), pavement.surface_str().into());
     }
     if let Some(limit) = road.speed_limit {
         // OSM's bare `maxspeed` is km/h, and a whole number of them is what a sign
@@ -384,4 +390,44 @@ mod building_tests {
         assert!(!tags.contains_key("min_height"));
         assert_eq!(tags.get("height").map(String::as_str), Some("8.0"));
     }
+}
+
+/// The tags of a barrier's way. OSM's `barrier` values cover the common built
+/// ones; a berm has none, so it is `barrier=yes` with the IR's word beside it.
+pub fn barrier_tags(kind: &str, height: f64) -> Tags {
+    let mut tags = Tags::new();
+    let value = match kind {
+        "guard_rail" | "wall" | "fence" | "kerb" => kind,
+        _ => "yes",
+    };
+    tags.insert("barrier".into(), value.into());
+    if value == "yes" {
+        tags.insert("description".into(), kind.into());
+    }
+    tags.insert("height".into(), format!("{height:.2}"));
+    tags
+}
+
+/// The tags of a land cover's area: the OSM value for what it is, where there is
+/// one, and the site's name.
+pub fn land_cover_tags(cover: &LandCover, site: Option<&Site>) -> Tags {
+    let mut tags = Tags::new();
+    let (key, value) = match cover.kind.as_str() {
+        "pit" | "quarry" => ("landuse", "quarry"),
+        "waste_dump" | "spoil_heap" => ("man_made", "spoil_heap"),
+        "stockpile" => ("man_made", "spoil_heap"),
+        "pad" | "yard" => ("landuse", "industrial"),
+        other => ("landuse", other),
+    };
+    tags.insert(key.into(), value.into());
+    if cover.kind == "stockpile" {
+        tags.insert("material".into(), "ore".into());
+    }
+    if cover.kind == "pad" || cover.kind == "yard" {
+        tags.insert("industrial".into(), "mine".into());
+    }
+    if let Some(name) = site.and_then(|site| site.name.as_ref()) {
+        tags.insert("name".into(), name.clone());
+    }
+    tags
 }

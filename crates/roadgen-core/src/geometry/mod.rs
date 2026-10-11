@@ -9,6 +9,7 @@ pub mod alignment;
 pub mod curve;
 pub mod grid;
 pub mod height;
+pub mod plan;
 pub mod polyline;
 pub mod profile;
 pub mod vector;

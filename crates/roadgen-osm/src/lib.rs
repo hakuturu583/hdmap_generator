@@ -195,6 +195,27 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
     }
     problems.extend(merged_controls(map));
     problems.extend(building_losses(map));
+    let changing: Vec<&str> = map
+        .roads
+        .iter()
+        .filter(|road| !road.is_connector() && road.pavement.spans().len() > 1)
+        .map(|road| road.id.as_str())
+        .collect();
+    if !changing.is_empty() {
+        problems.push(format!(
+            "one way carries one `surface`, so the pavement of {} roads whose surface \
+             changes along them is written as their first stretch's: {}",
+            changing.len(),
+            changing.join(", ")
+        ));
+    }
+    if !map.tin_surfaces.is_empty() {
+        problems.push(format!(
+            "OSM has no terrain: the {} TIN surfaces are dropped, and the land covers on \
+             them are written as flat areas",
+            map.tin_surfaces.len()
+        ));
+    }
     problems
 }
 
@@ -405,6 +426,7 @@ impl<'a> Exporter<'a> {
         self.add_furniture()?;
         self.add_restrictions();
         self.add_buildings()?;
+        self.add_land_covers()?;
         Ok(())
     }
 
@@ -559,6 +581,15 @@ impl<'a> Exporter<'a> {
     /// would otherwise pile up on one end.
     fn add_furniture(&mut self) -> Result<(), ExportError> {
         for object in self.map.objects.iter() {
+            // A barrier runs along the road beside it rather than standing on a
+            // point of it, so it is a way of its own, not a node of the road's.
+            if let MapObjectKind::Barrier { kind, height } = &object.kind {
+                if let Some(way) = self.add_barrier_way(object, kind, *height)? {
+                    self.trace
+                        .link(object.id.clone(), way_ref(way), Link::Exact);
+                }
+                continue;
+            }
             let Some(road) = self.road_of(object) else {
                 continue;
             };
@@ -585,6 +616,7 @@ impl<'a> Exporter<'a> {
                 MapObjectKind::StopLine => ("highway", "stop".to_owned()),
                 MapObjectKind::TrafficSign { code } => ("traffic_sign", code.clone()),
                 MapObjectKind::Crosswalk => ("highway", "crossing".to_owned()),
+                MapObjectKind::Barrier { .. } => unreachable!("written as a way above"),
             };
             if let Some(node) = self.document.nodes.get_mut(&node) {
                 // Several controls can share a point — a stop line under a traffic
@@ -620,6 +652,53 @@ impl<'a> Exporter<'a> {
                     self.trace
                         .link_as(object.id.clone(), way_ref(way), Link::Exact, "crossing");
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// A barrier as a way down the middle of the band it occupies.
+    fn add_barrier_way(
+        &mut self,
+        object: &MapObject,
+        kind: &str,
+        height: f64,
+    ) -> Result<Option<i64>, ExportError> {
+        let ObjectGeometry::Band { left, right } = &object.geometry else {
+            return Ok(None);
+        };
+        let config = self.map.metadata.sampling;
+        let (left, right) = (left.to_polyline(config)?, right.to_polyline(config)?);
+        let mut nodes = Vec::with_capacity(left.len());
+        for (a, b) in left.points().iter().zip(right.points()) {
+            nodes.push(self.node_at(a.lerp(*b, 0.5))?);
+        }
+        nodes.dedup();
+        if nodes.len() < 2 {
+            return Ok(None);
+        }
+        let id = self.take_id();
+        self.document.ways.insert(
+            id,
+            Way {
+                id,
+                nodes,
+                tags: tags::barrier_tags(kind, height),
+            },
+        );
+        Ok(Some(id))
+    }
+
+    /// Every land cover, as a closed way tagged for what it is.
+    fn add_land_covers(&mut self) -> Result<(), ExportError> {
+        for cover in self.map.land_covers.iter() {
+            let site = cover
+                .site
+                .as_ref()
+                .and_then(|site| self.map.sites.get(site));
+            let ring = cover.area.points().to_vec();
+            if let Some(way) = self.add_closed_way(&ring, tags::land_cover_tags(cover, site))? {
+                self.trace.link(cover.id.clone(), way_ref(way), Link::Exact);
             }
         }
         Ok(())
