@@ -924,3 +924,57 @@ fn a_parapet_of_a_bridge_the_map_does_not_have_is_refused() {
             if *referrer == id.to_string() && feature == "structure/nowhere"
     )));
 }
+
+#[test]
+fn a_graded_deck_over_a_wide_road_keeps_the_clearance_at_its_low_edge_too() {
+    // A motorway climbing at 6 % on a viaduct over an eight-lane avenue: where the
+    // two centre lines cross it clears the avenue, but the avenue is 28 m wide,
+    // and at its edge downhill the deck is 0.84 m lower.
+    let deck = BridgeSpec::for_form(BridgeForm::Viaduct).deck_depth;
+    let middle = deck + CLEARANCE + 0.3;
+    let lane = |direction| LaneSpec::new(PositiveWidth::new(3.5).unwrap(), direction);
+    let mut builder = MapBuilder::default();
+    let motorway = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, middle - 18.0),
+                Point3::new(300.0, 0.0, middle + 18.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -200.0, 0.0),
+                Point3::new(0.0, 200.0, 0.0),
+                [Direction::Forward; 4]
+                    .into_iter()
+                    .chain([Direction::Backward; 4])
+                    .map(lane)
+                    .collect(),
+            )
+            .unwrap()
+            .with_name("avenue"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway, 200.0, 400.0)],
+            BridgeSpec::for_form(BridgeForm::Viaduct),
+        )
+        .unwrap();
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    assert!(
+        error.issues.iter().any(|issue| matches!(
+            issue,
+            ValidationIssue::InsufficientClearance { under, .. }
+                if under.local_name() == "avenue"
+        )),
+        "{error}"
+    );
+}
