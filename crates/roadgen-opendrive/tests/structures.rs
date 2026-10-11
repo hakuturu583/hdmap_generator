@@ -11,7 +11,8 @@ use roadgen_core::structure::{
     Underneath,
 };
 use roadgen_core::FormOfWay;
-use roadgen_opendrive::{check, from_xml, to_xml};
+use roadgen_core::{IrRef, Relation};
+use roadgen_opendrive::{check, from_xml, to_xml, to_xml_traced, Options};
 
 fn two_way() -> Vec<LaneSpec> {
     vec![
@@ -187,8 +188,9 @@ fn structures_come_back_over_the_same_stretches() {
     }));
 }
 
-#[test]
-fn one_named_deck_over_two_carriageways_comes_back_as_one_bridge() {
+/// One named deck over both carriageways of a dual road: one structure carrying
+/// two stretches.
+fn twin_deck() -> ValidatedMap {
     let mut builder = MapBuilder::default();
     let one_way = || {
         vec![
@@ -230,7 +232,12 @@ fn one_named_deck_over_two_carriageways_comes_back_as_one_bridge() {
             },
         )
         .unwrap();
-    let written = builder.finish().unwrap().validate().unwrap();
+    builder.finish().unwrap().validate().unwrap()
+}
+
+#[test]
+fn one_named_deck_over_two_carriageways_comes_back_as_one_bridge() {
+    let written = twin_deck();
     let map = from_xml(&to_xml(&written).unwrap())
         .unwrap()
         .map
@@ -238,4 +245,51 @@ fn one_named_deck_over_two_carriageways_comes_back_as_one_bridge() {
         .unwrap();
     assert_eq!(map.structures.len(), 1);
     assert_eq!(map.structures.iter().next().unwrap().carries.len(), 2);
+}
+
+#[test]
+fn each_bridge_and_tunnel_is_traced_to_its_structure() {
+    let map = structures();
+    let (xml, trace) = to_xml_traced(&map, &Options::default()).unwrap();
+    let parsed = OpenDrive::from_xml_str(&xml).unwrap();
+    let mut written = Vec::new();
+    for road in &parsed.road {
+        if let Some(objects) = &road.objects {
+            written.extend(objects.bridge.iter().map(|b| format!("bridge:{}", b.id)));
+            written.extend(objects.tunnel.iter().map(|t| format!("tunnel:{}", t.id)));
+        }
+    }
+    assert_eq!(written.len(), 3);
+
+    let mut traced = Vec::new();
+    for structure in map.structures.iter() {
+        let links: Vec<_> = trace
+            .links_of(&IrRef::Structure(structure.id.clone()))
+            .collect();
+        assert_eq!(links.len(), 1, "{}: {links:?}", structure.id);
+        assert_eq!(links[0].relation, Relation::Exact);
+        let kind = if structure.kind.bridge().is_some() {
+            "bridge:"
+        } else {
+            "tunnel:"
+        };
+        assert!(links[0].local.starts_with(kind), "{}", links[0].local);
+        traced.push(links[0].local.clone());
+    }
+    written.sort();
+    traced.sort();
+    assert_eq!(written, traced, "every element, and nothing else");
+}
+
+#[test]
+fn a_deck_over_two_roads_is_traced_as_two_parts() {
+    let map = twin_deck();
+    let (_, trace) = to_xml_traced(&map, &Options::default()).unwrap();
+    let structure = map.structures.iter().next().unwrap();
+    let links: Vec<_> = trace
+        .links_of(&IrRef::Structure(structure.id.clone()))
+        .collect();
+    assert_eq!(links.len(), 2, "{links:?}");
+    assert!(links.iter().all(|link| link.relation == Relation::Part));
+    assert_ne!(links[0].local, links[1].local);
 }

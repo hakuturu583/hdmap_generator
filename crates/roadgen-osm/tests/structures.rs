@@ -8,7 +8,7 @@ use roadgen_core::id::LandCoverId;
 use roadgen_core::land_cover::LandCover;
 use roadgen_core::prelude::*;
 use roadgen_core::structure::{BridgeForm, BridgeSpec, RoadSpan, TunnelForm, TunnelSpec};
-use roadgen_core::FormOfWay;
+use roadgen_core::{FormOfWay, IrRef, Relation, Trace};
 
 fn two_way() -> Vec<LaneSpec> {
     vec![
@@ -95,10 +95,19 @@ fn levels() -> ValidatedMap {
 }
 
 fn export(map: &ValidatedMap) -> Document {
-    let xml = roadgen_osm::to_xml(map).unwrap();
+    export_traced(map).0
+}
+
+fn export_traced(map: &ValidatedMap) -> (Document, Trace) {
+    let (xml, trace) = roadgen_osm::to_xml_traced(map).unwrap();
     let (document, errors) = ll2_io::osm::parse(&xml).unwrap();
     assert!(errors.is_empty(), "{errors:?}");
-    document
+    (document, trace)
+}
+
+/// How the trace names a way of the file.
+fn way_ref(way: &Way) -> String {
+    format!("way:{}", way.id)
 }
 
 /// The ways named `name`, in the order the road runs.
@@ -185,8 +194,9 @@ fn check_says_what_a_structure_loses() {
     assert!(notes.iter().any(|note| note.contains("piers")), "{notes:?}");
 }
 
-#[test]
-fn a_slip_road_off_a_motorway_is_a_motorway_link() {
+/// A motorway with a slip road leaving it at an exit of the Kita interchange, and a
+/// slip road off on its own.
+fn kita_exit() -> ValidatedMap {
     let mut builder = MapBuilder::default();
     let main = builder
         .add_road(line("main", (0.0, 0.0, 0.0), (300.0, 0.0, 0.0)).with_form(FormOfWay::Motorway))
@@ -205,8 +215,12 @@ fn a_slip_road_off_a_motorway_is_a_motorway_link() {
     builder
         .add_interchange("Kita IC", "diamond", vec![junction], vec![main])
         .unwrap();
-    let map = builder.finish().unwrap().validate().unwrap();
-    let document = export(&map);
+    builder.finish().unwrap().validate().unwrap()
+}
+
+#[test]
+fn a_slip_road_off_a_motorway_is_a_motorway_link() {
+    let document = export(&kita_exit());
     assert_eq!(
         tag(ways_of(&document, "ramp")[0], "highway"),
         Some("motorway_link")
@@ -221,5 +235,94 @@ fn a_slip_road_off_a_motorway_is_a_motorway_link() {
         .values()
         .find(|node| node.tags.get("highway").map(String::as_str) == Some("motorway_junction"))
         .expect("the node where the ramp leaves");
+    assert_eq!(exit.tags.get("name").map(String::as_str), Some("Kita IC"));
+}
+
+#[test]
+fn a_structure_is_traced_to_the_ways_it_carries_and_its_deck() {
+    let map = levels();
+    let (document, trace) = export_traced(&map);
+    let structure_of = |road: &str| {
+        let road = map
+            .roads
+            .iter()
+            .find(|r| r.name.as_deref() == Some(road))
+            .unwrap();
+        road.structure.spans()[0].structure.clone()
+    };
+
+    let viaduct = structure_of("motorway");
+    let links: Vec<_> = trace.links_of(&IrRef::Structure(viaduct)).collect();
+    assert_eq!(links.len(), 2, "{links:?}");
+    let carried = links
+        .iter()
+        .find(|link| link.role.as_deref() == Some("bridge"))
+        .expect("the way on the viaduct");
+    assert_eq!(
+        carried.relation,
+        Relation::Merged,
+        "it is the road's way too"
+    );
+    assert_eq!(carried.local, way_ref(ways_of(&document, "motorway")[1]));
+    let deck = links
+        .iter()
+        .find(|link| link.role.as_deref() == Some("outline"))
+        .expect("the deck's outline");
+    assert_eq!(deck.relation, Relation::Exact);
+    let deck = document
+        .ways
+        .values()
+        .find(|way| way_ref(way) == deck.local)
+        .unwrap();
+    assert_eq!(tag(deck, "man_made"), Some("bridge"));
+    assert_eq!(tag(deck, "name"), Some("Street Viaduct"));
+
+    let underpass = structure_of("through");
+    let links: Vec<_> = trace.links_of(&IrRef::Structure(underpass)).collect();
+    assert_eq!(links.len(), 1, "a tunnel has no outline: {links:?}");
+    assert_eq!(links[0].relation, Relation::Merged);
+    assert_eq!(links[0].role.as_deref(), Some("tunnel"));
+    assert_eq!(links[0].local, way_ref(ways_of(&document, "through")[1]));
+}
+
+#[test]
+fn a_grade_separation_is_collapsed_into_the_layer_of_the_bridge_it_raises() {
+    let map = levels();
+    let (document, trace) = export_traced(&map);
+    assert_eq!(
+        map.grade_separations.len(),
+        2,
+        "street and motorway are crossed"
+    );
+    for separation in map.grade_separations.iter() {
+        let over = map.road(&separation.over.road).unwrap();
+        let links: Vec<_> = trace
+            .links_of(&IrRef::GradeSeparation(separation.id.clone()))
+            .collect();
+        assert_eq!(links.len(), 1, "{}: {links:?}", separation.id);
+        assert_eq!(links[0].relation, Relation::Collapsed);
+        assert_eq!(links[0].role.as_deref(), Some("layer"));
+        let on_bridge = ways_of(&document, over.name.as_deref().unwrap())[1];
+        assert_eq!(links[0].local, way_ref(on_bridge));
+        assert!(tag(on_bridge, "layer").is_some());
+    }
+}
+
+#[test]
+fn an_interchange_is_merged_into_the_exit_node_it_names() {
+    let map = kita_exit();
+    let (document, trace) = export_traced(&map);
+    let interchange = map.interchanges.iter().next().unwrap();
+    let links: Vec<_> = trace
+        .links_of(&IrRef::Interchange(interchange.id.clone()))
+        .collect();
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert_eq!(links[0].relation, Relation::Merged);
+    assert_eq!(links[0].role.as_deref(), Some("motorway_junction"));
+    let exit = document
+        .nodes
+        .values()
+        .find(|node| format!("node:{}", node.id) == links[0].local)
+        .expect("a node of the file");
     assert_eq!(exit.tags.get("name").map(String::as_str), Some("Kita IC"));
 }

@@ -489,7 +489,13 @@ impl TraceIndex {
 /// [`TraceIndex::neighbours`]: a lane's road and the connections that join it, a
 /// road's lanes and its junction, a connection's two lanes and its junction, a
 /// junction's connecting roads, an object's lanes, a rule's objects and then its
-/// lanes, a building's parts, a part's building.
+/// lanes, a building's parts, a part's building, the roads a structure carries, a
+/// grade separation's upper road and the structure it is made by, and an
+/// interchange's junctions, roads and structures.
+///
+/// The structures and what they join are only stepped out from, never into: a
+/// road's neighbours are the same with a bridge on it as without, so a lookup that
+/// steps from a lane to its road does not also reach every bridge along the road.
 ///
 /// An element is taken by the kind its id names, as [`IrRef::parse`] reads it, and
 /// where two entries share an id the first is the one described — as a search of
@@ -578,6 +584,38 @@ fn neighbour_table(catalog: &IrCatalog) -> HashMap<String, Vec<String>> {
                     .entry(part.clone())
                     .or_insert_with(|| vec![building.id.clone()]);
             }
+        }
+    }
+    for structure in &catalog.structures {
+        if is(&structure.id, |r| matches!(r, IrRef::Structure(_))) {
+            table.entry(structure.id.clone()).or_insert_with(|| {
+                let mut roads: Vec<String> = Vec::new();
+                for span in &structure.carries {
+                    if !roads.contains(&span.road) {
+                        roads.push(span.road.clone());
+                    }
+                }
+                roads
+            });
+        }
+    }
+    for separation in &catalog.grade_separations {
+        if is(&separation.id, |r| matches!(r, IrRef::GradeSeparation(_))) {
+            table
+                .entry(separation.id.clone())
+                .or_insert_with(|| vec![separation.over.road.clone(), separation.via.clone()]);
+        }
+    }
+    for interchange in &catalog.interchanges {
+        if is(&interchange.id, |r| matches!(r, IrRef::Interchange(_))) {
+            table.entry(interchange.id.clone()).or_insert_with(|| {
+                [
+                    interchange.junctions.clone(),
+                    interchange.roads.clone(),
+                    interchange.structures.clone(),
+                ]
+                .concat()
+            });
         }
     }
     table

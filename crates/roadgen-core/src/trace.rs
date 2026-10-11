@@ -19,8 +19,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::id::{
-    BuildingId, BuildingPartId, ConnectionId, JunctionId, LandCoverId, LaneId, ObjectId, RoadId,
-    SiteId, TinBreaklineId, TinSurfaceId,
+    BuildingId, BuildingPartId, ConnectionId, GradeSeparationId, InterchangeId, JunctionId,
+    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
 };
 
 /// Any element of the IR, by its identifier.
@@ -41,6 +41,11 @@ pub enum IrRef {
     TinSurface(TinSurfaceId),
     TinBreakline(TinBreaklineId),
     LandCover(LandCoverId),
+    /// A bridge or a tunnel: GDF's Structure, a Level 1 feature of its own rather
+    /// than an attribute of the roads it carries.
+    Structure(StructureId),
+    GradeSeparation(GradeSeparationId),
+    Interchange(InterchangeId),
 }
 
 impl IrRef {
@@ -67,6 +72,9 @@ impl IrRef {
             TinSurfaceId::PREFIX => IrRef::TinSurface(TinSurfaceId::from_raw(text)),
             TinBreaklineId::PREFIX => IrRef::TinBreakline(TinBreaklineId::from_raw(text)),
             LandCoverId::PREFIX => IrRef::LandCover(LandCoverId::from_raw(text)),
+            StructureId::PREFIX => IrRef::Structure(StructureId::from_raw(text)),
+            GradeSeparationId::PREFIX => IrRef::GradeSeparation(GradeSeparationId::from_raw(text)),
+            InterchangeId::PREFIX => IrRef::Interchange(InterchangeId::from_raw(text)),
             _ => return None,
         })
     }
@@ -87,6 +95,9 @@ impl fmt::Display for IrRef {
             IrRef::TinSurface(id) => f.write_str(id.as_str()),
             IrRef::TinBreakline(id) => f.write_str(id.as_str()),
             IrRef::LandCover(id) => f.write_str(id.as_str()),
+            IrRef::Structure(id) => f.write_str(id.as_str()),
+            IrRef::GradeSeparation(id) => f.write_str(id.as_str()),
+            IrRef::Interchange(id) => f.write_str(id.as_str()),
         }
     }
 }
@@ -144,6 +155,21 @@ impl From<TinBreaklineId> for IrRef {
 impl From<LandCoverId> for IrRef {
     fn from(id: LandCoverId) -> Self {
         IrRef::LandCover(id)
+    }
+}
+impl From<StructureId> for IrRef {
+    fn from(id: StructureId) -> Self {
+        IrRef::Structure(id)
+    }
+}
+impl From<GradeSeparationId> for IrRef {
+    fn from(id: GradeSeparationId) -> Self {
+        IrRef::GradeSeparation(id)
+    }
+}
+impl From<InterchangeId> for IrRef {
+    fn from(id: InterchangeId) -> Self {
+        IrRef::Interchange(id)
     }
 }
 
@@ -311,6 +337,10 @@ mod tests {
             "building/north/left/3/0",
             "part/north/left/3/0/1",
             "rule/4",
+            "structure/arakawa_bridge",
+            "structure/e1_north/viaduct/0",
+            "separation/e1_north/avenue/0",
+            "interchange/kita_ic",
         ] {
             let parsed = IrRef::parse(text).expect(text);
             assert_eq!(parsed.to_string(), text);

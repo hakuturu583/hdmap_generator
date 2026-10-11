@@ -289,6 +289,8 @@ pub fn to_opendrive_with(map: &ValidatedMap, options: &Options) -> Result<OpenDr
 ///   object:<id>                             ← stop line, crosswalk and building, exact
 ///   outline:<object id>/<outline id>        ← BuildingPart, exact
 ///   controller:<id>                         ← traffic light, merged, role "controller"
+///   bridge:<id>, tunnel:<id>                ← Structure, exact, or part when it
+///                                             carries several stretches
 /// ```
 ///
 /// A lane's number is unique only within its `<laneSection>`, which is why the
@@ -1831,8 +1833,9 @@ impl<'a> Exporter<'a> {
     /// made-up one, and a reader that took it for a name would make up another
     /// from it.
     ///
-    /// No structure is traced, because the trace has no kind for one; the road
-    /// the element hangs off is traced already.
+    /// Each element is traced to its structure as `bridge:<id>` or `tunnel:<id>`:
+    /// exactly, when the structure carries this one stretch, or as a part of it when
+    /// it carries several and each is an element of its own.
     fn structures(&self, road: &Road) -> Result<(Vec<OdTunnel>, Vec<OdBridge>), ExportError> {
         let (mut tunnels, mut bridges) = (Vec::new(), Vec::new());
         for span in road.structure.spans() {
@@ -1852,6 +1855,17 @@ impl<'a> Exporter<'a> {
                 .get(&(structure.id.clone(), index))
                 .cloned()
                 .ok_or_else(|| ExportError::Unknown(structure.id.to_string()))?;
+            let relation = if structure.carries.len() > 1 {
+                Relation::Part
+            } else {
+                Relation::Exact
+            };
+            let kind = if structure.kind.bridge().is_some() {
+                "bridge"
+            } else {
+                "tunnel"
+            };
+            self.record(structure.id.clone(), format!("{kind}:{id}"), relation);
             let s = Length::new::<meter>(span.from);
             let length = Length::new::<meter>(span.to - span.from);
             let name = structure.name.clone();

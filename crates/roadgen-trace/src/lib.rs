@@ -357,6 +357,61 @@ mod tests {
     }
 
     #[test]
+    fn a_structure_steps_to_the_roads_it_carries_and_a_road_not_to_its_structures() {
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(300.0, 0.0, 0.0),
+                    vec![
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+                    ],
+                )
+                .unwrap()
+                .with_name("through"),
+            )
+            .unwrap();
+        builder
+            .add_tunnel(
+                vec![roadgen_core::structure::RoadSpan::new(
+                    road.clone(),
+                    100.0,
+                    200.0,
+                )],
+                roadgen_core::structure::TunnelSpec::default(),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let fingerprint = IrCatalog::of(&map).fingerprint();
+        let tunnel = map.structures.iter().next().unwrap().id.clone();
+
+        // A format that writes the tunnel, and one that writes only the road.
+        let mut structures = Trace::new("structures");
+        structures.link(tunnel.clone(), "tunnel:1", Relation::Exact);
+        let mut roads = Trace::new("roads");
+        roads.link(road.clone(), "road:1", Relation::Exact);
+
+        let mut index = TraceIndex::new();
+        index.add_ir(IrDocument::of(&map)).unwrap();
+        index.add_trace(&structures, &fingerprint).unwrap();
+        index.add_trace(&roads, &fingerprint).unwrap();
+        let answers = index.translate("structures", "tunnel:1", "roads").unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].ir, road.to_string());
+        assert_eq!(answers[0].via.as_deref(), Some(tunnel.as_str()));
+        assert_eq!(
+            IrRef::parse(&answers[0].via.clone().unwrap()),
+            Some(IrRef::Structure(tunnel))
+        );
+        assert!(index
+            .translate("roads", "road:1", "structures")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn bare_elements_take_the_formats_usual_kind() {
         let map = two_roads();
         let mut sumo = Trace::new("sumo");
