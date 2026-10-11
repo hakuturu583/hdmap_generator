@@ -179,10 +179,13 @@ fn emit(svg: &mut String, view: &View, shape: &Shape) {
         }
         Shape::Band { points, width, .. } => {
             // The width is metres, so it scales with the map: a 3.5 m lane is 3.5 m
-            // wide in the picture rather than a fixed number of pixels.
+            // wide in the picture rather than a fixed number of pixels. Unfilled by
+            // an inline style, not an attribute: the class fills a surface's areas,
+            // and a stylesheet outranks an attribute, so a lane that bends back on
+            // itself — a ramp spiralling down a pit — would be filled across.
             let _ = write!(
                 svg,
-                "<polyline class=\"{class}\" fill=\"none\" stroke-width=\"{}\" points=\"{}\"/>",
+                "<polyline class=\"{class}\" style=\"fill:none\" stroke-width=\"{}\" points=\"{}\"/>",
                 number(width * view.scale),
                 polygon_points(view, points)
             );
@@ -440,6 +443,30 @@ mod tests {
             ],
         );
         drawing
+    }
+
+    #[test]
+    fn a_lane_that_bends_back_on_itself_is_not_filled_across() {
+        // A surface's class fills areas, and a stylesheet outranks an attribute, so
+        // only an inline style keeps a band a band.
+        let mut drawing = Drawing::new("test");
+        drawing.band(
+            Kind::Surface,
+            vec![
+                Point::new(0.0, 0.0),
+                Point::new(100.0, 0.0),
+                Point::new(100.0, 100.0),
+                Point::new(0.0, 100.0),
+            ],
+            3.5,
+        );
+        let svg = drawing.to_svg();
+        let band = svg
+            .split("<polyline")
+            .nth(1)
+            .and_then(|rest| rest.split("/>").next())
+            .unwrap();
+        assert!(band.contains("style=\"fill:none\""), "{band}");
     }
 
     #[test]
