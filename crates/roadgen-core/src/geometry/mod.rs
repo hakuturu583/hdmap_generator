@@ -13,6 +13,7 @@ pub mod plan;
 pub mod polyline;
 pub mod profile;
 pub mod vector;
+pub mod vertical;
 pub mod width;
 
 pub use alignment::Alignment;
@@ -22,4 +23,5 @@ pub use height::LaneHeight;
 pub use polyline::Polyline3;
 pub use profile::{Poly3Piece, Poly3Profile};
 pub use vector::{Frame3, Point3, UnitVector3, Vector3};
+pub use vertical::VerticalProfile;
 pub use width::{Taper, WidthProfile};

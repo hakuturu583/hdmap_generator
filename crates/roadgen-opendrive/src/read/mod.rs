@@ -397,6 +397,8 @@ impl<'a> Reader<'a> {
             speed_limit,
             superelevation,
             pavement,
+            form: roadgen_core::semantics::FormOfWay::Unspecified,
+            structure: roadgen_core::structure::StructureProfile::at_grade(),
         };
         self.map
             .roads

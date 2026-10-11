@@ -98,6 +98,67 @@ impl RoadType {
     }
 }
 
+/// What part a road plays in the network, kept apart from [`RoadType`].
+///
+/// GDF's Form of Way. A road type says what kind of place the road is in — a town,
+/// the country, a motorway — which is what OpenDRIVE's `<type>` holds; the form says
+/// what the road *is* to the network: a carriageway of a motorway, the slip road
+/// onto it, a parallel collector. The two are different questions, and a slip road
+/// in a town is both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FormOfWay {
+    /// Nothing said; what every road is unless the caller says otherwise.
+    #[default]
+    Unspecified,
+    /// One carriageway of a road for motor vehicles only, entered and left only by
+    /// slip roads and crossing nothing on the level.
+    Motorway,
+    /// A road with physically separated carriageways that is not a motorway.
+    MultipleCarriageway,
+    SingleCarriageway,
+    /// A road built to enter or leave another: a ramp, a link between motorways.
+    SlipRoad,
+    /// A collector-distributor beside a carriageway, or a frontage road.
+    ParallelRoad,
+    ServiceRoad,
+    Roundabout,
+}
+
+impl FormOfWay {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FormOfWay::Unspecified => "unspecified",
+            FormOfWay::Motorway => "motorway",
+            FormOfWay::MultipleCarriageway => "multiple_carriageway",
+            FormOfWay::SingleCarriageway => "single_carriageway",
+            FormOfWay::SlipRoad => "slip_road",
+            FormOfWay::ParallelRoad => "parallel_road",
+            FormOfWay::ServiceRoad => "service_road",
+            FormOfWay::Roundabout => "roundabout",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<FormOfWay> {
+        Some(match value.to_ascii_lowercase().as_str() {
+            "unspecified" | "" => FormOfWay::Unspecified,
+            "motorway" => FormOfWay::Motorway,
+            "multiple_carriageway" | "dual_carriageway" => FormOfWay::MultipleCarriageway,
+            "single_carriageway" => FormOfWay::SingleCarriageway,
+            "slip_road" | "ramp" => FormOfWay::SlipRoad,
+            "parallel_road" => FormOfWay::ParallelRoad,
+            "service_road" => FormOfWay::ServiceRoad,
+            "roundabout" => FormOfWay::Roundabout,
+            _ => return None,
+        })
+    }
+
+    /// A motorway or a slip road: entered only where a slip road joins, crossing
+    /// nothing on the level, and with no frontage for a building to face.
+    pub fn is_controlled_access(self) -> bool {
+        matches!(self, FormOfWay::Motorway | FormOfWay::SlipRoad)
+    }
+}
+
 /// What a road is surfaced with: whether it is paved, and with what.
 ///
 /// Two levels, the way GDF puts it — a pavement status, then a surface type that

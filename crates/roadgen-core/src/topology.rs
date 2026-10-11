@@ -5,7 +5,7 @@
 //! from these — OpenDRIVE's `<link>`/`<laneLink>` and Lanelet2's shared boundary
 //! points are *lowerings* of this, never the other way round.
 
-use crate::id::{ConnectionId, JunctionId, LaneId, RoadId};
+use crate::id::{ConnectionId, InterchangeId, JunctionId, LaneId, RoadId};
 
 /// Which way traffic runs along a lane, relative to its road's reference line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -222,6 +222,8 @@ pub struct Junction {
     pub incoming_roads: Vec<RoadId>,
     /// Generated roads that carry traffic through the junction.
     pub connecting_roads: Vec<RoadId>,
+    /// The interchange the junction is part of, when it is part of one.
+    pub interchange: Option<InterchangeId>,
 }
 
 impl Junction {
@@ -231,6 +233,7 @@ impl Junction {
             name,
             incoming_roads: Vec::new(),
             connecting_roads: Vec::new(),
+            interchange: None,
         }
     }
 }

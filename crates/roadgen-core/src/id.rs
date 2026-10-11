@@ -101,6 +101,17 @@ define_id!(
     /// Identifies a land cover feature, e.g. `landcover/north_pit/pit`.
     LandCoverId, "landcover");
 
+define_id!(
+    /// Identifies a bridge or a tunnel, e.g. `structure/arakawa_bridge`.
+    StructureId, "structure");
+define_id!(
+    /// Identifies a grade separation: one road passing over another, e.g.
+    /// `separation/e1_north/avenue/0`.
+    GradeSeparationId, "separation");
+define_id!(
+    /// Identifies an interchange, e.g. `interchange/kita_ic`.
+    InterchangeId, "interchange");
+
 impl LaneId {
     /// The identifier of lane number `index` of `road`.
     ///

@@ -79,6 +79,12 @@ impl<K: Eq + Hash + Clone, V> Arena<K, V> {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut V> {
         self.items.iter_mut()
     }
+
+    /// Takes everything out.
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.index.clear();
+    }
 }
 
 impl<'a, K: Eq + Hash + Clone, V> IntoIterator for &'a Arena<K, V> {

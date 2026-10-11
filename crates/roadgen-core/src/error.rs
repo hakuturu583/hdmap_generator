@@ -110,6 +110,8 @@ pub enum BuildError {
         angle_degrees: f64,
         detail: String,
     },
+    /// A bridge, tunnel or interchange could not be laid out.
+    Structure(String),
 }
 
 impl From<GeometryError> for BuildError {
@@ -175,6 +177,7 @@ impl fmt::Display for BuildError {
                  cannot be rounded: {detail}. Give the bend an arc or spiral alignment, or \
                  more room"
             ),
+            BuildError::Structure(detail) => f.write_str(detail),
         }
     }
 }
@@ -310,6 +313,13 @@ pub enum ValidationIssue {
         feature: String,
         detail: String,
     },
+    /// A motorway, a slip road or a road on a structure crosses another road on
+    /// the level, or close enough that nothing could carry one over the other.
+    UnseparatedCrossing {
+        over: RoadId,
+        under: RoadId,
+        detail: String,
+    },
     Geometry {
         detail: String,
     },
@@ -379,6 +389,11 @@ impl fmt::Display for ValidationIssue {
             ValidationIssue::ImplausibleFeature { feature, detail } => {
                 write!(f, "{feature}: {detail}")
             }
+            ValidationIssue::UnseparatedCrossing { detail, .. } => write!(
+                f,
+                "{detail}: a motorway, a slip road or a road on a structure crosses nothing \
+                 on the level — carry one over the other with a bridge or a tunnel"
+            ),
             ValidationIssue::Geometry { detail } => write!(f, "geometry error: {detail}"),
         }
     }

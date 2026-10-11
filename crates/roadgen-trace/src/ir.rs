@@ -108,6 +108,14 @@ pub struct IrCatalog {
     pub tin_breaklines: Vec<TinBreaklineEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub land_covers: Vec<LandCoverEntry>,
+    /// Left out when empty, like the terrain above: a map with no bridge, tunnel
+    /// or interchange dumps as it did before those existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structures: Vec<StructureEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grade_separations: Vec<GradeSeparationEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interchanges: Vec<InterchangeEntry>,
     /// `sha256:<hex>` of the whole IR — geometry, sampling, footprints and every
     /// other field the entries above leave out — so the fingerprint covers what the
     /// exports are written from, and not only what a lookup reads.
@@ -149,6 +157,56 @@ pub struct RoadEntry {
     /// `(station, surface)` for each stretch whose pavement was stated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pavement: Vec<PavementEntry>,
+    /// The road's form of way, when one was stated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<String>,
+    /// The stretches of it on a bridge or in a tunnel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structures: Vec<StructureSpanEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StructureSpanEntry {
+    pub structure: String,
+    pub from: f64,
+    pub to: f64,
+}
+
+/// A stretch of a road, by station, and what is there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpanEntry {
+    pub road: String,
+    pub from: f64,
+    pub to: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StructureEntry {
+    pub id: String,
+    pub name: Option<String>,
+    pub kind: String,
+    pub form: String,
+    pub carries: Vec<SpanEntry>,
+    pub site: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GradeSeparationEntry {
+    pub id: String,
+    pub over: SpanEntry,
+    /// A road's stretch, or a land cover's id.
+    pub under: String,
+    pub via: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterchangeEntry {
+    pub id: String,
+    pub name: Option<String>,
+    pub kind: String,
+    pub junctions: Vec<String>,
+    pub roads: Vec<String>,
+    pub structures: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -228,6 +286,8 @@ pub struct JunctionEntry {
     pub name: Option<String>,
     pub incoming: Vec<String>,
     pub connecting: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interchange: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -315,6 +375,18 @@ impl IrCatalog {
                             surface: pavement.surface_str().into(),
                         })
                         .collect(),
+                    form: (road.form != roadgen_core::semantics::FormOfWay::Unspecified)
+                        .then(|| road.form.as_str().to_owned()),
+                    structures: road
+                        .structure
+                        .spans()
+                        .iter()
+                        .map(|span| StructureSpanEntry {
+                            structure: span.structure.to_string(),
+                            from: span.from,
+                            to: span.to,
+                        })
+                        .collect(),
                 })
                 .collect(),
             lanes: map
@@ -349,6 +421,7 @@ impl IrCatalog {
                         .iter()
                         .map(ToString::to_string)
                         .collect(),
+                    interchange: junction.interchange.as_ref().map(ToString::to_string),
                 })
                 .collect(),
             connections: map
@@ -440,6 +513,53 @@ impl IrCatalog {
                     draped_on: cover.draped_on.as_ref().map(ToString::to_string),
                 })
                 .collect(),
+            structures: map
+                .structures
+                .iter()
+                .map(|structure| StructureEntry {
+                    id: structure.id.to_string(),
+                    name: structure.name.clone(),
+                    kind: structure.kind.as_str().into(),
+                    form: structure.kind.form().into(),
+                    carries: structure.carries.iter().map(span_entry).collect(),
+                    site: structure.site.as_ref().map(ToString::to_string),
+                })
+                .collect(),
+            grade_separations: map
+                .grade_separations
+                .iter()
+                .map(|separation| GradeSeparationEntry {
+                    id: separation.id.to_string(),
+                    over: span_entry(&separation.over),
+                    under: match &separation.under {
+                        roadgen_core::structure::Underneath::Road(span) => {
+                            format!("{}@{:.3}-{:.3}", span.road, span.from, span.to)
+                        }
+                        roadgen_core::structure::Underneath::LandCover(cover) => cover.to_string(),
+                    },
+                    via: separation.via.to_string(),
+                })
+                .collect(),
+            interchanges: map
+                .interchanges
+                .iter()
+                .map(|interchange| InterchangeEntry {
+                    id: interchange.id.to_string(),
+                    name: interchange.name.clone(),
+                    kind: interchange.kind.clone(),
+                    junctions: interchange
+                        .junctions
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    roads: interchange.roads.iter().map(ToString::to_string).collect(),
+                    structures: interchange
+                        .structures
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                })
+                .collect(),
             geometry: geometry_digest(map),
         }
     }
@@ -485,7 +605,18 @@ fn geometry_digest(map: &Map) -> String {
     map.tin_surfaces.iter().for_each(|x| feed(x));
     map.tin_breaklines.iter().for_each(|x| feed(x));
     map.land_covers.iter().for_each(|x| feed(x));
+    map.structures.iter().for_each(|x| feed(x));
+    map.grade_separations.iter().for_each(|x| feed(x));
+    map.interchanges.iter().for_each(|x| feed(x));
     sha256_tag(&digest.0.finalize())
+}
+
+fn span_entry(span: &roadgen_core::structure::RoadSpan) -> SpanEntry {
+    SpanEntry {
+        road: span.road.to_string(),
+        from: span.from,
+        to: span.to,
+    }
 }
 
 fn link_entry(target: &RoadLinkTarget) -> LinkEntry {

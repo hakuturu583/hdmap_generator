@@ -11,14 +11,17 @@ use std::collections::{HashMap, HashSet};
 use crate::error::{BuildError, GeometryError};
 use crate::geometry::{
     Arc3, Bezier3, Curve3, LaneHeight, Point3, Poly3Piece, Poly3Profile, Polyline3, SamplingConfig,
-    Taper, UnitVector3, Vector3, WidthProfile,
+    Taper, UnitVector3, Vector3, VerticalProfile, WidthProfile,
 };
-use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
+use crate::id::{ConnectionId, InterchangeId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::layout::{self, RoadGeometry, SectionLayout};
 use crate::map::{CrossSection, Lane, Map, MapMetadata, Road};
 use crate::semantics::{
-    BoundaryMarking, LaneType, LightHead, MapObject, MapObjectKind, ObjectGeometry,
+    BoundaryMarking, FormOfWay, LaneType, LightHead, MapObject, MapObjectKind, ObjectGeometry,
     PavementProfile, RoadMarking, RoadType, TrafficRule,
+};
+use crate::structure::{
+    self, BridgeSpec, Interchange, RoadSpan, StructureProfile, StructureSpec, TunnelSpec,
 };
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
@@ -125,6 +128,8 @@ pub struct RoadSpec {
     pub superelevation: Poly3Profile,
     /// What the road is surfaced with along its length; unknown unless said.
     pub pavement: PavementProfile,
+    /// What part the road plays in the network.
+    pub form: FormOfWay,
 }
 
 impl RoadSpec {
@@ -140,6 +145,7 @@ impl RoadSpec {
             speed_limit: None,
             superelevation: Poly3Profile::default(),
             pavement: PavementProfile::unknown(),
+            form: FormOfWay::Unspecified,
         }
     }
 
@@ -175,6 +181,23 @@ impl RoadSpec {
     pub fn with_pavement(mut self, pavement: PavementProfile) -> Self {
         self.pavement = pavement;
         self
+    }
+
+    /// Says what part the road plays in the network: a motorway carriageway, a
+    /// slip road.
+    pub fn with_form(mut self, form: FormOfWay) -> Self {
+        self.form = form;
+        self
+    }
+
+    /// Gives the road a vertical alignment: its plan stays, and its heights are
+    /// read from `profile` against horizontal station, the reference line cut
+    /// every five metres so the vertical curves are followed.
+    pub fn with_vertical(mut self, profile: &VerticalProfile) -> Result<Self, GeometryError> {
+        self.reference_line = self
+            .reference_line
+            .draped(&|station| profile.height(station), 5.0)?;
+        Ok(self)
     }
 
     /// Adds a cross-section that takes over at `station`.
@@ -232,6 +255,16 @@ impl LaneRef {
     fn lane_id(&self) -> LaneId {
         LaneId::of_road(&self.road, self.index)
     }
+}
+
+/// An interchange as the caller named it.
+#[derive(Debug, Clone)]
+struct InterchangeSpec {
+    id: InterchangeId,
+    name: String,
+    kind: String,
+    junctions: Vec<JunctionId>,
+    roads: Vec<RoadId>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +350,8 @@ pub struct MapBuilder {
     objects: Vec<(ObjectId, ObjectSpec)>,
     object_index: HashMap<ObjectId, usize>,
     rules: Vec<RuleSpec>,
+    structures: Vec<(Vec<RoadSpan>, StructureSpec)>,
+    interchanges: Vec<InterchangeSpec>,
     auto_road: usize,
     auto_junction: usize,
     auto_object: usize,
@@ -340,6 +375,8 @@ impl MapBuilder {
             objects: Vec::new(),
             object_index: HashMap::new(),
             rules: Vec::new(),
+            structures: Vec::new(),
+            interchanges: Vec::new(),
             auto_road: 0,
             auto_junction: 0,
             auto_object: 0,
@@ -921,6 +958,78 @@ impl MapBuilder {
         self.rules.push(RuleSpec::SpeedLimit { limit, lanes });
     }
 
+    /// Puts a bridge under `spans`: one stretch of road, or several side by side
+    /// that share a deck — both carriageways of a motorway. Its outline, abutments
+    /// and piers are laid out once the roads are built.
+    pub fn add_bridge(&mut self, spans: Vec<RoadSpan>, spec: BridgeSpec) -> Result<(), BuildError> {
+        self.add_structure(spans, StructureSpec::Bridge(spec))
+    }
+
+    /// Puts a tunnel round `spans`. Twin bores are two tunnels.
+    pub fn add_tunnel(&mut self, spans: Vec<RoadSpan>, spec: TunnelSpec) -> Result<(), BuildError> {
+        self.add_structure(spans, StructureSpec::Tunnel(spec))
+    }
+
+    fn add_structure(
+        &mut self,
+        spans: Vec<RoadSpan>,
+        spec: StructureSpec,
+    ) -> Result<(), BuildError> {
+        for span in &spans {
+            if !self.road_index.contains_key(&span.road) {
+                return Err(BuildError::UnknownRoad(span.road.clone()));
+            }
+        }
+        if spans.is_empty() {
+            return Err(BuildError::Structure(
+                "a structure has to carry some road".into(),
+            ));
+        }
+        self.structures.push((spans, spec));
+        Ok(())
+    }
+
+    /// Gathers junctions and roads into one interchange. The movements through
+    /// its junctions are its roads too, and the structures any of its roads are on
+    /// are its structures; both are filled in when the map is built.
+    pub fn add_interchange(
+        &mut self,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        junctions: Vec<JunctionId>,
+        roads: Vec<RoadId>,
+    ) -> Result<InterchangeId, BuildError> {
+        let name = name.into();
+        let key = structure::slug(&name);
+        if key.is_empty() {
+            return Err(BuildError::Structure(format!(
+                "an interchange named {name:?} has nothing to name it after"
+            )));
+        }
+        let id = InterchangeId::new(key);
+        if self.interchanges.iter().any(|spec| spec.id == id) {
+            return Err(BuildError::DuplicateId(id.to_string()));
+        }
+        for junction in &junctions {
+            if !self.junction_index.contains_key(junction) {
+                return Err(BuildError::UnknownJunction(junction.clone()));
+            }
+        }
+        for road in &roads {
+            if !self.road_index.contains_key(road) {
+                return Err(BuildError::UnknownRoad(road.clone()));
+            }
+        }
+        self.interchanges.push(InterchangeSpec {
+            id: id.clone(),
+            name,
+            kind: kind.into(),
+            junctions,
+            roads,
+        });
+        Ok(id)
+    }
+
     /// Generates geometry and produces the map, ready for validation.
     pub fn finish(self) -> Result<UnvalidatedMap, BuildError> {
         Generator::new(self).run()
@@ -972,7 +1081,37 @@ impl Generator {
         self.build_connections()?;
         self.build_objects()?;
         self.build_rules()?;
+        self.place_structures()?;
+        self.build_interchanges()?;
+        structure::derive_separations(&mut self.map);
         Ok(UnvalidatedMap::from_map(self.map))
+    }
+
+    fn place_structures(&mut self) -> Result<(), BuildError> {
+        for (spans, spec) in &self.builder.structures {
+            structure::place(&mut self.map, spans, spec)
+                .map_err(|error| BuildError::Structure(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn build_interchanges(&mut self) -> Result<(), BuildError> {
+        for spec in &self.builder.interchanges {
+            let interchange = Interchange {
+                id: spec.id.clone(),
+                name: Some(spec.name.clone()),
+                kind: spec.kind.clone(),
+                junctions: spec.junctions.clone(),
+                roads: spec.roads.clone(),
+                structures: Vec::new(),
+            };
+            self.map
+                .interchanges
+                .insert(spec.id.clone(), interchange)
+                .map_err(|duplicate| BuildError::DuplicateId(duplicate.0.to_string()))?;
+        }
+        structure::refresh_interchanges(&mut self.map);
+        Ok(())
     }
 
     fn build_reference_geometry(&mut self) -> Result<(), BuildError> {
@@ -1624,6 +1763,8 @@ impl Generator {
                 speed_limit: spec.speed_limit,
                 superelevation: spec.superelevation.clone(),
                 pavement: spec.pavement.clone(),
+                form: spec.form,
+                structure: StructureProfile::at_grade(),
             },
             lanes,
         ))
@@ -2049,6 +2190,13 @@ impl Generator {
                     road.pavement.at(station)
                 })
                 .map(PavementProfile::constant)
+                .unwrap_or_default(),
+            // And plays the part the road it leaves plays: a movement off a slip road
+            // is a slip road.
+            form: self
+                .map
+                .road(&from_lane.road)
+                .map(|road| road.form)
                 .unwrap_or_default(),
         };
         let (road, lanes) = self.build_road(

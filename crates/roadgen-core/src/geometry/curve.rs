@@ -874,6 +874,97 @@ impl Curve3 {
         }
     }
 
+    /// The same plan, with its heights read from `z` against horizontal station
+    /// instead: each line, arc and spiral cut into pieces no longer than `step`,
+    /// each piece keeping its plan exactly and climbing at a constant grade between
+    /// the heights `z` gives at its two ends. A polyline or a Bézier keeps its
+    /// vertices and takes their heights from `z`.
+    ///
+    /// This is how a vertical curve gets into a curve that carries a constant grade
+    /// per piece: a parabola of radius 3000 m cut every 5 m is off by a millimetre.
+    pub fn draped(&self, z: &dyn Fn(f64) -> f64, step: f64) -> Result<Curve3, GeometryError> {
+        let mut pieces = Vec::new();
+        self.drape_into(0.0, z, step.max(0.1), &mut pieces)?;
+        Curve3::composite(pieces)
+    }
+
+    fn drape_into(
+        &self,
+        offset: f64,
+        z: &dyn Fn(f64) -> f64,
+        step: f64,
+        out: &mut Vec<Curve3>,
+    ) -> Result<(), GeometryError> {
+        let cuts = |length: f64| {
+            let count = ((length / step).ceil() as usize).max(1);
+            (0..=count).map(move |index| length * index as f64 / count as f64)
+        };
+        match self {
+            Curve3::Line(line) => {
+                let length = line.start().horizontal_distance_to(line.end());
+                let stations: Vec<f64> = cuts(length).collect();
+                for pair in stations.windows(2) {
+                    let at = |s: f64| {
+                        let p = line.start().lerp(line.end(), s / length);
+                        Point3::new(p.x, p.y, z(offset + s))
+                    };
+                    out.push(Curve3::Line(Line3::new(at(pair[0]), at(pair[1]))?));
+                }
+            }
+            Curve3::Arc(arc) => {
+                let stations: Vec<f64> = cuts(arc.horizontal_length).collect();
+                for pair in stations.windows(2) {
+                    let (point, tangent) = arc.at(pair[0]);
+                    out.push(Curve3::Arc(Arc3::new(
+                        Point3::new(point.x, point.y, z(offset + pair[0])),
+                        tangent.heading(),
+                        arc.curvature,
+                        pair[1] - pair[0],
+                        z(offset + pair[1]),
+                    )?));
+                }
+            }
+            Curve3::Clothoid(clothoid) => {
+                let stations: Vec<f64> = cuts(clothoid.horizontal_length).collect();
+                let points = clothoid.walk(&stations);
+                for (index, pair) in stations.windows(2).enumerate() {
+                    let point = points[index];
+                    let curvature = |s: f64| clothoid.curvature_start + clothoid.sharpness() * s;
+                    out.push(Curve3::Clothoid(Clothoid3::new(
+                        Point3::new(point.x, point.y, z(offset + pair[0])),
+                        clothoid.heading_at(pair[0]),
+                        curvature(pair[0]),
+                        curvature(pair[1]),
+                        pair[1] - pair[0],
+                        z(offset + pair[1]),
+                    )?));
+                }
+            }
+            Curve3::Bezier(_) | Curve3::Polyline(_) => {
+                let polyline = self.to_polyline(SamplingConfig::default())?;
+                let mut station = 0.0;
+                let mut previous: Option<Point3> = None;
+                let mut points = Vec::new();
+                for point in polyline.points() {
+                    if let Some(last) = previous {
+                        station += last.horizontal_distance_to(*point);
+                    }
+                    previous = Some(*point);
+                    points.push(Point3::new(point.x, point.y, z(offset + station)));
+                }
+                out.push(Curve3::polyline(points)?);
+            }
+            Curve3::Composite(segments) => {
+                let mut at = offset;
+                for segment in segments {
+                    segment.drape_into(at, z, step, out)?;
+                    at += segment.horizontal_length()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// True arc length, in three dimensions.
     pub fn length(&self, config: SamplingConfig) -> Result<f64, GeometryError> {
         Ok(self.to_polyline(config)?.length())
