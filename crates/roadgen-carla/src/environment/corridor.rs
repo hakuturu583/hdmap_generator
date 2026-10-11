@@ -318,6 +318,18 @@ impl CorridorSpec {
 const STEP: f64 = 5.0;
 /// The length of a junction where a slip road leaves or joins, metres.
 const GAP: f64 = 20.0;
+/// The radius of a loop slip road along the middle of its lane, metres: the
+/// Road Structure Ordinance's least radius (art. 15) for 30 km/h, the speed a
+/// loop is designed to — slower than the 40 km/h of the other slip roads, whose
+/// 60 m would need the terminals half as far out again.
+const LOOP_RADIUS: f64 = 30.0;
+/// The room kept between a loop and the off slip road outside it, metres.
+const LOOP_CLEARANCE: f64 = 2.0;
+/// How much farther out than the terminal an off slip road may end, metres, to
+/// make room for the loop inside it: the junction at the terminal reaches
+/// [`GAP`] / 2 along the crossroad each side, and the off slip road's lanes stay
+/// within it.
+const LOOP_PUSH: f64 = 3.5;
 
 /// The centre line, rounded and sampled: station, position, heading.
 #[derive(Debug, Clone)]
@@ -1264,9 +1276,47 @@ impl CorridorSpec {
                 // Beside a loop the off slip road ends a ramp's width out, the
                 // loop leaving the terminal a ramp's width in.
                 let apart = ramp_width / 2.0 + 1.0;
+                // The loop: its radius is what a loop is designed to, whatever
+                // the room. It leaves the terminal a ramp's width in, against the
+                // traffic, and turns towards the corridor to come out on the
+                // merge line with the traffic, and on under the crossroad. Its
+                // reference line is its outer edge, the lane inside it.
+                let loop_start = {
+                    let b = back(setback);
+                    [
+                        b[0] + toward[0] * (ramp_width + 1.0),
+                        b[1] + toward[1] * (ramp_width + 1.0),
+                    ]
+                };
+                let loop_radius =
+                    LOOP_RADIUS + ramp_standard.inner_shoulder + ramp_standard.lane_width / 2.0;
+                // How far the loop has to come in, from its start to the merge
+                // line: twice its radius is a half turn; more room is taken up by
+                // a straight towards the corridor between two quarter turns, and
+                // less by starting out turned away from the corridor and going
+                // round more than a half turn, which takes the loop out past its
+                // start by the shortfall. Out there is the off slip road, which
+                // ends farther out than the terminal if it has to.
+                let drop = {
+                    let (_, lateral) = track.locate(loop_start);
+                    lateral.abs() - (standard.median / 2.0 + cw_width + 0.5)
+                };
+                let rise = (2.0 * loop_radius - drop).max(0.0);
+                // The loop's outer edge starts a ramp's width and 2 m in from
+                // the off slip road's inner one.
+                let push = (rise - (ramp_width + 2.0 - LOOP_CLEARANCE)).max(0.0);
+                if looped && push > LOOP_PUSH {
+                    let least = site.terminal + push - LOOP_PUSH;
+                    return Err(format!(
+                        "{}: the terminal is too near the motorway for a loop of {LOOP_RADIUS:.0} m; \
+                         put it {least:.0} m out or farther",
+                        site.name
+                    ));
+                }
                 let off_end = if looped {
                     let p = shift(back(setback));
-                    [p[0] - toward[0] * apart, p[1] - toward[1] * apart]
+                    let out = apart + push;
+                    [p[0] - toward[0] * out, p[1] - toward[1] * out]
                 } else {
                     shift(back(setback))
                 };
@@ -1295,51 +1345,67 @@ impl CorridorSpec {
                     ic_roads.push(on_name.clone());
                 }
                 if looped {
-                    // The loop: away from the crossroad against the traffic, round
-                    // through a half turn towards the corridor, and on to the
-                    // carriageway with it, under the crossroad.
-                    let b = back(setback);
-                    let start = [
-                        b[0] + toward[0] * (ramp_width + 1.0),
-                        b[1] + toward[1] * (ramp_width + 1.0),
-                    ];
-                    let (_, lateral) = track.locate(start);
-                    let merge = standard.median / 2.0 + cw_width + 0.5;
-                    let radius = (lateral.abs() - merge) / 2.0;
-                    if radius < 20.0 {
-                        return Err(format!(
-                            "{}: the terminal is too near the motorway for a loop; \
-                             put it farther out than {:.0} m",
-                            site.name, site.terminal
-                        ));
+                    // The turns, as headings in the plane of along the traffic
+                    // and towards the corridor, the loop turning from the one to
+                    // the other: away from the corridor by `turned` at the start,
+                    // against the traffic, towards the corridor, and with the
+                    // traffic at the end.
+                    let turned = if rise > 0.0 {
+                        (drop / loop_radius - 1.0).clamp(-1.0, 1.0).acos()
+                    } else {
+                        0.0
+                    };
+                    let straight = (drop - 2.0 * loop_radius).max(0.0);
+                    let half_pi = std::f64::consts::FRAC_PI_2;
+                    // Points about a metre or two apart round the turns, so the
+                    // curve fitted through them keeps the radius.
+                    let mut local = vec![[0.0_f64, 0.0_f64]];
+                    let mut heading = std::f64::consts::PI + turned;
+                    let arc = |local: &mut Vec<[f64; 2]>, heading: &mut f64, to: f64| {
+                        let at = *local.last().expect("a start");
+                        // Turning clockwise here, the centre is to the right.
+                        let centre = [
+                            at[0] + loop_radius * heading.sin(),
+                            at[1] - loop_radius * heading.cos(),
+                        ];
+                        let count = ((*heading - to) * loop_radius / 2.0).ceil().max(2.0) as usize;
+                        for k in 1..=count {
+                            let h = *heading + (to - *heading) * k as f64 / count as f64;
+                            local.push([
+                                centre[0] - loop_radius * h.sin(),
+                                centre[1] + loop_radius * h.cos(),
+                            ]);
+                        }
+                        *heading = to;
+                    };
+                    arc(&mut local, &mut heading, half_pi);
+                    if straight > 0.0 {
+                        let at = *local.last().expect("a start");
+                        let count = (straight / STEP).ceil().max(1.0) as usize;
+                        for k in 1..=count {
+                            local.push([at[0], at[1] + straight * k as f64 / count as f64]);
+                        }
                     }
-                    if radius < 30.0 {
-                        plan.notes.push(format!(
-                            "{}: the loop on the {} is {radius:.0} m round, tighter than 30 m",
-                            site.name,
-                            side.as_str()
-                        ));
-                    }
-                    let centre = [start[0] + toward[0] * radius, start[1] + toward[1] * radius];
-                    let count = ((std::f64::consts::PI * radius) / STEP).ceil().max(4.0) as usize;
-                    let lead: Vec<Point3> = (0..=count)
-                        .map(|k| {
-                            let angle = std::f64::consts::PI * k as f64 / count as f64;
-                            let (cos, sin) = (angle.cos(), angle.sin());
+                    arc(&mut local, &mut heading, 0.0);
+                    let lead: Vec<Point3> = local
+                        .iter()
+                        .map(|[a, b]| {
                             Point3::new(
-                                centre[0] - radius * (toward[0] * cos + u[0] * sin),
-                                centre[1] - radius * (toward[1] * cos + u[1] * sin),
+                                loop_start[0] + u[0] * a + toward[0] * b,
+                                loop_start[1] + u[1] * a + toward[1] * b,
                                 terminal.z,
                             )
                         })
                         .collect();
                     let end = *lead.last().expect("points");
-                    let (end_station, _) = track.locate([end.x, end.y]);
+                    // On to the nose 25 m on from where the loop starts, which
+                    // is as far on as the loop goes: the merge is past the
+                    // crossroad, not under it.
                     accesses.push(Access {
                         ramp: loop_name.clone(),
                         carriageway: c,
                         on: true,
-                        nose: travel(carriageway, end_station) + 25.0 + GAP / 2.0,
+                        nose: travel_at - setback + 25.0 + GAP / 2.0,
                         end: [end.x, end.y],
                         end_z: terminal.z,
                         end_heading: heading_travel,
