@@ -280,6 +280,56 @@ pub(crate) fn separate(map: &mut Map) -> Vec<String> {
     notes
 }
 
+/// How far a road may stand off the natural land and still have a frontage,
+/// metres.
+const FRONTAGE: f64 = 1.5;
+
+/// The stretches of `roads` that stand more than [`FRONTAGE`] off the natural land
+/// — an embankment, a cutting — each as an outline reaching a lot's depth past the
+/// road, for buildings to keep out of.
+pub(crate) fn off_the_land(map: &Map, roads: &[RoadId], natural: &Natural) -> Vec<Vec<PlanPoint>> {
+    let mut rings = Vec::new();
+    for id in roads {
+        let Some(road) = map.road(id) else { continue };
+        let Ok(length) = road.horizontal_length() else {
+            continue;
+        };
+        let count = (length / STEP).ceil().max(1.0) as usize;
+        let mut run: Option<f64> = None;
+        let close = |from: f64, to: f64, rings: &mut Vec<Vec<PlanPoint>>| {
+            let span = RoadSpan::new(id.clone(), (from - 10.0).max(0.0), (to + 10.0).min(length));
+            if span.length() > 1.0 {
+                if let Ok(ring) = structure::outline(map, &[span], 25.0) {
+                    rings.push(plan_of(&ring));
+                }
+            }
+        };
+        for index in 0..=count {
+            let station = length * index as f64 / count as f64;
+            let Ok(sample) = road
+                .reference_line
+                .sample_at(station, map.metadata.sampling)
+            else {
+                continue;
+            };
+            let p = sample.point;
+            let off = (p.z - natural.height(p.x, p.y)).abs() > FRONTAGE;
+            match (off, run) {
+                (true, None) => run = Some(station),
+                (false, Some(from)) => {
+                    close(from, station, &mut rings);
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(from) = run {
+            close(from, length, &mut rings);
+        }
+    }
+    rings
+}
+
 /// The land's cut and fill along a corridor's roads where they are on the ground:
 /// from each edge a slope runs out at [`FILL`] down to the natural land, or at
 /// [`CUT`] up to it. Each slope's far edge is a breakline; what lies between it

@@ -35,6 +35,7 @@
 //! `open_pit_mine`.
 
 pub mod corridor;
+pub mod foundation;
 pub mod heap;
 pub(crate) mod highway;
 pub mod hill;
@@ -110,6 +111,8 @@ pub struct Report {
     pub sites: usize,
     /// Bridges and tunnels on the map once the rules have run.
     pub structures: usize,
+    /// Buildings given a foundation down to land that falls away under them.
+    pub foundations: usize,
     /// Where a rule could not be kept, or was kept only just.
     pub notes: Vec<String>,
 }
@@ -375,6 +378,9 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
         .map(|part| plan_of(&part.outline))
         .collect();
     let mut earthworks = None;
+    // The stretches of a fitted road that stand well off the land — a crossroad's
+    // embankment up to its overpass — which nothing has a frontage on.
+    let mut embanked: Vec<Vec<roadgen_core::geometry::plan::PlanPoint>> = Vec::new();
     if separates {
         let natural = highway::Natural {
             field: land::base_field(
@@ -413,6 +419,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
         if !fitted.is_empty() {
             earthworks = Some(highway::earthworks(target, &fitted, &natural));
         }
+        embanked = highway::off_the_land(target, &places.fitted_roads, &natural);
     }
     if let Some(works) = &earthworks {
         forms.lines.extend(works.lines.clone());
@@ -450,6 +457,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
             .collect();
         let mut outside: Vec<Vec<roadgen_core::geometry::plan::PlanPoint>> =
             parts.iter().map(|part| plan_of(&part.outline)).collect();
+        outside.extend(embanked.iter().cloned());
         for (road, _) in &corridor_roads {
             let Some(entry) = source.road(road) else {
                 continue;
@@ -555,6 +563,12 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
                 }
             }
         }
+    }
+
+    // Every building stands on the land: where it falls away under one, the
+    // building gets a foundation down to it.
+    if let Some(surface) = &surface {
+        report.foundations = foundation::lay(map.as_map_mut(), surface)?;
     }
 
     // What each part's land is, and which site it belongs to.

@@ -246,3 +246,37 @@ fn carla_draws_the_decks_piers_and_tunnels() {
     assert!(top > 40.0, "the ridge reaches {top:.1} m");
     let _ = StructureKind::Bridge;
 }
+
+#[test]
+fn every_building_stands_on_the_land_on_a_foundation_where_it_falls_away() {
+    let map = highway();
+    let tin = map.tin_surfaces.iter().next().expect("land").tin.locator();
+    let mut founded = 0;
+    for building in map.buildings.iter() {
+        let parts: Vec<_> = building
+            .parts
+            .iter()
+            .filter_map(|id| map.building_parts.get(id))
+            .collect();
+        founded += usize::from(
+            parts
+                .iter()
+                .any(|p| p.kind.as_deref() == Some("foundation")),
+        );
+        let corners = || parts.iter().flat_map(|p| p.solid.footprint.points());
+        let base = corners().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        let land = corners()
+            .filter_map(|p| tin.height_at(p.x, p.y))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            base - land < 0.3,
+            "{} floats {:.2} m over the land",
+            building.id,
+            base - land
+        );
+    }
+    assert!(
+        founded > 0,
+        "the crossroad's approach leaves some building a foundation"
+    );
+}

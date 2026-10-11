@@ -890,12 +890,27 @@ impl CorridorSpec {
             // its abutments to the motorway at a fill's slope.
             let half_corridor = half_corridor + (target - motorway_z).abs() * 1.8;
             let flat = half_corridor + 5.0;
+            // Level over the motorway, down at an approach grade each side, and on
+            // the ground it was drawn on beyond that: an overpass's approach is an
+            // embankment only as long as it has to be.
+            let approach_grade = 0.05;
             let mut cross_pvis = vec![(0.0, ground_at(0.0))];
-            if c_station - flat > 1.0 {
-                cross_pvis.push((c_station - flat, target));
+            let before = c_station - flat;
+            let after = c_station + flat;
+            let foot_before = before - (target - ground_at(before.max(0.0))).abs() / approach_grade;
+            let foot_after =
+                after + (target - ground_at(after.min(cross_length))).abs() / approach_grade;
+            if foot_before > 1.0 {
+                cross_pvis.push((foot_before, ground_at(foot_before)));
             }
-            if c_station + flat < cross_length - 1.0 {
-                cross_pvis.push((c_station + flat, target));
+            if before > 1.0 {
+                cross_pvis.push((before, target));
+            }
+            if after < cross_length - 1.0 {
+                cross_pvis.push((after, target));
+            }
+            if foot_after < cross_length - 1.0 {
+                cross_pvis.push((foot_after, ground_at(foot_after)));
             }
             cross_pvis.push((cross_length, ground_at(cross_length)));
             let cross_profile =
