@@ -381,10 +381,16 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
             ),
             rises: &forms.rises,
         };
-        let modes: Vec<(String, StructureMode)> = places
+        let modes: Vec<(String, StructureMode, bool)> = places
             .corridors
             .iter()
-            .map(|corridor| (corridor.name.clone(), corridor.structures))
+            .map(|corridor| {
+                (
+                    corridor.name.clone(),
+                    corridor.structures,
+                    corridor.shared_deck,
+                )
+            })
             .collect();
         let target = map.as_map_mut();
         report.notes.extend(highway::choose_structures(

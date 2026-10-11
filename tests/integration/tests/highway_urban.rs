@@ -205,3 +205,146 @@ fn a_lone_slip_road_and_a_half_diamond_join_the_streets() {
                 && o.lanes.iter().any(|l| l.as_str().contains("east_")))
     );
 }
+
+#[test]
+fn an_elevated_motorway_on_a_shared_deck_is_one_viaduct_on_piers_down_the_median() {
+    let mut spec = corridor(true);
+    spec.shared_deck = true;
+    let median = spec.standard.median;
+    let (map, notes) = generate(spec, |_| {});
+    assert!(notes.is_empty(), "{notes:#?}");
+    let viaducts: Vec<_> = map
+        .structures
+        .iter()
+        .filter(|s| s.kind.form() == "viaduct")
+        .collect();
+    assert_eq!(viaducts.len(), 1, "one deck for both carriageways");
+    let viaduct = viaducts[0];
+    let mut carried: Vec<&str> = viaduct.carries.iter().map(|s| s.road.as_str()).collect();
+    carried.sort();
+    assert_eq!(carried, ["road/shuto_left_0", "road/shuto_right_0"]);
+    // Both carriageways still pass over each street, through the one viaduct.
+    for street in ["road/first", "road/second"] {
+        let under: Vec<_> = map
+            .grade_separations
+            .iter()
+            .filter(|g| matches!(&g.under, Underneath::Road(span) if span.road.as_str() == street))
+            .collect();
+        assert_eq!(under.len(), 2, "both carriageways pass over {street}");
+        assert!(under.iter().all(|g| g.via == viaduct.id));
+    }
+    // The piers stand in the median, one row of them, and none on a street; the
+    // abutments reach across the whole deck.
+    let supports = &viaduct.kind.bridge().unwrap().supports;
+    let piers: Vec<_> = supports
+        .iter()
+        .filter(|s| s.kind == roadgen_core::structure::SupportKind::Pier)
+        .collect();
+    assert!(piers.len() >= 10, "{} piers", piers.len());
+    for pier in &piers {
+        for p in pier.footprint.points() {
+            assert!(p.y.abs() <= median / 2.0, "a pier off the median at {p:?}");
+            for x in [-100.0, 200.0] {
+                assert!((p.x - x).abs() > 3.5, "a pier on the street at {p:?}");
+            }
+        }
+    }
+    for abutment in supports
+        .iter()
+        .filter(|s| s.kind == roadgen_core::structure::SupportKind::Abutment)
+    {
+        let ys: Vec<f64> = abutment.footprint.points().iter().map(|p| p.y).collect();
+        let (low, high) = (
+            ys.iter().copied().fold(f64::INFINITY, f64::min),
+            ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        );
+        assert!(low < -9.0 && high > 9.0, "an abutment {low:.1}–{high:.1}");
+    }
+    // Its parapets stand along the outer edges only, none down the median.
+    let parapets: Vec<_> = map
+        .objects
+        .iter()
+        .filter(|o| {
+            matches!(
+                &o.kind,
+                MapObjectKind::Barrier { structure: Some(of), .. } if *of == viaduct.id
+            )
+        })
+        .collect();
+    assert_eq!(parapets.len(), 2, "one along each outer edge");
+
+    // In CARLA the deck is one slab across the median, and the parapets stand on
+    // its outer edges only.
+    let meshes = roadgen_carla::to_meshes(&map, &roadgen_carla::PackageConfig::new("shuto"));
+    let terrain: Vec<[Point3; 3]> = meshes
+        .iter()
+        .filter(|mesh| mesh.role == roadgen_carla::Role::Terrain)
+        .flat_map(|mesh| {
+            mesh.triangles
+                .iter()
+                .map(|t| t.map(|i| mesh.positions[i as usize]))
+        })
+        .collect();
+    let deck_top = 9.0;
+    let covered = |x: f64, y: f64| {
+        terrain.iter().any(|corners| {
+            corners.iter().all(|p| (p.z - deck_top).abs() < 0.05)
+                && ring_contains(&corners.map(|p| [p.x, p.y]), [x, y])
+        })
+    };
+    // Where it is up to its full height, between the ramps up to it.
+    for x in [-150.0, 50.0, 150.0] {
+        for y in [-1.25, -0.5, 0.5, 1.25] {
+            assert!(covered(x, y), "no deck over the median at ({x}, {y})");
+        }
+    }
+    let parapet_top = deck_top + roadgen_core::structure::PARAPET;
+    let tops: Vec<Point3> = terrain
+        .iter()
+        .filter(|corners| corners.iter().all(|p| (p.z - parapet_top).abs() < 0.05))
+        .flatten()
+        .copied()
+        .collect();
+    assert!(!tops.is_empty());
+    assert!(
+        tops.iter().all(|p| p.y.abs() > 9.0),
+        "a parapet over the median"
+    );
+}
+
+#[test]
+fn carriageways_leaving_the_viaduct_at_different_places_share_its_deck_wherever_side_by_side() {
+    let mut spec = corridor(true);
+    spec.shared_deck = true;
+    // A slip road down off each carriageway, at different stations.
+    spec.ramps.push(RampSite {
+        name: "West Off".into(),
+        on: false,
+        side: Side::Right,
+        at: 700.0,
+        end: Point3::new(60.0, -90.0, 0.0),
+    });
+    spec.ramps.push(RampSite {
+        name: "East Off".into(),
+        on: false,
+        side: Side::Left,
+        at: 1000.0,
+        end: Point3::new(40.0, 90.0, 0.0),
+    });
+    let (map, notes) = generate(spec, |_| {});
+    assert!(notes.is_empty(), "{notes:#?}");
+    let viaducts: Vec<_> = map
+        .structures
+        .iter()
+        .filter(|s| s.kind.form() == "viaduct")
+        .collect();
+    // Before the first slip road, between the two and after the second: each a
+    // deck of both carriageways.
+    assert_eq!(viaducts.len(), 3, "{viaducts:#?}");
+    for viaduct in &viaducts {
+        let roads: Vec<&str> = viaduct.carries.iter().map(|s| s.road.as_str()).collect();
+        assert_eq!(roads.len(), 2, "{roads:?}");
+        assert_eq!(roads.iter().filter(|r| r.contains("_left_")).count(), 1);
+        assert_eq!(roads.iter().filter(|r| r.contains("_right_")).count(), 1);
+    }
+}

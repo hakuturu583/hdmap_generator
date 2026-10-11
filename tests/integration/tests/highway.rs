@@ -613,3 +613,81 @@ fn one_bridge_over_both_carriageways_is_one_deck_across_the_median() {
         .iter()
         .any(|p| p.y.abs() < 1e-6 && (p.z - 9.0).abs() < 1e-6));
 }
+
+#[test]
+fn on_a_shared_deck_the_river_is_crossed_by_one_bridge_carrying_both_carriageways() {
+    use roadgen_core::structure::SupportKind;
+    let mut places = roadgen_integration_tests::highway::places();
+    places.corridors[0].shared_deck = true;
+    let median = places.corridors[0].standard.median;
+    let mut builder = MapBuilder::default();
+    places.corridors[0]
+        .plan(TrafficHandedness::RightHand)
+        .expect("plans")
+        .apply(&mut builder, &mut places)
+        .expect("applies");
+    let mut map = builder.finish().expect("builds");
+    let report = roadgen_carla::environment::generate(&mut map, &places).expect("generates");
+    assert!(report.notes.is_empty(), "{:#?}", report.notes);
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
+
+    let bridges: Vec<_> = map
+        .structures
+        .iter()
+        .filter(|s| s.kind.form() == BridgeForm::Bridge.as_str())
+        .collect();
+    assert_eq!(bridges.len(), 1, "one deck over the river");
+    let bridge = bridges[0];
+    assert_eq!(bridge.carries.len(), 2);
+    assert_ne!(bridge.carries[0].road, bridge.carries[1].road);
+    // Both carriageways cross the river through it.
+    let over_river = map
+        .grade_separations
+        .iter()
+        .filter(|g| {
+            g.via == bridge.id
+                && matches!(&g.under, Underneath::LandCover(cover) if cover.as_str().contains("ara_river"))
+        })
+        .count();
+    assert_eq!(over_river, 2);
+    // Its two halves begin and end across from each other: the union of where
+    // each carriageway would be bridged.
+    let ends: Vec<[f64; 2]> = bridge
+        .carries
+        .iter()
+        .map(|span| {
+            let road = map.road(&span.road).unwrap();
+            let x = |s: f64| {
+                road.reference_line
+                    .sample_at(s, map.metadata.sampling)
+                    .unwrap()
+                    .point
+                    .x
+            };
+            let (a, b) = (x(span.from), x(span.to));
+            [a.min(b), a.max(b)]
+        })
+        .collect();
+    for k in 0..2 {
+        assert!(
+            (ends[0][k] - ends[1][k]).abs() < 6.0,
+            "the halves end apart: {ends:?}"
+        );
+    }
+    // Its piers stand down the median.
+    let piers: Vec<_> = bridge
+        .kind
+        .bridge()
+        .unwrap()
+        .supports
+        .iter()
+        .filter(|s| s.kind == SupportKind::Pier)
+        .collect();
+    assert!(!piers.is_empty());
+    for pier in piers {
+        let c = pier.footprint.centroid();
+        assert!(c.y.abs() < median / 2.0, "a pier off the median at {c:?}");
+    }
+    // The ridge's twin bores stay two tunnels.
+    assert_eq!(structures_of(&map, TunnelForm::Bored.as_str()).len(), 2);
+}
