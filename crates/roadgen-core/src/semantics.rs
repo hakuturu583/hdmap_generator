@@ -5,7 +5,7 @@
 //! vocabulary, and a format that cannot express one simply drops it.
 
 use crate::geometry::{Curve3, Point3, UnitVector3};
-use crate::id::{LaneId, ObjectId};
+use crate::id::{LaneId, ObjectId, StructureId};
 use crate::units::SpeedLimit;
 
 /// What a lane is for.
@@ -519,12 +519,18 @@ pub enum MapObjectKind {
     StopLine,
     Crosswalk,
     /// Something that stands along the road to keep traffic on it: a safety berm
-    /// beside a haul road, a guard rail, a wall. `kind` says which, in the
-    /// caller's words; `height` is how far its top stands above its base, metres.
-    /// The geometry is a band along the ground it occupies.
+    /// beside a haul road, a guard rail, a wall, a bridge's parapet. `kind` says
+    /// which, in the caller's words; `height` is how far its top stands above its
+    /// base, metres. The geometry is a band along the ground it occupies.
+    ///
+    /// GDF holds a safety barrier as road furniture related to the road it lines,
+    /// and one that is part of a structure — a parapet along a bridge's deck — as
+    /// belonging to that structure too: `structure` says which, and is `None` for a
+    /// barrier that stands on the ground.
     Barrier {
         kind: String,
         height: f64,
+        structure: Option<StructureId>,
     },
 }
 

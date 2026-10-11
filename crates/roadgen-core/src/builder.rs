@@ -908,6 +908,7 @@ impl MapBuilder {
                 kind: MapObjectKind::Barrier {
                     kind: kind.into(),
                     height,
+                    structure: None,
                 },
                 lane: lane.clone(),
             },

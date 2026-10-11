@@ -326,3 +326,36 @@ fn an_interchange_is_merged_into_the_exit_node_it_names() {
         .expect("a node of the file");
     assert_eq!(exit.tags.get("name").map(String::as_str), Some("Kita IC"));
 }
+
+#[test]
+fn a_bridges_parapets_are_walls_on_its_level_traced_to_the_barriers() {
+    let map = levels();
+    let (document, trace) = export_traced(&map);
+    let walls: Vec<&Way> = document
+        .ways
+        .values()
+        .filter(|way| tag(way, "barrier") == Some("wall"))
+        .collect();
+    assert_eq!(walls.len(), 4, "two along each bridge");
+    for wall in &walls {
+        assert_eq!(tag(wall, "height"), Some("1.10"));
+        assert!(
+            tag(wall, "bridge").is_some(),
+            "on its bridge: {:?}",
+            wall.tags
+        );
+        assert!(tag(wall, "layer").is_some_and(|layer| layer != "0"));
+    }
+    assert!(walls
+        .iter()
+        .any(|wall| tag(wall, "bridge") == Some("viaduct")
+            && tag(wall, "layer") == Some("1")
+            && tag(wall, "bridge:name") == Some("Street Viaduct")));
+    assert!(walls.iter().any(|wall| tag(wall, "layer") == Some("2")));
+    for parapet in map.objects.iter() {
+        let links: Vec<_> = trace.links_of(&IrRef::Object(parapet.id.clone())).collect();
+        assert_eq!(links.len(), 1, "{}: {links:?}", parapet.id);
+        assert_eq!(links[0].relation, Relation::Exact);
+        assert!(walls.iter().any(|wall| way_ref(wall) == links[0].local));
+    }
+}

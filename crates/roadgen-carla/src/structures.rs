@@ -1,10 +1,11 @@
 //! The bridges and tunnels a map's roads are carried on, as solids.
 //!
 //! The road surface on a structure is drawn like any other road's; what this adds
-//! is what holds it up or closes it in. A bridge gets the underside of its deck, a
-//! parapet along each side standing on the deck's curb, and its abutments and piers
-//! down to the land. A tunnel gets its walls, its ceiling and the walkway each side,
-//! all facing in, and a portal face round each mouth facing out.
+//! is what holds it up or closes it in. A bridge gets the underside of its deck,
+//! the deck's sides, its parapets — the map's own barriers that are part of it,
+//! standing on the deck's curb — and its abutments and piers down to the land. A
+//! tunnel gets its walls, its ceiling and the walkway each side, all facing in,
+//! and a portal face round each mouth facing out.
 //!
 //! None of it is a road a vehicle drives on, and CARLA's import has no class for a
 //! bridge a map can reach, so it is all terrain — the same as a berm — in concrete,
@@ -12,8 +13,9 @@
 
 use roadgen_core::geometry::{Frame3, Point3};
 use roadgen_core::map::Map;
+use roadgen_core::semantics::MapObjectKind;
 use roadgen_core::structure::{
-    road_extent, Bridge, RoadSpan, StructureKind, StructureMaterial, Tunnel,
+    road_extent, shared_sides, Bridge, RoadSpan, StructureKind, StructureMaterial, Tunnel, MEDIAN,
 };
 
 use crate::ground::Ground;
@@ -22,8 +24,10 @@ use crate::mesh::Mesh;
 use crate::surfaces::Ordinals;
 use crate::tags::{mesh_name, Role};
 
-/// How tall a bridge's parapet stands above its deck, metres.
-pub const PARAPET: f64 = 1.1;
+/// How tall a bridge's parapet stands above its deck, metres: the core's, which
+/// is what the parapets the core stands along a bridge are built to.
+pub use roadgen_core::structure::PARAPET;
+
 /// How far apart the sections of a structure's solids are, metres.
 const STEP: f64 = 2.0;
 /// How far a pier goes down where nothing says where the ground is, metres.
@@ -139,8 +143,19 @@ pub fn meshes(
                         .filter(|(other, _)| *other != index)
                         .map(|(_, rows)| rows.as_slice())
                         .collect();
-                    let [left, right] = joins(own, &others);
+                    let shared = shared_sides(map, &structure.carries, index);
+                    let [left, right] = joins(own, &others, shared);
                     deck(&mut mesh, own, bridge, left.as_deref(), right.as_deref());
+                }
+                // Its parapets, the map's barriers that are part of it, on its curb
+                // and in its material.
+                for parapet in map.objects.iter().filter(|object| {
+                    matches!(
+                        &object.kind,
+                        MapObjectKind::Barrier { structure: Some(of), .. } if *of == structure.id
+                    )
+                }) {
+                    crate::barriers::raise(&mut mesh, parapet, map.metadata.sampling);
                 }
                 for support in &bridge.supports {
                     let ring = support.footprint.points();
@@ -165,13 +180,14 @@ pub fn meshes(
     out
 }
 
-/// The widest gap between two roads one deck carries, metres: a median.
-const MEDIAN: f64 = 15.0;
-
 /// Where a road's deck runs on into another's, side by side on one deck: for each
 /// of its two sides, left then right, how far out — to halfway across the gap to
 /// the other road — row by row, or `None` on a side with no road beside it.
-fn joins(rows: &[Row], others: &[&[Row]]) -> [Option<Vec<f64>>; 2] {
+///
+/// Which sides those are is `shared`, the core's own answer, which is also what
+/// decides where the bridge has no parapet: so a side the slab runs on across
+/// never has one standing on it.
+fn joins(rows: &[Row], others: &[&[Row]], shared: [bool; 2]) -> [Option<Vec<f64>>; 2] {
     // The other roads' edges beside each row, as offsets to its left.
     let beside = |row: &Row| -> Vec<f64> {
         let left = row.frame.left.get();
@@ -202,11 +218,10 @@ fn joins(rows: &[Row], others: &[&[Row]]) -> [Option<Vec<f64>>; 2] {
             .min_by(f64::total_cmp)
             .map(|d| edge + side * d / 2.0)
     };
-    [1.0, -1.0].map(|side| {
-        // Decided once, in the middle: the carriageways run side by side the
-        // length of the deck.
-        let middle = rows.get(rows.len() / 2)?;
-        gap(middle, side)?;
+    [(1.0, shared[0]), (-1.0, shared[1])].map(|(side, shared)| {
+        if !shared || rows.is_empty() {
+            return None;
+        }
         Some(
             rows.iter()
                 .map(|row| gap(row, side).unwrap_or(if side > 0.0 { row.left } else { row.right }))
@@ -215,9 +230,10 @@ fn joins(rows: &[Row], others: &[&[Row]]) -> [Option<Vec<f64>>; 2] {
     })
 }
 
-/// A deck's parapets and underside. The curb under each parapet is the parapet's
-/// own footprint. A side running on into another road on the same deck has no
-/// parapet: the slab goes on across, at the road's height, to `left_to` or
+/// A deck's sides and underside. Each side runs from the underside up to the
+/// curb, where the parapet — a barrier of the map's, raised beside the deck —
+/// stands on it. A side running on into another road on the same deck has no
+/// face: the slab goes on across, at the road's height, to `left_to` or
 /// `right_to`, where the other road's half of it begins.
 fn deck(
     mesh: &mut Mesh,
@@ -244,21 +260,13 @@ fn deck(
     match left_to {
         // The slab across to the next road, facing up.
         Some(_) => mesh.strip(&at(&left_outer, 0.0), &at(&left_inner, 0.0), 0),
-        // The parapet's inner face, facing the road; its top; its outer face,
-        // which runs down the side of the deck to its underside.
-        None => {
-            mesh.strip(&at(&left_inner, PARAPET), &at(&left_inner, 0.0), 0);
-            mesh.strip(&at(&left_outer, PARAPET), &at(&left_inner, PARAPET), 0);
-            mesh.strip(&at(&left_outer, -depth), &at(&left_outer, PARAPET), 0);
-        }
+        // The deck's side, facing out, from its underside up to the curb, whose
+        // top the parapet stands on and covers.
+        None => mesh.strip(&at(&left_outer, -depth), &at(&left_outer, 0.0), 0),
     }
     match right_to {
         Some(_) => mesh.strip(&at(&right_inner, 0.0), &at(&right_outer, 0.0), 0),
-        None => {
-            mesh.strip(&at(&right_inner, 0.0), &at(&right_inner, PARAPET), 0);
-            mesh.strip(&at(&right_inner, PARAPET), &at(&right_outer, PARAPET), 0);
-            mesh.strip(&at(&right_outer, PARAPET), &at(&right_outer, -depth), 0);
-        }
+        None => mesh.strip(&at(&right_outer, 0.0), &at(&right_outer, -depth), 0),
     }
     // The underside, facing down.
     mesh.strip(&at(&right_outer, -depth), &at(&left_outer, -depth), 0);
@@ -395,6 +403,65 @@ mod tests {
             .map(|p| p.z)
             .fold(f64::INFINITY, f64::min);
         assert!((lowest - (7.5 - FALLBACK_DEPTH)).abs() < 1e-6, "{lowest}");
+    }
+
+    #[test]
+    fn a_bridges_parapets_are_the_maps_barriers_drawn_once_with_its_deck() {
+        let map = map(false);
+        let top = 10.0 + PARAPET;
+        let parapet_tops = |map: &ValidatedMap| -> (usize, Vec<f64>) {
+            let mut ordinals = Ordinals::default();
+            let mut all = meshes(map, None, "m", &mut ordinals);
+            all.extend(crate::barriers::berms(map, "m", &mut ordinals));
+            let tops = all
+                .iter()
+                .flat_map(faces)
+                .filter(|(n, a)| n.z > 0.99 && (a.z - top).abs() < 1e-6)
+                .map(|(_, a)| a.y)
+                .collect();
+            (all.len(), tops)
+        };
+        // One mesh for the bridge and nothing more: the barriers' own pass leaves
+        // the parapets to it.
+        let (count, tops) = parapet_tops(&map);
+        assert_eq!(count, 1);
+        // Their tops, over the curb each side: from the road's edge 3.5 m out to
+        // the deck's 0.6 m further.
+        assert!(tops.iter().any(|y| *y > 3.5 - 1e-6 && *y < 4.1 + 1e-6));
+        assert!(tops.iter().any(|y| *y < -3.5 + 1e-6 && *y > -4.1 - 1e-6));
+        assert!(tops
+            .iter()
+            .all(|y| y.abs() > 3.5 - 1e-6 && y.abs() < 4.1 + 1e-6));
+
+        // A parapet taken off the map is not drawn: they are the map's, not the
+        // deck's own.
+        let mut bare = map.into_map();
+        let ids: Vec<_> = bare
+            .objects
+            .iter()
+            .filter(|object| {
+                matches!(
+                    &object.kind,
+                    MapObjectKind::Barrier { kind, .. } if kind == roadgen_core::structure::PARAPET_KIND
+                )
+            })
+            .map(|object| object.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        let mut kept = roadgen_core::Arena::new();
+        for object in bare.objects.iter() {
+            if object.id != ids[0] {
+                kept.insert(object.id.clone(), object.clone()).unwrap();
+            }
+        }
+        bare.objects = kept;
+        let bare = roadgen_core::validation::UnvalidatedMap::from_map(bare)
+            .validate()
+            .unwrap();
+        let (_, tops) = parapet_tops(&bare);
+        let sides: Vec<f64> = tops.iter().map(|y| y.signum()).collect();
+        assert!(!sides.is_empty());
+        assert!(sides.iter().all(|side| *side == sides[0]), "one side only");
     }
 
     #[test]

@@ -3,9 +3,9 @@
 use roadgen_core::prelude::*;
 use roadgen_core::structure::{
     BridgeForm, BridgeSpec, RoadSpan, StructureKind, SupportKind, TunnelForm, TunnelSpec,
-    Underneath,
+    Underneath, PARAPET, PARAPET_KIND,
 };
-use roadgen_core::{FormOfWay, ValidationIssue, VerticalProfile};
+use roadgen_core::{FormOfWay, MapObject, StructureId, ValidationIssue, VerticalProfile};
 
 fn two_way() -> Vec<LaneSpec> {
     vec![
@@ -187,6 +187,7 @@ fn a_tunnel_has_a_portal_at_each_end_of_what_it_carries() {
         .map(|p| p.y)
         .fold(0.0_f64, f64::max);
     assert!((widest - (3.5 + 0.75 + 0.6)).abs() < 1e-6);
+    assert!(parapets(&map).is_empty(), "a tunnel has no parapets");
 }
 
 #[test]
@@ -642,4 +643,192 @@ fn a_street_drawn_wholly_inside_a_motorway_is_refused() {
         .filter(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. }))
         .collect();
     assert_eq!(unseparated.len(), 1, "{unseparated:?}");
+}
+
+/// The bridges' parapets on a map: its barriers of that kind.
+fn parapets(map: &Map) -> Vec<&MapObject> {
+    map.objects
+        .iter()
+        .filter(|object| {
+            matches!(&object.kind, MapObjectKind::Barrier { kind, .. } if kind == PARAPET_KIND)
+        })
+        .collect()
+}
+
+/// How far across a parapet's band reaches, its lowest y and its highest, and
+/// where along x it begins and ends.
+fn reach(parapet: &MapObject) -> ((f64, f64), (f64, f64)) {
+    let ObjectGeometry::Band { left, right } = &parapet.geometry else {
+        panic!("{} is a band", parapet.id)
+    };
+    let ends = [
+        left.start_point(),
+        left.end_point(),
+        right.start_point(),
+        right.end_point(),
+    ];
+    let span = |f: fn(&Point3) -> f64| {
+        ends.iter()
+            .map(f)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| {
+                (l.min(v), h.max(v))
+            })
+    };
+    (span(|p| p.y), span(|p| p.x))
+}
+
+#[test]
+fn a_bridge_over_two_stretches_of_one_road_stands_parapets_along_each() {
+    let (mut builder, motorway, _) = crossing(9.0);
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(motorway.clone(), 50.0, 150.0),
+                RoadSpan::new(motorway.clone(), 250.0, 400.0),
+            ],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let parapets = parapets(&map);
+    assert_eq!(parapets.len(), 4, "one each side of each stretch");
+    let mut ids: Vec<_> = parapets.iter().map(|p| p.id.as_str().to_owned()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 4, "{ids:?}");
+}
+
+#[test]
+fn a_bridge_stands_a_parapet_on_the_curb_along_each_side_of_its_deck() {
+    let (mut builder, motorway, _) = crossing(9.0);
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway.clone(), 200.0, 400.0)],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let structure = map.structures.iter().next().unwrap();
+    let parapets = parapets(&map);
+    assert_eq!(parapets.len(), 2, "one each side");
+    let mut sides = Vec::new();
+    for parapet in &parapets {
+        let MapObjectKind::Barrier {
+            height,
+            structure: of,
+            ..
+        } = &parapet.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(of.as_ref(), Some(&structure.id), "it is the bridge's");
+        assert_eq!(*height, PARAPET);
+        assert!(!parapet.lanes.is_empty());
+        assert!(parapet
+            .lanes
+            .iter()
+            .all(|lane| map.lanes.get(lane).unwrap().road == motorway));
+        // On the curb, from the road's edge out to the deck's, the length of it.
+        let ((low, high), (start, end)) = reach(parapet);
+        assert!((start + 100.0).abs() < 1e-6 && (end - 100.0).abs() < 1e-6);
+        assert!((high - low - 0.6).abs() < 1e-6, "{low}..{high}");
+        assert!(
+            (low.abs().min(high.abs()) - 3.5).abs() < 1e-6,
+            "{low}..{high}"
+        );
+        assert!(
+            (parapet_z(parapet) - 9.0).abs() < 1e-6,
+            "it stands on the deck"
+        );
+        sides.push(low.signum());
+    }
+    sides.sort_by(f64::total_cmp);
+    assert_eq!(sides, [-1.0, 1.0]);
+}
+
+fn parapet_z(parapet: &MapObject) -> f64 {
+    let ObjectGeometry::Band { left, .. } = &parapet.geometry else {
+        panic!("{} is a band", parapet.id)
+    };
+    left.start_point().z
+}
+
+#[test]
+fn a_deck_over_both_carriageways_has_parapets_down_its_outer_edges_and_none_down_the_median() {
+    let mut builder = MapBuilder::default();
+    let one_way = || {
+        vec![
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+        ]
+    };
+    // Each carriageway's lanes lie to its right, so the two face each other across
+    // a 4 m median.
+    let left = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 9.0, 10.0),
+                Point3::new(400.0, 9.0, 10.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("left"),
+        )
+        .unwrap();
+    let right = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(400.0, -9.0, 10.0),
+                Point3::new(0.0, -9.0, 10.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("right"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(left, 100.0, 300.0),
+                RoadSpan::new(right, 100.0, 300.0),
+            ],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let parapets = parapets(&map);
+    assert_eq!(parapets.len(), 2, "{parapets:#?}");
+    for parapet in parapets {
+        let ((low, high), _) = reach(parapet);
+        assert!(
+            low.abs().min(high.abs()) >= 9.0 - 1e-6,
+            "{} stands at {low}..{high}, in the median",
+            parapet.id
+        );
+        assert!((low.abs().max(high.abs()) - 9.6).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn a_parapet_of_a_bridge_the_map_does_not_have_is_refused() {
+    let (mut builder, motorway, _) = crossing(9.0);
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway, 200.0, 400.0)],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let mut map = builder.finish().unwrap();
+    let id = parapets(map.as_map_mut())[0].id.clone();
+    if let MapObjectKind::Barrier { structure, .. } =
+        &mut map.as_map_mut().objects.get_mut(&id).unwrap().kind
+    {
+        *structure = Some(StructureId::new("nowhere"));
+    }
+    let error = map.validate().unwrap_err();
+    assert!(error.issues.iter().any(|issue| matches!(
+        issue,
+        ValidationIssue::DanglingFeatureReference { referrer, feature }
+            if *referrer == id.to_string() && feature == "structure/nowhere"
+    )));
 }

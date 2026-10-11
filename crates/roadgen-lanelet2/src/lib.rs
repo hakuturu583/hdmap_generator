@@ -784,7 +784,7 @@ impl<'a> Exporter<'a> {
                         attributes.push(("height", format!("{height:.6}")));
                     }
                 }
-                MapObjectKind::Barrier { kind, height } => {
+                MapObjectKind::Barrier { kind, height, .. } => {
                     attributes.push(("subtype", kind.clone()));
                     attributes.push(("height", format!("{height:.6}")));
                 }

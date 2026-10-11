@@ -106,7 +106,7 @@ use roadgen_core::structure::{Structure, StructureKind, StructureSpan, Underneat
 use roadgen_core::topology::{RoadEnd, RoadLinkTarget};
 // OSM has a relation of its own, which is the one this file means by the bare name.
 use roadgen_core::trace::Relation as Link;
-use roadgen_core::{JunctionId, RoadId, Trace, ValidatedMap};
+use roadgen_core::{JunctionId, RoadId, StructureId, Trace, ValidatedMap};
 
 pub use error::ExportError;
 
@@ -830,8 +830,15 @@ impl<'a> Exporter<'a> {
         for object in self.map.objects.iter() {
             // A barrier runs along the road beside it rather than standing on a
             // point of it, so it is a way of its own, not a node of the road's.
-            if let MapObjectKind::Barrier { kind, height } = &object.kind {
-                if let Some(way) = self.add_barrier_way(object, kind, *height)? {
+            if let MapObjectKind::Barrier {
+                kind,
+                height,
+                structure,
+            } = &object.kind
+            {
+                if let Some(way) =
+                    self.add_barrier_way(object, kind, *height, structure.as_ref())?
+                {
                     self.trace
                         .link(object.id.clone(), way_ref(way), Link::Exact);
                 }
@@ -910,10 +917,24 @@ impl<'a> Exporter<'a> {
         object: &MapObject,
         kind: &str,
         height: f64,
+        structure: Option<&StructureId>,
     ) -> Result<Option<i64>, ExportError> {
         let ObjectGeometry::Band { left, right } = &object.geometry else {
             return Ok(None);
         };
+        let mut tags = tags::barrier_tags(kind, height);
+        // A parapet is on its bridge, and says so the way the roads on the bridge
+        // do, at the bridge's level, so a renderer draws it on the deck rather than
+        // on whatever the bridge passes over.
+        if let Some(structure) = structure.and_then(|id| self.map.structures.get(id)) {
+            let layer = structure
+                .carries
+                .iter()
+                .map(|span| level(self.map, &span.road, (span.from + span.to) / 2.0))
+                .max()
+                .unwrap_or(0);
+            tags::structure_tags(&mut tags, structure, layer);
+        }
         let config = self.map.metadata.sampling;
         let (left, right) = (left.to_polyline(config)?, right.to_polyline(config)?);
         let mut nodes = Vec::with_capacity(left.len());
@@ -925,14 +946,7 @@ impl<'a> Exporter<'a> {
             return Ok(None);
         }
         let id = self.take_id();
-        self.document.ways.insert(
-            id,
-            Way {
-                id,
-                nodes,
-                tags: tags::barrier_tags(kind, height),
-            },
-        );
+        self.document.ways.insert(id, Way { id, nodes, tags });
         Ok(Some(id))
     }
 

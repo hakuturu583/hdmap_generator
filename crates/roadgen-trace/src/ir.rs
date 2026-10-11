@@ -311,6 +311,10 @@ pub struct ObjectEntry {
     /// A sign's code, in whatever catalogue the caller used.
     pub code: Option<String>,
     pub lanes: Vec<String>,
+    /// The structure a barrier is part of: a bridge, for its parapet. Left out for
+    /// everything else, so a map with no bridge dumps as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure: Option<String>,
 }
 
 /// A traffic rule, which has no identifier of its own and is named `rule/<index>`.
@@ -445,6 +449,13 @@ impl IrCatalog {
                         _ => None,
                     },
                     lanes: object.lanes.iter().map(ToString::to_string).collect(),
+                    structure: match &object.kind {
+                        MapObjectKind::Barrier {
+                            structure: Some(structure),
+                            ..
+                        } => Some(structure.to_string()),
+                        _ => None,
+                    },
                 })
                 .collect(),
             rules: map

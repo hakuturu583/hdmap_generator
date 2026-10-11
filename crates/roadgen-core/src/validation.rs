@@ -237,15 +237,28 @@ fn check_buildings(map: &Map, issues: &mut Vec<ValidationIssue>) {
     }
 }
 
-/// A barrier's height is what a consumer builds it to, so it has to be one.
+/// A barrier's height is what a consumer builds it to, so it has to be one; and a
+/// barrier that is part of a structure — a bridge's parapet — has to name one the
+/// map has.
 fn check_barriers(map: &Map, issues: &mut Vec<ValidationIssue>) {
     for object in map.objects.iter() {
-        if let MapObjectKind::Barrier { height, .. } = &object.kind {
+        if let MapObjectKind::Barrier {
+            height, structure, ..
+        } = &object.kind
+        {
             if !height.is_finite() || *height <= 0.0 {
                 issues.push(ValidationIssue::ImplausibleFeature {
                     feature: object.id.to_string(),
                     detail: format!("a barrier {height} m high stands no height at all"),
                 });
+            }
+            if let Some(structure) = structure {
+                if !map.structures.contains(structure) {
+                    issues.push(ValidationIssue::DanglingFeatureReference {
+                        referrer: object.id.to_string(),
+                        feature: structure.to_string(),
+                    });
+                }
             }
         }
     }

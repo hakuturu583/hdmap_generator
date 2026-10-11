@@ -39,6 +39,7 @@ use roadgen_core::geometry::{Curve3, Frame3, Point3};
 use roadgen_core::id::{BuildingId, BuildingPartId, JunctionId, LaneId, ObjectId, RoadId};
 use roadgen_core::map::Road;
 use roadgen_core::semantics::{LightHead, MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
+use roadgen_core::structure;
 use roadgen_core::topology::{Direction, LateralSide, RoadEnd, RoadEndpoint};
 use roadgen_core::trace::{IrRef, Relation};
 
@@ -107,6 +108,11 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
                         stop_lines.push(id);
                     }
                 }
+                // A bridge's parapet comes back with its bridge: placing the bridge
+                // stands its parapets along the deck again, as it did when the map
+                // was made.
+                Some(ObjectType::Barrier)
+                    if object.subtype.as_deref() == Some(structure::PARAPET_KIND) => {}
                 _ => reader.approximations.count(format!(
                     "the IR has no object of type {:?}, so {{n}} of them are not read",
                     object.r#type

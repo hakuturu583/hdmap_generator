@@ -4,6 +4,7 @@
 
 use opendrive::core::OpenDrive;
 use opendrive::object::bridge_type::BridgeType;
+use opendrive::object::orientation::ObjectType;
 use opendrive::object::tunnel_type::TunnelType;
 use roadgen_core::prelude::*;
 use roadgen_core::structure::{
@@ -292,4 +293,76 @@ fn a_deck_over_two_roads_is_traced_as_two_parts() {
     assert_eq!(links.len(), 2, "{links:?}");
     assert!(links.iter().all(|link| link.relation == Relation::Part));
     assert_ne!(links[0].local, links[1].local);
+}
+
+#[test]
+fn a_bridges_parapets_are_barriers_along_the_road_it_carries() {
+    let xml = to_xml(&structures()).unwrap();
+    let parsed = OpenDrive::from_xml_str(&xml).unwrap();
+    let barriers = |name: &str| -> Vec<opendrive::object::Object> {
+        parsed
+            .road
+            .iter()
+            .find(|road| road.name.as_deref() == Some(name))
+            .unwrap()
+            .objects
+            .iter()
+            .flat_map(|objects| objects.object.iter())
+            .filter(|object| object.r#type == Some(ObjectType::Barrier))
+            .cloned()
+            .collect()
+    };
+    let parapets = barriers("motorway");
+    assert_eq!(parapets.len(), 2, "one each side of the viaduct");
+    let mut sides = Vec::new();
+    for parapet in &parapets {
+        assert_eq!(parapet.subtype.as_deref(), Some("parapet"));
+        assert!((parapet.height.unwrap().value - 1.1).abs() < 1e-9);
+        assert!((parapet.s.value - 200.0).abs() < 1e-6);
+        assert!((parapet.length.unwrap().value - 200.0).abs() < 1e-6);
+        assert!((parapet.width.unwrap().value - 0.6).abs() < 1e-6);
+        // On the curb: half its width out past the road's 3.5 m edge.
+        assert!(
+            (parapet.t.value.abs() - 3.8).abs() < 1e-6,
+            "{}",
+            parapet.t.value
+        );
+        sides.push(parapet.t.value.signum());
+    }
+    sides.sort_by(f64::total_cmp);
+    assert_eq!(sides, [-1.0, 1.0]);
+    assert!(barriers("through").is_empty(), "a tunnel has no parapets");
+}
+
+#[test]
+fn a_bridges_parapets_come_back_with_it() {
+    let written = structures();
+    let imported = from_xml(&to_xml(&written).unwrap()).unwrap();
+    assert!(
+        !imported
+            .approximations
+            .iter()
+            .any(|note| note.contains("Barrier")),
+        "{:?}",
+        imported.approximations
+    );
+    let map = imported.map.validate().unwrap();
+    let bridge = map
+        .structures
+        .iter()
+        .find(|structure| structure.kind.bridge().is_some())
+        .unwrap();
+    let parapets: Vec<_> = map
+        .objects
+        .iter()
+        .filter(|object| {
+            matches!(&object.kind, MapObjectKind::Barrier { structure: Some(of), .. } if *of == bridge.id)
+        })
+        .collect();
+    assert_eq!(parapets.len(), 2, "placed again, once each");
+    assert_eq!(
+        map.objects.len(),
+        written.objects.len(),
+        "and nothing read twice"
+    );
 }
