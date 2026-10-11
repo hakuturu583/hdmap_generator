@@ -527,7 +527,11 @@ m.interchange("interchange/kita_ic")
 
 材質：床版・橋脚・坑門・トンネルの覆工は、既存の `M_Road_Concrete` を使う（新しい材質は足していない）。使っている Poly Haven のスラッグは、すべて polyhaven.com に実在することを確認した。
 
-**川**（`crates/roadgen-carla/src/water.rs`）：`water` の土地被覆の地面は河床の材質 `M_Terrain_Riverbed`（Poly Haven `river_small_rocks`）で描き、その上に水面を 1 枚足す。水面は河床から一定の深さ（岸の上端の最低点と河床の最低点の差の 2/3）に張る。河床の高さは外形の各頂点から川幅以内の最低点で読むので、勾配のある川では水面も下流へ下がる。外形の中だけを三角形分割した面で、材質 `M_Water` は色と低い粗さだけ（Poly Haven に水面のスキャンはない。UV は平面座標）。
+**川**（`crates/roadgen-carla/src/water.rs`）：`water` の土地被覆の地面は河床の材質 `M_Terrain_Riverbed`（Poly Haven `river_small_rocks`）で描き、その上に水面を 1 枚足す。水面は河床から一定の深さ（岸の上端の最低点と河床の最低点の差の 2/3）に張る。河床の高さは外形の各頂点から川幅以内の最低点で読むので、勾配のある川では水面も下流へ下がる。外形の中だけを三角形分割した面で、材質は色と低い粗さだけ（Poly Haven に水面のスキャンはない）。流れる水（`water`・`river`・`canal`）と止まった水（`lake`・`pond`）で材質を分け、川は `M_Water_Flowing`、湖・池は `M_Water_Still` にする。
+
+川の水面の UV は流れに沿わせる。IR の川は外形しか持たないので、中心線は外形から読み戻す：外形のうち前後で最も大きく（半回転近く）向きを変える辺 2 本を両端とし、その間の 2 本の岸を、それぞれの長さに対する割合で対応させた中点を中心線とする。水面の高い方の端を水源として、`u` は水源から中心線に沿った距離、`v` は中心線からの横断方向の距離（下流を向いて左が正）。どちらもメートルをテクスチャの縮尺（4 m）で割った値。法線マップを `u` 方向にパンするマテリアルなら、下流へ流れて見える。湖・池の UV は平面座標のまま。
+
+CARLA のパッケージの記述（`<Package>.json`）の各マップには `water` を書き、流れる水と止まった水それぞれのスロット名（FBX の材質名）と、そこに入れる UE のマテリアルを示す。既定は UE の Water プラグインの `/Water/Materials/WaterSurface/Water_Material_River` と `…/Water_Material_Lake` で、`PackageConfig::with_water_materials` か記述の JSON の書き換えで差し替えられる。`Import.py` は知らないキーを読み飛ばす。パッケージのスクリプトは、水がある地図なら `Import.py` の後に `roadgen.carla_water()`（`python -m roadgen water`）を走らせ、パッケージのメッシュのうち名前が一致するスロットにそのマテリアルを入れる。`flowing=`・`still=` で記述のマテリアルを上書きでき、プロジェクトにないマテリアルは警告して平らな色のまま残す。
 
 ## 8. テスト
 

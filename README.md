@@ -272,6 +272,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
 | `carla_sky(carla_root, package, map_name, engine=, sun_altitude=, sun_azimuth=)` | after `Import.py`: give the imported level a daylight sky, with the editor's own scripting |
 | `carla_furniture(carla_root, package, map_name, engine=, manifest=)` | after `Import.py`: stand the package's traffic lights, signs and props town in the level, and make CARLA adopt the lights and signs |
+| `carla_water(carla_root, package, map_name, engine=, descriptor=, flowing=, still=)` | after `Import.py`: put the Unreal materials the descriptor names in the water's slots — `M_Water_Flowing` on rivers, whose UVs run downstream for a panning normal map, and `M_Water_Still` on lakes and ponds |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 | `render_opendrive(path)` / `render_sumo(directory)` / `render_carla(path)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |

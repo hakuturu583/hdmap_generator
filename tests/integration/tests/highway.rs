@@ -364,7 +364,7 @@ fn carla_draws_the_decks_piers_and_tunnels() {
     assert!(terrain.materials.contains(&materials::RIVERBED));
     let water: Vec<_> = meshes
         .iter()
-        .filter(|mesh| mesh.materials == [materials::WATER])
+        .filter(|mesh| mesh.materials == [materials::FLOWING_WATER])
         .collect();
     assert_eq!(water.len(), 1, "one river, one sheet of water");
     let level = water[0].positions[0].z;
@@ -504,8 +504,8 @@ fn a_post_on_a_bridge_stands_on_its_parapet_not_in_the_air() {
     assert!((sign.position.z - (9.0 + roadgen_carla::structures::PARAPET)).abs() < 1e-6);
 }
 
-#[test]
-fn a_river_falls_along_its_length_and_its_water_with_it() {
+/// A river by a road, running north.
+fn tama() -> ValidatedMap {
     use roadgen_carla::environment::{self, Places, RiverSpec};
     let mut builder = MapBuilder::default();
     builder
@@ -539,31 +539,12 @@ fn a_river_falls_along_its_length_and_its_water_with_it() {
     };
     let mut map = builder.finish().unwrap();
     environment::generate(&mut map, &places).expect("generates");
-    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
-    let tin = map.tin_surfaces.iter().next().unwrap().tin.locator();
-    let beds: Vec<f64> = [-350.0, -200.0, 0.0, 150.0, 350.0]
-        .iter()
-        .map(|&y| tin.height_at(200.0, y).unwrap())
-        .collect();
-    assert!(beds.windows(2).all(|w| w[1] <= w[0] + 1e-6), "{beds:?}");
-    assert!(beds[0] - beds[4] > 8.0, "{beds:?}");
-    let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("tama"));
-    let water = meshes
-        .iter()
-        .find(|mesh| mesh.materials == [materials::WATER])
-        .expect("water");
-    // Level across the river, down along it, and over the bed everywhere.
-    let mut along: Vec<&Point3> = water.positions.iter().collect();
-    along.sort_by(|a, b| a.y.total_cmp(&b.y));
-    // Short of its two ends, where the channel stops and the land does not.
-    for p in along.iter().filter(|p| p.y.abs() < 380.0) {
-        let bed = tin.height_at(200.0, p.y).unwrap();
-        assert!(p.z > bed && p.z < bed + 4.0, "{p:?} over a bed at {bed:.2}");
-    }
-    assert!(along.first().unwrap().z - along.last().unwrap().z > 8.0);
+    map.validate().unwrap_or_else(|error| panic!("{error}"))
+}
 
-    // The same hollow as a lake: standing water, one level all over.
-    let mut lake = (*map).clone();
+/// `map` with its river standing still: the same hollow, as a lake.
+fn as_lake(map: &ValidatedMap) -> ValidatedMap {
+    let mut lake = (**map).clone();
     let ids: Vec<_> = lake
         .land_covers
         .iter()
@@ -576,16 +557,104 @@ fn a_river_falls_along_its_length_and_its_water_with_it() {
             }
         }
     }
-    let lake = UnvalidatedMap::from_map(lake)
+    UnvalidatedMap::from_map(lake)
         .validate()
-        .unwrap_or_else(|error| panic!("{error}"));
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+#[test]
+fn a_river_falls_along_its_length_and_its_water_with_it() {
+    let map = tama();
+    let tin = map.tin_surfaces.iter().next().unwrap().tin.locator();
+    let beds: Vec<f64> = [-350.0, -200.0, 0.0, 150.0, 350.0]
+        .iter()
+        .map(|&y| tin.height_at(200.0, y).unwrap())
+        .collect();
+    assert!(beds.windows(2).all(|w| w[1] <= w[0] + 1e-6), "{beds:?}");
+    assert!(beds[0] - beds[4] > 8.0, "{beds:?}");
+    let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("tama"));
+    let water = meshes
+        .iter()
+        .find(|mesh| mesh.materials == [materials::FLOWING_WATER])
+        .expect("water");
+    // Level across the river, down along it, and over the bed everywhere.
+    let mut along: Vec<&Point3> = water.positions.iter().collect();
+    along.sort_by(|a, b| a.y.total_cmp(&b.y));
+    // Short of its two ends, where the channel stops and the land does not.
+    for p in along.iter().filter(|p| p.y.abs() < 380.0) {
+        let bed = tin.height_at(200.0, p.y).unwrap();
+        assert!(p.z > bed && p.z < bed + 4.0, "{p:?} over a bed at {bed:.2}");
+    }
+    assert!(along.first().unwrap().z - along.last().unwrap().z > 8.0);
+
+    // The same hollow as a lake: standing water, one level all over.
+    let lake = as_lake(&map);
     let meshes = roadgen_carla::to_meshes(&lake, &PackageConfig::new("tama"));
     let water = meshes
         .iter()
-        .find(|mesh| mesh.materials == [materials::WATER])
+        .find(|mesh| mesh.materials == [materials::STILL_WATER])
         .expect("water");
     let level = water.positions[0].z;
     assert!(water.positions.iter().all(|p| (p.z - level).abs() < 1e-9));
+}
+
+#[test]
+fn a_rivers_water_is_mapped_down_its_length_and_a_lakes_in_plan() {
+    let map = tama();
+    let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("tama"));
+    let water = meshes
+        .iter()
+        .find(|mesh| mesh.materials == [materials::FLOWING_WATER])
+        .expect("running water");
+    assert!(!meshes
+        .iter()
+        .any(|mesh| mesh.materials.contains(&materials::STILL_WATER)));
+    let scale = roadgen_carla::mesh::TEXTURE_SCALE;
+    // `u` is the distance down the centre line from the source in the south,
+    // so it rises northward wherever across the river a vertex lies.
+    let mut along: Vec<(&Point3, [f64; 2])> = water
+        .positions
+        .iter()
+        .zip(water.uvs.iter().copied())
+        .collect();
+    along.sort_by(|a, b| a.0.y.total_cmp(&b.0.y));
+    for (p, uv) in &along {
+        assert!(
+            (uv[0] * scale - (p.y + 400.0)).abs() < 1e-6,
+            "{p:?} is {:.3} m down the river",
+            uv[0] * scale
+        );
+    }
+    assert!(along.windows(2).all(|w| w[1].1[0] >= w[0].1[0] - 1e-9));
+    // `v` across it, from bank to bank: 40 m, left of the flow positive.
+    let across: Vec<f64> = water.uvs.iter().map(|uv| uv[1] * scale).collect();
+    let (low, high) = across
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+    assert!(
+        (low + 20.0).abs() < 1e-6 && (high - 20.0).abs() < 1e-6,
+        "{low} to {high}"
+    );
+    for (p, uv) in water.positions.iter().zip(&water.uvs) {
+        assert!(
+            (uv[1] * scale - (200.0 - p.x)).abs() < 1e-6,
+            "{p:?}: {uv:?}"
+        );
+    }
+
+    // Standing water has nowhere to run: a lake keeps its texture in plan.
+    let lake = as_lake(&map);
+    let meshes = roadgen_carla::to_meshes(&lake, &PackageConfig::new("tama"));
+    let water = meshes
+        .iter()
+        .find(|mesh| mesh.materials == [materials::STILL_WATER])
+        .expect("standing water");
+    assert!(!meshes
+        .iter()
+        .any(|mesh| mesh.materials.contains(&materials::FLOWING_WATER)));
+    for (p, uv) in water.positions.iter().zip(&water.uvs) {
+        assert!((uv[0] * scale - p.x).abs() < 1e-9 && (uv[1] * scale - p.y).abs() < 1e-9);
+    }
 }
 
 #[test]

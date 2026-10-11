@@ -60,6 +60,66 @@ pub struct MapEntry {
     pub use_carla_materials: bool,
     /// Path to the `.xodr`, relative to the descriptor.
     pub xodr: String,
+    /// What the map's water is to be surfaced with in Unreal. `Import.py` reads
+    /// the keys it knows and passes this one by; the package's script reads it,
+    /// and puts each material in the slots of its name.
+    pub water: WaterSlots,
+}
+
+/// The Unreal Engine Water plugin's river material, which a river's surface is
+/// given unless the package says otherwise.
+pub const FLOWING_WATER_MATERIAL: &str = "/Water/Materials/WaterSurface/Water_Material_River";
+/// The same plugin's lake material, for a lake's or a pond's.
+pub const STILL_WATER_MATERIAL: &str = "/Water/Materials/WaterSurface/Water_Material_Lake";
+
+/// The Unreal materials a package's water is given: paths in the content tree,
+/// `/Game/…` for one of the project's own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaterMaterials {
+    /// For a river, a canal: a material whose normals pan along the mesh's `u`,
+    /// which runs downstream.
+    pub flowing: String,
+    /// For a lake, a pond: the mesh's texture coordinates are in plan.
+    pub still: String,
+}
+
+impl Default for WaterMaterials {
+    fn default() -> Self {
+        WaterMaterials {
+            flowing: FLOWING_WATER_MATERIAL.to_owned(),
+            still: STILL_WATER_MATERIAL.to_owned(),
+        }
+    }
+}
+
+/// Running water and standing water, each as the slot the FBX names and the
+/// material the package's script puts in it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WaterSlots {
+    pub flowing: WaterSlot,
+    pub still: WaterSlot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WaterSlot {
+    /// The material's name in the FBX, which is the slot's name on the
+    /// imported mesh.
+    pub slot: String,
+    /// The Unreal material that goes in it.
+    pub material: String,
+}
+
+impl WaterSlots {
+    pub fn new(materials: &WaterMaterials) -> WaterSlots {
+        let slot = |index: usize, material: &str| WaterSlot {
+            slot: materials::MATERIALS[index].name.to_owned(),
+            material: material.to_owned(),
+        };
+        WaterSlots {
+            flowing: slot(materials::FLOWING_WATER, &materials.flowing),
+            still: slot(materials::STILL_WATER, &materials.still),
+        }
+    }
 }
 
 /// One prop: a mesh imported into a tagged folder, and not placed in any map.
@@ -274,6 +334,7 @@ mod tests {
                 source: "./Town01/Town01.fbx".into(),
                 use_carla_materials: true,
                 xodr: "./Town01/Town01.xodr".into(),
+                water: WaterSlots::new(&WaterMaterials::default()),
             }],
             props: Vec::new(),
         };
@@ -281,6 +342,33 @@ mod tests {
         assert!(json.contains("\"name\": \"Town01\""));
         assert!(json.contains("Town01.fbx"));
         assert!(json.contains("Town01.xodr"));
+    }
+
+    #[test]
+    fn a_descriptor_names_running_and_standing_water_apart() {
+        // Two slots, so that a river can flow and a lake stand still, each in a
+        // material of its own; the default is Unreal's, and the package's own.
+        let materials = WaterMaterials {
+            still: "/Game/Water/M_Pond".into(),
+            ..WaterMaterials::default()
+        };
+        let descriptor = Descriptor {
+            maps: vec![MapEntry {
+                name: "Town01".into(),
+                source: "./Town01/Town01.fbx".into(),
+                use_carla_materials: true,
+                xodr: "./Town01/Town01.xodr".into(),
+                water: WaterSlots::new(&materials),
+            }],
+            props: Vec::new(),
+        };
+        let json: serde_json::Value = serde_json::from_str(&descriptor.to_json().unwrap()).unwrap();
+        let water = &json["maps"][0]["water"];
+        assert_eq!(water["flowing"]["slot"], "M_Water_Flowing");
+        assert_eq!(water["flowing"]["material"], FLOWING_WATER_MATERIAL);
+        assert_eq!(water["still"]["slot"], "M_Water_Still");
+        assert_eq!(water["still"]["material"], "/Game/Water/M_Pond");
+        assert_ne!(water["flowing"]["slot"], water["still"]["slot"]);
     }
 
     #[test]

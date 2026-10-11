@@ -4,7 +4,9 @@
 //! descriptor, the `.fbx`, the `.xodr`, the texture manifest — and then the sky,
 //! which `Import.py` does not give a map and `roadgen.carla_sky()` does, and the
 //! furniture, which `Import.py` imports as props and leaves in the content browser
-//! and `roadgen.carla_furniture()` stands in the level. Getting from the written
+//! and `roadgen.carla_furniture()` stands in the level, and the water, which
+//! `Import.py` imports in flat colours and `roadgen.carla_water()` gives the
+//! Unreal materials the descriptor names. Getting from the written
 //! folder to a level that runs is half a dozen steps in the right order with the
 //! right environment, and the second time through anyone would have scripted them. So the exporter writes the script, next to the descriptor, with
 //! everything it knows baked in: the package and map names, the sun, whether the
@@ -24,8 +26,9 @@ use crate::PackageConfig;
 
 /// The script, as text. `config.carla_root` and `config.engine` become its
 /// defaults; without them it takes both from its arguments or the environment.
-/// `furniture` is whether the package has any lights or signs to place.
-pub fn script(config: &PackageConfig, furniture: bool) -> String {
+/// `furniture` is whether the package has any lights or signs to place, and
+/// `water` whether its map has any water to dress.
+pub fn script(config: &PackageConfig, furniture: bool, water: bool) -> String {
     let python_string = |value: Option<&str>| match value {
         Some(text) => format!("{text:?}"),
         None => "None".to_owned(),
@@ -64,6 +67,9 @@ OWN_TEXTURES = {own_textures}
 #: Whether the package has traffic lights, signs or a town of props to stand in
 #: the level.
 FURNITURE = {furniture}
+#: Whether the map has rivers, lakes or ponds for the descriptor's water
+#: materials to go on.
+WATER = {water}
 
 
 def main(argv=None):
@@ -73,6 +79,7 @@ def main(argv=None):
     parser.add_argument("--no-textures", action="store_true", help="do not fetch the package's textures")
     parser.add_argument("--no-sky", action="store_true", help="leave the level without a sky")
     parser.add_argument("--no-furniture", action="store_true", help="leave the lights and signs unplaced")
+    parser.add_argument("--no-water", action="store_true", help="leave the water in its flat colours")
     parser.add_argument("--launch", action="store_true", help="start the CARLA server on the map afterwards")
     args = parser.parse_args(argv)
     if not args.carla or not args.engine:
@@ -166,6 +173,13 @@ def main(argv=None):
         lights, signs, buildings = roadgen.carla_furniture(str(carla), PACKAGE, MAP, engine=str(engine))
         print("%d lights, %d signs and %d buildings placed" % (lights, signs, buildings))
 
+    # The water: slots Import.py filled with flat colours, given the Unreal
+    # materials the descriptor names — a river's one that flows down it.
+    if WATER and not args.no_water:
+        print("dressing the water in %s" % MAP)
+        dressed = roadgen.carla_water(str(carla), PACKAGE, MAP, engine=str(engine))
+        print("%d water meshes dressed" % dressed)
+
     editor = engine / "Engine" / "Binaries" / ("Win64" if os.name == "nt" else "Linux") / "UnrealEditor"
     level = "/Game/%s/Maps/%s/%s" % (PACKAGE, MAP, MAP)
     command = [str(editor), str(uproject), level, "-game", "-vulkan", "-carla-rpc-port=2000", "-RenderOffScreen"]
@@ -193,6 +207,7 @@ if __name__ == "__main__":
             "True"
         },
         furniture = if furniture { "True" } else { "False" },
+        water = if water { "True" } else { "False" },
     )
 }
 
@@ -206,7 +221,7 @@ mod tests {
             .with_package("Pkg")
             .with_carla_materials(false)
             .with_carla("/opt/carla", "/opt/ue5");
-        let text = script(&config, true);
+        let text = script(&config, true, true);
         assert!(text.starts_with("#!/usr/bin/env python3\n"));
         assert!(text.contains("PACKAGE = \"Pkg\"") && text.contains("MAP = \"Town01\""));
         assert!(
@@ -215,20 +230,21 @@ mod tests {
         assert!(text.contains("OWN_TEXTURES = True"));
         assert!(text.contains("SUN_ALTITUDE = 45") && text.contains("roadgen.carla_sky("));
         assert!(text.contains("FURNITURE = True") && text.contains("roadgen.carla_furniture("));
+        assert!(text.contains("WATER = True") && text.contains("roadgen.carla_water("));
     }
 
     #[test]
     fn a_package_in_carlas_materials_fetches_nothing_and_asks_where_carla_is() {
-        let text = script(&PackageConfig::new("Town01"), false);
+        let text = script(&PackageConfig::new("Town01"), false, false);
         assert!(text.contains("OWN_TEXTURES = False"));
-        assert!(text.contains("FURNITURE = False"));
+        assert!(text.contains("FURNITURE = False") && text.contains("WATER = False"));
         assert!(text.contains("CARLA_ROOT = None") && text.contains("ENGINE = None"));
     }
 
     #[test]
     fn a_windows_path_survives_as_a_python_string() {
         let config = PackageConfig::new("Town01").with_carla("C:\\carla", "C:\\UE_5.5");
-        let text = script(&config, false);
+        let text = script(&config, false, false);
         assert!(text.contains("CARLA_ROOT = \"C:\\\\carla\""), "{text}");
     }
 }

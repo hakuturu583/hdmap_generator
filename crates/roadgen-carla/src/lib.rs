@@ -107,7 +107,7 @@ pub use error::ExportError;
 pub use furniture::{FurnitureConfig, SignKind};
 pub use materials::Material;
 pub use mesh::Mesh;
-pub use package::{Descriptor, MapEntry, PropEntry, TextureManifest};
+pub use package::{Descriptor, MapEntry, PropEntry, TextureManifest, WaterMaterials};
 pub use pointcloud::{PointCloudConfig, PointCloudMap};
 pub use surfaces::SurfaceConfig;
 pub use tags::{Folder, Label, Role};
@@ -169,6 +169,9 @@ pub struct PackageConfig {
     /// Where the script puts the sun, in degrees, the way CARLA's weather spells it.
     pub sun_altitude: f64,
     pub sun_azimuth: f64,
+    /// The Unreal materials the script gives the map's running and standing
+    /// water, written into the descriptor.
+    pub water: package::WaterMaterials,
 }
 
 impl Default for PackageConfig {
@@ -191,6 +194,7 @@ impl PackageConfig {
             engine: None,
             sun_altitude: 45.0,
             sun_azimuth: -50.0,
+            water: package::WaterMaterials::default(),
         }
     }
 
@@ -220,6 +224,20 @@ impl PackageConfig {
 
     pub fn with_furniture(mut self, furniture: Option<FurnitureConfig>) -> Self {
         self.furniture = furniture;
+        self
+    }
+
+    /// The Unreal materials the map's water is given in place of its flat
+    /// colours: `flowing` for a river's, `still` for a lake's or a pond's.
+    pub fn with_water_materials(
+        mut self,
+        flowing: impl Into<String>,
+        still: impl Into<String>,
+    ) -> Self {
+        self.water = package::WaterMaterials {
+            flowing: flowing.into(),
+            still: still.into(),
+        };
         self
     }
 
@@ -421,6 +439,7 @@ pub fn write_traced(
             source: relative(&config.map, &format!("{}.fbx", config.map)),
             use_carla_materials: config.use_carla_materials,
             xodr: relative(&config.map, &format!("{}.xodr", config.map)),
+            water: package::WaterSlots::new(&config.water),
         }],
         props,
     };
@@ -432,9 +451,14 @@ pub fn write_traced(
             .map_err(|error| ExportError::Json(error.to_string()))?,
     )?;
     let script_path = root.join(format!("{}.py", config.package));
+    let water = meshes.iter().any(|mesh| {
+        mesh.materials
+            .iter()
+            .any(|&m| m == materials::FLOWING_WATER || m == materials::STILL_WATER)
+    });
     write_text(
         &script_path,
-        &script::script(config, !furniture.is_empty() || !town.is_empty()),
+        &script::script(config, !furniture.is_empty() || !town.is_empty(), water),
     )?;
     make_executable(&script_path)?;
 
