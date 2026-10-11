@@ -102,6 +102,8 @@ own elements. Loaded together they follow one element across formats:
 
 from ._roadgen import (
     Alignment,
+    Corridor,
+    CorridorPlan,
     Junction,
     Lane,
     LaneRef,
@@ -127,6 +129,8 @@ from .textures import TextureError, fetch_textures, texture_manifest
 
 __all__ = [
     "Alignment",
+    "Corridor",
+    "CorridorPlan",
     "Junction",
     "Lane",
     "LaneRef",

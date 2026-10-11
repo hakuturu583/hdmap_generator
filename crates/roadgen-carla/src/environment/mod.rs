@@ -34,11 +34,17 @@
 //! covers, its roads, and the land they all lie on. A site with a pit in it is an
 //! `open_pit_mine`.
 
+pub mod corridor;
+pub mod foundation;
 pub mod heap;
+pub(crate) mod highway;
+pub mod hill;
 pub mod land;
 pub mod noise;
 pub mod pad;
 pub mod pit;
+pub mod river;
+mod structures;
 pub mod tin;
 
 use std::collections::BTreeMap;
@@ -49,10 +55,16 @@ use roadgen_core::id::{LandCoverId, RoadId, SiteId};
 use roadgen_core::site::Site;
 use roadgen_core::validation::UnvalidatedMap;
 
+pub use corridor::{
+    Control, CorridorPlan, CorridorSpec, DesignStandard, InterchangeKind, InterchangeSite,
+    RampSite, Side, StructureMode,
+};
 pub use heap::HeapSpec;
+pub use hill::HillSpec;
 pub use land::GroundSpec;
 pub use pad::PadSpec;
 pub use pit::{PitSpec, RampSpec};
+pub use river::RiverSpec;
 
 use land::{plan_of, Base, Land, Landforms};
 
@@ -73,16 +85,36 @@ pub struct Places {
     /// lays its own ground under the roads.
     pub ground: Option<GroundSpec>,
     pub seed: u64,
+    /// Hills and ridges: swells of the country, for a tunnel to go through.
+    pub hills: Vec<HillSpec>,
+    /// Rivers: channels in the land, for a bridge to cross.
+    pub rivers: Vec<RiverSpec>,
+    /// Motorway corridors: the rules their roads are fitted to the land by.
+    pub corridors: Vec<CorridorSpec>,
+    /// Roads that belong to a corridor, by the corridor's name.
+    pub corridor_roads: Vec<(RoadId, String)>,
+    /// Roads the land is cut and filled to meet, rather than read its height from,
+    /// that are no corridor's: a crossroad lifted over a motorway.
+    pub fitted_roads: Vec<RoadId>,
+    /// Heights the land meets where they are known: the ground a crossroad was
+    /// drawn on, before it was lifted.
+    pub anchors: Vec<roadgen_core::geometry::Point3>,
 }
 
 /// What [`generate`] came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Report {
     /// Buildings put on the map, along the streets and on the pads.
     pub buildings: usize,
     pub land: Option<land::Report>,
     pub land_covers: usize,
     pub sites: usize,
+    /// Bridges and tunnels on the map once the rules have run.
+    pub structures: usize,
+    /// Buildings given a foundation down to land that falls away under them.
+    pub foundations: usize,
+    /// Where a rule could not be kept, or was kept only just.
+    pub notes: Vec<String>,
 }
 
 /// Why the places could not be generated.
@@ -112,18 +144,7 @@ impl From<land::Error> for Error {
     }
 }
 
-/// The name made safe to put in an identifier: lower case, words joined by `_`.
-pub fn slug(name: &str) -> String {
-    let mut out = String::new();
-    for character in name.trim().chars() {
-        if character.is_ascii_alphanumeric() {
-            out.push(character.to_ascii_lowercase());
-        } else if !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    out.trim_matches('_').to_owned()
-}
+pub use roadgen_core::structure::slug;
 
 /// What the land is named: `tin/land`.
 pub const LAND: &str = "land";
@@ -191,6 +212,17 @@ impl Places {
                 key,
             });
         }
+        for river in &self.rivers {
+            river.check().map_err(Error::Spec)?;
+            let key = named(&river.name, "river")?;
+            parts.push(Part {
+                forms: river.landforms(&key, spacing),
+                outline: river.outline(spacing),
+                kind: "water".into(),
+                site: river.site.clone(),
+                key,
+            });
+        }
         // Two parts in one place would be two shapes of one piece of land.
         for (index, a) in parts.iter().enumerate() {
             if parts[..index].iter().any(|b| b.key == a.key) {
@@ -234,18 +266,152 @@ fn site_junctions(map: &roadgen_core::map::Map, places: &Places) -> Vec<(String,
         .collect()
 }
 
+/// The roads through every junction whose roads all belong to one corridor: they
+/// are the corridor's too.
+fn corridor_junctions(map: &roadgen_core::map::Map, places: &Places) -> Vec<(String, Vec<RoadId>)> {
+    map.junctions
+        .iter()
+        .filter_map(|junction| {
+            let owners = junction
+                .incoming_roads
+                .iter()
+                .map(|road| places.corridor_roads.iter().find(|(id, _)| id == road))
+                .collect::<Option<Vec<_>>>()?;
+            let first = owners.first()?.1.clone();
+            owners
+                .iter()
+                .all(|(_, name)| *name == first)
+                .then(|| (first, junction.connecting_roads.clone()))
+        })
+        .collect()
+}
+
 /// Generates the places onto `map`, once its roads are built and before it is
-/// validated: the buildings first — the land keeps its roll off them — then one
-/// land round every road and shaped by every part, then what each part's land is,
-/// then the sites.
+/// validated:
+///
+/// 1. the natural land — the country, the hills, the rivers and the parts —
+///    before anything is fitted to it;
+/// 2. the structures a corridor's roads need to cross it: a bridge where a road is
+///    far above it or over water, a tunnel where it is far below;
+/// 3. an overpass wherever one road crosses over another with nothing carrying it,
+///    and every grade separation;
+/// 4. the cuttings and embankments that fit the rest of the corridor to the land;
+/// 5. the buildings — off the corridors, the structures and the parts;
+/// 6. one land round all of it;
+/// 7. what each part's land is, and the sites.
 pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Error> {
     let ground = places.ground.clone().unwrap_or_default();
     ground.check().map_err(Error::Spec)?;
     let parts = places.parts(ground.spacing)?;
     let mut report = Report::default();
+    for hill in &places.hills {
+        hill.check().map_err(Error::Spec)?;
+    }
+    for corridor in &places.corridors {
+        corridor.check().map_err(Error::Spec)?;
+    }
+
+    // Everything that shapes the land, and the roads the land does not take its
+    // height from: a corridor's, and the movements through its junctions.
+    let mut forms = Landforms::default();
+    for part in &parts {
+        forms.extend(part.forms.clone());
+    }
+    for hill in &places.hills {
+        forms.extend(hill.landforms());
+    }
+    let mut corridor_roads = places.corridor_roads.clone();
+    for (corridor, roads) in corridor_junctions(map.as_map(), places) {
+        corridor_roads.extend(roads.into_iter().map(|road| (road, corridor.clone())));
+    }
+    for (road, _) in &corridor_roads {
+        if !map.as_map().roads.contains(road) {
+            return Err(Error::Spec(format!("{road} is no road on the map")));
+        }
+    }
+    forms.floating = corridor_roads
+        .iter()
+        .map(|(road, _)| road.clone())
+        .collect();
+    forms.floating.extend(places.fitted_roads.iter().cloned());
+    // And the movements through a junction whose roads are all fitted to the land:
+    // a ramp terminal on a lifted crossroad is as far off the ground as they are.
+    let through: Vec<RoadId> = map
+        .as_map()
+        .junctions
+        .iter()
+        .filter(|junction| {
+            junction
+                .incoming_roads
+                .iter()
+                .all(|road| forms.floating.contains(road))
+        })
+        .flat_map(|junction| junction.connecting_roads.iter().cloned())
+        .collect();
+    forms.floating.extend(through);
+    forms.anchors.extend(places.anchors.iter().copied());
+
+    // The structures and the separations: what the corridors ask for, and what any
+    // road crossing another does. A map with none of either — no corridor, no
+    // structure, no motorway — is left exactly as it was.
+    let separates = !places.corridors.is_empty()
+        || !map.as_map().structures.is_empty()
+        || map
+            .as_map()
+            .roads
+            .iter()
+            .any(|road| road.form.is_controlled_access());
+    let water: Vec<Vec<roadgen_core::geometry::plan::PlanPoint>> = parts
+        .iter()
+        .filter(|part| part.kind == "water")
+        .map(|part| plan_of(&part.outline))
+        .collect();
+    let mut earthworks = None;
+    // The stretches of a fitted road that stand well off the land — a crossroad's
+    // embankment up to its overpass — which nothing has a frontage on.
+    let mut embanked: Vec<Vec<roadgen_core::geometry::plan::PlanPoint>> = Vec::new();
+    if separates {
+        let natural = highway::Natural {
+            field: land::base_field(
+                map.as_map(),
+                &ground,
+                &forms.holes,
+                forms.anchors.clone(),
+                &forms.floating,
+            ),
+            rises: &forms.rises,
+        };
+        let modes: Vec<(String, StructureMode)> = places
+            .corridors
+            .iter()
+            .map(|corridor| (corridor.name.clone(), corridor.structures))
+            .collect();
+        let target = map.as_map_mut();
+        report.notes.extend(highway::choose_structures(
+            target,
+            &places.corridor_roads,
+            &modes,
+            &natural,
+            &water,
+        ));
+        report.notes.extend(highway::separate(target));
+        // Every road the land is fitted to; the movements among them are skipped,
+        // as the land does not take its slopes from a junction.
+        if !forms.floating.is_empty() {
+            earthworks = Some(highway::earthworks(target, &forms.floating, &natural));
+        }
+        embanked = highway::off_the_land(target, &places.fitted_roads, &natural);
+    }
+    if let Some(works) = &earthworks {
+        forms.lines.extend(works.lines.clone());
+        forms.holes.extend(works.holes.clone());
+    }
+    report.structures = map.as_map().structures.len();
 
     // The buildings: the pads' kept to their pads, the town's along every road no
-    // site has, kept off every part.
+    // site and no corridor has, and none that is a motorway or a slip road — they
+    // have no frontage — kept off every part, every corridor and the ground under
+    // every bridge.
     let before = map.as_map().buildings.len();
     for pad in &places.pads {
         if let Some(rules) = &pad.buildings {
@@ -260,18 +426,57 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     }
     if let Some(rules) = &places.town {
         let taken = site_junctions(map.as_map(), places);
-        let roads = map
-            .as_map()
+        let source = map.as_map();
+        let roads = source
             .roads
             .iter()
             .filter(|road| !places.site_roads.iter().any(|(id, _)| id == &road.id))
             .filter(|road| !taken.iter().any(|(_, roads)| roads.contains(&road.id)))
+            .filter(|road| !corridor_roads.iter().any(|(id, _)| id == &road.id))
+            .filter(|road| !road.form.is_controlled_access())
             .map(|road| road.id.clone())
             .collect();
+        let mut outside: Vec<Vec<roadgen_core::geometry::plan::PlanPoint>> =
+            parts.iter().map(|part| plan_of(&part.outline)).collect();
+        outside.extend(embanked.iter().cloned());
+        for (road, _) in &corridor_roads {
+            let Some(entry) = source.road(road) else {
+                continue;
+            };
+            let Ok(length) = entry.horizontal_length() else {
+                continue;
+            };
+            // The road, its slopes and its right of way.
+            if let Ok(ring) = roadgen_core::structure::outline(
+                source,
+                &[roadgen_core::structure::RoadSpan::new(
+                    road.clone(),
+                    0.0,
+                    length,
+                )],
+                25.0,
+            ) {
+                outside.push(plan_of(&ring));
+            }
+        }
+        for structure in source.structures.iter() {
+            let margin = match &structure.kind {
+                roadgen_core::structure::StructureKind::Bridge(_) => 5.0,
+                roadgen_core::structure::StructureKind::Tunnel(tunnel) => {
+                    if tunnel.form == roadgen_core::structure::TunnelForm::Bored {
+                        continue;
+                    }
+                    2.0
+                }
+            };
+            if let Ok(ring) = roadgen_core::structure::outline(source, &structure.carries, margin) {
+                outside.push(plan_of(&ring));
+            }
+        }
         let placement = roadgen_buildings::Placement {
             roads: Some(roads),
             within: Vec::new(),
-            outside: parts.iter().map(|part| plan_of(&part.outline)).collect(),
+            outside,
             keep: true,
         };
         roadgen_buildings::generate_with(map, rules, &placement).map_err(Error::Buildings)?;
@@ -280,13 +485,13 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
 
     // The land: one, round everything — when there is anything to shape it, or it
     // was asked for.
-    let surface = if parts.is_empty() && places.ground.is_none() {
+    let shaped = !parts.is_empty()
+        || !places.hills.is_empty()
+        || !places.corridors.is_empty()
+        || !map.as_map().structures.is_empty();
+    let surface = if !shaped && places.ground.is_none() {
         None
     } else {
-        let mut forms = Landforms::default();
-        for part in &parts {
-            forms.extend(part.forms.clone());
-        }
         let land = Land {
             name: LAND.into(),
             site: None,
@@ -299,9 +504,53 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
         Some(surface)
     };
 
+    // Each pier stands on the land, where there is some.
+    if let Some(surface) = &surface {
+        let target = map.as_map_mut();
+        let heights: Vec<(roadgen_core::id::StructureId, Vec<Option<f64>>)> = {
+            let tin = target.tin_surfaces.get(surface).expect("just built");
+            let locator = tin.tin.locator();
+            target
+                .structures
+                .iter()
+                .filter_map(|structure| {
+                    let bridge = structure.kind.bridge()?;
+                    Some((
+                        structure.id.clone(),
+                        bridge
+                            .supports
+                            .iter()
+                            .map(|support| {
+                                let centre = support.footprint.centroid();
+                                let top = support.footprint.lowest();
+                                locator.height_at(centre.x, centre.y).map(|z| z.min(top))
+                            })
+                            .collect(),
+                    ))
+                })
+                .collect()
+        };
+        for (id, bases) in heights {
+            if let Some(roadgen_core::structure::StructureKind::Bridge(bridge)) =
+                target.structures.get_mut(&id).map(|s| &mut s.kind)
+            {
+                for (support, base) in bridge.supports.iter_mut().zip(bases) {
+                    support.base = base;
+                }
+            }
+        }
+    }
+
+    // Every building stands on the land: where it falls away under one, the
+    // building gets a foundation down to it.
+    if let Some(surface) = &surface {
+        report.foundations = foundation::lay(map.as_map_mut(), surface)?;
+    }
+
     // What each part's land is, and which site it belongs to.
-    let mut sites: BTreeMap<String, (String, Vec<LandCoverId>, Vec<RoadId>, bool)> =
-        BTreeMap::new();
+    // By key: the site's name, its land covers, its roads and its kind.
+    type Gathered = (String, Vec<LandCoverId>, Vec<RoadId>, &'static str);
+    let mut sites: BTreeMap<String, Gathered> = BTreeMap::new();
     let site_of = |name: &str| -> Result<SiteId, Error> {
         let key = slug(name);
         if key.is_empty() {
@@ -327,9 +576,11 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
         if let (Some(site), Some(name)) = (site, &part.site) {
             let entry = sites
                 .entry(site.local_name().to_owned())
-                .or_insert_with(|| (name.clone(), Vec::new(), Vec::new(), false));
+                .or_insert_with(|| (name.clone(), Vec::new(), Vec::new(), "works"));
             entry.1.push(id);
-            entry.3 |= part.kind == "pit";
+            if part.kind == "pit" {
+                entry.3 = "open_pit_mine";
+            }
         }
     }
     for (road, name) in &places.site_roads {
@@ -339,7 +590,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
         let site = site_of(name)?;
         let entry = sites
             .entry(site.local_name().to_owned())
-            .or_insert_with(|| (name.clone(), Vec::new(), Vec::new(), false));
+            .or_insert_with(|| (name.clone(), Vec::new(), Vec::new(), "works"));
         entry.2.push(road.clone());
     }
     for (key, roads) in site_junctions(target, places) {
@@ -347,7 +598,57 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
             entry.2.extend(roads);
         }
     }
-    for (key, (name, land_covers, roads, pit)) in sites {
+    // A corridor is a site of its own: a motorway, its roads, and the cuttings and
+    // embankments it is fitted to the land with.
+    for corridor in &places.corridors {
+        let site = site_of(&corridor.name)?;
+        let key = site.local_name().to_owned();
+        let entry = sites
+            .entry(key.clone())
+            .or_insert_with(|| (corridor.name.clone(), Vec::new(), Vec::new(), "motorway"));
+        entry.3 = "motorway";
+        entry.2.extend(
+            corridor_roads
+                .iter()
+                .filter(|(_, name)| *name == corridor.name)
+                .map(|(road, _)| road.clone()),
+        );
+    }
+    if let Some(works) = earthworks {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let site = places
+            .corridors
+            .first()
+            .map(|corridor| site_of(&corridor.name))
+            .transpose()?;
+        for (kind, ring) in works.covers {
+            // Draped on the land just built, so the outline sits on it.
+            let count = counts.entry(kind.clone()).or_default();
+            let cover_key = format!("{kind}/{count}");
+            *count += 1;
+            let id = match land::cover(
+                target,
+                LAND,
+                &cover_key,
+                &kind,
+                ring,
+                site.as_ref(),
+                surface.as_ref(),
+            ) {
+                Ok(id) => id,
+                // A slope too thin to have an outline is no land cover.
+                Err(land::Error::Geometry(_)) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            report.land_covers += 1;
+            if let Some(site) = &site {
+                if let Some(entry) = sites.get_mut(site.local_name()) {
+                    entry.1.push(id);
+                }
+            }
+        }
+    }
+    for (key, (name, land_covers, roads, kind)) in sites {
         let id = SiteId::new(key);
         target
             .sites
@@ -356,7 +657,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
                 Site {
                     id,
                     name: Some(name),
-                    kind: if pit { "open_pit_mine" } else { "works" }.into(),
+                    kind: kind.into(),
                     land_covers,
                     surfaces: surface.iter().cloned().collect(),
                     roads,
@@ -364,6 +665,12 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
             )
             .map_err(|duplicate| land::Error::Duplicate(duplicate.0.to_string()))?;
         report.sites += 1;
+    }
+    // The separations once more, now the land covers are on the map: a bridge over
+    // a river passes over water.
+    if separates {
+        roadgen_core::structure::derive_separations(target);
+        roadgen_core::structure::refresh_interchanges(target);
     }
     Ok(report)
 }

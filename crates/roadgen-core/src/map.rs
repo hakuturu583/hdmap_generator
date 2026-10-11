@@ -16,14 +16,15 @@ use crate::geometry::{
     WidthProfile,
 };
 use crate::id::{
-    BuildingId, BuildingPartId, ConnectionId, JunctionId, LandCoverId, LaneId, ObjectId, RoadId,
-    SiteId, TinBreaklineId, TinSurfaceId,
+    BuildingId, BuildingPartId, ConnectionId, GradeSeparationId, InterchangeId, JunctionId,
+    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
 };
 use crate::land_cover::LandCover;
 use crate::semantics::{
-    BoundaryMarking, LaneType, MapObject, PavementProfile, RoadType, TrafficRule,
+    BoundaryMarking, FormOfWay, LaneType, MapObject, PavementProfile, RoadType, TrafficRule,
 };
 use crate::site::Site;
+use crate::structure::{GradeSeparation, Interchange, Structure, StructureProfile};
 use crate::terrain::{TinBreakline, TinSurface};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLink, RoadLinkTarget,
@@ -227,6 +228,10 @@ pub struct Road {
     /// What the road is surfaced with along its length; unknown unless the caller
     /// said.
     pub pavement: PavementProfile,
+    /// What part the road plays in the network.
+    pub form: FormOfWay,
+    /// Which stretches of it are on a bridge or in a tunnel; at grade elsewhere.
+    pub structure: StructureProfile,
 }
 
 impl Road {
@@ -463,6 +468,12 @@ pub struct Map {
     pub tin_breaklines: Arena<TinBreaklineId, TinBreakline>,
     /// What the land is used for or covered with.
     pub land_covers: Arena<LandCoverId, LandCover>,
+    /// The bridges and tunnels that carry roads clear of the ground.
+    pub structures: Arena<StructureId, Structure>,
+    /// Where one road passes over another, or over water, and by what.
+    pub grade_separations: Arena<GradeSeparationId, GradeSeparation>,
+    /// The grade-separated junctions, each as one feature.
+    pub interchanges: Arena<InterchangeId, Interchange>,
 }
 
 impl Map {
@@ -481,6 +492,9 @@ impl Map {
             tin_surfaces: Arena::new(),
             tin_breaklines: Arena::new(),
             land_covers: Arena::new(),
+            structures: Arena::new(),
+            grade_separations: Arena::new(),
+            interchanges: Arena::new(),
         }
     }
 
@@ -542,8 +556,16 @@ impl Map {
             return Ok(Vec::new());
         };
         let lanes = self.lanes_of(road);
+        // A vertex where a bridge or tunnel begins and ends, too, so the road's
+        // edges stop meeting the land exactly there.
         let required = required_stations(
-            entry.sections.iter().map(|section| section.station),
+            entry.sections.iter().map(|section| section.station).chain(
+                entry
+                    .structure
+                    .spans()
+                    .iter()
+                    .flat_map(|span| [span.from, span.to]),
+            ),
             lanes.iter().map(|lane| &lane.width),
             lanes.iter().map(|lane| &lane.height),
             self.metadata.sampling,
@@ -794,6 +816,8 @@ mod tests {
             speed_limit: None,
             superelevation: Poly3Profile::default(),
             pavement: PavementProfile::unknown(),
+            form: FormOfWay::Unspecified,
+            structure: StructureProfile::at_grade(),
         };
         assert_eq!(road.section_at(0.0), Some(0));
         assert_eq!(road.section_at(39.9), Some(0));

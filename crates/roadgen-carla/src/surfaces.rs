@@ -146,10 +146,15 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             }
             layout.surfaces(&within, map_name, &mut ordinal, &mut meshes);
             layout.markings(&within, map_name, config, &mut ordinal, &mut meshes);
-            if let Some([left, right]) =
-                layout.flanks(&within, facing, map_name, &mut ordinal, &mut meshes)
-            {
-                land.section(left, right);
+            // The land meets the road only where the road is on the ground: a
+            // stretch on a bridge has the land under it, one in a tunnel the land
+            // over it, and neither has a verge.
+            for run in at_grade(map, road, &within) {
+                if let Some([left, right]) =
+                    layout.flanks(run, facing, map_name, &mut ordinal, &mut meshes)
+                {
+                    land.section(left, right);
+                }
             }
         }
     }
@@ -169,9 +174,48 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
     if let Some(terrain) = land.mesh(ground.as_ref(), verge, map_name, &mut ordinal) {
         meshes.push(terrain);
     }
+    meshes.extend(crate::water::meshes(map, map_name, &mut ordinal));
+    meshes.extend(crate::structures::meshes(
+        map,
+        ground.as_ref(),
+        map_name,
+        &mut ordinal,
+    ));
     meshes.extend(crate::barriers::berms(map, map_name, &mut ordinal));
     meshes.retain(|mesh| !mesh.is_empty());
     meshes
+}
+
+/// The runs of `within` that are on the ground, each with at least two rungs: the
+/// whole of it for a road on no structure, the stretches between its bridges and
+/// tunnels otherwise. A rung on a span's boundary is in the run on either side.
+fn at_grade<'c, 'r>(map: &Map, road: &Road, within: &'c [Cross<'r>]) -> Vec<&'c [Cross<'r>]> {
+    if roadgen_core::structure::connector_carried(map, road) {
+        return Vec::new();
+    }
+    if road.structure.is_empty() {
+        return vec![within];
+    }
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    for (index, cross) in within.iter().enumerate() {
+        let station = cross.rung.station;
+        let carried = road.structure.carries_strictly(station);
+        if !carried {
+            start.get_or_insert(index);
+        }
+        // A rung on a span's start ends the run before it; one inside a span ends
+        // whatever run there was.
+        if carried || road.structure.begins_at(station) {
+            if let Some(from) = start.take() {
+                runs.push(&within[from..index + usize::from(!carried)]);
+            }
+        }
+    }
+    if let Some(from) = start {
+        runs.push(&within[from..]);
+    }
+    runs.into_iter().filter(|run| run.len() >= 2).collect()
 }
 
 /// Where each junction is: the mean of the midpoints of the roads through it.
@@ -254,7 +298,7 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
     let mut samples = map.vertex_samples(&road.id).ok()?;
     // A rung wherever the pavement changes, too, so that the surface can change
     // material there rather than at the next vertex, which on a straight road is
-    // its far end.
+    // its far end. A bridge's or a tunnel's ends are vertices of the road already.
     let (first, last) = (samples.first()?.station, samples.last()?.station);
     for &(station, _) in road.pavement.spans() {
         if station > first + 1e-6

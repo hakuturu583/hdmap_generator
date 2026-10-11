@@ -77,6 +77,7 @@ impl UnvalidatedMap {
         check_terrain(&self.0, config, &mut issues);
         check_land_covers(&self.0, &mut issues);
         check_sites(&self.0, &mut issues);
+        crate::structure::check(&self.0, config.position_tolerance.max(1e-2), &mut issues);
         issues
     }
 

@@ -67,6 +67,7 @@ pub mod layout;
 pub mod map;
 pub mod semantics;
 pub mod site;
+pub mod structure;
 pub mod terrain;
 pub mod topology;
 pub mod trace;
@@ -79,20 +80,25 @@ pub use buildings::{Building, BuildingPart, Face, Footprint, Frontage, Roof, Roo
 pub use error::{BuildError, GeometryError, QuantityError, ValidationError, ValidationIssue};
 pub use geometry::{
     Alignment, Arc3, Clothoid3, Curve3, Frame3, LaneHeight, Point3, Poly3Piece, Poly3Profile,
-    Polyline3, SamplingConfig, Taper, Vector3, WidthProfile,
+    Polyline3, SamplingConfig, Taper, Vector3, VerticalProfile, WidthProfile,
 };
 pub use id::{
-    BuildingId, BuildingPartId, ConnectionId, JunctionId, LandCoverId, LaneId, ObjectId, RoadId,
-    SiteId, TinBreaklineId, TinSurfaceId,
+    BuildingId, BuildingPartId, ConnectionId, GradeSeparationId, InterchangeId, JunctionId,
+    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
 };
 pub use land_cover::LandCover;
 pub use map::{CrossSection, Lane, Map, MapMetadata, Projection, Road, Route, TrafficHandedness};
 pub use semantics::{
-    BoundaryMarking, LaneType, LightArrow, LightBulb, LightColor, LightHead, MapObject,
+    BoundaryMarking, FormOfWay, LaneType, LightArrow, LightBulb, LightColor, LightHead, MapObject,
     MapObjectKind, MarkingColor, ObjectGeometry, PavedSurface, Pavement, PavementProfile,
     RoadMarking, RoadType, TrafficRule, UnpavedSurface,
 };
 pub use site::Site;
+pub use structure::{
+    Bridge, BridgeForm, BridgeSpec, GradeSeparation, Interchange, Portal, RoadSpan, Structure,
+    StructureKind, StructureMaterial, StructureProfile, StructureSpec, Support, SupportKind,
+    Tunnel, TunnelForm, TunnelSpec, Underneath,
+};
 pub use terrain::{Tin, TinBreakline, TinError, TinLocator, TinSurface};
 pub use topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,

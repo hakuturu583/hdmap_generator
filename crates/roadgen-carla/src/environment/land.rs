@@ -19,7 +19,9 @@
 
 use roadgen_core::buildings::Footprint;
 use roadgen_core::error::GeometryError;
-use roadgen_core::geometry::plan::{polyline_distance, ring_contains, PlanPoint, Segments};
+use roadgen_core::geometry::plan::{
+    bounds, polyline_distance, ring_contains, within_bounds, PlanPoint, Segments,
+};
 use roadgen_core::geometry::Point3;
 use roadgen_core::id::{LandCoverId, SiteId, TinBreaklineId, TinSurfaceId};
 use roadgen_core::land_cover::LandCover;
@@ -129,6 +131,32 @@ pub struct Landforms {
     /// Heights the country meets besides the roads': a pit's rim, a heap's toe.
     /// Read by [`Base::Roads`] only; a level base has its height already.
     pub anchors: Vec<Point3>,
+    /// Swells added to the country's height: a hill, a ridge.
+    pub rises: Vec<Rise>,
+    /// Roads whose height says nothing about the country's: a motorway's
+    /// carriageway, which the land is cut and filled to meet rather than the other
+    /// way round. Read by [`Base::Roads`] only.
+    pub floating: Vec<roadgen_core::id::RoadId>,
+}
+
+/// A swell of the land along a line — a ridge — or round a point — a hill: `height`
+/// over the line, falling away smoothly to nothing `half_width` from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rise {
+    pub crest: Vec<PlanPoint>,
+    pub half_width: f64,
+    pub height: f64,
+}
+
+impl Rise {
+    pub fn at(&self, p: PlanPoint) -> f64 {
+        let distance = polyline_distance(p, &self.crest);
+        if distance >= self.half_width {
+            return 0.0;
+        }
+        let t = distance / self.half_width;
+        self.height * (std::f64::consts::FRAC_PI_2 * t).cos().powi(2)
+    }
 }
 
 impl Landforms {
@@ -139,6 +167,8 @@ impl Landforms {
         self.holes.extend(other.holes);
         self.flats.extend(other.flats);
         self.anchors.extend(other.anchors);
+        self.rises.extend(other.rises);
+        self.floating.extend(other.floating);
     }
 }
 
@@ -196,6 +226,29 @@ impl From<TinError> for Error {
     }
 }
 
+/// Rings to ask "is this point in any of them?" of many times: each with its bounds,
+/// so a ring nowhere near the point is passed over without walking its edges.
+struct Rings<'a> {
+    rings: Vec<([f64; 4], &'a [PlanPoint])>,
+}
+
+impl<'a> Rings<'a> {
+    fn of(rings: &'a [Vec<PlanPoint>]) -> Rings<'a> {
+        Rings {
+            rings: rings
+                .iter()
+                .map(|ring| (bounds(ring), ring.as_slice()))
+                .collect(),
+        }
+    }
+
+    fn contain(&self, p: PlanPoint) -> bool {
+        self.rings
+            .iter()
+            .any(|(b, ring)| within_bounds(b, p, 0.0) && ring_contains(ring, p))
+    }
+}
+
 pub(crate) fn plan_of(points: &[Point3]) -> Vec<PlanPoint> {
     points.iter().map(|p| [p.x, p.y]).collect()
 }
@@ -230,6 +283,99 @@ pub fn road_edges(map: &Map, road: &roadgen_core::id::RoadId) -> (Vec<Point3>, V
     (left, right)
 }
 
+/// The outer edges of the stretches of a road that are on the ground — between and
+/// beyond its bridges and tunnels — each as a left and a right edge. The vertex on
+/// a structure's end is in the stretch beside it, so the land meets the road up to
+/// exactly where the structure begins.
+///
+/// A road on no structure is one stretch, its edges whole; a movement through a
+/// junction on a viaduct, carried like the roads it joins, is none.
+pub fn at_grade_edges(
+    map: &Map,
+    road: &roadgen_core::map::Road,
+) -> Vec<(Vec<Point3>, Vec<Point3>)> {
+    if roadgen_core::structure::connector_carried(map, road) {
+        return Vec::new();
+    }
+    if road.structure.is_empty() {
+        return vec![road_edges(map, &road.id)];
+    }
+    let sampling = map.metadata.sampling;
+    let Ok(stations) = map.vertex_stations(&road.id) else {
+        return Vec::new();
+    };
+    // Each vertex of the outer edges, with its station: a lane's vertices are the
+    // road's vertex stations within the lane's range.
+    let mut rows: Vec<(f64, Point3, Point3)> = Vec::new();
+    for section in 0..road.sections.len() {
+        let lanes = map.lanes_of_section(&road.id, section);
+        let outer_left = lanes.iter().max_by_key(|lane| lane.left_edge);
+        let outer_right = lanes.iter().min_by_key(|lane| lane.right_edge);
+        let (Some(l), Some(r)) = (outer_left, outer_right) else {
+            continue;
+        };
+        let (Ok(left), Ok(right)) = (
+            l.left_boundary.to_polyline(sampling),
+            r.right_boundary.to_polyline(sampling),
+        ) else {
+            continue;
+        };
+        let (from, to) = l.station_range;
+        let within: Vec<f64> = stations
+            .iter()
+            .copied()
+            .filter(|s| *s >= from - 1e-6 && *s <= to + 1e-6)
+            .collect();
+        // The boundaries' vertices are the stations', one for one; should they ever
+        // not be, the edges are laid out again from the road's frames, which is
+        // where the boundaries came from.
+        let pairs: Vec<(Point3, Point3)> =
+            if within.len() == left.points().len() && within.len() == right.points().len() {
+                left.points()
+                    .iter()
+                    .copied()
+                    .zip(right.points().iter().copied())
+                    .collect()
+            } else {
+                within
+                    .iter()
+                    .filter_map(|&station| {
+                        let frame = road.frame_at(station, sampling).ok()?;
+                        let (l, r) = roadgen_core::structure::road_extent(map, &road.id, station)?;
+                        Some((frame.offset(l), frame.offset(r)))
+                    })
+                    .collect()
+            };
+        if pairs.len() != within.len() {
+            continue;
+        }
+        for (station, (a, b)) in within.into_iter().zip(pairs) {
+            if rows
+                .last()
+                .is_some_and(|last| (last.0 - station).abs() < 1e-6)
+            {
+                continue;
+            }
+            rows.push((station, a, b));
+        }
+    }
+    let mut runs = Vec::new();
+    let (mut left, mut right): (Vec<Point3>, Vec<Point3>) = (Vec::new(), Vec::new());
+    for (station, a, b) in rows {
+        let carried = road.structure.carries_strictly(station);
+        if !carried {
+            left.push(a);
+            right.push(b);
+        }
+        if carried || road.structure.begins_at(station) {
+            runs.push((std::mem::take(&mut left), std::mem::take(&mut right)));
+        }
+    }
+    runs.push((left, right));
+    runs.retain(|(left, _)| left.len() >= 2);
+    runs
+}
+
 /// Every road on the map as the land sees it: through roads' edges as breaklines,
 /// and every road's outline — a junction's movements included — as ground nothing
 /// of the land is put on.
@@ -247,57 +393,59 @@ impl Roads {
             edges: Vec::new(),
         };
         for road in map.roads.iter() {
-            let (left, right) = road_edges(map, &road.id);
-            if left.len() < 2 || right.len() < 2 {
-                continue;
-            }
-            let ring: Vec<PlanPoint> = plan_of(&left)
-                .into_iter()
-                .chain(plan_of(&right).into_iter().rev())
-                .collect();
-            let bounds = ring.iter().fold(
-                [
-                    f64::INFINITY,
-                    f64::INFINITY,
-                    f64::NEG_INFINITY,
-                    f64::NEG_INFINITY,
-                ],
-                |b, p| {
-                    [
-                        b[0].min(p[0]),
-                        b[1].min(p[1]),
-                        b[2].max(p[0]),
-                        b[3].max(p[1]),
-                    ]
-                },
-            );
-            roads.outlines.push((bounds, ring));
-            if road.is_connector() {
-                continue;
-            }
-            for (side, points) in [("left", left), ("right", right)] {
-                roads.rails.insert_polyline(&plan_of(&points));
-                roads.edges.push(Constraint {
-                    kind: "road_edge".into(),
-                    key: format!("road/{}/{side}", road.id.local_name()),
-                    points,
-                    closed: false,
-                });
+            let runs = at_grade_edges(map, road);
+            let several = runs.len() > 1;
+            for (index, (left, right)) in runs.into_iter().enumerate() {
+                // A road cut by its structures has one edge per stretch.
+                let run = several.then_some(index);
+                roads.add(road, run, left, right);
             }
         }
         roads
     }
 
+    /// One stretch of road on the ground: its outline, and its edges as breaklines
+    /// unless it is a movement through a junction.
+    fn add(
+        &mut self,
+        road: &roadgen_core::map::Road,
+        run: Option<usize>,
+        left: Vec<Point3>,
+        right: Vec<Point3>,
+    ) {
+        if left.len() < 2 || right.len() < 2 {
+            return;
+        }
+        let ring: Vec<PlanPoint> = plan_of(&left)
+            .into_iter()
+            .chain(plan_of(&right).into_iter().rev())
+            .collect();
+        self.outlines.push((bounds(&ring), ring));
+        if road.is_connector() {
+            return;
+        }
+        let name = road.id.local_name();
+        for (side, points) in [("left", left), ("right", right)] {
+            self.rails.insert_polyline(&plan_of(&points));
+            self.edges.push(Constraint {
+                kind: "road_edge".into(),
+                key: match run {
+                    Some(run) => format!("road/{name}/{side}/{run}"),
+                    None => format!("road/{name}/{side}"),
+                },
+                points,
+                closed: false,
+            });
+        }
+    }
+
     /// Within `reach` of a road's edge, or on a road.
     fn near(&self, p: PlanPoint, reach: f64) -> bool {
         self.rails.within(p, reach).is_some()
-            || self.outlines.iter().any(|(b, ring)| {
-                p[0] >= b[0]
-                    && p[0] <= b[2]
-                    && p[1] >= b[1]
-                    && p[1] <= b[3]
-                    && ring_contains(ring, p)
-            })
+            || self
+                .outlines
+                .iter()
+                .any(|(b, ring)| within_bounds(b, p, 0.0) && ring_contains(ring, p))
     }
 }
 
@@ -358,6 +506,53 @@ fn clear_of(roads: &Roads, line: Line) -> Vec<Constraint> {
         .collect()
 }
 
+/// The country's height before it rolls, read off the roads it meets: every lane a
+/// vehicle drives on — a pavement stands above the road and would bring the ground
+/// up through it — and `anchors`, the heights of the parts' rims and toes. Not a
+/// road in one of `holes`, which a part shapes; not one of the `floating` roads,
+/// which the land is cut and filled to meet rather than the other way round; and
+/// not a road on a bridge or in a tunnel, which is off the ground.
+pub(crate) fn base_field(
+    source: &Map,
+    ground: &GroundSpec,
+    holes: &[Vec<PlanPoint>],
+    anchors: Vec<Point3>,
+    floating: &[roadgen_core::id::RoadId],
+) -> Option<Field> {
+    let holes = Rings::of(holes);
+    let carried = crate::structures::Carried::of(source);
+    let off_ground = |road: &roadgen_core::id::RoadId| {
+        floating.contains(road)
+            || source
+                .road(road)
+                .is_some_and(|r| roadgen_core::structure::connector_carried(source, r))
+    };
+    let samples: Vec<Point3> = source
+        .lanes
+        .iter()
+        .filter(|lane| {
+            !matches!(lane.lane_type, roadgen_core::semantics::LaneType::Sidewalk)
+                && !off_ground(&lane.road)
+        })
+        .filter_map(|lane| lane.centerline.to_polyline(source.metadata.sampling).ok())
+        .flat_map(|line| line.points().to_vec())
+        .collect();
+    let mut floating_lines = Segments::new(20.0);
+    for road in floating.iter().filter_map(|road| source.road(road)) {
+        if let Ok(line) = road.reference_line.to_polyline(source.metadata.sampling) {
+            floating_lines.insert_polyline(&plan_of(line.points()));
+        }
+    }
+    let samples = with_reference_lines(source, samples)
+        .into_iter()
+        .filter(|p| !holes.contain([p.x, p.y]))
+        .filter(|p| !carried.contains(p))
+        .filter(|p| floating_lines.within([p.x, p.y], 0.5).is_none())
+        .chain(anchors)
+        .collect();
+    Field::from_samples(samples, &[], ground.margin + ground.cell, ground.cell)
+}
+
 /// Builds the land round every road on `map` and `forms`, and puts it on the map as
 /// one TIN surface with its breaklines.
 pub fn generate(
@@ -387,7 +582,10 @@ pub fn generate(
         holes,
         flats,
         anchors,
+        rises,
+        floating,
     } = forms;
+    let zones = super::structures::Zones::of(source, ground.cell);
     // The roads' edges first: where anything else would cross one, the road wins.
     let mut constraints: Vec<Constraint> = roads
         .edges
@@ -440,6 +638,7 @@ pub fn generate(
         .flat_map(|c| c.points.iter())
         .for_each(|p| widen([p.x, p.y]));
     flats.iter().flatten().copied().for_each(&mut widen);
+    zones.rings().flatten().copied().for_each(&mut widen);
     if !bounds[0].is_finite() {
         return Err(Error::Spec(
             "there is nothing on the map to build land round".into(),
@@ -449,40 +648,27 @@ pub fn generate(
     // The height the country sits at, before it rolls.
     let field = match land.base {
         Base::Level(_) => None,
-        Base::Roads => {
-            // Every lane a vehicle drives on; a pavement stands above the road and
-            // would bring the ground up through it.
-            let samples: Vec<Point3> = source
-                .lanes
-                .iter()
-                .filter(|lane| {
-                    !matches!(lane.lane_type, roadgen_core::semantics::LaneType::Sidewalk)
-                })
-                .filter_map(|lane| lane.centerline.to_polyline(source.metadata.sampling).ok())
-                .flat_map(|line| line.points().to_vec())
-                .collect();
-            let samples = with_reference_lines(source, samples)
-                .into_iter()
-                .filter(|p| !holes.iter().any(|ring| ring_contains(ring, [p.x, p.y])))
-                .chain(anchors)
-                .collect();
-            Field::from_samples(samples, &[], ground.margin + ground.cell, ground.cell)
-        }
+        Base::Roads => base_field(source, ground, &holes, anchors, &floating),
     };
     let base = |x: f64, y: f64| match (land.base, &field) {
         (Base::Level(z), _) => z,
         (Base::Roads, Some(field)) => field.height(x, y),
         (Base::Roads, None) => 0.0,
     };
+    let in_flat = Rings::of(&flats);
+    let in_hole = Rings::of(&holes);
     let height = |x: f64, y: f64| -> f64 {
-        let flat = flats.iter().any(|ring| ring_contains(ring, [x, y]));
+        let flat = in_flat.contain([x, y]);
         let distance = features.within([x, y], ROLLING).unwrap_or(ROLLING);
         let weight = if flat {
             0.0
         } else {
             smoothstep(QUIET, ROLLING, distance)
         };
-        base(x, y) + ground.relief * weight * noise::fractal(x, y, ground.wavelength, land.seed)
+        let natural = base(x, y)
+            + rises.iter().map(|rise| rise.at([x, y])).sum::<f64>()
+            + ground.relief * weight * noise::fractal(x, y, ground.wavelength, land.seed);
+        zones.adjust(x, y, natural)
     };
 
     // The free points: the country on a grid, and the levels.
@@ -495,10 +681,7 @@ pub fn generate(
     for j in 0..=rows {
         for i in 0..=columns {
             let p = [x0 + cell * i as f64, y0 + cell * j as f64];
-            if holes.iter().any(|ring| ring_contains(ring, p))
-                || roads.near(p, cell * 0.5)
-                || !off_lines(p, cell * 0.45)
-            {
+            if in_hole.contain(p) || roads.near(p, cell * 0.5) || !off_lines(p, cell * 0.45) {
                 continue;
             }
             free.push(Point3::new(p[0], p[1], height(p[0], p[1])));

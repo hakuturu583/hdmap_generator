@@ -379,6 +379,29 @@ pub const MATERIALS: &[Material] = &[
         roughness: 0.95,
         texture: None,
     },
+    // A river: its bed and banks under the water, and the water's surface over
+    // them. Poly Haven publishes no scan of open water — a water surface is a
+    // shader, not a photograph — so the surface is a colour and a gloss, with its
+    // texture coordinates laid in plan for an engine's water material to take over;
+    // the bed it is seen through is photographed.
+    Material {
+        name: "M_Terrain_Riverbed",
+        color: [0.35, 0.33, 0.28],
+        roughness: 0.85,
+        texture: Some(Texture {
+            slug: "river_small_rocks",
+            resolution: "2k",
+            format: "jpg",
+            maps: FULL,
+            scale: 2.0,
+        }),
+    },
+    Material {
+        name: "M_Water",
+        color: [0.10, 0.22, 0.24],
+        roughness: 0.05,
+        texture: None,
+    },
 ];
 
 /// The material a road surfaced with `pavement` is drawn in; asphalt when nobody
@@ -422,6 +445,8 @@ pub const ROAD_CONCRETE: usize = 22;
 pub const COBBLESTONE: usize = 23;
 pub const DIRT: usize = 24;
 pub const SAND: usize = 25;
+pub const RIVERBED: usize = 26;
+pub const WATER: usize = 27;
 
 /// One texture file the package expects, and where it comes from.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

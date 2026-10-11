@@ -182,12 +182,14 @@ impl Land {
                     let handle = clear
                         .then(|| cdt.insert(Vertex::free(point)).ok())
                         .flatten();
-                    if let (Some((from, start)), Some(to)) = (previous, handle) {
-                        if from != to {
-                            cdt.add_constraint_and_split(from, to, |at| {
-                                let t = fraction_along(start, point, [at.x, at.y]);
-                                Vertex::free(Point3::new(at.x, at.y, start.lerp(point, t).z))
-                            });
+                    if let (Some((from, _)), Some(to)) = (previous, handle) {
+                        // A stretch of one that would cross another constraint is
+                        // left out rather than split: two lines of a stated terrain
+                        // cross only where it already has a node, and splitting a
+                        // near-parallel pair is where the triangulation's arithmetic
+                        // gives out.
+                        if from != to && cdt.can_add_constraint(from, to) {
+                            cdt.add_constraint(from, to);
                         }
                     }
                     previous = handle.map(|handle| (handle, point));

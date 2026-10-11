@@ -20,18 +20,26 @@
 //! `road_edge` is something an agent collides with and there is no wall down the
 //! middle of a junction.
 //!
+//! **A road edge stops where another road passes over or under it.** The scene is a
+//! plane, so a motorway on a bridge and the street beneath it are drawn on top of
+//! each other, and each road's edges cross the other's lanes. Each edge is cut
+//! where it lies on the other road of a grade separation, so an agent on either
+//! road can drive through the crossing without hitting the other's wall.
+//!
 //! Every element also records, as it is pushed, which IR elements it came from. The
 //! row's index is the only identifier GPUDrive keeps, so the push is the one place the
 //! correspondence is known; the [`Trace`] names an element `road:<id>`.
 
 use std::collections::BTreeMap;
 
+use roadgen_core::geometry::plan::{ring_contains, PlanPoint};
 use roadgen_core::geometry::{Curve3, Point3, SamplingConfig};
 use roadgen_core::map::Lane;
 use roadgen_core::semantics::{
     BoundaryMarking, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType,
 };
-use roadgen_core::{IrRef, LaneType, Relation, Trace, ValidatedMap};
+use roadgen_core::structure::{self, RoadSpan, Underneath};
+use roadgen_core::{IrRef, LaneType, Relation, RoadId, Trace, ValidatedMap};
 
 use crate::error::ExportError;
 use crate::scene::{MapElement, Road, RoadKind, Vector2};
@@ -155,8 +163,11 @@ fn lane_element(map: &ValidatedMap, lane: &Lane) -> MapElement {
     if lane.lane_type == LaneType::Biking {
         return MapElement::LaneBikeLane;
     }
-    match map.road(&lane.road).map(|road| road.road_type) {
-        Some(RoadType::Motorway) => MapElement::LaneFreeway,
+    // A motorway carriageway or a slip road is a freeway lane by its form of way,
+    // whatever its road type says about where it runs.
+    match map.road(&lane.road) {
+        Some(road) if road.form.is_controlled_access() => MapElement::LaneFreeway,
+        Some(road) if road.road_type == RoadType::Motorway => MapElement::LaneFreeway,
         Some(_) => MapElement::LaneSurfaceStreet,
         None => MapElement::LaneUndefined,
     }
@@ -208,7 +219,8 @@ impl<'a> Edge<'a> {
     }
 }
 
-/// The boundaries of every cross-section, as one element each.
+/// The boundaries of every cross-section, as one element each — a road edge cut
+/// where it passes over or under another road (see [`crossed_ground`]).
 fn edges_and_lines(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportError> {
     let config = map.metadata.sampling;
     for road in map.roads.iter() {
@@ -217,6 +229,7 @@ fn edges_and_lines(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportErro
         if road.is_connector() {
             continue;
         }
+        let zones = crossed_ground(map, &road.id)?;
         for section in 0..road.sections.len() {
             for edge in edges_of(&map.lanes_of_section(&road.id, section)).values() {
                 let Some((curve, marking)) = edge.boundary() else {
@@ -229,11 +242,148 @@ fn edges_and_lines(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportErro
                     RoadKind::RoadLine => "road_line",
                     _ => "road_edge",
                 };
-                rows.push(kind, element, vertices(curve, config)?, edge.sources(role));
+                let line = vertices(curve, config)?;
+                if kind == RoadKind::RoadEdge && !zones.is_empty() {
+                    for piece in cut_out(&line, &zones) {
+                        rows.push(kind, element, piece, edge.sources(role));
+                    }
+                } else {
+                    rows.push(kind, element, line, edge.sources(role));
+                }
             }
         }
     }
     Ok(())
+}
+
+/// How far past the other road's outline a road edge is cut, metres: enough that
+/// an agent brushing the other road's kerb does not meet the stub of an edge.
+const CUT_MARGIN: f64 = 0.5;
+
+/// How far along the other road its outline is drawn past the stretch the grade
+/// separation names, metres. The separation's stretch is as long as the crossing is
+/// wide when the roads meet square; a skewed crossing reaches further along each,
+/// and an outline drawn a little long cuts nothing it should not, since a road edge
+/// only meets it where the two roads overlap in plan.
+const CUT_REACH: f64 = 30.0;
+
+/// The ground, in plan, where `road` passes over or under another road: for every
+/// grade separation it is on either side of, the other road's outline along the
+/// crossing, widened by [`CUT_MARGIN`].
+///
+/// GPUDrive is a plane, and a `road_edge` is a wall: an agent that touches one has
+/// collided. Where a motorway bridges a street, the motorway's edges run straight
+/// across the street's lanes in plan, and the street's edges across the motorway's;
+/// written whole, they would wall each road off from itself at the crossing. So
+/// each road's edges are cut where they lie on the other road — the over road's
+/// where it passes above the under road's carriageway, and the under road's where
+/// it passes beneath the deck. Both cuts are needed: with either left whole, the
+/// agents on the other road drive into it. What is lost is a deck's width of edge on
+/// each, where an agent on either road could leave it without hitting anything.
+fn crossed_ground(map: &ValidatedMap, road: &RoadId) -> Result<Vec<Vec<PlanPoint>>, ExportError> {
+    let mut zones = Vec::new();
+    for separation in map.grade_separations.iter() {
+        let Underneath::Road(under) = &separation.under else {
+            continue;
+        };
+        let other = if separation.over.road == *road {
+            under
+        } else if under.road == *road {
+            &separation.over
+        } else {
+            continue;
+        };
+        if let Some(zone) = outline_along(map, other)? {
+            zones.push(zone);
+        }
+    }
+    Ok(zones)
+}
+
+/// The outline in plan of a road's full width along a stretch of it, reaching
+/// [`CUT_REACH`] past each end and [`CUT_MARGIN`] past each side.
+fn outline_along(
+    map: &ValidatedMap,
+    span: &RoadSpan,
+) -> Result<Option<Vec<PlanPoint>>, ExportError> {
+    let Some(road) = map.road(&span.road) else {
+        return Ok(None);
+    };
+    let length = road.horizontal_length()?;
+    let from = (span.from - CUT_REACH).max(0.0);
+    let to = (span.to + CUT_REACH).min(length);
+    if to <= from {
+        return Ok(None);
+    }
+    Ok(structure::outline(
+        map,
+        &[RoadSpan::new(span.road.clone(), from, to)],
+        CUT_MARGIN,
+    )
+    .ok()
+    .map(|ring| ring.iter().map(|p| [p.x, p.y]).collect()))
+}
+
+/// A polyline with every stretch of it that lies inside one of `zones` taken out:
+/// the pieces left, in order, each of two or more vertices.
+fn cut_out(line: &[Vector2], zones: &[Vec<PlanPoint>]) -> Vec<Vec<Vector2>> {
+    let inside = |p: PlanPoint| zones.iter().any(|zone| ring_contains(zone, p));
+    let mut pieces: Vec<Vec<Vector2>> = Vec::new();
+    let mut current: Vec<Vector2> = Vec::new();
+    let mut close = |current: &mut Vec<Vector2>| {
+        if current.len() >= 2 {
+            pieces.push(std::mem::take(current));
+        } else {
+            current.clear();
+        }
+    };
+    for pair in line.windows(2) {
+        let (a, b) = ([pair[0].x, pair[0].y], [pair[1].x, pair[1].y]);
+        // Where the segment crosses any zone's outline, as fractions along it: the
+        // places it can go in or come out.
+        let mut cuts = vec![0.0, 1.0];
+        for zone in zones {
+            for index in 0..zone.len() {
+                let (r, s) = (zone[index], zone[(index + 1) % zone.len()]);
+                if let Some(t) = crossing_fraction(a, b, r, s) {
+                    cuts.push(t);
+                }
+            }
+        }
+        cuts.sort_by(f64::total_cmp);
+        cuts.dedup_by(|x, y| (*x - *y).abs() < 1e-12);
+        let at = |t: f64| Vector2::new(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+        for window in cuts.windows(2) {
+            let (t0, t1) = (window[0], window[1]);
+            let middle = at((t0 + t1) / 2.0);
+            if inside([middle.x, middle.y]) {
+                close(&mut current);
+                continue;
+            }
+            let start = at(t0);
+            if current.last() != Some(&start) {
+                close(&mut current);
+                current.push(start);
+            }
+            current.push(at(t1));
+        }
+    }
+    close(&mut current);
+    pieces
+}
+
+/// Where segment `a–b` crosses segment `r–s`, as a fraction along `a–b`.
+fn crossing_fraction(a: PlanPoint, b: PlanPoint, r: PlanPoint, s: PlanPoint) -> Option<f64> {
+    let (dx1, dy1) = (b[0] - a[0], b[1] - a[1]);
+    let (dx2, dy2) = (s[0] - r[0], s[1] - r[1]);
+    let denominator = dx1 * dy2 - dy1 * dx2;
+    if denominator.abs() < 1e-12 {
+        return None;
+    }
+    let (ex, ey) = (r[0] - a[0], r[1] - a[1]);
+    let t = (ex * dy2 - ey * dx2) / denominator;
+    let u = (ex * dy1 - ey * dx1) / denominator;
+    ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)).then_some(t)
 }
 
 /// The edges of one cross-section, keyed by edge index so that two lanes meeting at

@@ -267,3 +267,47 @@ fn the_same_map_exports_identically_twice() {
         roadgen_lanelet2::to_osm_xml(&two_roads()).unwrap()
     );
 }
+
+#[test]
+fn a_motorway_and_its_slip_road_are_highway_lanelets() {
+    let mut builder = MapBuilder::new(metadata());
+    for (name, y, form) in [
+        ("main", 0.0, roadgen_core::FormOfWay::Motorway),
+        ("ramp", 50.0, roadgen_core::FormOfWay::SlipRoad),
+        ("street", 100.0, roadgen_core::FormOfWay::Unspecified),
+    ] {
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, y, 0.0),
+                    Point3::new(100.0, y, 0.0),
+                    lanes(),
+                )
+                .unwrap()
+                .with_name(name)
+                .with_form(form),
+            )
+            .unwrap();
+    }
+    let map = builder.finish().unwrap().validate().unwrap();
+    let loaded = load(&roadgen_lanelet2::to_osm_xml(&map).unwrap(), &map);
+    let lanelets = lanelets_of(&loaded);
+    assert_eq!(lanelets.len(), 6);
+    for lanelet in lanelets {
+        let attributes = lanelet.attributes().read();
+        let y = lanelet.left_bound().front().unwrap().y();
+        let expected = if y < 75.0 {
+            ("highway", "nonurban")
+        } else {
+            ("road", "urban")
+        };
+        assert_eq!(
+            (
+                attributes["subtype"].value(),
+                attributes["location"].value()
+            ),
+            expected,
+            "the lanelet at y = {y}"
+        );
+    }
+}

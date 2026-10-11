@@ -10,9 +10,10 @@ use ll2_io::osm::Tags;
 use roadgen_core::buildings::{Building, BuildingPart, RoofShape};
 use roadgen_core::land_cover::LandCover;
 use roadgen_core::map::{Map, Road};
-use roadgen_core::semantics::{LaneType, RoadType};
+use roadgen_core::semantics::{FormOfWay, LaneType, RoadType};
 use roadgen_core::site::Site;
-use roadgen_core::topology::Direction;
+use roadgen_core::structure::{BridgeForm, Structure, StructureKind};
+use roadgen_core::topology::{Direction, RoadEnd, RoadLinkTarget};
 
 /// The `highway` value for a road.
 ///
@@ -29,10 +30,110 @@ pub fn highway_value(road_type: RoadType) -> &'static str {
     }
 }
 
+/// Whether a road is a motorway carriageway, by either axis the IR has for it: the
+/// form of way that says what part it plays, or the road type that says what
+/// sort of place it runs through. A map that sets only one of them still means it.
+pub fn is_motorway(road: &Road) -> bool {
+    road.form == FormOfWay::Motorway || road.road_type == RoadType::Motorway
+}
+
+/// The roads a road's ends are joined to: the road at the other end of a direct
+/// link, and every other arm of a junction it enters.
+pub fn neighbours<'m>(map: &'m Map, road: &Road) -> Vec<&'m Road> {
+    let mut out: Vec<&Road> = Vec::new();
+    for end in [RoadEnd::Start, RoadEnd::End] {
+        match road.link.at(end) {
+            Some(RoadLinkTarget::Road(endpoint)) => out.extend(map.road(&endpoint.road)),
+            Some(RoadLinkTarget::Junction(junction)) => {
+                if let Some(junction) = map.junction(junction) {
+                    out.extend(
+                        junction
+                            .incoming_roads
+                            .iter()
+                            .filter(|other| **other != road.id)
+                            .filter_map(|other| map.road(other)),
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// The `highway` value for a road, from its form of way where that says more than
+/// its road type does.
+///
+/// The form of way is the road's part in the network, which is exactly what OSM's
+/// `highway` means, so it wins where it has a word: a motorway carriageway is
+/// `motorway` whatever sort of place it runs through, and a service road is
+/// `service`. A slip road is the link of the class it serves: `motorway_link` when
+/// any road it joins is a motorway, and `trunk_link` otherwise — a grade-separated
+/// ramp off a road that is not a motorway is, in OSM's hierarchy, a trunk road's
+/// ramp, and there is no `tertiary_link` worth claiming for one. Every other form
+/// leaves the road type's rung as it was.
+pub fn highway_for(map: &Map, road: &Road) -> &'static str {
+    match road.form {
+        FormOfWay::Motorway => "motorway",
+        FormOfWay::SlipRoad => {
+            if neighbours(map, road).into_iter().any(is_motorway) {
+                "motorway_link"
+            } else {
+                "trunk_link"
+            }
+        }
+        FormOfWay::ServiceRoad => "service",
+        _ => highway_value(road.road_type),
+    }
+}
+
+/// The tags a stretch of road on or in a structure adds to the road's own.
+///
+/// `bridge=viaduct` for a viaduct and `bridge=yes` for every other bridge;
+/// `tunnel=yes` for every tunnel, an underpass and a covered cutting included —
+/// OSM keeps `tunnel=building_passage` and `tunnel=culvert` for other things, and
+/// `covered=yes` for a road under a roof that is not a tunnel. The structure's name
+/// is `bridge:name` or `tunnel:name`, since the way's own `name` is the road's.
+pub fn structure_tags(tags: &mut Tags, structure: &Structure, layer: i32) {
+    let (key, value) = match &structure.kind {
+        StructureKind::Bridge(bridge) => (
+            "bridge",
+            match bridge.form {
+                BridgeForm::Viaduct => "viaduct",
+                BridgeForm::Bridge | BridgeForm::Overpass => "yes",
+            },
+        ),
+        StructureKind::Tunnel(_) => ("tunnel", "yes"),
+    };
+    tags.insert(key.into(), value.into());
+    if layer != 0 {
+        tags.insert("layer".into(), layer.to_string());
+    }
+    if let Some(name) = &structure.name {
+        tags.insert(format!("{key}:name"), name.clone());
+    }
+}
+
+/// The tags of a bridge's deck outline: `man_made=bridge`, its name and its level.
+pub fn bridge_outline_tags(structure: &Structure, layer: i32) -> Tags {
+    let mut tags = Tags::new();
+    tags.insert("man_made".into(), "bridge".into());
+    if let Some(name) = &structure.name {
+        tags.insert("name".into(), name.clone());
+    }
+    if layer != 0 {
+        tags.insert("layer".into(), layer.to_string());
+    }
+    tags
+}
+
 /// Every tag a road's way carries.
 pub fn road_tags(map: &Map, road: &Road) -> Tags {
     let mut tags = Tags::new();
-    tags.insert("highway".into(), highway_value(road.road_type).into());
+    tags.insert("highway".into(), highway_for(map, road).into());
+    if road.form == FormOfWay::Roundabout {
+        tags.insert("junction".into(), "roundabout".into());
+    }
     if let Some(name) = &road.name {
         tags.insert("name".into(), name.clone());
     }
@@ -417,9 +518,15 @@ pub fn land_cover_tags(cover: &LandCover, site: Option<&Site>) -> Tags {
         "waste_dump" | "spoil_heap" => ("man_made", "spoil_heap"),
         "stockpile" => ("man_made", "spoil_heap"),
         "pad" | "yard" => ("landuse", "industrial"),
+        // Water is not a use of land but what the ground is, which OSM says with
+        // `natural`; `water=*` says which kind where the IR does.
+        "water" | "river" | "canal" | "lake" | "pond" => ("natural", "water"),
         other => ("landuse", other),
     };
     tags.insert(key.into(), value.into());
+    if matches!(cover.kind.as_str(), "river" | "canal" | "lake" | "pond") {
+        tags.insert("water".into(), cover.kind.clone());
+    }
     if cover.kind == "stockpile" {
         tags.insert("material".into(), "ore".into());
     }

@@ -107,7 +107,7 @@ pub fn render(drawing: &Drawing) -> String {
 
     svg.push_str("<g>");
     let mut shapes: Vec<&Shape> = drawing.shapes.iter().collect();
-    shapes.sort_by_key(|shape| shape.kind());
+    shapes.sort_by_key(|shape| (shape.level(), shape.kind()));
     for shape in shapes {
         emit(&mut svg, &view, shape);
     }
@@ -207,6 +207,15 @@ fn emit(svg: &mut String, view: &View, shape: &Shape) {
                 polygon_points(view, &corners)
             );
         }
+        // A level is a group, so that what is underground can be styled as such —
+        // faded and dashed, the way a map draws what it cannot see — without every
+        // kind needing a second class of its own.
+        Shape::Level { level, shape } => {
+            let group = if *level < 0 { "rg-below" } else { "rg-above" };
+            let _ = write!(svg, "<g class=\"{group}\">");
+            emit(svg, view, shape);
+            svg.push_str("</g>");
+        }
     }
 }
 
@@ -240,6 +249,7 @@ fn legend(svg: &mut String, kinds: &[Kind], columns: usize, top: f64, width: f64
             Kind::Terrain
             | Kind::Building
             | Kind::Junction
+            | Kind::Casing
             | Kind::Surface
             | Kind::Sidewalk
             | Kind::Crosswalk
@@ -291,6 +301,7 @@ fn class(kind: Kind) -> String {
         Kind::Terrain => "rg-terrain".into(),
         Kind::Building => "rg-building".into(),
         Kind::Junction => "rg-junction".into(),
+        Kind::Casing => "rg-casing".into(),
         Kind::Surface => "rg-surface".into(),
         Kind::Sidewalk => "rg-sidewalk".into(),
         Kind::Boundary => "rg-boundary".into(),
@@ -323,6 +334,7 @@ fn label(kind: Kind) -> &'static str {
         Kind::Terrain => "ground",
         Kind::Building => "building",
         Kind::Junction => "junction",
+        Kind::Casing => "bridge deck",
         Kind::Surface => "lane surface",
         Kind::Sidewalk => "pavement",
         Kind::Boundary => "road boundary",
@@ -370,6 +382,10 @@ stroke:var(--rg-sidewalk,#94a3b8);stroke-width:.6}\
 stroke:var(--rg-building,#78716c);stroke-width:.6}\
 .rg-junction{fill:var(--rg-junction-fill,rgba(37,99,235,.10));\
 stroke:var(--rg-junction,#60a5fa);stroke-width:1}\
+.rg-casing{fill:var(--rg-casing-fill,rgba(51,65,85,.55));\
+stroke:var(--rg-casing,#334155);stroke-width:1.2}\
+.rg-below{opacity:.45}\
+.rg-below :where(polyline,polygon){stroke-dasharray:4 3}\
 .rg-surface{fill:var(--rg-surface,rgba(100,116,139,.16));\
 stroke:var(--rg-surface,rgba(100,116,139,.16));stroke-linecap:butt}\
 .rg-boundary{stroke:var(--rg-boundary,#64748b);stroke-width:1.6}\

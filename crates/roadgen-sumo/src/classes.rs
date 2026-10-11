@@ -6,7 +6,7 @@
 //! how fast a road type is when the map gives no limit, and where a road type sits
 //! in the priority order netconvert uses to work out who yields.
 
-use roadgen_core::semantics::{LaneType, RoadMarking, RoadType};
+use roadgen_core::semantics::{FormOfWay, LaneType, RoadMarking, RoadType};
 use roadgen_core::topology::LateralSide;
 
 /// What a SUMO lane says about who may use it.
@@ -134,6 +134,23 @@ pub fn priority(road_type: RoadType) -> i32 {
     }
 }
 
+/// Where a road sits in the priority order, by its form of way where that says
+/// more than its road type.
+///
+/// The form of way is the road's part in the network, which is what the ladder
+/// ranks: a motorway carriageway is on the motorway rung whatever sort of place it
+/// runs through, and a slip road sits just below it, at 11 — above every road it
+/// could come down to, so a ramp joining a rural road at its foot keeps right of
+/// way over it, and below the carriageway it merges into. Every other form leaves
+/// the road type's rung as it was.
+pub fn priority_for(road_type: RoadType, form: FormOfWay) -> i32 {
+    match form {
+        FormOfWay::Motorway => priority(RoadType::Motorway),
+        FormOfWay::SlipRoad => 11,
+        _ => priority(road_type),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +201,22 @@ mod tests {
         assert!(priority(RoadType::Rural) > priority(RoadType::Town));
         assert!(priority(RoadType::Town) > priority(RoadType::LowSpeed));
         assert!(priority(RoadType::LowSpeed) > priority(RoadType::Pedestrian));
+    }
+
+    #[test]
+    fn a_motorway_form_is_on_the_motorway_rung_and_a_slip_road_just_below() {
+        assert_eq!(
+            priority_for(RoadType::Town, FormOfWay::Motorway),
+            priority(RoadType::Motorway)
+        );
+        let slip = priority_for(RoadType::Town, FormOfWay::SlipRoad);
+        assert_eq!(slip, 11);
+        assert!(slip < priority(RoadType::Motorway));
+        assert!(slip > priority(RoadType::Rural));
+        assert_eq!(
+            priority_for(RoadType::Rural, FormOfWay::ServiceRoad),
+            priority(RoadType::Rural)
+        );
     }
 
     #[test]

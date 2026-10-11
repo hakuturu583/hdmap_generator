@@ -87,9 +87,11 @@ pub mod obj;
 pub mod package;
 pub mod pointcloud;
 pub mod script;
+pub mod structures;
 pub mod surfaces;
 pub mod tags;
 pub mod terrain;
+pub mod water;
 
 use std::collections::BTreeMap;
 use std::fs;

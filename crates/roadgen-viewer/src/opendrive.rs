@@ -33,6 +33,15 @@
 //! A plan view draws every part, not only the one on the ground: a wing behind a
 //! house and a tower set back on a podium are both things you would see from above,
 //! and drawing the building's outline alone would hide the massing the file holds.
+//!
+//! # Bridges and tunnels
+//!
+//! A `<bridge>` or a `<tunnel>` is a stretch of `s` on its road. The road is drawn a
+//! stretch at a time, cut where each begins and ends, and what lies on a bridge is
+//! drawn a level above the ground — after every road beneath it — on a darker deck
+//! a little wider than the road, the casing a map draws a bridge with. What lies in
+//! a tunnel is drawn a level below, before the ground and faded, as a map draws what
+//! it cannot see.
 
 use std::f64::consts::PI;
 
@@ -73,6 +82,7 @@ pub fn draw(xml: &str) -> Result<Drawing, ViewError> {
     let mut lanes = 0usize;
 
     let mut buildings = 0usize;
+    let (mut bridges, mut tunnels) = (0usize, 0usize);
 
     for road in &document.road {
         let reference = ReferenceLine::of(road);
@@ -80,6 +90,9 @@ pub fn draw(xml: &str) -> Result<Drawing, ViewError> {
             continue;
         }
         buildings += draw_buildings(&mut drawing, road, &reference);
+        let structures = structures_of(road);
+        bridges += structures.iter().filter(|span| span.2 > 0).count();
+        tunnels += structures.iter().filter(|span| span.2 < 0).count();
         for (index, section) in road.lanes.lane_section.iter().enumerate() {
             let end = road
                 .lanes
@@ -87,61 +100,90 @@ pub fn draw(xml: &str) -> Result<Drawing, ViewError> {
                 .get(index + 1)
                 .map(|next| next.s)
                 .unwrap_or(reference.length);
-            let stations = stations(section.s, end);
-            if stations.len() < 2 {
-                continue;
-            }
+            lanes += Side::Left.lanes(section).len() + Side::Right.lanes(section).len();
+            // The section is drawn a stretch at a time, cut where a bridge or a
+            // tunnel begins and ends, so that what is on a structure can be drawn at
+            // its own level.
+            for (from, to, level) in stretches(section.s, end, &structures) {
+                let stations = stations(from, to);
+                if stations.len() < 2 {
+                    continue;
+                }
 
-            let centre: Vec<Point> = stations
-                .iter()
-                .map(|s| reference.at(*s, lane_offset(road, *s)))
-                .collect();
-            // The centre lane is a line, never a surface: it is where the reference
-            // line runs, and what is painted on it.
-            if let Some(mark) = mark_of(Some(&section.center.lane.first().base)) {
-                drawing.path(Kind::Marking(mark), centre.clone());
-            }
+                let centre: Vec<Point> = stations
+                    .iter()
+                    .map(|s| reference.at(*s, lane_offset(road, *s)))
+                    .collect();
+                // The centre lane is a line, never a surface: it is where the
+                // reference line runs, and what is painted on it.
+                if let Some(mark) = mark_of(Some(&section.center.lane.first().base)) {
+                    drawing.path_at(level, Kind::Marking(mark), centre.clone());
+                }
 
-            for side in [Side::Left, Side::Right] {
-                // Offsets are accumulated as numbers and turned into points once.
-                // That is OpenDRIVE's own rule — a `<width>` is measured from the
-                // border inside, not from the centre — and keeping it in one place is
-                // what stops the second lane being laid out from the wrong edge.
-                let mut inner_offset = vec![0.0; stations.len()];
-                let mut inner = centre.clone();
+                // How far out each side reaches, for a bridge's deck.
+                let mut reach: Vec<Vec<f64>> = Vec::with_capacity(2);
+                for side in [Side::Left, Side::Right] {
+                    // Offsets are accumulated as numbers and turned into points once.
+                    // That is OpenDRIVE's own rule — a `<width>` is measured from the
+                    // border inside, not from the centre — and keeping it in one place
+                    // is what stops the second lane being laid out from the wrong edge.
+                    let mut inner_offset = vec![0.0; stations.len()];
+                    let mut inner = centre.clone();
 
-                for lane in side.lanes(section) {
-                    lanes += 1;
-                    let outer_offset: Vec<f64> = stations
-                        .iter()
-                        .zip(inner_offset.iter())
-                        .map(|(s, offset)| lane.edge(*s, section.s).outer(*offset))
-                        .collect();
-                    let outer: Vec<Point> = stations
-                        .iter()
-                        .zip(outer_offset.iter())
-                        .map(|(s, offset)| {
-                            reference.at(*s, lane_offset(road, *s) + side.sign() * offset)
-                        })
-                        .collect();
+                    for lane in side.lanes(section) {
+                        let outer_offset: Vec<f64> = stations
+                            .iter()
+                            .zip(inner_offset.iter())
+                            .map(|(s, offset)| lane.edge(*s, section.s).outer(*offset))
+                            .collect();
+                        let outer: Vec<Point> = stations
+                            .iter()
+                            .zip(outer_offset.iter())
+                            .map(|(s, offset)| {
+                                reference.at(*s, lane_offset(road, *s) + side.sign() * offset)
+                            })
+                            .collect();
 
-                    let mut ring = inner.clone();
-                    ring.extend(outer.iter().rev());
-                    drawing.area(Kind::Surface, ring);
-                    if lane.is_drivable() {
-                        drawing.path(Kind::Center, midline(&inner, &outer));
+                        let mut ring = inner.clone();
+                        ring.extend(outer.iter().rev());
+                        drawing.area_at(level, Kind::Surface, ring);
+                        if lane.is_drivable() {
+                            drawing.path_at(level, Kind::Center, midline(&inner, &outer));
+                        }
+
+                        match mark_of(Some(lane.base)) {
+                            // A lane whose outer edge is painted gets the paint; one
+                            // whose edge is a kerb or nothing at all gets the
+                            // boundary, because the drivable surface ends there either
+                            // way.
+                            Some(mark) => {
+                                drawing.path_at(level, Kind::Marking(mark), outer.clone())
+                            }
+                            None => drawing.path_at(level, Kind::Boundary, outer.clone()),
+                        }
+
+                        inner_offset = outer_offset;
+                        inner = outer;
                     }
+                    reach.push(inner_offset);
+                }
 
-                    match mark_of(Some(lane.base)) {
-                        // A lane whose outer edge is painted gets the paint; one whose
-                        // edge is a kerb or nothing at all gets the boundary, because
-                        // the drivable surface ends there either way.
-                        Some(mark) => drawing.path(Kind::Marking(mark), outer.clone()),
-                        None => drawing.path(Kind::Boundary, outer.clone()),
-                    }
-
-                    inner_offset = outer_offset;
-                    inner = outer;
+                // A bridge's deck: the road's full width and a parapet's more either
+                // side, under the lanes it carries.
+                if level > 0 {
+                    let edge = |sign: f64, offsets: &[f64]| -> Vec<Point> {
+                        stations
+                            .iter()
+                            .zip(offsets)
+                            .map(|(s, offset)| {
+                                reference
+                                    .at(*s, lane_offset(road, *s) + sign * (offset + DECK_PARAPET))
+                            })
+                            .collect()
+                    };
+                    let mut deck = edge(1.0, &reach[0]);
+                    deck.extend(edge(-1.0, &reach[1]).into_iter().rev());
+                    drawing.area_at(level, Kind::Casing, deck);
                 }
             }
         }
@@ -157,12 +199,76 @@ pub fn draw(xml: &str) -> Result<Drawing, ViewError> {
             "{buildings} building parts, drawn from the outlines each object carries"
         ));
     }
+    if bridges + tunnels > 0 {
+        drawing.note(format!(
+            "{bridges} bridge and {tunnels} tunnel spans: a bridge is drawn on its deck \
+             above the ground, a tunnel faded below it"
+        ));
+    }
     drawing.note(
         "the shapes are evaluated, not read: OpenDRIVE holds a reference line and \
          width polynomials, and this walks them"
             .to_owned(),
     );
     Ok(drawing)
+}
+
+/// How far a bridge's deck is drawn past the road's outer edge, metres: the kerb a
+/// parapet stands on, wide enough to show as a casing at the scale of a map.
+const DECK_PARAPET: f64 = 0.8;
+
+/// The stretches of a road a `<bridge>` or a `<tunnel>` covers: where each begins
+/// and ends, and the level it is drawn at — 1 on a bridge, −1 in a tunnel — in the
+/// order they come along the road.
+///
+/// A bridge over a bridge is drawn at the same level as the one beneath it: an
+/// OpenDRIVE file says a stretch is a bridge and not what it passes over, and which
+/// of two crossing decks is higher is in the elevation profile, which a plan view
+/// does not read.
+fn structures_of(road: &Road) -> Vec<(f64, f64, i32)> {
+    let Some(objects) = &road.objects else {
+        return Vec::new();
+    };
+    let mut spans: Vec<(f64, f64, i32)> = objects
+        .bridge
+        .iter()
+        .map(|bridge| (bridge.s.get::<meter>(), bridge.length.get::<meter>(), 1))
+        .chain(
+            objects
+                .tunnel
+                .iter()
+                .map(|tunnel| (tunnel.s.get::<meter>(), tunnel.length.get::<meter>(), -1)),
+        )
+        .filter(|(_, length, _)| *length > 0.0)
+        .map(|(s, length, level)| (s, s + length, level))
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    spans
+}
+
+/// `start` to `end`, cut where any of `structures` begins and ends: each stretch
+/// with the level it is drawn at, 0 where no structure covers it.
+fn stretches(start: f64, end: f64, structures: &[(f64, f64, i32)]) -> Vec<(f64, f64, i32)> {
+    let mut cuts: Vec<f64> = vec![start, end];
+    for (from, to, _) in structures {
+        for station in [*from, *to] {
+            if station > start && station < end {
+                cuts.push(station);
+            }
+        }
+    }
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    cuts.windows(2)
+        .map(|pair| {
+            let middle = (pair[0] + pair[1]) / 2.0;
+            let level = structures
+                .iter()
+                .find(|(from, to, _)| *from <= middle && middle <= *to)
+                .map_or(0, |span| span.2);
+            (pair[0], pair[1], level)
+        })
+        .collect()
 }
 
 /// Draws every outline of every building object of one road, and says how many there
@@ -643,6 +749,7 @@ fn mark_of(lane: Option<&Lane>) -> Option<Mark> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drawing::Shape;
 
     /// One straight road, two lanes, painted on the centre.
     const STRAIGHT: &str = r#"<?xml version="1.0"?>
@@ -893,5 +1000,58 @@ mod tests {
     #[test]
     fn xml_that_is_not_opendrive_is_an_error() {
         assert!(matches!(draw("<nope/>"), Err(ViewError::Parse(_))));
+    }
+
+    /// The straight road, on a bridge from 20 m to 60 m and in a tunnel from 70 m to
+    /// 90 m.
+    fn structured() -> String {
+        STRAIGHT.replace(
+            "</lanes>",
+            r#"</lanes>
+        <objects>
+          <tunnel s="70" length="20" id="2" type="standard" lighting="1" daylight="0"/>
+          <bridge s="20" length="40" id="1" type="concrete"/>
+        </objects>"#,
+        )
+    }
+
+    #[test]
+    fn a_bridge_is_drawn_on_a_deck_above_the_ground_and_a_tunnel_below_it() {
+        let drawing = draw(&structured()).unwrap();
+        let decks: Vec<&Shape> = drawing
+            .shapes
+            .iter()
+            .filter(|shape| shape.kind() == Kind::Casing)
+            .collect();
+        assert_eq!(decks.len(), 1);
+        assert_eq!(decks[0].level(), 1);
+        // The deck spans the bridge, and reaches past both lanes.
+        let extent = decks[0].extent();
+        let xs = extent.iter().map(|p| p.x);
+        let (low, high) = xs.fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), x| {
+            (l.min(x), h.max(x))
+        });
+        assert!((low - 20.0).abs() < 1e-6 && (high - 60.0).abs() < 1e-6);
+        assert!(extent.iter().any(|p| p.y > 3.5) && extent.iter().any(|p| p.y < -3.5));
+        // The road is drawn in five stretches: ground, bridge, ground, tunnel, ground.
+        let levels: Vec<i32> = drawing
+            .shapes
+            .iter()
+            .filter(|shape| shape.kind() == Kind::Center)
+            .map(Shape::level)
+            .collect();
+        assert_eq!(levels.iter().filter(|level| **level == 1).count(), 2);
+        assert_eq!(levels.iter().filter(|level| **level == -1).count(), 2);
+        assert_eq!(levels.iter().filter(|level| **level == 0).count(), 6);
+    }
+
+    #[test]
+    fn the_svg_draws_the_deck_after_the_ground_and_the_tunnel_before_it() {
+        let svg = draw(&structured()).unwrap().to_svg();
+        let deck = svg.find("class=\"rg-casing\"").expect("a casing");
+        let ground = svg.find("<polygon class=\"rg-surface\"").expect("ground");
+        let tunnel = svg.find("<g class=\"rg-below\">").expect("a tunnel");
+        assert!(tunnel < ground && ground < deck, "{svg}");
+        assert!(svg.contains(".rg-below{opacity"));
     }
 }

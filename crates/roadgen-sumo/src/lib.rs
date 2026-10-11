@@ -433,6 +433,18 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
             map.land_covers.len()
         ));
     }
+    // A road over another is two edges whose shapes cross in plan and share no node,
+    // which netconvert reads as no junction at all: the grade separation is right as
+    // it stands. What has nowhere to go is the structure itself.
+    if !map.structures.is_empty() {
+        problems.push(format!(
+            "SUMO has no bridges or tunnels, so the map's {} structures are not written; \
+             the edges they carry keep their heights in their shapes, and a road passing \
+             over another shares no node with it, so the crossing stays a crossing \
+             without a junction",
+            map.structures.len()
+        ));
+    }
     if !map.buildings.is_empty() {
         problems.push(format!(
             "a SUMO network is a traffic network and holds no scenery, so the map's \
@@ -2096,7 +2108,7 @@ impl<'a> Exporter<'a> {
     /// place relative to every other; since only the *order* of the numbers decides
     /// anything, the shift changes nothing else.
     fn priority_of(&self, road: &Road, lanes: &[&Lane]) -> i32 {
-        let base = classes::priority(road.road_type) + 1;
+        let base = classes::priority_for(road.road_type, road.form) + 1;
         let carries = |named: &HashSet<LaneId>| lanes.iter().any(|lane| named.contains(&lane.id));
         let raise = i32::from(carries(&self.right_of_way));
         let lower = i32::from(carries(&self.yielding));
@@ -7131,6 +7143,56 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    /// A motorway carriageway ranks with a motorway whatever its road type, and a
+    /// slip road between it and every road below — by [`classes::priority_for`].
+    #[test]
+    fn a_road_s_form_of_way_sets_its_place_in_the_priority_order() {
+        let mut builder = MapBuilder::new(metadata("forms"));
+        for (row, (name, road_type, form)) in [
+            (
+                "motorway",
+                RoadType::Motorway,
+                roadgen_core::FormOfWay::Unspecified,
+            ),
+            (
+                "carriageway",
+                RoadType::Town,
+                roadgen_core::FormOfWay::Motorway,
+            ),
+            ("ramp", RoadType::Town, roadgen_core::FormOfWay::SlipRoad),
+            (
+                "rural",
+                RoadType::Rural,
+                roadgen_core::FormOfWay::Unspecified,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let y = 50.0 * row as f64;
+            builder
+                .add_road(
+                    RoadSpec::line(
+                        Point3::new(0.0, y, 0.0),
+                        Point3::new(120.0, y, 0.0),
+                        vec![lane(3.5)],
+                    )
+                    .unwrap()
+                    .with_name(name)
+                    .with_type(road_type)
+                    .with_form(form),
+                )
+                .unwrap();
+        }
+        let map = builder.finish().unwrap().validate().unwrap();
+        let network = to_plain_xml(&map).unwrap();
+        let edges = edges_file(&network);
+        let priority = |name: &str| edges[&format!("{name}.fwd")].number("priority");
+        assert_eq!(priority("carriageway"), priority("motorway"));
+        assert!(priority("ramp") < priority("carriageway"));
+        assert!(priority("ramp") > priority("rural"));
     }
 
     /// What [`identifier`] does to each character SUMO cannot take in a name it did

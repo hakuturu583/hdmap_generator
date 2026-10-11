@@ -17,8 +17,9 @@
 //! straight taper through samples of it; a width that reaches zero is held at a
 //! floor; an `<elevation>` that curves within one plan-view piece is split into
 //! straight grades; a lane type the IR does not have lands on the nearest it does;
-//! a building's roof is flat. None of these is an error, because none of them stops
-//! the map being a map — they are the reader's equivalent of an exporter's `check`.
+//! a building's roof is flat; a bridge's piers are laid out again rather than read.
+//! None of these is an error, because none of them stops the map being a map —
+//! they are the reader's equivalent of an exporter's `check`.
 //!
 //! What is an error is a document that cannot be read as a road network at all: a
 //! reference line with a gap in it too wide to close, a link to a road that is not
@@ -46,6 +47,7 @@ mod furniture;
 mod geometry;
 mod lanes;
 mod links;
+mod structures;
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -252,6 +254,7 @@ impl<'a> Reader<'a> {
         }
         links::connect(&mut self)?;
         furniture::read(&mut self)?;
+        structures::read(&mut self)?;
         Ok(Imported {
             map: UnvalidatedMap::from_map(self.map),
             approximations: self.approximations.finish(),
@@ -397,6 +400,8 @@ impl<'a> Reader<'a> {
             speed_limit,
             superelevation,
             pavement,
+            form: roadgen_core::semantics::FormOfWay::Unspecified,
+            structure: roadgen_core::structure::StructureProfile::at_grade(),
         };
         self.map
             .roads

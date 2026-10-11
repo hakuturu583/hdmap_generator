@@ -7,7 +7,7 @@
 
 use ll2_core::attribute::{Attribute, AttributeMap};
 
-use roadgen_core::semantics::{LaneType, MapObjectKind, RoadMarking};
+use roadgen_core::semantics::{FormOfWay, LaneType, MapObjectKind, RoadMarking};
 
 /// Builds an attribute map from `(key, value)` pairs.
 pub fn attributes(pairs: impl IntoIterator<Item = (&'static str, String)>) -> AttributeMap {
@@ -41,6 +41,23 @@ pub fn lanelet_subtype(lane_type: LaneType) -> Option<&'static str> {
         // A shoulder, a border or a parking strip is part of the road surface but
         // carries no through traffic, so it is not a lanelet.
         _ => None,
+    }
+}
+
+/// The subtype a lanelet of a road with this form of way takes instead of
+/// `lane_subtype`.
+///
+/// Lanelet2 has a `highway` subtype for a road only motor vehicles use and that is
+/// entered and left only at its ramps — which is what the IR's controlled-access
+/// forms say — and the traffic rules read it to keep pedestrians and bicycles off.
+/// A motorway carriageway's driving lanes and a slip road's are `highway`; any
+/// other lanelet keeps the subtype its lane type gives it, since a walkway beside a
+/// slip road, if a map has one, is still a walkway.
+pub fn road_subtype(lane_subtype: &'static str, form: FormOfWay) -> &'static str {
+    if lane_subtype == "road" && form.is_controlled_access() {
+        "highway"
+    } else {
+        lane_subtype
     }
 }
 

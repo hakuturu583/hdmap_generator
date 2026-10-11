@@ -84,6 +84,16 @@ impl Field {
         if samples.is_empty() {
             return None;
         }
+        // Not a road on a bridge or in a tunnel: the ground is under the one and
+        // over the other, and neither says what height it is.
+        let carried = crate::structures::Carried::of(map);
+        let samples: Vec<Point3> = with_reference_lines(map, samples)
+            .into_iter()
+            .filter(|point| !carried.contains(point))
+            .collect();
+        if samples.is_empty() {
+            return None;
+        }
         let buildings: Vec<Point3> = map
             .building_parts
             .iter()
@@ -91,7 +101,7 @@ impl Field {
             .collect();
         // The verge is what the ground is drawn up to, and it reaches past the road.
         Field::from_samples(
-            with_reference_lines(map, samples),
+            samples,
             &buildings,
             config.ground_extent + config.verge_width,
             config.ground_cell,
@@ -252,15 +262,8 @@ impl<'a> Stated<'a> {
             .land_covers
             .iter()
             .map(|cover| {
-                let material = match cover.kind.as_str() {
-                    "pit" | "quarry" | "waste_dump" | "spoil_heap" | "stockpile" => {
-                        crate::materials::ROCK
-                    }
-                    "pad" | "yard" => crate::materials::GRAVEL,
-                    _ => crate::materials::GRASS,
-                };
                 let ring = cover.area.points().iter().map(|p| [p.x, p.y]).collect();
-                (ring, material)
+                (ring, cover_material(&cover.kind))
             })
             .collect();
         Some(Stated {
@@ -286,9 +289,12 @@ impl<'a> Stated<'a> {
             // Each land cover's outline too, draped on the land, so that where the
             // surface changes from grass to rock it changes along the outline
             // rather than along whichever triangles straddle it.
+            // Not one surfaced like the land round it — a cutting, an embankment:
+            // there is no change of surface along its outline to keep.
             let outlines: Vec<Vec<Point3>> = map
                 .land_covers
                 .iter()
+                .filter(|cover| cover_material(&cover.kind) != crate::materials::GRASS)
                 .map(|cover| stated.drape(cover.area.points()))
                 .collect();
             stated.breaklines.extend(outlines);
@@ -329,6 +335,17 @@ impl<'a> Stated<'a> {
             .rev()
             .find(|(ring, _)| roadgen_core::geometry::plan::ring_contains(ring, [x, y]))
             .map_or(crate::materials::GRASS, |&(_, material)| material)
+    }
+}
+
+/// What land of a cover's kind is surfaced with: grass unless it is dug, heaped or
+/// levelled.
+pub fn cover_material(kind: &str) -> usize {
+    match kind {
+        "pit" | "quarry" | "waste_dump" | "spoil_heap" | "stockpile" => crate::materials::ROCK,
+        "pad" | "yard" => crate::materials::GRAVEL,
+        kind if crate::water::is_water(kind) => crate::materials::RIVERBED,
+        _ => crate::materials::GRASS,
     }
 }
 
