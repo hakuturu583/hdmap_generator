@@ -7,6 +7,11 @@
 //! that are not the corridor's, the parts' rims and toes, and the hills, before
 //! anything is cut or filled for the motorway. A motorway is fitted to the land,
 //! not the other way round, so its own heights are left out of it.
+//!
+//! An ordinary road asked to have its structures chosen
+//! ([`Places::structured_roads`](super::Places::structured_roads)) is read by the
+//! same rules: it is no motorway and belongs to no corridor, but it is fitted to
+//! the land the same way.
 
 use roadgen_core::geometry::plan::{ring_contains, PlanPoint, Segments};
 use roadgen_core::geometry::Point3;
@@ -21,7 +26,8 @@ use super::corridor::StructureMode;
 use super::land::{at_grade_edges, plan_of, Line, Rise};
 use crate::ground::Field;
 
-/// Above the land by more than this, a corridor's road goes on a bridge, metres;
+/// Above the land by more than this, a road whose structures are chosen goes on a
+/// bridge, metres;
 /// and the bridge reaches out to where it is this far above.
 const BRIDGE: f64 = 8.0;
 const ABUTMENT: f64 = 5.0;
@@ -162,11 +168,13 @@ const PARALLEL: f64 = 0.94;
 /// metres: a median and a carriageway's width, about.
 const BESIDE: f64 = 2.0 * structure::MEDIAN;
 
-/// Chooses the structures of every corridor road whose corridor leaves them to the
-/// land. Returns the notes worth telling the caller.
+/// Chooses the structures of every road in `roads` whose corridor leaves them to
+/// the land, and of every road there of no corridor — an ordinary road asked to
+/// have its structures chosen the same way. Returns the notes worth telling the
+/// caller.
 pub(crate) fn choose_structures(
     map: &mut Map,
-    roads: &[(RoadId, String)],
+    roads: &[(RoadId, Option<String>)],
     modes: &Modes,
     natural: &Natural,
     water: &[Vec<PlanPoint>],
@@ -178,7 +186,9 @@ pub(crate) fn choose_structures(
     // road's are known.
     let mut kept: Vec<Run> = Vec::new();
     for (id, corridor) in roads {
-        let mode = modes.iter().find(|(name, _, _)| name == corridor);
+        let mode = corridor
+            .as_ref()
+            .and_then(|corridor| modes.iter().find(|(name, _, _)| name == corridor));
         let auto = mode.is_none_or(|(_, mode, _)| *mode == StructureMode::Auto);
         if !auto {
             continue;
@@ -193,9 +203,33 @@ pub(crate) fn choose_structures(
             FormOfWay::Motorway | FormOfWay::MultipleCarriageway
         );
         // The road at each of its own vertices, sampled once: classified, and
-        // whether it is over water.
-        let Ok(samples) = road.reference_line.samples(map.metadata.sampling) else {
+        // whether it is over water. Where two are further apart than a step — a
+        // straight line drawn end to end — it is read every step between them too.
+        let Ok(vertices) = road.reference_line.samples(map.metadata.sampling) else {
             continue;
+        };
+        let between: Vec<f64> = vertices
+            .windows(2)
+            .flat_map(|pair| {
+                let (a, b) = (pair[0].station, pair[1].station);
+                let count = if b - a > STEP + 0.5 {
+                    ((b - a) / STEP).ceil() as usize
+                } else {
+                    1
+                };
+                (1..count).map(move |k| a + (b - a) * k as f64 / count as f64)
+            })
+            .collect();
+        let samples = if between.is_empty() {
+            vertices
+        } else {
+            let Ok(samples) = road
+                .reference_line
+                .samples_including(map.metadata.sampling, &between)
+            else {
+                continue;
+            };
+            samples
         };
         let mut rows: Vec<(f64, f64, Class)> = Vec::with_capacity(samples.len());
         let mut points: Vec<Point3> = Vec::with_capacity(samples.len());
@@ -226,7 +260,7 @@ pub(crate) fn choose_structures(
                 if kind == Class::Bridge && shared && carriageway {
                     kept.push(Run {
                         road: id.clone(),
-                        corridor: corridor.clone(),
+                        corridor: corridor.clone().unwrap_or_default(),
                         from,
                         to,
                         rows: rows
@@ -535,7 +569,7 @@ pub(crate) fn off_the_land(map: &Map, roads: &[RoadId], natural: &Natural) -> Ve
     rings
 }
 
-/// The land's cut and fill along a corridor's roads where they are on the ground:
+/// The land's cut and fill along the fitted roads where they are on the ground:
 /// from each edge a slope runs out at [`FILL`] down to the natural land, or at
 /// [`CUT`] up to it. Each slope's far edge is a breakline; what lies between it
 /// and the road is shaped by the two, and is a land cover — an embankment or a
@@ -549,7 +583,16 @@ pub(crate) struct Earthworks {
     pub owners: Vec<RoadId>,
 }
 
-pub(crate) fn earthworks(map: &Map, roads: &[RoadId], natural: &Natural) -> Earthworks {
+///
+/// The edges of every road in `drawn` — an ordinary road, drawn with its vertices
+/// as far apart as its caller liked — are read every [`STEP`] between their
+/// vertices too; a corridor's roads have a vertex every step already.
+pub(crate) fn earthworks(
+    map: &Map,
+    roads: &[RoadId],
+    drawn: &[RoadId],
+    natural: &Natural,
+) -> Earthworks {
     let mut out = Earthworks {
         lines: Vec::new(),
         holes: Vec::new(),
@@ -569,8 +612,10 @@ pub(crate) fn earthworks(map: &Map, roads: &[RoadId], natural: &Natural) -> Eart
         if road.is_connector() {
             continue;
         }
+        let dense = drawn.contains(id);
         for (run, (left, right)) in at_grade_edges(map, road).into_iter().enumerate() {
             for (side, points, sign) in [("left", left, 1.0), ("right", right, -1.0)] {
+                let points = if dense { every_step(&points) } else { points };
                 slopes(
                     &format!("{}/{run}/{side}", id.local_name()),
                     &points,
@@ -583,6 +628,19 @@ pub(crate) fn earthworks(map: &Map, roads: &[RoadId], natural: &Natural) -> Eart
         }
         out.owners.resize(out.covers.len(), id.clone());
     }
+    out
+}
+
+/// `points` with more between any two further apart than a [`STEP`], evenly, so
+/// none are.
+fn every_step(points: &[Point3]) -> Vec<Point3> {
+    let mut out = Vec::with_capacity(points.len());
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let count = (a.horizontal_distance_to(b) / STEP).ceil().max(1.0) as usize;
+        out.extend((0..count).map(|k| a.lerp(b, k as f64 / count as f64)));
+    }
+    out.extend(points.last().copied());
     out
 }
 

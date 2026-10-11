@@ -176,13 +176,17 @@ class Map:
         site: Optional[str] = None,
         form: Optional[str] = None,
         corridor: Optional[str] = None,
+        structures: Optional[str] = None,
     ) -> Road:
         """`form` is the road's form of way: `motorway`, `slip_road`,
         `multiple_carriageway`, `single_carriageway`, `parallel_road`,
         `service_road`, `roundabout`. A motorway or slip road crosses nothing on
         the level and has no frontage for a building. `corridor` names the
         corridor the road belongs to: the land is cut and filled to meet it, and
-        its structures are chosen from the land."""
+        its structures are chosen from the land. `structures="auto"` has an
+        ordinary road's structures chosen from the land the same way: a stretch
+        far above it or over water goes on a bridge, one far below it through a
+        bored tunnel, and the rest is cut and filled to meet it."""
         ...
     def add_junction(self, name: Optional[str] = None) -> Junction: ...
     def connect(

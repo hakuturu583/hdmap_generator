@@ -691,3 +691,174 @@ fn on_a_shared_deck_the_river_is_crossed_by_one_bridge_carrying_both_carriageway
     // The ridge's twin bores stay two tunnels.
     assert_eq!(structures_of(&map, TunnelForm::Bored.as_str()).len(), 2);
 }
+
+/// An ordinary two-way road, no motorway and of no corridor, along `points`, and
+/// what is generated onto it: its structures chosen from the land when
+/// `structured`, with `places` round it, and on the site named `site` if any.
+fn ordinary_road(
+    points: &[Point3],
+    places: roadgen_carla::environment::Places,
+    structured: bool,
+    site: Option<&str>,
+) -> (UnvalidatedMap, roadgen_carla::environment::Report) {
+    let mut builder = MapBuilder::default();
+    let road = builder
+        .add_road(
+            RoadSpec::new(
+                Curve3::polyline(points.iter().copied()).unwrap(),
+                roadgen_integration_tests::highway::street_lanes(),
+            )
+            .with_name("pass"),
+        )
+        .unwrap();
+    let mut places = places;
+    if let Some(site) = site {
+        places.site_roads.push((road.clone(), site.into()));
+    }
+    if structured {
+        places.structured_roads.push(road);
+    }
+    let mut map = builder.finish().unwrap();
+    let report = roadgen_carla::environment::generate(&mut map, &places).expect("generates");
+    (map, report)
+}
+
+/// A road high across a river's valley, down to the country either side.
+fn across_the_valley(
+    structured: bool,
+    site: Option<&str>,
+) -> (UnvalidatedMap, roadgen_carla::environment::Report) {
+    use roadgen_carla::environment::{Places, RiverSpec};
+    ordinary_road(
+        &[
+            Point3::new(-600.0, 0.0, 0.0),
+            Point3::new(-200.0, 0.0, 12.0),
+            Point3::new(200.0, 0.0, 12.0),
+            Point3::new(600.0, 0.0, 0.0),
+        ],
+        Places {
+            rivers: vec![RiverSpec {
+                name: "Naka".into(),
+                centre: vec![Point3::new(0.0, -400.0, 0.0), Point3::new(0.0, 400.0, 0.0)],
+                width: 60.0,
+                depth: 6.0,
+                bank_slope: 2.0,
+                site: None,
+            }],
+            ..Places::default()
+        },
+        structured,
+        site,
+    )
+}
+
+/// A road level through a hill.
+fn through_the_hill(structured: bool) -> (UnvalidatedMap, roadgen_carla::environment::Report) {
+    use roadgen_carla::environment::{HillSpec, Places};
+    ordinary_road(
+        &[Point3::new(-800.0, 0.0, 0.0), Point3::new(800.0, 0.0, 0.0)],
+        Places {
+            hills: vec![HillSpec {
+                name: "Kobu".into(),
+                crest: vec![Point3::new(0.0, 0.0, 0.0)],
+                width: 900.0,
+                height: 60.0,
+            }],
+            ..Places::default()
+        },
+        structured,
+        None,
+    )
+}
+
+/// One concrete solid for each structure in CARLA's meshes.
+fn carla_draws_every_structure(map: &ValidatedMap) {
+    let meshes = roadgen_carla::to_meshes(map, &PackageConfig::new("pass"));
+    let concrete = meshes
+        .iter()
+        .filter(|mesh| mesh.role == Role::Terrain && mesh.materials == [materials::ROAD_CONCRETE])
+        .count();
+    assert_eq!(concrete, map.structures.len());
+}
+
+#[test]
+fn an_ordinary_road_asked_to_have_its_structures_chosen_bridges_a_river_valley() {
+    let (map, report) = across_the_valley(true, None);
+    assert!(report.notes.is_empty(), "{:#?}", report.notes);
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
+    let bridges = structures_of(&map, BridgeForm::Bridge.as_str());
+    assert_eq!(bridges.len(), 1, "{bridges:?}");
+    assert_eq!(map.structures.len(), 1);
+    assert!(map.grade_separations.iter().any(|g| g.via.as_str() == bridges[0]
+        && matches!(&g.under, Underneath::LandCover(cover) if cover.as_str().contains("naka"))));
+    // It reaches from where the road is well above the land on one side to the
+    // other, and the rest is on embankments of no site.
+    let span = &map.structures.iter().next().unwrap().carries[0];
+    assert!(span.length() > 300.0, "{:.0} m", span.length());
+    let embankments: Vec<_> = map
+        .land_covers
+        .iter()
+        .filter(|cover| cover.kind == "embankment")
+        .collect();
+    assert!(!embankments.is_empty());
+    assert!(
+        map.sites.is_empty(),
+        "no motorway site for an ordinary road"
+    );
+    let road = map.roads.iter().next().unwrap();
+    assert!(!road.form.is_controlled_access());
+    carla_draws_every_structure(&map);
+}
+
+#[test]
+fn an_ordinary_road_asked_to_have_its_structures_chosen_tunnels_through_a_hill() {
+    let (map, report) = through_the_hill(true);
+    assert!(report.notes.is_empty(), "{:#?}", report.notes);
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
+    let tunnels = structures_of(&map, TunnelForm::Bored.as_str());
+    assert_eq!(tunnels.len(), 1, "{tunnels:?}");
+    let tunnel = map.structures.iter().next().unwrap();
+    let span = &tunnel.carries[0];
+    assert!(span.length() > 200.0, "{:.0} m", span.length());
+    let portals = &tunnel.kind.tunnel().unwrap().portals;
+    assert!(portals[0].station < portals[1].station);
+    // Cut down to the portals either side.
+    assert!(map.land_covers.iter().any(|cover| cover.kind == "cutting"));
+    carla_draws_every_structure(&map);
+}
+
+#[test]
+fn an_ordinary_road_not_asked_to_have_its_structures_chosen_gets_none() {
+    for (map, report) in [across_the_valley(false, None), through_the_hill(false)] {
+        assert_eq!(report.structures, 0);
+        assert!(map.as_map().structures.is_empty());
+        assert!(!map
+            .as_map()
+            .land_covers
+            .iter()
+            .any(|cover| cover.kind == "embankment" || cover.kind == "cutting"));
+    }
+}
+
+#[test]
+fn the_cuttings_and_embankments_of_an_ordinary_road_are_on_its_own_site() {
+    let (map, report) = across_the_valley(true, Some("Quarry Haul"));
+    assert!(report.notes.is_empty(), "{:#?}", report.notes);
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
+    let site = map.sites.iter().next().expect("the road's site");
+    assert_eq!(map.sites.len(), 1);
+    assert_eq!(site.kind, "works");
+    let embankments = map
+        .land_covers
+        .iter()
+        .filter(|cover| cover.kind == "embankment")
+        .count();
+    assert!(embankments > 0);
+    let on_site = site
+        .land_covers
+        .iter()
+        .filter_map(|id| map.land_covers.get(id))
+        .filter(|cover| cover.kind == "embankment")
+        .count();
+    assert_eq!(on_site, embankments);
+}
