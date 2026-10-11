@@ -429,11 +429,16 @@ impl<'a> Layout<'a> {
     /// still has the post on it. On the verge, `setback` out from the carriageway's
     /// edge, when there is not. `None` when the cross-section carries no vehicles
     /// at all, since there is then no road for a post to stand beside.
+    ///
+    /// `ledge` is where a post stands on a road with no pavement whose edge has
+    /// no verge either — a deck's parapet, a tunnel's walkway: how far out from
+    /// the road's outer edge, and how high.
     pub(crate) fn post_position(
         &self,
         station: f64,
         side: LateralSide,
         setback: f64,
+        ledge: Option<(f64, f64)>,
     ) -> Option<(f64, f64)> {
         let cuts = self.cuts(station);
         let (left_edge, right_edge) = self.carriageway(station)?;
@@ -466,7 +471,16 @@ impl<'a> Layout<'a> {
                     self.rise_of(lane),
                 ))
             }
-            None => Some((edge + outward * setback, 0.0)),
+            None => match ledge {
+                Some((out, rise)) => {
+                    let outer = match side {
+                        LateralSide::Left => cuts[0],
+                        LateralSide::Right => cuts[cuts.len() - 1],
+                    };
+                    Some((outer + outward * out, rise))
+                }
+                None => Some((edge + outward * setback, 0.0)),
+            },
         }
     }
 

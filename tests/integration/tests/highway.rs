@@ -319,3 +319,50 @@ fn every_building_stands_on_the_land_on_a_foundation_where_it_falls_away() {
         "the crossroad's approach leaves some building a foundation"
     );
 }
+
+#[test]
+fn a_post_on_a_bridge_stands_on_its_parapet_not_in_the_air() {
+    use roadgen_core::structure::{BridgeSpec, RoadSpan};
+    use roadgen_core::topology::LaneEnd;
+    let lane = |direction| LaneSpec::new(PositiveWidth::new(3.5).unwrap(), direction);
+    let lanes = vec![lane(Direction::Backward), lane(Direction::Forward)];
+    let mut builder = MapBuilder::default();
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 9.0),
+                Point3::new(300.0, 0.0, 9.0),
+                lanes,
+            )
+            .unwrap()
+            .with_name("deck"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(road.clone(), 0.0, 300.0)],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    builder
+        .add_traffic_sign(&LaneRef::new(road, 1), LaneEnd::End, "stop", 2.0)
+        .unwrap();
+    let map = builder.finish().unwrap();
+    let map = map.as_map();
+    let bridge = map.structures.iter().next().unwrap();
+    let curb = bridge.kind.bridge().unwrap().curb;
+    let furniture = roadgen_carla::furniture::build(
+        map,
+        "deck",
+        &PackageConfig::new("deck").surfaces,
+        &roadgen_carla::FurnitureConfig::default(),
+    );
+    let [sign] = furniture.signs.as_slice() else {
+        panic!("one sign: {furniture:?}");
+    };
+    // On the parapet over the deck's curb, 3.5 m out: inside the deck, and up
+    // on the parapet rather than level with the road.
+    let out = sign.position.y.abs();
+    assert!(out > 3.5 && out < 3.5 + curb, "{:?}", sign.position);
+    assert!((sign.position.z - (9.0 + roadgen_carla::structures::PARAPET)).abs() < 1e-6);
+}
