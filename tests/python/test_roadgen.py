@@ -2159,6 +2159,32 @@ def test_carla_water_reads_the_descriptors_slots_and_takes_overrides(tmp_path):
     assert os.path.exists(roadgen.water.EDITOR_SCRIPT)
 
 
+def test_carla_water_dresses_the_levels_actors_as_well_as_the_meshes(tmp_path, monkeypatch):
+    # With CARLA's materials, cooking gives every land actor's component the
+    # land's material, which wins over the mesh's: the editor script has to set
+    # the components' slots in the map's level too, and be told which level.
+    import roadgen.water
+
+    descriptor = tmp_path / "Pkg.json"
+    descriptor.write_text(json.dumps({"maps": [{"name": "Town", "water": {
+        "flowing": {"slot": "M_Water_Flowing", "material": "/Water/River"},
+    }}], "props": []}))
+    seen = {}
+
+    def run(editor, uproject, script, environment, log=None):
+        seen.update(environment)
+        return ["roadgen-water: dressed 2 meshes of Town"], 0, True
+
+    monkeypatch.setattr(roadgen.water, "editor_paths", lambda *args: ("ed", "proj"))
+    monkeypatch.setattr(roadgen.water, "run_editor_script", run)
+    assert roadgen.water.carla_water(str(tmp_path), "Pkg", "Town", descriptor=str(descriptor)) == 2
+    assert seen["ROADGEN_LEVEL"] == "/Game/Pkg/Maps/Town/Town"
+    with open(roadgen.water.EDITOR_SCRIPT, encoding="utf-8") as file:
+        text = file.read()
+    for needed in ("ROADGEN_LEVEL", "load_map", "StaticMeshComponent", "save_current_level"):
+        assert needed in text
+
+
 def test_carla_water_refuses_to_run_without_an_engine(tmp_path, monkeypatch):
     monkeypatch.delenv("CARLA_UNREAL_ENGINE_PATH", raising=False)
     with pytest.raises(roadgen.CarlaWaterError, match="CARLA_UNREAL_ENGINE_PATH"):

@@ -5,7 +5,8 @@ meshes in the flat colours the FBX gives them. A flat colour is no water. So the
 package's descriptor names, for each map, an Unreal material for running water
 and one for standing water, beside the material slot each goes in — and this is
 one more run of the editor after `Import.py`'s, putting each material in every
-slot of its name on the package's meshes.
+slot of its name on the package's meshes, and on the actors of the map's level,
+whose components CARLA's cooking gave the land's material.
 
 The two are apart because the meshes are: a river's texture coordinates run down
 it from its source (`u`) and across it (`v`), so a material that pans its normal
@@ -92,6 +93,7 @@ def carla_water(
         uproject,
         EDITOR_SCRIPT,
         {
+            "ROADGEN_LEVEL": "/Game/%s/Maps/%s/%s" % (package, map_name, map_name),
             "ROADGEN_PACKAGE": package,
             "ROADGEN_MAP": map_name,
             "ROADGEN_WATER": json.dumps(slots),
