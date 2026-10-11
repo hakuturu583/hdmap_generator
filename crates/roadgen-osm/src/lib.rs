@@ -50,6 +50,25 @@
 //! street a building faces has no tag at all. [`check`] says each of those rather
 //! than letting the file look like a round trip.
 //!
+//! # Bridges, tunnels and levels
+//!
+//! OSM has no structure of its own: a road is on a bridge because its way says
+//! `bridge=yes`, so the way has to begin and end where the bridge does. Each road
+//! is cut at the ends of every structure that carries it, the pieces sharing the
+//! node at each cut, and the piece on a bridge or in a tunnel is tagged for it —
+//! `bridge=viaduct` for a viaduct, `tunnel=yes` for every tunnel, an underpass and
+//! a covered cutting alike. `layer` is what keeps a renderer from drawing a
+//! motorway under the street it bridges, and the IR keeps no level, only heights;
+//! so the level is derived from the grade separations, from the ground up: 0 at
+//! grade, a bridge one above the highest thing it passes over, a tunnel −1. A
+//! bridge's deck outline is a closed way tagged `man_made=bridge`.
+//!
+//! The form of way chooses `highway` where it has a word for it: a motorway
+//! carriageway is `motorway` whatever its road type, a slip road `motorway_link`
+//! when it joins a motorway and `trunk_link` when it does not, and the junction
+//! node where a slip road leaves a motorway is a `highway=motorway_junction`. A
+//! land cover of water is `natural=water`.
+//!
 //! # Tracing
 //!
 //! Every id in the file comes off one negative counter, in the order things were
@@ -59,6 +78,7 @@
 //!
 //! - a road is its way, and a junction its node, one for one; a connector has no
 //!   counterpart at all, since OSM draws the movement as two ways sharing a node;
+//!   a road cut at its structures is a `part` of each of its ways;
 //! - furniture is `merged` into the road node that carries it as a tag, with the tag
 //!   as the role, and a crossing is also the footway across the road;
 //! - a restriction is a `part` of its junction: it says what the junction forbids,
@@ -76,7 +96,8 @@ use ll2_projection::{GpsPoint, LocalCartesian, Origin, Projector, Utm};
 
 use roadgen_core::geometry::Point3;
 use roadgen_core::map::{Map, Projection, Road};
-use roadgen_core::semantics::{MapObject, MapObjectKind, ObjectGeometry};
+use roadgen_core::semantics::{FormOfWay, MapObject, MapObjectKind, ObjectGeometry};
+use roadgen_core::structure::{StructureKind, StructureSpan, Underneath};
 use roadgen_core::topology::{RoadEnd, RoadLinkTarget};
 // OSM has a relation of its own, which is the one this file means by the bare name.
 use roadgen_core::trace::Relation as Link;
@@ -207,6 +228,40 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
              changes along them is written as their first stretch's: {}",
             changing.len(),
             changing.join(", ")
+        ));
+    }
+    if !map.structures.is_empty() {
+        let tunnels = map
+            .structures
+            .iter()
+            .filter(|structure| structure.kind.tunnel().is_some())
+            .count();
+        problems.push(format!(
+            "OSM says a road is on a bridge or in a tunnel by tagging its way, so the \
+             roads on the {} structures are cut where each begins and ends and given a \
+             `layer` derived from what passes over what; a bridge's deck is a \
+             `man_made=bridge` outline, but its piers and abutments, the {tunnels} \
+             tunnels' bores and portals, and every height but `ele` are not written",
+            map.structures.len()
+        ));
+    }
+    let unspoken = map
+        .roads
+        .iter()
+        .filter(|road| {
+            matches!(
+                road.form,
+                FormOfWay::MultipleCarriageway
+                    | FormOfWay::SingleCarriageway
+                    | FormOfWay::ParallelRoad
+            )
+        })
+        .count();
+    if unspoken > 0 {
+        problems.push(format!(
+            "OSM has no tag for a carriageway's form beyond `highway`, `oneway` and \
+             `junction=roundabout`, so whether the {unspoken} roads that say so are \
+             single, dual or parallel carriageways is left to their `highway` rung"
         ));
     }
     if !map.tin_surfaces.is_empty() {
@@ -374,8 +429,9 @@ struct Exporter<'a> {
     /// Where each node sits in the map's own metres, so that a way can be measured
     /// along without going back through the projection.
     positions: HashMap<i64, Point3>,
-    /// The way each road was written as.
-    ways: HashMap<RoadId, i64>,
+    /// The ways each road was written as, in order along it: one, unless a
+    /// structure carries part of it.
+    ways: HashMap<RoadId, Vec<i64>>,
     /// The node each junction collapsed to.
     junction_nodes: HashMap<JunctionId, i64>,
     /// Where each IR element went, written down as each id is handed out: the ids
@@ -418,16 +474,91 @@ impl<'a> Exporter<'a> {
                 // a relation instead.
                 continue;
             }
-            let way = self.road_way(road)?;
-            self.ways.insert(road.id.clone(), way);
-            self.trace.link(road.id.clone(), way_ref(way), Link::Exact);
+            let ways = self.road_ways(road)?;
+            // A road cut at its structures is several ways, each a part of it.
+            let relation = if ways.len() > 1 {
+                Link::Part
+            } else {
+                Link::Exact
+            };
+            for way in &ways {
+                self.trace.link(road.id.clone(), way_ref(*way), relation);
+            }
+            self.ways.insert(road.id.clone(), ways);
         }
 
+        self.add_motorway_junctions();
         self.add_furniture()?;
         self.add_restrictions();
         self.add_buildings()?;
+        self.add_bridge_outlines()?;
         self.add_land_covers()?;
         Ok(())
+    }
+
+    /// Each bridge's deck as a closed way tagged `man_made=bridge`, which is how
+    /// OSM draws the structure as opposed to the roads on it.
+    ///
+    /// Not traced: the trace has no kind for a structure, and the ways of the roads
+    /// it carries are traced already.
+    fn add_bridge_outlines(&mut self) -> Result<(), ExportError> {
+        for structure in self.map.structures.iter() {
+            if structure.kind.bridge().is_none() {
+                continue;
+            }
+            let layer = structure
+                .carries
+                .iter()
+                .map(|span| level(self.map, &span.road, (span.from + span.to) / 2.0))
+                .max()
+                .unwrap_or(1);
+            let ring = structure.outline.points().to_vec();
+            self.add_closed_way(&ring, tags::bridge_outline_tags(structure, layer))?;
+        }
+        Ok(())
+    }
+
+    /// `highway=motorway_junction` on the node where a slip road leaves a motorway.
+    ///
+    /// A junction is one node here, so the node is the junction's: one whose arms
+    /// include a motorway carriageway and a slip road that starts there. It is named
+    /// after the interchange the junction belongs to, which is what the sign at a
+    /// motorway exit says. A node that already says something else under `highway`
+    /// keeps it.
+    fn add_motorway_junctions(&mut self) {
+        for junction in self.map.junctions.iter() {
+            let Some(node) = self.junction_nodes.get(&junction.id).copied() else {
+                continue;
+            };
+            let arms: Vec<&Road> = junction
+                .incoming_roads
+                .iter()
+                .filter_map(|road| self.map.road(road))
+                .collect();
+            let motorway = arms.iter().any(|road| tags::is_motorway(road));
+            let leaving = arms.iter().any(|road| {
+                road.form == FormOfWay::SlipRoad
+                    && end_facing(road, &junction.id) == Some(RoadEnd::Start)
+            });
+            if !(motorway && leaving) {
+                continue;
+            }
+            let name = junction
+                .interchange
+                .as_ref()
+                .and_then(|id| self.map.interchanges.get(id))
+                .and_then(|interchange| interchange.name.clone());
+            if let Some(node) = self.document.nodes.get_mut(&node) {
+                if node.tags.contains_key("highway") {
+                    continue;
+                }
+                node.tags
+                    .insert("highway".into(), "motorway_junction".into());
+                if let Some(name) = name {
+                    node.tags.insert("name".into(), name);
+                }
+            }
+        }
     }
 
     /// Every building, as a closed way, with a way per part where there is more than
@@ -536,42 +667,102 @@ impl<'a> Exporter<'a> {
         Ok(id)
     }
 
-    fn road_way(&mut self, road: &Road) -> Result<i64, ExportError> {
-        let line = road
+    /// A road's ways: one down its whole centreline, or one for each stretch
+    /// between where a structure begins and ends.
+    ///
+    /// OSM says a road is on a bridge by tagging the way, so the way has to stop
+    /// where the bridge does. The centreline is sampled with a vertex at every
+    /// structure's ends, and the ways are cut there; the vertex at a cut is one node
+    /// both pieces share, which keeps the road one connected line — two pieces that
+    /// only meet in the plane are, to OSM, not joined at all.
+    fn road_ways(&mut self, road: &Road) -> Result<Vec<i64>, ExportError> {
+        let spans = road.structure.spans();
+        let cuts: Vec<f64> = spans.iter().flat_map(|span| [span.from, span.to]).collect();
+        let samples = road
             .reference_line
-            .to_polyline(self.map.metadata.sampling)?;
-        let mut nodes = Vec::with_capacity(line.len() + 2);
-        for point in line.points() {
-            nodes.push(self.node_at(*point)?);
+            .samples_including(self.map.metadata.sampling, &cuts)?;
+        let mut nodes = Vec::with_capacity(samples.len());
+        for sample in &samples {
+            nodes.push(self.node_at(sample.point)?);
         }
 
-        // An end that faces a junction is carried on to the junction's node, so the
-        // arms actually meet. In the IR they stop short of each other by half the
-        // junction, with the connectors covering the gap.
-        for end in [RoadEnd::Start, RoadEnd::End] {
-            let Some(RoadLinkTarget::Junction(junction)) = road.link.at(end) else {
+        // Which sample each cut fell on, and what each stretch between two cuts is
+        // on: the pieces, as ranges of samples sharing their end ones.
+        let index_of = |station: f64| {
+            samples
+                .iter()
+                .enumerate()
+                .min_by(|a, b| {
+                    (a.1.station - station)
+                        .abs()
+                        .total_cmp(&(b.1.station - station).abs())
+                })
+                .map_or(0, |(index, _)| index)
+        };
+        let mut pieces: Vec<(usize, usize, Option<&StructureSpan>)> = Vec::new();
+        let mut at = 0;
+        for span in spans {
+            let (from, to) = (index_of(span.from).max(at), index_of(span.to));
+            if to <= from {
                 continue;
-            };
-            let Some(node) = self.junction_nodes.get(junction).copied() else {
-                continue;
-            };
-            match end {
-                RoadEnd::Start => nodes.insert(0, node),
-                RoadEnd::End => nodes.push(node),
             }
+            if from > at {
+                pieces.push((at, from, None));
+            }
+            pieces.push((from, to, Some(span)));
+            at = to;
         }
-        nodes.dedup();
+        if at + 1 < nodes.len() || pieces.is_empty() {
+            pieces.push((at, nodes.len() - 1, None));
+        }
 
-        let id = self.take_id();
-        self.document.ways.insert(
-            id,
-            Way {
+        let mut ways = Vec::with_capacity(pieces.len());
+        let last = pieces.len() - 1;
+        for (number, (from, to, span)) in pieces.into_iter().enumerate() {
+            let mut piece: Vec<i64> = nodes[from..=to].to_vec();
+            // An end that faces a junction is carried on to the junction's node, so
+            // the arms actually meet. In the IR they stop short of each other by
+            // half the junction, with the connectors covering the gap.
+            for end in [RoadEnd::Start, RoadEnd::End] {
+                let outer = match end {
+                    RoadEnd::Start => number == 0,
+                    RoadEnd::End => number == last,
+                };
+                if !outer {
+                    continue;
+                }
+                let Some(RoadLinkTarget::Junction(junction)) = road.link.at(end) else {
+                    continue;
+                };
+                let Some(node) = self.junction_nodes.get(junction).copied() else {
+                    continue;
+                };
+                match end {
+                    RoadEnd::Start => piece.insert(0, node),
+                    RoadEnd::End => piece.push(node),
+                }
+            }
+            piece.dedup();
+
+            let mut tags = tags::road_tags(self.map, road);
+            if let Some(span) = span {
+                if let Some(structure) = self.map.structures.get(&span.structure) {
+                    let layer = level(self.map, &road.id, (span.from + span.to) / 2.0);
+                    tags::structure_tags(&mut tags, structure, layer);
+                }
+            }
+            let id = self.take_id();
+            self.document.ways.insert(
                 id,
-                nodes,
-                tags: tags::road_tags(self.map, road),
-            },
-        );
-        Ok(id)
+                Way {
+                    id,
+                    nodes: piece,
+                    tags,
+                },
+            );
+            ways.push(id);
+        }
+        Ok(ways)
     }
 
     /// Furniture goes on a way's own nodes, which is how OSM places it: a traffic
@@ -771,40 +962,26 @@ impl<'a> Exporter<'a> {
         position: Point3,
         may_reuse: impl Fn(&Tags) -> bool,
     ) -> Result<Option<i64>, ExportError> {
-        let Some(way_id) = self.ways.get(road).copied() else {
+        let Some(ways) = self.ways.get(road).cloned() else {
             return Ok(None);
         };
-        let Some(nodes) = self.document.ways.get(&way_id).map(|way| way.nodes.clone()) else {
-            return Ok(None);
-        };
-        if nodes.len() < 2 {
-            return Ok(None);
-        }
-
-        // Which stretch of the way the object is abeam of, and where along it.
-        let mut best: Option<(usize, f64, f64)> = None;
-        for (index, pair) in nodes.windows(2).enumerate() {
-            let (Some(a), Some(b)) = (
-                self.positions.get(&pair[0]).copied(),
-                self.positions.get(&pair[1]).copied(),
-            ) else {
+        // Which stretch of which of the road's ways the object is abeam of, and
+        // where along it.
+        let mut best: Option<(i64, Vec<i64>, usize, f64, f64)> = None;
+        for way_id in ways {
+            let Some(nodes) = self.document.ways.get(&way_id).map(|way| way.nodes.clone()) else {
                 continue;
             };
-            let along = (b.x - a.x, b.y - a.y);
-            let length = along.0 * along.0 + along.1 * along.1;
-            let fraction = if length > 0.0 {
-                (((position.x - a.x) * along.0 + (position.y - a.y) * along.1) / length)
-                    .clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let nearest = (a.x + along.0 * fraction, a.y + along.1 * fraction);
-            let distance = (nearest.0 - position.x).hypot(nearest.1 - position.y);
-            if best.is_none_or(|(_, _, previous)| distance < previous) {
-                best = Some((index, fraction, distance));
+            if let Some((index, fraction, distance)) = self.abeam(&nodes, position) {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, _, _, _, previous)| distance < *previous)
+                {
+                    best = Some((way_id, nodes, index, fraction, distance));
+                }
             }
         }
-        let Some((index, fraction, _)) = best else {
+        let Some((way_id, nodes, index, fraction, _)) = best else {
             return Ok(None);
         };
 
@@ -834,6 +1011,34 @@ impl<'a> Exporter<'a> {
         Ok(Some(node))
     }
 
+    /// The stretch of a way's `nodes` nearest `position` in plan: its index, how far
+    /// along it the nearest point lies, and how far that is from `position`.
+    fn abeam(&self, nodes: &[i64], position: Point3) -> Option<(usize, f64, f64)> {
+        let mut best: Option<(usize, f64, f64)> = None;
+        for (index, pair) in nodes.windows(2).enumerate() {
+            let (Some(a), Some(b)) = (
+                self.positions.get(&pair[0]).copied(),
+                self.positions.get(&pair[1]).copied(),
+            ) else {
+                continue;
+            };
+            let along = (b.x - a.x, b.y - a.y);
+            let length = along.0 * along.0 + along.1 * along.1;
+            let fraction = if length > 0.0 {
+                (((position.x - a.x) * along.0 + (position.y - a.y) * along.1) / length)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let nearest = (a.x + along.0 * fraction, a.y + along.1 * fraction);
+            let distance = (nearest.0 - position.x).hypot(nearest.1 - position.y);
+            if best.is_none_or(|(_, _, previous)| distance < previous) {
+                best = Some((index, fraction, distance));
+            }
+        }
+        best
+    }
+
     /// A `no_*_turn` for every pair of arms the IR does not join.
     ///
     /// This is the direction OSM reads in: a junction permits everything, and a
@@ -852,6 +1057,15 @@ impl<'a> Exporter<'a> {
                 .iter()
                 .filter(|road| self.ways.contains_key(road))
                 .collect();
+            // The piece of a road's way that touches the junction: its first when
+            // the road starts there, its last when it ends there.
+            let facing = |road: &Road| -> Option<i64> {
+                let ways = self.ways.get(&road.id)?;
+                match end_facing(road, &junction.id)? {
+                    RoadEnd::Start => ways.first().copied(),
+                    RoadEnd::End => ways.last().copied(),
+                }
+            };
 
             for from in &arms {
                 for to in &arms {
@@ -868,6 +1082,10 @@ impl<'a> Exporter<'a> {
                     let Some(restriction) = tags::restriction_value(change) else {
                         continue;
                     };
+                    let (Some(from_way), Some(to_way)) = (facing(from_road), facing(to_road))
+                    else {
+                        continue;
+                    };
 
                     let mut tags = Tags::new();
                     tags.insert("type".into(), "restriction".into());
@@ -879,7 +1097,7 @@ impl<'a> Exporter<'a> {
                             members: vec![
                                 Member {
                                     kind: MemberType::Way,
-                                    reference: self.ways[*from],
+                                    reference: from_way,
                                     role: "from".into(),
                                 },
                                 Member {
@@ -889,7 +1107,7 @@ impl<'a> Exporter<'a> {
                                 },
                                 Member {
                                     kind: MemberType::Way,
-                                    reference: self.ways[*to],
+                                    reference: to_way,
                                     role: "to".into(),
                                 },
                             ],
@@ -918,6 +1136,66 @@ impl<'a> Exporter<'a> {
 // --------------------------------------------------------------------------- //
 // Junction geometry
 // --------------------------------------------------------------------------- //
+
+/// How many levels above the ground a road is at `station`, as OSM's `layer`
+/// counts them: 0 at grade, −1 in a tunnel, and on a bridge one more than the
+/// highest thing it passes over — so a bridge over a street is 1 and a bridge over
+/// that bridge 2.
+///
+/// The IR keeps no level, only heights, and says what passes over what in its grade
+/// separations; the level is read off those, from the bottom up. A tunnel is −1
+/// whatever is above it: what OSM needs is that it is below the ground, and a
+/// tunnel under a tunnel is rare enough not to be worth a deeper number.
+fn level(map: &Map, road: &RoadId, station: f64) -> i32 {
+    level_within(map, road, station, 0)
+}
+
+/// [`level`], refusing to follow more than a few bridges down: the separations
+/// cannot go round in a circle on a map that validated, and this makes sure.
+fn level_within(map: &Map, road: &RoadId, station: f64, depth: usize) -> i32 {
+    let Some(entry) = map.road(road) else {
+        return 0;
+    };
+    let Some(span) = entry
+        .structure
+        .spans()
+        .iter()
+        .find(|span| span.from - 1e-6 <= station && station <= span.to + 1e-6)
+    else {
+        return 0;
+    };
+    let Some(structure) = map.structures.get(&span.structure) else {
+        return 0;
+    };
+    match &structure.kind {
+        StructureKind::Tunnel(_) => -1,
+        StructureKind::Bridge(_) => {
+            if depth >= 8 {
+                return 1;
+            }
+            let below = map
+                .grade_separations
+                .iter()
+                .filter(|separation| {
+                    separation.over.road == *road
+                        && separation.over.from < span.to
+                        && span.from < separation.over.to
+                })
+                .filter_map(|separation| match &separation.under {
+                    Underneath::Road(under) => Some(level_within(
+                        map,
+                        &under.road,
+                        (under.from + under.to) / 2.0,
+                        depth + 1,
+                    )),
+                    Underneath::LandCover(_) => None,
+                })
+                .max()
+                .unwrap_or(0);
+            below.max(0) + 1
+        }
+    }
+}
 
 /// How strong a control a `highway` value is, so that two at one point do not
 /// overwrite each other by accident.

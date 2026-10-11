@@ -361,6 +361,25 @@ pub fn check(map: &ValidatedMap, config: Option<&SceneConfig>) -> Vec<String> {
         ));
     }
 
+    // A plane has one level. Where one road passes over another, both are written
+    // on it, and the edges of each would wall the other off where they cross.
+    if !map.grade_separations.is_empty() {
+        problems.push(format!(
+            "a GPUDrive scene is a plane, so at the map's {} grade separations both \
+             roads are written on one level, and each road's edges are cut where they \
+             cross the other road's outline — an agent can leave either road there \
+             without meeting an edge",
+            map.grade_separations.len()
+        ));
+    }
+    if !map.structures.is_empty() {
+        problems.push(format!(
+            "a GPUDrive scene has no structures, so the map's {} bridges and tunnels are \
+             not written",
+            map.structures.len()
+        ));
+    }
+
     if !map.connections.is_empty() {
         problems.push(format!(
             "a GPUDrive scene holds no lane topology, so the map's {} lane connections \

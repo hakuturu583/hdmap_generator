@@ -144,6 +144,18 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         ));
     }
 
+    // Lanelet2 has no tag for a bridge or a tunnel. A lanelet on a deck is a lanelet
+    // whose boundaries are high, and that is all a consumer can tell: the heights
+    // are what keep a motorway's lanelets apart from the street's beneath them.
+    if !map.structures.is_empty() {
+        problems.push(format!(
+            "Lanelet2 has no tag for a bridge or a tunnel, so the map's {} structures \
+             survive only as the heights of the lanelets they carry, and their decks, \
+             piers and portals are not written",
+            map.structures.len()
+        ));
+    }
+
     // An MGRS map has to fit inside one 100 km square. Checking the corners of every
     // lane is enough to find a map that does not, and says so before the export turns
     // it into a file whose far end is in the wrong place.
@@ -698,6 +710,10 @@ impl<'a> Exporter<'a> {
             let Some(subtype) = tags::lanelet_subtype(lane.lane_type) else {
                 continue;
             };
+            let subtype = match self.map.road(&lane.road) {
+                Some(road) => tags::road_subtype(subtype, road.form),
+                None => subtype,
+            };
             let inner_left = self.boundary(&lane, lane.left_edge)?;
             let inner_right = self.boundary(&lane, lane.right_edge)?;
             // A lanelet runs the way traffic does: for a backward lane that means
@@ -739,9 +755,17 @@ impl<'a> Exporter<'a> {
     }
 
     fn location_of(&self, lane: &Lane) -> &'static str {
+        // A motorway or a slip road is out of town by what it is, whatever the
+        // road type says about where it runs.
         self.map
             .road(&lane.road)
-            .map(|road| road.road_type.lanelet2_location())
+            .map(|road| {
+                if road.form.is_controlled_access() {
+                    "nonurban"
+                } else {
+                    road.road_type.lanelet2_location()
+                }
+            })
             .unwrap_or("urban")
     }
 
