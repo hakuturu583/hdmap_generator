@@ -5,7 +5,9 @@
 //! it rolls. How it is built is the same, so it is built here once:
 //!
 //! - every through road's two edges are breaklines, so the land under a road is the
-//!   road's own plane, vertex for vertex, whatever kind of place it is in;
+//!   road's own plane, vertex for vertex — but for a vertex a hand's breadth from
+//!   the one before it, which [`tin::CLOSEST`] leaves out — whatever kind of place
+//!   it is in;
 //! - a place's own [`Line`]s — a bench's crest, a heap's toe — are breaklines too,
 //!   cut back where a road runs through them;
 //! - the country is a grid of points at the [`Base`] height, rolling with seeded

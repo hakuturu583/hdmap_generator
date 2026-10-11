@@ -59,6 +59,13 @@ pub fn build(
 
     // Every constraint's vertices first, then its segments: a vertex that lands on
     // a segment already constrained would split it.
+    let constraints: Vec<Constraint> = constraints
+        .into_iter()
+        .map(|constraint| Constraint {
+            points: thinned(&constraint.points, constraint.closed),
+            ..constraint
+        })
+        .collect();
     let mut handles: Vec<Vec<FixedVertexHandle>> = Vec::with_capacity(constraints.len());
     for constraint in &constraints {
         let mut own = Vec::with_capacity(constraint.points.len());
@@ -135,6 +142,45 @@ pub fn build(
     Ok((Tin::new(nodes, triangles)?, breaklines))
 }
 
+/// Two vertices of one line nearer each other than this are one, metres.
+///
+/// A road's edge has a vertex at every station its road is sampled at, and a few
+/// of those come in pairs a hand's breadth apart — the curve's own sample beside
+/// one a width's taper asked for — as does every line laid out from the edge, the
+/// toe of the slope down from it. Each such pair is a segment shorter than the
+/// land's triangles are wide, and every triangle on it a sliver, so one of the two
+/// is left out: the line between the vertices either side of it is the same line
+/// to well under a centimetre.
+pub const CLOSEST: f64 = 1.0;
+
+/// `points` with every vertex nearer than [`CLOSEST`] to the one kept before it
+/// left out. A line's ends are its ends still: the vertex before the last gives
+/// way to it, and on a closed line the last gives way to the first.
+fn thinned(points: &[Point3], closed: bool) -> Vec<Point3> {
+    let mut out: Vec<Point3> = Vec::with_capacity(points.len());
+    for (index, &point) in points.iter().enumerate() {
+        let Some(&last) = out.last() else {
+            out.push(point);
+            continue;
+        };
+        if last.horizontal_distance_to(point) >= CLOSEST {
+            out.push(point);
+        } else if index + 1 == points.len() {
+            // The end stays: it takes the place of the vertex before it, unless
+            // that is the line's start, and a line shorter than this is two ends.
+            if out.len() > 1 {
+                *out.last_mut().expect("kept") = point;
+            } else {
+                out.push(point);
+            }
+        }
+    }
+    if closed && out.len() > 3 && out[0].horizontal_distance_to(out[out.len() - 1]) < CLOSEST {
+        out.pop();
+    }
+    out
+}
+
 /// The runs of consecutive kept segments, as the vertices along each. A closed
 /// constraint kept whole comes back as one run whose last vertex is its first.
 fn pieces(
@@ -185,6 +231,18 @@ fn pieces(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vertex_a_hand_from_the_one_before_it_is_left_out_but_never_an_end() {
+        let at = |x: f64| Point3::new(x, 0.0, 0.0);
+        let line = [at(0.0), at(0.3), at(5.0), at(5.2), at(10.0), at(10.4)];
+        let xs = |points: Vec<Point3>| points.iter().map(|p| p.x).collect::<Vec<_>>();
+        assert_eq!(xs(thinned(&line, false)), [0.0, 5.0, 10.4]);
+        assert_eq!(xs(thinned(&[at(0.0), at(0.5)], false)), [0.0, 0.5]);
+        // Closed, the last gives way to the first it joins back to.
+        let ring = [at(0.0), at(5.0), Point3::new(5.0, 5.0, 0.0), at(0.5)];
+        assert_eq!(thinned(&ring, true).len(), 3);
+    }
 
     #[test]
     fn a_breakline_crossing_another_is_cut_where_it_crosses() {
