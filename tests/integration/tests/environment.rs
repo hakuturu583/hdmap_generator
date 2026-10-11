@@ -1,4 +1,5 @@
-//! A generated open-pit mine, through every exporter.
+//! The environments a CARLA map is generated for — a town, a mine — and what
+//! comes of them in every exporter.
 //!
 //! The mine is the one map in the workspace whose IR states the land, so it is the
 //! test of what each format makes of that: CARLA builds its ground from the TIN,
@@ -274,4 +275,110 @@ fn a_barrier_is_built_the_way_its_kind_is() {
         height: 1.0,
     };
     assert!(draw(&map).contains(&materials::CURB));
+}
+
+#[test]
+fn a_mine_puts_buildings_on_its_yard_from_the_towns_grammar() {
+    let map = mine();
+    assert!(!map.buildings.is_empty());
+    let yard = map
+        .land_covers
+        .iter()
+        .find(|cover| cover.kind == "pad")
+        .unwrap();
+    let ring: Vec<[f64; 2]> = yard.area.points().iter().map(|p| [p.x, p.y]).collect();
+    for part in map.building_parts.iter() {
+        for corner in part.solid.footprint.points() {
+            assert!(
+                roadgen_core::geometry::plan::ring_contains(&ring, [corner.x, corner.y]),
+                "{} stands off the yard",
+                part.id
+            );
+        }
+    }
+    // Facing the haul road, the way a town's buildings face their street.
+    for building in map.buildings.iter() {
+        let road = &building.frontage.as_ref().unwrap().road;
+        assert!(road.as_str().contains("haul_waste_dump"), "{road}");
+    }
+}
+
+#[test]
+fn a_town_builds_its_land_the_way_a_mine_does() {
+    use roadgen_carla::environment::{GroundSpec, UrbanSpec};
+    use roadgen_core::topology::Direction;
+    use roadgen_core::units::PositiveWidth;
+
+    let mut builder = MapBuilder::default();
+    let lanes = || {
+        vec![
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+        ]
+    };
+    builder
+        .add_road(
+            RoadSpec::line(Point3::new(0.0, 0.0, 10.0), Point3::new(300.0, 0.0, 16.0), lanes())
+                .unwrap()
+                .with_name("high_street"),
+        )
+        .unwrap();
+    let town = Environment::Urban(UrbanSpec {
+        name: "town".into(),
+        buildings: roadgen_buildings::Rules::preset("town"),
+        ground: Some(GroundSpec::default()),
+        seed: 3,
+    });
+    let plan = environment::lay_out(&mut builder, &town).unwrap();
+    let mut map = builder.finish().unwrap();
+    environment::generate(&mut map, &plan).unwrap();
+    let map = map.validate().expect("validates");
+
+    assert!(!map.buildings.is_empty());
+    let surface = map.tin_surfaces.iter().next().expect("the town's land");
+    // The road's edges are breaklines of it, as a haul road's are of a mine's.
+    assert_eq!(
+        map.tin_breaklines
+            .iter()
+            .filter(|line| line.kind == "road_edge")
+            .count(),
+        2
+    );
+    // And the land sits at the road's height beside it, climbing as it does.
+    let locator = surface.tin.locator();
+    for (x, z) in [(20.0, 10.4), (280.0, 15.6)] {
+        let ground = locator.height_at(x, 12.0).unwrap();
+        assert!((ground - z).abs() < 0.5, "{x}: {ground}");
+    }
+    // CARLA draws the land from the TIN, as it does a mine's.
+    let warnings = roadgen_carla::check(&map, &PackageConfig::new("Town"));
+    assert!(warnings.iter().any(|w| w.contains("TIN surfaces")), "{warnings:#?}");
+}
+
+#[test]
+fn a_town_beside_a_mine_does_not_line_the_mines_roads() {
+    use roadgen_carla::environment::UrbanSpec;
+
+    let map = {
+        let mut builder = MapBuilder::default();
+        let mine = environment::lay_out(&mut builder, &Environment::Mine(Box::default())).unwrap();
+        let town = environment::lay_out(
+            &mut builder,
+            &Environment::Urban(UrbanSpec {
+                buildings: roadgen_buildings::Rules::preset("town"),
+                ..UrbanSpec::default()
+            }),
+        )
+        .unwrap();
+        let mut map = builder.finish().unwrap();
+        environment::generate(&mut map, &mine).unwrap();
+        environment::generate(&mut map, &town).unwrap();
+        map.validate().expect("validates")
+    };
+    // Every building is the mine's own, on its yard: the town has no street of its
+    // own here, and the ramp and haul roads are the mine's.
+    for building in map.buildings.iter() {
+        let road = &building.frontage.as_ref().unwrap().road;
+        assert!(road.as_str().contains("haul_waste_dump"), "{road}");
+    }
 }

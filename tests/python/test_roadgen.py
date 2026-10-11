@@ -2218,3 +2218,25 @@ def test_a_road_can_say_what_it_is_surfaced_with():
     assert m.road_pavement(road.id) == [(0.0, "asphalt"), (60.0, "gravel")]
     with pytest.raises(ValueError):
         m.add_road(start=(0.0, 10.0, 0.0), end=(50.0, 10.0, 0.0), lanes=lanes, pavement=[(0.0, "lava")])
+
+
+def test_a_mine_and_a_town_share_their_buildings_and_their_land():
+    # The mine's yard gets buildings from the same grammar a town's streets do.
+    m = roadgen.Map(name="quarry")
+    m.generate_mine(name="North Pit", seed=2)
+    assert m.building_ids()
+    assert all("haul_waste_dump" in m.building_frontage(b)[0] for b in m.building_ids())
+    bare = roadgen.Map(name="quarry")
+    bare.generate_mine(name="North Pit", seed=2, yard_buildings=False)
+    assert bare.building_ids() == []
+
+    # A town's land is built the way a mine's is: a TIN with the roads' edges in it.
+    t = street()
+    t.generate_buildings()
+    t.generate_land(relief=4.0, seed=1)
+    surfaces = t.tin_surface_ids()
+    assert len(surfaces) == 1
+    kinds = {kind for _, kind, _ in t.tin_breaklines(surfaces[0])}
+    assert kinds == {"road_edge"}
+    t.generate_land(False)
+    assert t.tin_surface_ids() == []

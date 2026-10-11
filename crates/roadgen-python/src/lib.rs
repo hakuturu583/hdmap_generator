@@ -465,6 +465,8 @@ pub struct PyMap {
     /// Held rather than applied, because a lot is cut out of generated geometry and
     /// there is none until the map is built.
     buildings: Option<BuildingRules>,
+    /// The country round a town, when asked for, and its seed.
+    land: Option<(environment::GroundSpec, u64)>,
     /// The places laid out on the builder — a mine, say — whose land is generated
     /// once the roads are, because it is built round the roads' generated edges.
     /// A town's buildings are the same kind of thing, held in `buildings` so that
@@ -535,6 +537,7 @@ impl PyMap {
             built: None,
             fingerprint: None,
             buildings: None,
+            land: None,
             environments: Vec::new(),
         })
     }
@@ -850,6 +853,44 @@ impl PyMap {
         // than on whichever export happened to build the map first.
         rules.compile().map_err(value_error)?;
         self.buildings = Some(rules);
+        Ok(())
+    }
+
+    /// States the land round the map's roads as a TIN, the way a mine's is built
+    /// but shaped by nothing except the roads: at their height near them, rolling
+    /// by `relief` metres away from them. Off by default, when the CARLA export
+    /// lays its own ground under the roads.
+    #[pyo3(signature = (
+        enabled = true,
+        relief = 6.0,
+        cell = 10.0,
+        margin = 150.0,
+        wavelength = 180.0,
+        seed = 0,
+    ))]
+    fn generate_land(
+        &mut self,
+        enabled: bool,
+        relief: f64,
+        cell: f64,
+        margin: f64,
+        wavelength: f64,
+        seed: u64,
+    ) -> PyResult<()> {
+        self.invalidate();
+        if !enabled {
+            self.land = None;
+            return Ok(());
+        }
+        let ground = environment::GroundSpec {
+            margin,
+            cell,
+            relief,
+            wavelength,
+            ..environment::GroundSpec::default()
+        };
+        ground.check().map_err(PyValueError::new_err)?;
+        self.land = Some((ground, seed));
         Ok(())
     }
 
@@ -1698,6 +1739,7 @@ impl PyMap {
         ground_margin = 150.0,
         ground_cell = 10.0,
         relief = 6.0,
+        yard_buildings = true,
         seed = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -1725,6 +1767,7 @@ impl PyMap {
         ground_margin: f64,
         ground_cell: f64,
         relief: f64,
+        yard_buildings: bool,
         seed: u64,
     ) -> PyResult<Bound<'py, PyDict>> {
         let defaults = mine::MineSpec::default();
@@ -1770,6 +1813,11 @@ impl PyMap {
                 cell: ground_cell,
                 relief,
                 ..defaults.ground.clone()
+            },
+            buildings: if yard_buildings {
+                defaults.buildings.clone()
+            } else {
+                None
             },
             seed,
         };
@@ -2089,8 +2137,15 @@ impl PyMap {
         for plan in &self.environments {
             environment::generate(&mut map, plan).map_err(value_error)?;
         }
-        if let Some(rules) = &self.buildings {
-            environment::generate(&mut map, &environment::Plan::Urban(rules.clone()))
+        // The town, through the same stages a mine's buildings and land go through.
+        if self.buildings.is_some() || self.land.is_some() {
+            let spec = environment::UrbanSpec {
+                name: self.source.metadata().name.clone().unwrap_or_default(),
+                buildings: self.buildings.clone(),
+                ground: self.land.as_ref().map(|(ground, _)| ground.clone()),
+                seed: self.land.as_ref().map_or(0, |&(_, seed)| seed),
+            };
+            environment::generate(&mut map, &environment::Plan::Urban(spec))
                 .map_err(value_error)?;
         }
         Ok(map)
@@ -2304,6 +2359,7 @@ fn read_opendrive(
         built: None,
         fingerprint: None,
         buildings: None,
+        land: None,
         environments: Vec::new(),
     })
 }

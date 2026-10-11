@@ -324,19 +324,7 @@ impl Polygon {
         if x < self.min[0] || x > self.max[0] || y < self.min[1] || y > self.max[1] {
             return false;
         }
-        let mut inside = false;
-        let count = self.points.len();
-        for i in 0..count {
-            let a = self.points[i];
-            let b = self.points[(i + 1) % count];
-            if (a[1] > y) != (b[1] > y) {
-                let cross = (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0];
-                if x < cross {
-                    inside = !inside;
-                }
-            }
-        }
-        inside
+        roadgen_core::geometry::plan::ring_contains(&self.points, [x, y])
     }
 }
 

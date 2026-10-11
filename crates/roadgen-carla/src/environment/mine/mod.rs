@@ -44,33 +44,27 @@
 //! from the site's name and what each feature is, never from a counter.
 
 pub mod geometry;
-pub mod noise;
-pub mod tin;
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::TAU;
 use std::fmt;
 
 use roadgen_core::builder::{LaneSpec, MapBuilder, RoadSpec};
-use roadgen_core::buildings::Footprint;
 use roadgen_core::error::{BuildError, GeometryError};
 use roadgen_core::geometry::{Curve3, Point3};
-use roadgen_core::id::{
-    JunctionId, LandCoverId, ObjectId, RoadId, SiteId, TinBreaklineId, TinSurfaceId,
-};
-use roadgen_core::land_cover::LandCover;
-use roadgen_core::map::{Lane, Map};
+use roadgen_core::id::{JunctionId, ObjectId, RoadId, SiteId, TinSurfaceId};
+use roadgen_core::map::Lane;
 use roadgen_core::semantics::{
     BoundaryMarking, LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, Pavement,
     PavementProfile, RoadMarking, RoadType, UnpavedSurface,
 };
 use roadgen_core::site::Site;
-use roadgen_core::terrain::{TinBreakline, TinError, TinSurface};
+use roadgen_core::terrain::TinError;
 use roadgen_core::topology::{Direction, LateralSide, RoadEnd};
 use roadgen_core::units::{PositiveWidth, SpeedLimit};
 use roadgen_core::validation::UnvalidatedMap;
 
-use self::geometry::{polyline_distance, ring_contains, smoothstep, Ellipse, Frame, SegmentIndex};
-use self::tin::Constraint;
+use self::geometry::{Ellipse, Frame};
+use super::land::{self, plan_of, smoothstep, Base, Land, Landforms, Level, Line};
 
 /// The pit: its floor, and the benches stepped up from it to the rim.
 #[derive(Debug, Clone, PartialEq)]
@@ -171,32 +165,7 @@ pub struct HeapSpec {
     pub repose: f64,
 }
 
-/// The country round the site.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GroundSpec {
-    /// How far past everything the site is made of the land is written, metres.
-    pub margin: f64,
-    /// How far apart the ground's own points are, metres.
-    pub cell: f64,
-    /// How far apart the vertices of a bench or a heap are, metres.
-    pub spacing: f64,
-    /// How much the undisturbed ground rolls, up or down, metres, and over how long
-    /// a distance.
-    pub relief: f64,
-    pub wavelength: f64,
-}
-
-impl Default for GroundSpec {
-    fn default() -> Self {
-        GroundSpec {
-            margin: 150.0,
-            cell: 10.0,
-            spacing: 5.0,
-            relief: 6.0,
-            wavelength: 180.0,
-        }
-    }
-}
+pub use super::land::GroundSpec;
 
 /// Everything an open-pit mine is generated from.
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +183,10 @@ pub struct MineSpec {
     pub waste_dump: HeapSpec,
     pub stockpile: HeapSpec,
     pub ground: GroundSpec,
+    /// What stands on the yard beside the waste dump's haul road — the workshops,
+    /// the offices — from the same shape grammar a town's buildings come from, or
+    /// nothing.
+    pub buildings: Option<roadgen_buildings::Rules>,
     pub seed: u64,
 }
 
@@ -241,6 +214,7 @@ impl Default for MineSpec {
                 repose: 37.0,
             },
             ground: GroundSpec::default(),
+            buildings: roadgen_buildings::Rules::preset("industrial"),
             seed: 0,
         }
     }
@@ -256,6 +230,8 @@ pub enum Error {
     Tin(TinError),
     /// The map already holds a feature this site would be named the same as.
     Duplicate(String),
+    /// The yard's buildings could not be generated.
+    Buildings(roadgen_buildings::Error),
 }
 
 impl fmt::Display for Error {
@@ -266,6 +242,7 @@ impl fmt::Display for Error {
             Error::Geometry(error) => write!(f, "{error}"),
             Error::Tin(error) => write!(f, "terrain: {error}"),
             Error::Duplicate(id) => write!(f, "{id} is already on the map"),
+            Error::Buildings(error) => write!(f, "the yard's buildings: {error}"),
         }
     }
 }
@@ -281,6 +258,17 @@ impl From<BuildError> for Error {
 impl From<GeometryError> for Error {
     fn from(error: GeometryError) -> Self {
         Error::Geometry(error)
+    }
+}
+
+impl From<super::land::Error> for Error {
+    fn from(error: super::land::Error) -> Self {
+        match error {
+            super::land::Error::Spec(detail) => Error::Spec(detail),
+            super::land::Error::Geometry(error) => Error::Geometry(error),
+            super::land::Error::Tin(error) => Error::Tin(error),
+            super::land::Error::Duplicate(id) => Error::Duplicate(id),
+        }
     }
 }
 
@@ -316,6 +304,8 @@ pub struct Report {
     pub breaklines: usize,
     pub land_covers: usize,
     pub berms: usize,
+    /// Buildings put on the yard.
+    pub buildings: usize,
 }
 
 /// A heap, placed.
@@ -345,10 +335,23 @@ struct Layout {
     ramp: Vec<Point3>,
     hub: [f64; 2],
     heaps: Vec<Heap>,
-    /// The yard beside the junction, anticlockwise.
+    /// The yard beside the waste dump's haul road, anticlockwise.
     pad: Vec<Point3>,
     /// Where each haul road starts and ends.
     haul: Vec<(&'static str, Point3, Point3)>,
+}
+
+/// The yard: how far its near edge stands off the road's edge, how far back it
+/// reaches, and how long it is along the road, metres.
+const PAD_SETBACK: f64 = 2.0;
+const PAD_DEPTH: f64 = 45.0;
+const PAD_LENGTH: f64 = 80.0;
+
+/// A point of the map's frame in a pit's frame: the inverse of [`Frame::place`].
+fn frame_local(frame: &Frame, point: Point3) -> [f64; 2] {
+    let (sin, cos) = frame.heading.sin_cos();
+    let (dx, dy) = (point.x - frame.centre.x, point.y - frame.centre.y);
+    [dx * cos + dy * sin, -dx * sin + dy * cos]
 }
 
 /// How far a heap's or a road's mouth stands from the junction centre, metres.
@@ -358,8 +361,6 @@ const LEAD_IN: f64 = 80.0;
 const LEAD_OUT: f64 = 35.0;
 /// How far round the rim the ramp eases from the rim into the wall.
 const EASE: f64 = 40.0;
-/// Clearance past a road's edge inside which no breakline of the land runs.
-const ROAD_CLEARANCE: f64 = 3.0;
 
 fn check(spec: &MineSpec) -> Result<(), Error> {
     let positive = |name: &str, value: f64| {
@@ -574,29 +575,40 @@ impl Layout {
             ));
         }
 
-        // The yard: between the ramp's run-in and the waste dump's road, set back
-        // from both.
-        let bisector = {
-            let ramp_bearing = (mouth[1] - hub[1]).atan2(mouth[0] - hub[0]);
-            let dump = spec.waste_dump.bearing.to_radians();
-            let mut gap = (ramp_bearing - dump).rem_euclid(TAU);
-            if gap > PI {
-                gap -= TAU;
+        // The yard: beside the waste dump's haul road, halfway along it and on the
+        // side away from the pit, so that a building on it faces the road the way
+        // a building in a town faces its street.
+        let pad = {
+            let (_, start, end) = &haul[0];
+            let (start, end) = (frame_local(&frame, *start), frame_local(&frame, *end));
+            let length = (end[0] - start[0]).hypot(end[1] - start[1]);
+            let along = [(end[0] - start[0]) / length, (end[1] - start[1]) / length];
+            let mut across = [-along[1], along[0]];
+            let middle = [(start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0];
+            if middle[0] * across[0] + middle[1] * across[1] < 0.0 {
+                across = [-across[0], -across[1]];
             }
-            dump + gap / 2.0
-        };
-        let (along, across) = (bisector.cos(), bisector.sin());
-        let pad_centre = [hub[0] + along * 90.0, hub[1] + across * 90.0];
-        let (half_long, half_wide) = (35.0, 25.0);
-        let pad = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            let (near, far, half_long) = (
+                half + PAD_SETBACK,
+                half + PAD_SETBACK + PAD_DEPTH,
+                PAD_LENGTH / 2.0,
+            );
+            [
+                (-half_long, near),
+                (half_long, near),
+                (half_long, far),
+                (-half_long, far),
+            ]
             .iter()
             .map(|&(u, v)| {
-                // Long side across the bisector.
-                let x = pad_centre[0] + v * half_wide * along - u * half_long * across;
-                let y = pad_centre[1] + v * half_wide * across + u * half_long * along;
-                frame.place(x, y, rim)
+                frame.place(
+                    middle[0] + along[0] * u + across[0] * v,
+                    middle[1] + along[1] * u + across[1] * v,
+                    rim,
+                )
             })
-            .collect();
+            .collect()
+        };
 
         Layout {
             frame,
@@ -721,29 +733,6 @@ pub fn lay_out(builder: &mut MapBuilder, spec: &MineSpec) -> Result<Plan, Error>
     })
 }
 
-/// The outer edges of a road, left then right, from its generated lanes.
-fn road_edges(map: &Map, road: &RoadId) -> Result<(Vec<Point3>, Vec<Point3>), Error> {
-    let sampling = map.metadata.sampling;
-    let entry = map
-        .road(road)
-        .ok_or_else(|| Error::Spec(format!("{road} is not on the map")))?;
-    let (mut left, mut right) = (Vec::new(), Vec::new());
-    for section in 0..entry.sections.len() {
-        let lanes = map.lanes_of_section(road, section);
-        let outer_left = lanes.iter().max_by_key(|lane| lane.left_edge);
-        let outer_right = lanes.iter().min_by_key(|lane| lane.right_edge);
-        if let (Some(l), Some(r)) = (outer_left, outer_right) {
-            left.extend_from_slice(l.left_boundary.to_polyline(sampling)?.points());
-            right.extend_from_slice(r.right_boundary.to_polyline(sampling)?.points());
-        }
-    }
-    Ok((left, right))
-}
-
-fn plan_of(points: &[Point3]) -> Vec<[f64; 2]> {
-    points.iter().map(|p| [p.x, p.y]).collect()
-}
-
 /// Fills `map` with the mine's land, land covers, berms and site. The roads have
 /// to have been laid out on the builder `map` came from, with the same `plan`.
 pub fn generate(map: &mut UnvalidatedMap, plan: &Plan) -> Result<Report, Error> {
@@ -761,348 +750,105 @@ pub fn generate(map: &mut UnvalidatedMap, plan: &Plan) -> Result<Report, Error> 
         }
     }
 
+    // The land, shaped by the pit and the heaps — the town's land is the same
+    // land shaped by nothing — and round every road on the map.
     let spacing = spec.ground.spacing;
-    // Every road on the map, not only the mine's own: the land has to meet whatever
-    // the map holds — a road the caller laid beside the mine, with a pavement on it,
-    // is as much a road the ground runs up to. Each through road's edges become
-    // breaklines of the land; a junction's movements overlap one another and add no
-    // edge of their own, but nothing of the land is put inside them either.
-    let mut rails = SegmentIndex::new(20.0);
-    let mut outlines: Vec<([f64; 4], Vec<[f64; 2]>)> = Vec::new();
-    let mut constraints: Vec<Constraint> = Vec::new();
-    {
-        let source = map.as_map();
-        for road in plan.roads() {
-            if source.road(road).is_none() {
-                return Err(Error::Spec(format!(
-                    "{road} is not on the map: lay the mine out on its builder"
-                )));
-            }
-        }
-        for road in source.roads.iter() {
-            let (left, right) = road_edges(source, &road.id)?;
-            if left.len() < 2 || right.len() < 2 {
-                continue;
-            }
-            let ring: Vec<[f64; 2]> = plan_of(&left)
-                .into_iter()
-                .chain(plan_of(&right).into_iter().rev())
-                .collect();
-            let bounds = ring.iter().fold(
-                [
-                    f64::INFINITY,
-                    f64::INFINITY,
-                    f64::NEG_INFINITY,
-                    f64::NEG_INFINITY,
-                ],
-                |b, p| {
-                    [
-                        b[0].min(p[0]),
-                        b[1].min(p[1]),
-                        b[2].max(p[0]),
-                        b[3].max(p[1]),
-                    ]
-                },
-            );
-            outlines.push((bounds, ring));
-            if road.is_connector() {
-                continue;
-            }
-            for (side, points) in [("left", left), ("right", right)] {
-                rails.insert_polyline(&plan_of(&points));
-                constraints.push(Constraint {
-                    kind: "road_edge".into(),
-                    key: format!("road/{}/{side}", road.id.local_name()),
-                    points,
-                    closed: false,
-                });
-            }
-        }
-    }
-    // Within `reach` of a road's edge, or on a road.
-    let near_road = |p: [f64; 2], reach: f64| {
-        rails.distance_within(p, reach).is_some()
-            || outlines.iter().any(|(b, ring)| {
-                p[0] >= b[0]
-                    && p[0] <= b[2]
-                    && p[1] >= b[1]
-                    && p[1] <= b[3]
-                    && ring_contains(ring, p)
-            })
-    };
-
-    // Each ring of the pit, cut where the ramp passes through it.
     let pit = &spec.pit;
-    let mut rings: Vec<(String, &str, Vec<Point3>)> = Vec::new();
+    let mut forms = Landforms::default();
     for bench in 0..pit.benches {
         let toe = bench as f64 * (layout.run + pit.bench_width);
         let z = layout.bottom + bench as f64 * pit.bench_height;
-        rings.push((
-            format!("bench/{bench}/toe"),
-            "toe",
-            layout.pit_ring(toe, z, spacing),
-        ));
-        rings.push((
-            format!("bench/{bench}/crest"),
-            "crest",
-            layout.pit_ring(toe + layout.run, z + pit.bench_height, spacing),
-        ));
+        forms.lines.push(Line {
+            key: format!("bench/{bench}/toe"),
+            kind: "toe",
+            points: layout.pit_ring(toe, z, spacing),
+            closed: true,
+        });
+        forms.lines.push(Line {
+            key: format!("bench/{bench}/crest"),
+            kind: "crest",
+            points: layout.pit_ring(toe + layout.run, z + pit.bench_height, spacing),
+            closed: true,
+        });
     }
+    let rim = layout.pit_ring(layout.top, layout.rim, spacing);
+    forms.holes.push(plan_of(&rim));
+    forms.levels.push(Level {
+        ring: plan_of(&layout.pit_ring(0.0, layout.bottom, spacing)),
+        z: layout.bottom,
+    });
     for heap in &layout.heaps {
-        rings.push((
-            format!("{}/toe", heap.key),
-            "toe",
-            heap_ring(heap, heap.radius, layout.rim, spacing),
-        ));
-        rings.push((
-            format!("{}/crest", heap.key),
-            "crest",
-            heap_ring(heap, heap.top, layout.rim + heap.height, spacing),
-        ));
+        let toe = heap_ring(heap, heap.radius, layout.rim, spacing);
+        forms.holes.push(plan_of(&toe));
+        forms.levels.push(Level {
+            ring: plan_of(&heap_ring(heap, heap.top, 0.0, spacing)),
+            z: layout.rim + heap.height,
+        });
+        forms.lines.push(Line {
+            key: format!("{}/toe", heap.key),
+            kind: "toe",
+            points: toe,
+            closed: true,
+        });
+        forms.lines.push(Line {
+            key: format!("{}/crest", heap.key),
+            kind: "crest",
+            points: heap_ring(heap, heap.top, layout.rim + heap.height, spacing),
+            closed: true,
+        });
     }
-    for (key, kind, ring) in rings {
-        let kept: Vec<bool> = ring
-            .iter()
-            .map(|p| !near_road([p.x, p.y], ROAD_CLEARANCE))
-            .collect();
-        if kept.iter().all(|&ok| ok) {
-            constraints.push(Constraint {
-                kind: kind.into(),
-                key,
-                points: ring,
-                closed: true,
-            });
-            continue;
-        }
-        // The stretches clear of every road, each an open line of its own.
-        let count = ring.len();
-        let start = kept.iter().position(|&ok| !ok).unwrap_or(0);
-        let mut run: Vec<Point3> = Vec::new();
-        let mut pieces = Vec::new();
-        for step in 1..=count {
-            let index = (start + step) % count;
-            if kept[index] {
-                run.push(ring[index]);
-            } else if !run.is_empty() {
-                pieces.push(std::mem::take(&mut run));
-            }
-        }
-        if !run.is_empty() {
-            pieces.push(run);
-        }
-        let several = pieces.len() > 1;
-        for (index, piece) in pieces
-            .into_iter()
-            .filter(|piece| piece.len() >= 2)
-            .enumerate()
-        {
-            constraints.push(Constraint {
-                kind: kind.into(),
-                key: if several {
-                    format!("{key}/{index}")
-                } else {
-                    key.clone()
-                },
-                points: piece,
-                closed: false,
-            });
-        }
-    }
+    forms.flats.push(plan_of(&layout.pad));
 
-    // Every line the land breaks along, for keeping the ground's own points off
-    // them, and everything the site is made of, for keeping the country's roll off
-    // it.
-    let mut lines = SegmentIndex::new(spec.ground.cell);
-    for constraint in &constraints {
-        lines.insert_polyline(&plan_of(&constraint.points));
-    }
-    let rim_ring = plan_of(&layout.pit_ring(layout.top, layout.rim, spacing));
-    let pad_ring = plan_of(&layout.pad);
-    let mut features = SegmentIndex::new(40.0);
-    let mut closed_rim = rim_ring.clone();
-    closed_rim.push(rim_ring[0]);
-    features.insert_polyline(&closed_rim);
-    let mut closed_pad = pad_ring.clone();
-    closed_pad.push(pad_ring[0]);
-    features.insert_polyline(&closed_pad);
-    for constraint in constraints.iter().filter(|c| c.kind == "road_edge") {
-        features.insert_polyline(&plan_of(&constraint.points));
-    }
-    let heap_rings: Vec<Vec<[f64; 2]>> = layout
-        .heaps
-        .iter()
-        .map(|heap| plan_of(&heap_ring(heap, heap.radius, layout.rim, spacing)))
-        .collect();
-    for ring in &heap_rings {
-        let mut closed = ring.clone();
-        closed.push(ring[0]);
-        features.insert_polyline(&closed);
-    }
-    let (quiet, rolling) = (20.0, 140.0);
-    let ground = |x: f64, y: f64| -> f64 {
-        let distance = features.distance_within([x, y], rolling).unwrap_or(rolling);
-        let inside_pad = ring_contains(&pad_ring, [x, y]);
-        let weight = if inside_pad {
-            0.0
-        } else {
-            smoothstep(quiet, rolling, distance)
+    // What stands on the yard, from the town's own shape grammar: lots along the
+    // haul road it is beside, kept to the yard. Before the land, so that the land
+    // keeps its roll off them.
+    let mut report = Report::default();
+    if let Some(rules) = &spec.buildings {
+        let placement = roadgen_buildings::Placement {
+            roads: Some(plan.haul_roads.clone()),
+            within: vec![plan_of(&layout.pad)],
+            keep: true,
         };
-        layout.rim
-            + spec.ground.relief * weight * noise::fractal(x, y, spec.ground.wavelength, spec.seed)
+        let before = map.as_map().buildings.len();
+        roadgen_buildings::generate_with(map, &rules.clone().with_seed(spec.seed), &placement)
+            .map_err(Error::Buildings)?;
+        report.buildings = map.as_map().buildings.len() - before;
+    }
+
+    let land = Land {
+        name: name.clone(),
+        site: Some(plan.site.clone()),
+        base: Base::Level(layout.rim),
+        ground: spec.ground.clone(),
+        seed: spec.seed,
     };
-
-    // The free points: the country on a grid, the pit's floor, the heaps' tops.
-    let mut bounds = [
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-    ];
-    for p in constraints
-        .iter()
-        .flat_map(|c| c.points.iter())
-        .chain(&layout.pad)
-    {
-        bounds = [
-            bounds[0].min(p.x),
-            bounds[1].min(p.y),
-            bounds[2].max(p.x),
-            bounds[3].max(p.y),
-        ];
-    }
-    let margin = spec.ground.margin;
-    let cell = spec.ground.cell;
-    let (x0, y0) = (bounds[0] - margin, bounds[1] - margin);
-    let columns = ((bounds[2] + margin - x0) / cell).ceil() as usize;
-    let rows = ((bounds[3] + margin - y0) / cell).ceil() as usize;
-    let off_lines = |p: [f64; 2], reach: f64| lines.distance_within(p, reach).is_none();
-    let mut free = Vec::new();
-    for j in 0..=rows {
-        for i in 0..=columns {
-            let p = [x0 + cell * i as f64, y0 + cell * j as f64];
-            if ring_contains(&rim_ring, p)
-                || heap_rings.iter().any(|ring| ring_contains(ring, p))
-                || near_road(p, cell * 0.5)
-                || !off_lines(p, cell * 0.45)
-            {
-                continue;
-            }
-            free.push(Point3::new(p[0], p[1], ground(p[0], p[1])));
-        }
-    }
-    let inner = (cell / 2.0).max(spacing);
-    let floor_ring = plan_of(&layout.pit_ring(0.0, layout.bottom, spacing));
-    for (ring, z, step) in
-        std::iter::once((floor_ring, layout.bottom, inner)).chain(layout.heaps.iter().map(|heap| {
-            (
-                plan_of(&heap_ring(heap, heap.top, 0.0, spacing)),
-                layout.rim + heap.height,
-                inner,
-            )
-        }))
-    {
-        let (lo, hi) = ring.iter().fold(
-            ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
-            |(lo, hi), p| {
-                (
-                    [lo[0].min(p[0]), lo[1].min(p[1])],
-                    [hi[0].max(p[0]), hi[1].max(p[1])],
-                )
-            },
-        );
-        let mut y = lo[1] + step / 2.0;
-        while y < hi[1] {
-            let mut x = lo[0] + step / 2.0;
-            while x < hi[0] {
-                let p = [x, y];
-                if ring_contains(&ring, p)
-                    && polyline_distance(p, &ring) > step * 0.45
-                    && !near_road(p, step * 0.5)
-                    && off_lines(p, step * 0.45)
-                {
-                    free.push(Point3::new(x, y, z));
-                }
-                x += step;
-            }
-            y += step;
-        }
-    }
-
-    let (tin, breaklines) = tin::build(free, constraints)?;
-    let mut report = Report {
-        nodes: tin.nodes().len(),
-        triangles: tin.triangles().len(),
-        breaklines: breaklines.len(),
-        ..Report::default()
-    };
-
-    let target = map.as_map_mut();
-    let mut breakline_ids = Vec::with_capacity(breaklines.len());
-    for breakline in breaklines {
-        let id = TinBreaklineId::new(format!("{name}/{}", breakline.key));
-        target
-            .tin_breaklines
-            .insert(
-                id.clone(),
-                TinBreakline {
-                    id: id.clone(),
-                    surface: surface_id.clone(),
-                    kind: breakline.kind,
-                    line: breakline.line,
-                },
-            )
-            .map_err(|duplicate| Error::Duplicate(duplicate.0.to_string()))?;
-        breakline_ids.push(id);
-    }
-    target
-        .tin_surfaces
-        .insert(
-            surface_id.clone(),
-            TinSurface {
-                id: surface_id.clone(),
-                site: Some(plan.site.clone()),
-                breaklines: breakline_ids,
-                tin,
-            },
-        )
-        .map_err(|duplicate| Error::Duplicate(duplicate.0.to_string()))?;
+    let (surface_id, built) = land::generate(map, &land, forms)?;
+    report.nodes = built.nodes;
+    report.triangles = built.triangles;
+    report.breaklines = built.breaklines;
 
     // What the land is, each over the outline the land was shaped to.
-    let mut covers = Vec::new();
-    let mut add_cover =
-        |target: &mut Map, key: &str, kind: &str, ring: Vec<Point3>| -> Result<(), Error> {
-            let id = LandCoverId::new(format!("{name}/{key}"));
-            target
-                .land_covers
-                .insert(
-                    id.clone(),
-                    LandCover {
-                        id: id.clone(),
-                        site: Some(plan.site.clone()),
-                        kind: kind.into(),
-                        area: Footprint::new(ring)?,
-                        draped_on: Some(surface_id.clone()),
-                    },
-                )
-                .map_err(|duplicate| Error::Duplicate(duplicate.0.to_string()))?;
-            covers.push(id);
-            Ok(())
-        };
-    add_cover(
-        target,
-        "pit",
-        "pit",
-        layout.pit_ring(layout.top, layout.rim, spacing),
-    )?;
+    let target = map.as_map_mut();
+    let site = Some(&plan.site);
+    let surface = Some(&surface_id);
+    let mut covers = vec![land::cover(
+        target, &name, "pit", "pit", rim, site, surface,
+    )?];
     for heap in &layout.heaps {
-        add_cover(
-            target,
-            heap.key,
-            heap.key,
-            heap_ring(heap, heap.radius, layout.rim, spacing),
-        )?;
+        let toe = heap_ring(heap, heap.radius, layout.rim, spacing);
+        covers.push(land::cover(
+            target, &name, heap.key, heap.key, toe, site, surface,
+        )?);
     }
-    add_cover(target, "pad", "pad", layout.pad.clone())?;
+    covers.push(land::cover(
+        target,
+        &name,
+        "pad",
+        "pad",
+        layout.pad.clone(),
+        site,
+        surface,
+    )?);
     report.land_covers = covers.len();
 
     // The berm along the ramp's pit side: on the shoulder on the side the pit's

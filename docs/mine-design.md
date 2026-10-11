@@ -14,7 +14,11 @@
 | 検証（TIN の折り返し、折れ線が TIN の辺に乗っているか、参照の双方向性） | `crates/roadgen-core/src/validation.rs` |
 | IR ダンプ（新しい地物は空なら出力しない＝既存の地図の fingerprint は不変） | `crates/roadgen-trace/src/ir.rs` |
 | 環境の切り替え: `Environment::{Urban, Mine}` / `lay_out` / `generate` | `crates/roadgen-carla/src/environment/mod.rs` |
-| 鉱山の生成 | `crates/roadgen-carla/src/environment/mine/` |
+| 共通: 地形（TIN の組み立て、全道路の縁を折れ線に、起伏、基準高さ）、土地被覆の登録 | `crates/roadgen-carla/src/environment/{land,tin,noise}.rs` |
+| 共通: 建物（CGA 文法、道路沿いの区画、`Placement` で道路・範囲を絞る） | `crates/roadgen-buildings`（`generate_with`） |
+| 共通: 平面幾何（内外判定・距離・線分インデックス） | `crates/roadgen-core/src/geometry/plan.rs` |
+| 鉱山固有: ピット・ランプ・盛土・ヤードの形、土手、Site | `crates/roadgen-carla/src/environment/mine/` |
+| Python: `Map.generate_land()`（街の地形）、`generate_mine(yard_buildings=...)` | `crates/roadgen-python` |
 | CARLA: 地形を TIN から構築、砂利・岩の材質、土手のメッシュ | `crates/roadgen-carla/src/{ground,terrain,barriers}.rs` |
 | OpenDRIVE: `<lane><material>`（書き出しと読み戻し）、`<object type="barrier">` + `<repeat>` | `crates/roadgen-opendrive` |
 | OpenStreetMap: `surface=*`、`landuse=quarry` / `man_made=spoil_heap` の面、`barrier` の way | `crates/roadgen-osm` |
@@ -93,6 +97,26 @@ validate()
 7. **Site** で全体を束ねる。
 
 同じ `MineSpec`（seed を含む）からは常に同じ鉱山ができる。ID は名前と地物の種類から決まる。
+
+## 3.5 市街地と鉱山で共有しているもの
+
+環境ごとに違うのは「形」だけで、組み立て方は共有する。
+
+```
+                    共通の段                          市街地                     鉱山
+道路の配置          MapBuilder                         利用者が描く               ランプ・運搬路・交差点
+建物                roadgen_buildings::generate_with   Site に属さない全道路沿い  運搬路沿い・ヤード内のみ
+                    （区画割り＋CGA 文法）             （town などのプリセット）  （industrial プリセット）
+地形                environment::land::generate        Base::Roads、形なし        Base::Level(リム)、
+                    （全道路の縁＝折れ線、格子、起伏、                            ベンチ・盛土の線、床・天端
+                     TIN、IR へ登録）
+土地被覆            land::cover                        —                          pit / waste_dump / stockpile / pad
+CARLA 出力          surfaces / terrain / barriers      IR から（環境によらず同じ）
+```
+
+- 地形は「基準高さ（一定 or 道路から決まる高さ）」と「形（折れ線・平坦面・穴・平地）」を渡すだけで、市街地も鉱山も同じ関数で作る。道路から決まる高さには、CARLA 出力が地面を作るときと同じ `ground::Field` を使う。
+- 建物は、鉱山のヤードにも市街地と同じ区画割り・同じ文法で建てる。区画は道路沿いなので、ヤードの建物も運搬路に面する。
+- 市街地は、鉱山など他の Site に属する道路には建物を並べない。
 
 ## 4. 各出力処理
 

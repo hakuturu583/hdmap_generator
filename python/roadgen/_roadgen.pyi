@@ -262,6 +262,7 @@ class Map:
         ground_margin: float = 150.0,
         ground_cell: float = 10.0,
         relief: float = 6.0,
+        yard_buildings: bool = True,
         seed: int = 0,
     ) -> dict[str, Any]:
         """Lays out an open-pit mine: benches, a ramp down the wall, haul roads to
@@ -270,6 +271,17 @@ class Map:
         A heap is `(bearing_degrees, distance, radius, height)` from the junction at
         the top of the ramp. Returns `{"site", "ramp", "haul_roads", "junction"}`.
         """
+    def generate_land(
+        self,
+        enabled: bool = True,
+        relief: float = 6.0,
+        cell: float = 10.0,
+        margin: float = 150.0,
+        wavelength: float = 180.0,
+        seed: int = 0,
+    ) -> None:
+        """States the land round the map's roads as a TIN — the same land a mine's
+        is built as, shaped by nothing but the roads."""
     def site_ids(self) -> list[str]: ...
     def site(self, site: str) -> dict[str, Any]: ...
     def tin_surface_ids(self) -> list[str]: ...

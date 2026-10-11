@@ -795,6 +795,13 @@ Cover themes:
 | `Road.pavement` | paved or unpaved, then what with — so an unpaved asphalt road is a value the type cannot hold |
 | `MapObjectKind::Barrier` | the safety berm along the ramp's pit side |
 
+A mine and a town are two branches of one generator, and they share everything but
+their shapes. The land is one TIN builder for both — every road's edges as
+breaklines, the country rolling away from them — given a pit and its heaps for a
+mine and nothing for a town (`m.generate_land()` states a town's land the same way).
+The buildings are one shape grammar on lots along roads for both: a town's streets,
+or the yard beside a mine's haul road (`industrial`, unless `yard_buildings=False`).
+
 The roads go into the TIN as breaklines, so the land under a road is the road's own
 plane, vertex for vertex. CARLA builds its ground from the TIN rather than from the
 roads — rock in the pit and on the heaps, gravel on the haul roads and the yard;

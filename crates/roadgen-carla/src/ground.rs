@@ -25,6 +25,35 @@ pub const DROP: f64 = 0.05;
 /// How far apart the reference line is sampled for the ground, metres.
 const SAMPLE_SPACING: f64 = 2.0;
 
+/// `samples` with every road's reference line added, densely: a straight road's
+/// surface has vertices at its two ends and nowhere between, and a ground that read
+/// only those would take the road's far end's height all the way along it. A
+/// polyline is already as dense as it is going to get, and its own samples are
+/// cheaper than resampling it.
+pub fn with_reference_lines(map: &Map, mut samples: Vec<Point3>) -> Vec<Point3> {
+    let sampling = map.metadata.sampling;
+    for road in map.roads.iter() {
+        let line = &road.reference_line;
+        if matches!(line, Curve3::Polyline(_) | Curve3::Bezier(_)) {
+            if let Ok(points) = line.samples(sampling) {
+                samples.extend(points.into_iter().map(|sample| sample.point));
+            }
+            continue;
+        }
+        let Ok(length) = line.horizontal_length() else {
+            continue;
+        };
+        let steps = (length / SAMPLE_SPACING).ceil().max(1.0) as usize;
+        for step in 0..=steps {
+            let station = length * step as f64 / steps as f64;
+            if let Ok(sample) = line.sample_at(station, sampling) {
+                samples.push(sample.point);
+            }
+        }
+    }
+    samples
+}
+
 /// The ground as a height field: a grid of heights, read between its vertices.
 pub struct Field {
     x0: f64,
@@ -47,7 +76,7 @@ impl Field {
         // Every vertex a vehicle drives on: the roads and the gutters. Pavements
         // stand above the road beside them and are left out, or the ground under
         // a pavement would come up through the road.
-        let mut samples: Vec<Point3> = surface
+        let samples: Vec<Point3> = surface
             .iter()
             .filter(|mesh| matches!(mesh.role, Role::Road | Role::Gutter))
             .flat_map(|mesh| mesh.positions.iter().copied())
@@ -55,32 +84,33 @@ impl Field {
         if samples.is_empty() {
             return None;
         }
-        // And the reference lines, densely: a straight road's surface has vertices
-        // at its two ends and nowhere between, and a ground that read only those
-        // would take the road's far end's height all the way along it. A polyline
-        // is already as dense as it is going to get, and its own samples are cheaper
-        // than resampling it.
-        let sampling = map.metadata.sampling;
-        for road in map.roads.iter() {
-            let line = &road.reference_line;
-            if matches!(line, Curve3::Polyline(_) | Curve3::Bezier(_)) {
-                if let Ok(points) = line.samples(sampling) {
-                    samples.extend(points.into_iter().map(|sample| sample.point));
-                }
-                continue;
-            }
-            let Ok(length) = line.horizontal_length() else {
-                continue;
-            };
-            let steps = (length / SAMPLE_SPACING).ceil().max(1.0) as usize;
-            for step in 0..=steps {
-                let station = length * step as f64 / steps as f64;
-                if let Ok(sample) = line.sample_at(station, sampling) {
-                    samples.push(sample.point);
-                }
-            }
-        }
+        let buildings: Vec<Point3> = map
+            .building_parts
+            .iter()
+            .flat_map(|part| part.solid.footprint.points().iter().copied())
+            .collect();
+        // The verge is what the ground is drawn up to, and it reaches past the road.
+        Field::from_samples(
+            with_reference_lines(map, samples),
+            &buildings,
+            config.ground_extent + config.verge_width,
+            config.ground_cell,
+        )
+    }
 
+    /// The field under `samples` — points of the roads a vehicle drives on — over
+    /// their extent and `extent`'s, plus `margin` all round, in `cell`-metre cells.
+    /// Shared by the export, which samples the surface it built, and by an
+    /// environment's land, which samples the lanes.
+    pub fn from_samples(
+        samples: Vec<Point3>,
+        extent: &[Point3],
+        margin: f64,
+        cell: f64,
+    ) -> Option<Field> {
+        if samples.is_empty() || cell <= 0.0 {
+            return None;
+        }
         let mut min = [f64::INFINITY; 2];
         let mut max = [f64::NEG_INFINITY; 2];
         let mut widen = |point: &Point3| {
@@ -90,12 +120,7 @@ impl Field {
             max[1] = max[1].max(point.y);
         };
         samples.iter().for_each(&mut widen);
-        for part in map.building_parts.iter() {
-            part.solid.footprint.points().iter().for_each(&mut widen);
-        }
-        // The verge is what the ground is drawn up to, and it reaches past the road.
-        let margin = config.ground_extent + config.verge_width;
-        let cell = config.ground_cell;
+        extent.iter().for_each(&mut widen);
         let x0 = min[0] - margin;
         let y0 = min[1] - margin;
         let columns = ((max[0] + margin - x0) / cell).ceil().max(1.0) as usize;
@@ -302,20 +327,9 @@ impl<'a> Stated<'a> {
         self.covers
             .iter()
             .rev()
-            .find(|(ring, _)| contains(ring, x, y))
+            .find(|(ring, _)| roadgen_core::geometry::plan::ring_contains(ring, [x, y]))
             .map_or(crate::materials::GRASS, |&(_, material)| material)
     }
-}
-
-fn contains(ring: &[[f64; 2]], x: f64, y: f64) -> bool {
-    let mut inside = false;
-    for i in 0..ring.len() {
-        let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
-        if (a[1] > y) != (b[1] > y) && x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0] {
-            inside = !inside;
-        }
-    }
-    inside
 }
 
 /// Where the land's heights come from: the map's own terrain, or the flattest
