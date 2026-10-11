@@ -1,6 +1,7 @@
 //! A river: a channel with a flat bed and sloping banks, for a bridge to cross.
 //!
-//! Its banks' tops and feet are breaklines, its bed a level, and what lies between
+//! Its banks' tops and feet are breaklines, its bed a level falling with the
+//! centre line from its first point to its last, and what lies between
 //! its banks' tops is a land cover of kind `water` — which is what makes a road over
 //! it a bridge over water, to every format that reads one.
 
@@ -53,19 +54,32 @@ impl RiverSpec {
         self.width / 2.0 - self.depth * self.bank_slope
     }
 
-    /// The centre line moved `offset` metres to its left, `drop` metres down,
-    /// with a vertex every `spacing` metres.
-    fn line(&self, offset: f64, drop: f64, spacing: f64) -> Vec<Point3> {
+    /// The bed's height under each point of the centre line: `depth` under
+    /// the banks' tops, but never higher than anywhere upstream of it, so that
+    /// the river runs downhill all the way to its last point.
+    fn bed(&self) -> Vec<f64> {
+        let mut lowest = f64::INFINITY;
+        self.centre
+            .iter()
+            .map(|p| {
+                lowest = lowest.min(p.z - self.depth);
+                lowest
+            })
+            .collect()
+    }
+
+    /// The centre line moved `offset` metres to its left, at the heights `z` —
+    /// one for each of its points — with a vertex every `spacing` metres.
+    fn line(&self, offset: f64, z: &[f64], spacing: f64) -> Vec<Point3> {
         let mut out = Vec::new();
         let n = self.centre.len();
-        for index in 0..n {
+        for (index, (p, &height)) in self.centre.iter().zip(z).enumerate() {
             let a = self.centre[index.saturating_sub(1)];
             let b = self.centre[(index + 1).min(n - 1)];
             let (dx, dy) = (b.x - a.x, b.y - a.y);
             let len = dx.hypot(dy).max(1e-9);
             let (nx, ny) = (-dy / len, dx / len);
-            let p = self.centre[index];
-            let here = Point3::new(p.x + nx * offset, p.y + ny * offset, p.z - drop);
+            let here = Point3::new(p.x + nx * offset, p.y + ny * offset, height);
             if let (Some(&last), true) = (out.last(), index > 0) {
                 let last: Point3 = last;
                 let steps = (last.horizontal_distance_to(here) / spacing)
@@ -80,11 +94,16 @@ impl RiverSpec {
         out
     }
 
+    fn tops(&self) -> Vec<f64> {
+        self.centre.iter().map(|p| p.z).collect()
+    }
+
     /// Its outline: the tops of both banks, round.
     pub fn outline(&self, spacing: f64) -> Vec<Point3> {
         let half = self.width / 2.0;
-        let mut ring = self.line(half, 0.0, spacing);
-        ring.extend(self.line(-half, 0.0, spacing).into_iter().rev());
+        let tops = self.tops();
+        let mut ring = self.line(half, &tops, spacing);
+        ring.extend(self.line(-half, &tops, spacing).into_iter().rev());
         ring
     }
 
@@ -96,15 +115,11 @@ impl RiverSpec {
             points,
             closed: false,
         };
-        let top_left = self.line(half, 0.0, spacing);
-        let top_right = self.line(-half, 0.0, spacing);
-        let bed_left = self.line(bed, self.depth, spacing);
-        let bed_right = self.line(-bed, self.depth, spacing);
-        let bed_z = self
-            .centre
-            .iter()
-            .map(|p| p.z - self.depth)
-            .fold(f64::INFINITY, f64::min);
+        let (tops, beds) = (self.tops(), self.bed());
+        let top_left = self.line(half, &tops, spacing);
+        let top_right = self.line(-half, &tops, spacing);
+        let bed_left = self.line(bed, &beds, spacing);
+        let bed_right = self.line(-bed, &beds, spacing);
         let bed_ring: Vec<Point3> = bed_left
             .iter()
             .copied()
@@ -114,7 +129,8 @@ impl RiverSpec {
         Landforms {
             levels: vec![Level {
                 ring: plan_of(&bed_ring),
-                z: bed_z,
+                z: beds[beds.len() - 1],
+                along: self.line(0.0, &beds, spacing),
             }],
             holes: vec![plan_of(&outline)],
             anchors: top_left.iter().chain(&top_right).copied().collect(),

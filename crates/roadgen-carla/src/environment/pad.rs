@@ -55,10 +55,7 @@ impl PadSpec {
         }
         let ring = plan_of(&edge);
         Landforms {
-            levels: vec![Level {
-                ring: ring.clone(),
-                z,
-            }],
+            levels: vec![Level::flat(ring.clone(), z)],
             holes: vec![ring.clone()],
             flats: vec![ring],
             anchors: edge.clone(),

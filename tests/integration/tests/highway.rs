@@ -366,3 +366,62 @@ fn a_post_on_a_bridge_stands_on_its_parapet_not_in_the_air() {
     assert!(out > 3.5 && out < 3.5 + curb, "{:?}", sign.position);
     assert!((sign.position.z - (9.0 + roadgen_carla::structures::PARAPET)).abs() < 1e-6);
 }
+
+#[test]
+fn a_river_falls_along_its_length_and_its_water_with_it() {
+    use roadgen_carla::environment::{self, Places, RiverSpec};
+    let mut builder = MapBuilder::default();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-200.0, -300.0, 6.0),
+                Point3::new(-200.0, 300.0, 6.0),
+                roadgen_integration_tests::highway::street_lanes(),
+            )
+            .unwrap()
+            .with_name("bank"),
+        )
+        .unwrap();
+    // Down from 12 m at its source to 0 at its mouth, with a rise on the way
+    // that the bed does not follow.
+    let places = Places {
+        rivers: vec![RiverSpec {
+            name: "Tama".into(),
+            centre: vec![
+                Point3::new(200.0, -400.0, 12.0),
+                Point3::new(200.0, -100.0, 6.0),
+                Point3::new(200.0, 100.0, 8.0),
+                Point3::new(200.0, 400.0, 0.0),
+            ],
+            width: 40.0,
+            depth: 4.0,
+            bank_slope: 2.0,
+            site: None,
+        }],
+        ..Places::default()
+    };
+    let mut map = builder.finish().unwrap();
+    environment::generate(&mut map, &places).expect("generates");
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
+    let tin = map.tin_surfaces.iter().next().unwrap().tin.locator();
+    let beds: Vec<f64> = [-350.0, -200.0, 0.0, 150.0, 350.0]
+        .iter()
+        .map(|&y| tin.height_at(200.0, y).unwrap())
+        .collect();
+    assert!(beds.windows(2).all(|w| w[1] <= w[0] + 1e-6), "{beds:?}");
+    assert!(beds[0] - beds[4] > 8.0, "{beds:?}");
+    let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("tama"));
+    let water = meshes
+        .iter()
+        .find(|mesh| mesh.materials == [materials::WATER])
+        .expect("water");
+    // Level across the river, down along it, and over the bed everywhere.
+    let mut along: Vec<&Point3> = water.positions.iter().collect();
+    along.sort_by(|a, b| a.y.total_cmp(&b.y));
+    // Short of its two ends, where the channel stops and the land does not.
+    for p in along.iter().filter(|p| p.y.abs() < 380.0) {
+        let bed = tin.height_at(200.0, p.y).unwrap();
+        assert!(p.z > bed && p.z < bed + 4.0, "{p:?} over a bed at {bed:.2}");
+    }
+    assert!(along.first().unwrap().z - along.last().unwrap().z > 8.0);
+}
