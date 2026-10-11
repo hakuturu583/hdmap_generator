@@ -98,6 +98,16 @@ pub struct IrCatalog {
     pub objects: Vec<ObjectEntry>,
     pub rules: Vec<RuleEntry>,
     pub buildings: Vec<BuildingEntry>,
+    /// Left out of a dump that has none, so a map with no terrain, land cover or
+    /// site dumps — and fingerprints — exactly as it did before those existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<SiteEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tin_surfaces: Vec<TinSurfaceEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tin_breaklines: Vec<TinBreaklineEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub land_covers: Vec<LandCoverEntry>,
     /// `sha256:<hex>` of the whole IR — geometry, sampling, footprints and every
     /// other field the entries above leave out — so the fingerprint covers what the
     /// exports are written from, and not only what a lookup reads.
@@ -136,6 +146,50 @@ pub struct RoadEntry {
     pub predecessor: Option<LinkEntry>,
     pub successor: Option<LinkEntry>,
     pub speed_limit_mps: Option<f64>,
+    /// `(station, surface)` for each stretch whose pavement was stated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pavement: Vec<PavementEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PavementEntry {
+    pub station: f64,
+    pub paved: bool,
+    pub surface: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SiteEntry {
+    pub id: String,
+    pub name: Option<String>,
+    pub kind: String,
+    pub land_covers: Vec<String>,
+    pub surfaces: Vec<String>,
+    pub roads: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TinSurfaceEntry {
+    pub id: String,
+    pub site: Option<String>,
+    pub breaklines: Vec<String>,
+    pub nodes: usize,
+    pub triangles: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TinBreaklineEntry {
+    pub id: String,
+    pub surface: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LandCoverEntry {
+    pub id: String,
+    pub site: Option<String>,
+    pub kind: String,
+    pub draped_on: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -251,6 +305,16 @@ impl IrCatalog {
                     predecessor: road.link.predecessor.as_ref().map(link_entry),
                     successor: road.link.successor.as_ref().map(link_entry),
                     speed_limit_mps: road.speed_limit.map(|limit| limit.mps()),
+                    pavement: road
+                        .pavement
+                        .spans()
+                        .iter()
+                        .map(|&(station, pavement)| PavementEntry {
+                            station,
+                            paved: pavement.is_paved(),
+                            surface: pavement.surface_str().into(),
+                        })
+                        .collect(),
                 })
                 .collect(),
             lanes: map
@@ -334,6 +398,48 @@ impl IrCatalog {
                         .map(|frontage| frontage.road.to_string()),
                 })
                 .collect(),
+            sites: map
+                .sites
+                .iter()
+                .map(|site| SiteEntry {
+                    id: site.id.to_string(),
+                    name: site.name.clone(),
+                    kind: site.kind.clone(),
+                    land_covers: site.land_covers.iter().map(ToString::to_string).collect(),
+                    surfaces: site.surfaces.iter().map(ToString::to_string).collect(),
+                    roads: site.roads.iter().map(ToString::to_string).collect(),
+                })
+                .collect(),
+            tin_surfaces: map
+                .tin_surfaces
+                .iter()
+                .map(|surface| TinSurfaceEntry {
+                    id: surface.id.to_string(),
+                    site: surface.site.as_ref().map(ToString::to_string),
+                    breaklines: surface.breaklines.iter().map(ToString::to_string).collect(),
+                    nodes: surface.tin.nodes().len(),
+                    triangles: surface.tin.triangles().len(),
+                })
+                .collect(),
+            tin_breaklines: map
+                .tin_breaklines
+                .iter()
+                .map(|breakline| TinBreaklineEntry {
+                    id: breakline.id.to_string(),
+                    surface: breakline.surface.to_string(),
+                    kind: breakline.kind.clone(),
+                })
+                .collect(),
+            land_covers: map
+                .land_covers
+                .iter()
+                .map(|cover| LandCoverEntry {
+                    id: cover.id.to_string(),
+                    site: cover.site.as_ref().map(ToString::to_string),
+                    kind: cover.kind.clone(),
+                    draped_on: cover.draped_on.as_ref().map(ToString::to_string),
+                })
+                .collect(),
             geometry: geometry_digest(map),
         }
     }
@@ -375,6 +481,10 @@ fn geometry_digest(map: &Map) -> String {
     map.rules.iter().for_each(|x| feed(x));
     map.buildings.iter().for_each(|x| feed(x));
     map.building_parts.iter().for_each(|x| feed(x));
+    map.sites.iter().for_each(|x| feed(x));
+    map.tin_surfaces.iter().for_each(|x| feed(x));
+    map.tin_breaklines.iter().for_each(|x| feed(x));
+    map.land_covers.iter().for_each(|x| feed(x));
     sha256_tag(&digest.0.finalize())
 }
 

@@ -17,8 +17,8 @@ use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::layout::{self, RoadGeometry, SectionLayout};
 use crate::map::{CrossSection, Lane, Map, MapMetadata, Road};
 use crate::semantics::{
-    BoundaryMarking, LaneType, LightHead, MapObject, MapObjectKind, ObjectGeometry, RoadMarking,
-    RoadType, TrafficRule,
+    BoundaryMarking, LaneType, LightHead, MapObject, MapObjectKind, ObjectGeometry,
+    PavementProfile, RoadMarking, RoadType, TrafficRule,
 };
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
@@ -123,6 +123,8 @@ pub struct RoadSpec {
     /// Roll of the road surface about its reference line, radians, as a function of
     /// horizontal station. Zero everywhere is a road that is flat across.
     pub superelevation: Poly3Profile,
+    /// What the road is surfaced with along its length; unknown unless said.
+    pub pavement: PavementProfile,
 }
 
 impl RoadSpec {
@@ -137,6 +139,7 @@ impl RoadSpec {
             road_type: RoadType::Town,
             speed_limit: None,
             superelevation: Poly3Profile::default(),
+            pavement: PavementProfile::unknown(),
         }
     }
 
@@ -164,6 +167,13 @@ impl RoadSpec {
     /// horizontal station, positive raising the left-hand side.
     pub fn with_superelevation(mut self, superelevation: Poly3Profile) -> Self {
         self.superelevation = superelevation;
+        self
+    }
+
+    /// Surfaces the road: what it is paved with, or that it is not, along its
+    /// length.
+    pub fn with_pavement(mut self, pavement: PavementProfile) -> Self {
+        self.pavement = pavement;
         self
     }
 
@@ -1589,6 +1599,7 @@ impl Generator {
                 road_type: spec.road_type,
                 speed_limit: spec.speed_limit,
                 superelevation: spec.superelevation.clone(),
+                pavement: spec.pavement.clone(),
             },
             lanes,
         ))
@@ -2002,6 +2013,19 @@ impl Generator {
                 .unwrap_or(RoadType::Town),
             speed_limit: from_lane.speed_limit,
             superelevation: Poly3Profile::default(),
+            // A movement through a junction is surfaced like the road it leaves.
+            pavement: self
+                .map
+                .road(&from_lane.road)
+                .and_then(|road| {
+                    let station = match from_end {
+                        RoadEnd::Start => 0.0,
+                        RoadEnd::End => road.horizontal_length().ok()?,
+                    };
+                    road.pavement.at(station)
+                })
+                .map(PavementProfile::constant)
+                .unwrap_or_default(),
         };
         let (road, lanes) = self.build_road(
             &road_id,

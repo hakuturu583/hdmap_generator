@@ -48,7 +48,7 @@ use std::collections::HashMap;
 
 use roadgen_core::geometry::{Frame3, Point3, Vector3};
 use roadgen_core::map::{Map, Road};
-use roadgen_core::semantics::{LaneType, MarkingColor, RoadMarking};
+use roadgen_core::semantics::{LaneType, MarkingColor, Pavement, RoadMarking};
 use roadgen_core::topology::LateralSide;
 
 use crate::facades;
@@ -154,10 +154,22 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
         }
     }
     crate::crosswalks::paint(map, map_name, config, &mut ordinal, &mut meshes);
-    let field = crate::ground::Field::under(map, &meshes, config);
-    if let Some(terrain) = land.mesh(field.as_ref(), config.verge_width, map_name, &mut ordinal) {
+    // The land the map states, where it states one; otherwise the flattest land
+    // under the roads, which is all a road network says about it.
+    let (ground, verge) = match crate::ground::Stated::of(map) {
+        Some(stated) => (
+            Some(crate::ground::Ground::Stated(stated)),
+            config.verge_width.min(crate::ground::STATED_VERGE),
+        ),
+        None => (
+            crate::ground::Field::under(map, &meshes, config).map(crate::ground::Ground::Field),
+            config.verge_width,
+        ),
+    };
+    if let Some(terrain) = land.mesh(ground.as_ref(), verge, map_name, &mut ordinal) {
         meshes.push(terrain);
     }
+    meshes.extend(crate::barriers::berms(map, map_name, &mut ordinal));
     meshes.retain(|mesh| !mesh.is_empty());
     meshes
 }
@@ -261,6 +273,9 @@ pub(crate) struct Layout<'a> {
     /// The lanes, from the leftmost to the rightmost.
     lanes: Vec<&'a roadgen_core::map::Lane>,
     config: SurfaceConfig,
+    /// Whether the road is unpaved here, which surfaces it in gravel rather than
+    /// asphalt.
+    unpaved: bool,
 }
 
 impl<'a> Layout<'a> {
@@ -296,6 +311,7 @@ impl<'a> Layout<'a> {
             lane_offset: &road.lane_offset,
             lanes: left,
             config: *config,
+            unpaved: matches!(road.pavement.at(range.0), Some(Pavement::Unpaved(_))),
         })
     }
 
@@ -432,6 +448,11 @@ impl<'a> Layout<'a> {
         for (index, lane) in self.lanes.iter().enumerate() {
             let Some((role, material)) = Self::role_of(lane) else {
                 continue;
+            };
+            let material = if self.unpaved && material == materials::ASPHALT {
+                materials::GRAVEL
+            } else {
+                material
             };
             let rise = self.rise_of(lane);
 

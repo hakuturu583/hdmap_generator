@@ -319,6 +319,7 @@ impl<'a> Reader<'a> {
             }
         };
         let link = links::road_link(road, &self.names, &mut self.approximations)?;
+        let pavement = lanes::pavement(road, &mut self.approximations);
 
         // The sections, each as the lane specs the layout takes.
         let sections = lanes::sections(
@@ -395,6 +396,7 @@ impl<'a> Reader<'a> {
             road_type,
             speed_limit,
             superelevation,
+            pavement,
         };
         self.map
             .roads

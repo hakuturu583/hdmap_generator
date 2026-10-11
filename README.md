@@ -1,6 +1,7 @@
 # roadgen
 
-Generate 3D road networks — with a town beside them, if you want one — and write the
+Generate 3D road networks — with a town beside them, or an open-pit mine round them,
+if you want one — and write the
 same network out as **OpenDRIVE**, as an **Autoware-ready Lanelet2** map, as plain
 **OpenStreetMap**, as a **SUMO** network, as a **CARLA UE5 asset package**, as a
 **ClipGT** clip for NVIDIA Cosmos, and as a **GPUDrive** scene.
@@ -63,7 +64,9 @@ m.export_gpudrive("scene.json")
        └─────────────┼─────────────┘
                      ▼
               Canonical Road IR ◀──── roadgen-buildings ◀── CGA shape grammar
-                     │                                        `symbios-shape`
+                     │      ▲                                 `symbios-shape`
+                     │      └──────── roadgen-mine ◀── MineSpec: benches, ramp,
+                     │                                 heaps, a TIN (`spade`)
                  validate()
                      ▼
                 ValidatedMap
@@ -90,6 +93,10 @@ rather than an exporter — it reads roads and writes [buildings](#buildings), t
 same way the builder reads a `RoadSpec` and writes lanes. It runs after generation
 and before validation, because a lot is measured against geometry that does not exist
 until the first and buildings are part of what the second checks.
+
+`roadgen-mine` is the other generator. It fills the part of the IR a road network
+leaves empty — the shape of the land, what the land is, and the place they add up
+to — and lays out the roads that place needs: see [Mines](#mines).
 
 The two arrows at the bottom go the other way. `roadgen-viewer` reads the **written
 files** — never the IR — so a picture it draws is a picture of what a consumer would
@@ -753,6 +760,45 @@ consumer evaluating the file back gets a banana. `cornerLocal` measures every co
 one frame — the road's, at the building's own station — so the shape that comes back is
 the shape that went in. The [viewer](#which-viewer-draws-what) draws every part from
 those outlines, which is why a town shows up in the OpenDRIVE picture and in no other.
+
+## Mines
+
+Not every map is a town. `generate_mine()` lays out an open-pit mine: a pit stepped
+down in benches, a ramp spiralling down its wall at a haul road's grade, haul roads
+from the top of the ramp to a waste dump and a stockpile, and — once the roads are
+built — the land round all of it as one triangulated surface.
+
+```python
+m = roadgen.Map(name="quarry")
+mine = m.generate_mine(name="North Pit", benches=6, bench_height=12.0, seed=1)
+m.export_carla("Import/", name="Quarry", use_carla_materials=False)
+
+site = m.site(mine["site"])             # {"kind": "open_pit_mine", "land_covers": [...], ...}
+nodes, triangles = m.tin_mesh(site["surfaces"][0])
+m.terrain_height(0.0, 0.0)               # the pit's floor: -72.0
+m.road_pavement(mine["ramp"])            # [(0.0, "gravel")]
+```
+
+What it adds to the IR is the land, said once and in the IR's own terms — the
+GDF ideas the rest of it is built on, applied to the Terrain Elevation and Land
+Cover themes:
+
+| IR | What it is |
+| --- | --- |
+| `TinSurface` | the land as a feature: a TIN whose nodes and triangles are its geometry, not features of their own |
+| `TinBreakline` | a line the land breaks along — a bench's crest or toe, a heap's, a road's edge — and **an edge of its surface**, which `validate()` checks |
+| `LandCover` | what an area of land is (`pit`, `waste_dump`, `stockpile`, `pad`), `draped_on` the surface it lies on |
+| `Site` | the complex feature that gathers them, and the roads, into one mine |
+| `Road.pavement` | paved or unpaved, then what with — so an unpaved asphalt road is a value the type cannot hold |
+| `MapObjectKind::Barrier` | the safety berm along the ramp's pit side |
+
+The roads go into the TIN as breaklines, so the land under a road is the road's own
+plane, vertex for vertex. CARLA builds its ground from the TIN rather than from the
+roads — rock in the pit and on the heaps, gravel on the haul roads and the yard;
+OpenDRIVE writes the gravel as `<lane><material>` and the berm as a `barrier`
+object; OpenStreetMap writes `landuse=quarry`, `man_made=spoil_heap` and `surface=`.
+The rest write the roads and say what they dropped. The design, and what is not
+done yet, is in [`docs/mine-design.md`](docs/mine-design.md).
 
 ## Coordinates
 

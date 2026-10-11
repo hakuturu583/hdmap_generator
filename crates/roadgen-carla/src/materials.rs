@@ -327,6 +327,32 @@ pub const MATERIALS: &[Material] = &[
         roughness: 0.4,
         texture: None,
     },
+    // The surfaces of a road that is not paved and of land that has been dug: a
+    // graded haul road, a pit's walls, a heap of broken rock.
+    Material {
+        name: "M_Road_Gravel",
+        color: [0.46, 0.41, 0.35],
+        roughness: 0.95,
+        texture: Some(Texture {
+            slug: "rocky_trail",
+            resolution: "2k",
+            format: "jpg",
+            maps: FULL,
+            scale: 4.0,
+        }),
+    },
+    Material {
+        name: "M_Terrain_Rock",
+        color: [0.43, 0.39, 0.34],
+        roughness: 0.9,
+        texture: Some(Texture {
+            slug: "aerial_rocks_02",
+            resolution: "2k",
+            format: "jpg",
+            maps: FULL,
+            scale: 12.0,
+        }),
+    },
 ];
 
 pub const ASPHALT: usize = 0;
@@ -349,6 +375,8 @@ pub const LAMP_GREEN: usize = 16;
 pub const PLATE_RED: usize = 17;
 pub const PLATE_WHITE: usize = 18;
 pub const PLATE_BLUE: usize = 19;
+pub const GRAVEL: usize = 20;
+pub const ROCK: usize = 21;
 
 /// One texture file the package expects, and where it comes from.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

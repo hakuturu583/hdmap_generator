@@ -271,4 +271,40 @@ for warning in m.carla_warnings(name="Town01"):
         print("carla:", warning)
 `,
   },
+  {
+    name: 'An open-pit mine, generated',
+    description: 'Benches, a ramp down the wall, haul roads, heaps — and the land as a TIN.',
+    code: `# Not a town: a quarry. generate_mine() lays out the roads a pit needs —
+# a ramp spiralling down its wall, haul roads to a waste dump and a
+# stockpile — and, once the roads are built, the land round all of it as
+# one TIN whose breaklines are every bench's crest and toe and every
+# road's edge.
+import roadgen
+
+m = roadgen.Map(name="quarry", origin=(-23.36, 119.73, 0.0))
+mine = m.generate_mine(name="North Pit", benches=5, ground_cell=15.0, seed=2)
+print(mine)
+
+m.validate()
+
+m.export_opendrive("map.xodr")
+m.export_lanelet2("lanelet2.osm")
+m.export_osm("openstreetmap.osm")
+m.export_sumo("sumo/")
+m.export_clipgt("clip/")
+m.export_gpudrive("scene.json")
+# Off, or CARLA repaints the gravel haul roads as its own asphalt.
+m.export_carla("Import/", name="Quarry", use_carla_materials=False)
+
+site = m.site(mine["site"])
+print("land covers:", [m.land_cover(c)["kind"] for c in site["land_covers"]])
+nodes, triangles = m.tin_mesh(site["surfaces"][0])
+print(len(nodes), "nodes,", len(triangles), "triangles,",
+      "floor at", min(z for _, _, z in nodes), "m")
+print("the ramp is", m.road_pavement(mine["ramp"]))
+
+for warning in m.carla_warnings(name="Quarry", use_carla_materials=False):
+    print("carla:", warning)
+`,
+  },
 ]

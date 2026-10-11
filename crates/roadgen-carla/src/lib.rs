@@ -64,6 +64,7 @@
 //! # }
 //! ```
 
+pub mod barriers;
 pub mod crosswalks;
 pub mod error;
 pub mod facades;
@@ -786,7 +787,18 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
         }
     }
 
-    if config.surfaces.ground_extent > 0.0 {
+    if !map.tin_surfaces.is_empty() {
+        let nodes: usize = map.tin_surfaces.iter().map(|s| s.tin.nodes().len()).sum();
+        warnings.push(format!(
+            "the land is the map's own terrain — {} TIN surfaces, {nodes} nodes, \
+             their breaklines kept as edges — re-triangulated round the roads as this \
+             exporter samples them, with at most a {:.0} m seam; it stops where the \
+             terrain does, and it is tagged `Terrain` ({}) throughout",
+            map.tin_surfaces.len(),
+            config.surfaces.verge_width.min(ground::STATED_VERGE),
+            Label::Terrain.stencil()
+        ));
+    } else if config.surfaces.ground_extent > 0.0 {
         warnings.push(format!(
             "the land past the {:.0} m verge is at the roads' own heights, out to \
              {:.0} m beyond the network: flat where the roads are flat and sloping \
@@ -809,6 +821,36 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
              and a vehicle that leaves a road there drives off the map"
                 .into(),
         );
+    }
+
+    let unpaved = map
+        .roads
+        .iter()
+        .filter(|road| {
+            road.pavement
+                .spans()
+                .iter()
+                .any(|(_, pavement)| !pavement.is_paved())
+        })
+        .count();
+    if unpaved > 0 && config.use_carla_materials {
+        warnings.push(format!(
+            "{unpaved} roads are unpaved and surfaced in gravel here, but CARLA's own \
+             materials are on and will repaint every road surface as its asphalt; \
+             turn them off to keep the gravel"
+        ));
+    }
+    let berms = map
+        .objects
+        .iter()
+        .filter(|object| matches!(object.kind, MapObjectKind::Barrier { .. }))
+        .count();
+    if berms > 0 {
+        warnings.push(format!(
+            "{berms} barriers are ridges in the map's FBX, tagged `Terrain` ({}): CARLA \
+             has no class for a berm",
+            Label::Terrain.stencil()
+        ));
     }
 
     let connectors = map.roads.iter().filter(|road| road.is_connector()).count();

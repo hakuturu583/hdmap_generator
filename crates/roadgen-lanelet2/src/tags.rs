@@ -60,5 +60,8 @@ pub fn object_type(kind: &MapObjectKind) -> &'static str {
         MapObjectKind::TrafficSign { .. } => "traffic_sign",
         MapObjectKind::StopLine => "stop_line",
         MapObjectKind::Crosswalk => "pedestrian_marking",
+        // Lanelet2 has no berm; what one is to a vehicle is the edge of the road it
+        // may not cross.
+        MapObjectKind::Barrier { .. } => "road_border",
     }
 }

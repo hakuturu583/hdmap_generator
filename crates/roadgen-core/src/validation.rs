@@ -15,7 +15,7 @@ use std::ops::Deref;
 
 use crate::error::{ValidationError, ValidationIssue};
 use crate::map::{Lane, Map, Projection};
-use crate::semantics::LaneType;
+use crate::semantics::{LaneType, MapObjectKind};
 use crate::topology::{LaneEnd, RoadEnd, RoadLinkTarget};
 
 /// How far apart two things may be before they count as disconnected.
@@ -73,6 +73,10 @@ impl UnvalidatedMap {
         check_junctions(&self.0, &mut issues);
         check_buildings(&self.0, &mut issues);
         check_traffic_lights(&self.0, &mut issues);
+        check_barriers(&self.0, &mut issues);
+        check_terrain(&self.0, config, &mut issues);
+        check_land_covers(&self.0, &mut issues);
+        check_sites(&self.0, &mut issues);
         issues
     }
 
@@ -228,6 +232,240 @@ fn check_buildings(map: &Map, issues: &mut Vec<ValidationIssue>) {
                 part: part.id.clone(),
                 detail: "no storeys; a part of a building has at least one".to_owned(),
             });
+        }
+    }
+}
+
+/// A barrier's height is what a consumer builds it to, so it has to be one.
+fn check_barriers(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for object in map.objects.iter() {
+        if let MapObjectKind::Barrier { height, .. } = &object.kind {
+            if !height.is_finite() || *height <= 0.0 {
+                issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: object.id.to_string(),
+                    detail: format!("a barrier {height} m high stands no height at all"),
+                });
+            }
+        }
+    }
+}
+
+/// The terrain is checked for its composition and for the one invariant that ties
+/// a breakline to its surface: it is an edge of the triangulation, vertex for vertex
+/// and segment for segment.
+///
+/// What [`Tin::new`](crate::terrain::Tin::new) already rules out — an index past
+/// the nodes, a triangle with no area, a clockwise triangle — is not rechecked.
+/// Folds are: two triangles that share an edge and lie on the same side of it are
+/// a surface folded over itself, which is two heights over one point of the plan.
+fn check_terrain(map: &Map, config: ValidationConfig, issues: &mut Vec<ValidationIssue>) {
+    for surface in map.tin_surfaces.iter() {
+        let feature = surface.id.to_string();
+        if surface.tin.is_empty() {
+            issues.push(ValidationIssue::ImplausibleFeature {
+                feature: feature.clone(),
+                detail: "no triangles; a surface is what its triangles cover".into(),
+            });
+        }
+        // Anticlockwise triangles that do not overlap use each directed edge once.
+        let mut directed: HashSet<(u32, u32)> = HashSet::new();
+        let mut folds = 0usize;
+        for &[a, b, c] in surface.tin.triangles() {
+            for edge in [(a, b), (b, c), (c, a)] {
+                if !directed.insert(edge) {
+                    folds += 1;
+                }
+            }
+        }
+        if folds > 0 {
+            issues.push(ValidationIssue::ImplausibleFeature {
+                feature: feature.clone(),
+                detail: format!(
+                    "{folds} edges are shared by two triangles on the same side of them: \
+                     the surface folds over itself"
+                ),
+            });
+        }
+        if let Some(site) = &surface.site {
+            check_site_membership(
+                map,
+                site,
+                &feature,
+                |entry| entry.surfaces.contains(&surface.id),
+                issues,
+            );
+        }
+
+        let nodes: std::collections::HashMap<(u64, u64), u32> = surface
+            .tin
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(index, node)| ((node.x.to_bits(), node.y.to_bits()), index as u32))
+            .collect();
+        let edges = surface.tin.edges();
+        for id in &surface.breaklines {
+            let Some(breakline) = map.tin_breaklines.get(id) else {
+                issues.push(ValidationIssue::DanglingFeatureReference {
+                    referrer: feature.clone(),
+                    feature: id.to_string(),
+                });
+                continue;
+            };
+            if breakline.surface != surface.id {
+                issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: id.to_string(),
+                    detail: format!(
+                        "listed by {feature} but names surface {}",
+                        breakline.surface
+                    ),
+                });
+                continue;
+            }
+            let mut indices = Vec::with_capacity(breakline.line.len());
+            for point in breakline.line.points() {
+                match nodes.get(&(point.x.to_bits(), point.y.to_bits())) {
+                    Some(&index)
+                        if (surface.tin.nodes()[index as usize].z - point.z).abs()
+                            <= config.position_tolerance =>
+                    {
+                        indices.push(index)
+                    }
+                    _ => {
+                        issues.push(ValidationIssue::ImplausibleFeature {
+                            feature: id.to_string(),
+                            detail: format!(
+                                "vertex ({:.3}, {:.3}, {:.3}) is not a node of {feature}",
+                                point.x, point.y, point.z
+                            ),
+                        });
+                        indices.clear();
+                        break;
+                    }
+                }
+            }
+            let crossings = indices
+                .windows(2)
+                .filter(|pair| !edges.contains(&(pair[0].min(pair[1]), pair[0].max(pair[1]))))
+                .count();
+            if crossings > 0 {
+                issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: id.to_string(),
+                    detail: format!(
+                        "{crossings} segments are not edges of {feature}: the triangles \
+                         cross the line rather than break along it"
+                    ),
+                });
+            }
+        }
+    }
+    for breakline in map.tin_breaklines.iter() {
+        match map.tin_surfaces.get(&breakline.surface) {
+            None => issues.push(ValidationIssue::DanglingFeatureReference {
+                referrer: breakline.id.to_string(),
+                feature: breakline.surface.to_string(),
+            }),
+            Some(surface) if !surface.breaklines.contains(&breakline.id) => {
+                issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: breakline.id.to_string(),
+                    detail: format!(
+                        "names surface {}, which does not list it",
+                        breakline.surface
+                    ),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+fn check_land_covers(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for cover in map.land_covers.iter() {
+        let feature = cover.id.to_string();
+        if cover.kind.trim().is_empty() {
+            issues.push(ValidationIssue::ImplausibleFeature {
+                feature: feature.clone(),
+                detail: "no kind; a land cover is the land being something".into(),
+            });
+        }
+        if let Some(surface) = &cover.draped_on {
+            if !map.tin_surfaces.contains(surface) {
+                issues.push(ValidationIssue::DanglingFeatureReference {
+                    referrer: feature.clone(),
+                    feature: surface.to_string(),
+                });
+            }
+        }
+        if let Some(site) = &cover.site {
+            check_site_membership(
+                map,
+                site,
+                &feature,
+                |entry| entry.land_covers.contains(&cover.id),
+                issues,
+            );
+        }
+    }
+}
+
+/// A feature that names a site has to be one the site lists: the composition is
+/// recorded from both ends, as a building and its parts record it.
+fn check_site_membership(
+    map: &Map,
+    site: &crate::id::SiteId,
+    feature: &str,
+    listed: impl Fn(&crate::site::Site) -> bool,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    match map.sites.get(site) {
+        None => issues.push(ValidationIssue::DanglingFeatureReference {
+            referrer: feature.to_owned(),
+            feature: site.to_string(),
+        }),
+        Some(entry) if !listed(entry) => issues.push(ValidationIssue::ImplausibleFeature {
+            feature: feature.to_owned(),
+            detail: format!("names site {site}, which does not list it"),
+        }),
+        Some(_) => {}
+    }
+}
+
+fn check_sites(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for site in map.sites.iter() {
+        let referrer = site.id.to_string();
+        for cover in &site.land_covers {
+            match map.land_covers.get(cover) {
+                Some(entry) if entry.site.as_ref() == Some(&site.id) => {}
+                Some(_) => issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: cover.to_string(),
+                    detail: format!("listed by {} but does not name it", site.id),
+                }),
+                None => issues.push(ValidationIssue::DanglingFeatureReference {
+                    referrer: referrer.clone(),
+                    feature: cover.to_string(),
+                }),
+            }
+        }
+        for surface in &site.surfaces {
+            match map.tin_surfaces.get(surface) {
+                Some(entry) if entry.site.as_ref() == Some(&site.id) => {}
+                Some(_) => issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: surface.to_string(),
+                    detail: format!("listed by {} but does not name it", site.id),
+                }),
+                None => issues.push(ValidationIssue::DanglingFeatureReference {
+                    referrer: referrer.clone(),
+                    feature: surface.to_string(),
+                }),
+            }
+        }
+        for road in &site.roads {
+            if !map.roads.contains(road) {
+                issues.push(ValidationIssue::DanglingRoadReference {
+                    referrer: referrer.clone(),
+                    road: road.clone(),
+                });
+            }
         }
     }
 }

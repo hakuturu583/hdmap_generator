@@ -30,7 +30,9 @@ use roadgen_core::geometry::{
 };
 use roadgen_core::id::RoadId;
 use roadgen_core::map::TrafficHandedness;
-use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking};
+use roadgen_core::semantics::{
+    BoundaryMarking, LaneType, MarkingColor, Pavement, PavementProfile, RoadMarking,
+};
 use roadgen_core::topology::{Direction, LateralSide};
 use roadgen_core::units::{PositiveWidth, SpeedLimit};
 
@@ -512,4 +514,43 @@ pub fn to_mps(value: f64, unit: Option<&SpeedUnit>) -> f64 {
         Some(SpeedUnit::MilesPerHour) => value * 0.44704,
         Some(SpeedUnit::MetersPerSecond) | None => value,
     }
+}
+
+/// The road's pavement, from its lanes' `<material>`: the IR keeps one pavement per
+/// road, so each section's is read off its first driving lane that states one, or
+/// failing that its first lane that does. A surface code the IR has no word for is
+/// noted and left out.
+pub fn pavement(road: &OdRoad, approximations: &mut Approximations) -> PavementProfile {
+    let mut spans: Vec<(f64, Pavement)> = Vec::new();
+    for section in &road.lanes.lane_section {
+        let lanes: Vec<&OdLane> = super::numbered_lanes(section)
+            .map(|(_, lane)| lane)
+            .filter(|lane| !lane.material.is_empty())
+            .collect();
+        let Some(lane) = lanes
+            .iter()
+            .find(|lane| lane.r#type == OdLaneType::Driving)
+            .or_else(|| lanes.first())
+        else {
+            continue;
+        };
+        for material in &lane.material {
+            let Some(code) = material.surface.as_deref() else {
+                continue;
+            };
+            let Some(pavement) = Pavement::parse(code) else {
+                approximations.note(format!(
+                    "road {}: lane material surface {code:?} is not a surface the IR \
+                     knows, and was left out",
+                    road.id
+                ));
+                continue;
+            };
+            let station = section.s + material.s_offset.value;
+            if spans.last().is_none_or(|&(last, _)| station > last) {
+                spans.push((station, pavement));
+            }
+        }
+    }
+    PavementProfile::new(spans).unwrap_or_default()
 }

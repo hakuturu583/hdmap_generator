@@ -98,6 +98,134 @@ impl RoadType {
     }
 }
 
+/// What a road is surfaced with: whether it is paved, and with what.
+///
+/// Two levels, the way GDF puts it — a pavement status, then a surface type that
+/// only means anything under it — so that a road that is unpaved and asphalt is a
+/// value this type cannot hold rather than one validation has to catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Pavement {
+    Paved(PavedSurface),
+    Unpaved(UnpavedSurface),
+}
+
+/// The surface of a paved road.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PavedSurface {
+    Asphalt,
+    Concrete,
+    Cobblestone,
+}
+
+/// The surface of an unpaved road.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnpavedSurface {
+    Gravel,
+    Dirt,
+    Sand,
+    Rock,
+}
+
+impl Pavement {
+    pub fn is_paved(self) -> bool {
+        matches!(self, Pavement::Paved(_))
+    }
+
+    /// The surface type on its own, which is the word every consumer that has one
+    /// field for it wants.
+    pub fn surface_str(self) -> &'static str {
+        match self {
+            Pavement::Paved(PavedSurface::Asphalt) => "asphalt",
+            Pavement::Paved(PavedSurface::Concrete) => "concrete",
+            Pavement::Paved(PavedSurface::Cobblestone) => "cobblestone",
+            Pavement::Unpaved(UnpavedSurface::Gravel) => "gravel",
+            Pavement::Unpaved(UnpavedSurface::Dirt) => "dirt",
+            Pavement::Unpaved(UnpavedSurface::Sand) => "sand",
+            Pavement::Unpaved(UnpavedSurface::Rock) => "rock",
+        }
+    }
+
+    /// Reads a surface type; its pavement status follows from it.
+    pub fn parse(value: &str) -> Option<Pavement> {
+        Some(match value.to_ascii_lowercase().as_str() {
+            "asphalt" => Pavement::Paved(PavedSurface::Asphalt),
+            "concrete" => Pavement::Paved(PavedSurface::Concrete),
+            "cobblestone" | "sett" => Pavement::Paved(PavedSurface::Cobblestone),
+            "gravel" => Pavement::Unpaved(UnpavedSurface::Gravel),
+            "dirt" | "earth" | "ground" => Pavement::Unpaved(UnpavedSurface::Dirt),
+            "sand" => Pavement::Unpaved(UnpavedSurface::Sand),
+            "rock" => Pavement::Unpaved(UnpavedSurface::Rock),
+            _ => return None,
+        })
+    }
+}
+
+/// A road's pavement along its length: each value holds from its station to the
+/// next one's. Empty when nobody said, which is every road the IR held before
+/// pavement existed, and which a consumer reads as "whatever it assumes".
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PavementProfile {
+    /// `(station, pavement)`, ascending by station.
+    spans: Vec<(f64, Pavement)>,
+}
+
+impl PavementProfile {
+    /// Unknown everywhere.
+    pub fn unknown() -> Self {
+        PavementProfile::default()
+    }
+
+    /// The same pavement along the whole road.
+    pub fn constant(pavement: Pavement) -> Self {
+        PavementProfile {
+            spans: vec![(0.0, pavement)],
+        }
+    }
+
+    /// Pavements taking over at each station in turn. Fails unless the stations are
+    /// finite and strictly ascending; a span that repeats the one before it is
+    /// merged into it.
+    pub fn new(spans: impl IntoIterator<Item = (f64, Pavement)>) -> Result<Self, String> {
+        let mut kept: Vec<(f64, Pavement)> = Vec::new();
+        for (station, pavement) in spans {
+            if !station.is_finite() {
+                return Err(format!("a pavement starts at station {station}"));
+            }
+            if let Some(&(previous, last)) = kept.last() {
+                if station <= previous {
+                    return Err(format!(
+                        "pavement stations must ascend, and {station} follows {previous}"
+                    ));
+                }
+                if last == pavement {
+                    continue;
+                }
+            }
+            kept.push((station, pavement));
+        }
+        Ok(PavementProfile { spans: kept })
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn spans(&self) -> &[(f64, Pavement)] {
+        &self.spans
+    }
+
+    /// The pavement at `station`: the last span that starts at or before it, or the
+    /// first before the first span begins.
+    pub fn at(&self, station: f64) -> Option<Pavement> {
+        self.spans
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= station + 1e-9)
+            .or_else(|| self.spans.first())
+            .map(|&(_, pavement)| pavement)
+    }
+}
+
 /// The paint on a lane boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RoadMarking {
@@ -329,6 +457,14 @@ pub enum MapObjectKind {
     },
     StopLine,
     Crosswalk,
+    /// Something that stands along the road to keep traffic on it: a safety berm
+    /// beside a haul road, a guard rail, a wall. `kind` says which, in the
+    /// caller's words; `height` is how far its top stands above its base, metres.
+    /// The geometry is a band along the ground it occupies.
+    Barrier {
+        kind: String,
+        height: f64,
+    },
 }
 
 impl MapObjectKind {
@@ -357,6 +493,7 @@ impl MapObjectKind {
             MapObjectKind::TrafficSign { .. } => "traffic_sign",
             MapObjectKind::StopLine => "stop_line",
             MapObjectKind::Crosswalk => "crosswalk",
+            MapObjectKind::Barrier { .. } => "barrier",
         }
     }
 }

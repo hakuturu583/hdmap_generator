@@ -17,9 +17,14 @@ use roadgen_core::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
 use roadgen_core::geometry::{
     Alignment, Curve3, LaneHeight, Point3, Poly3Profile, SamplingConfig, Taper, WidthProfile,
 };
-use roadgen_core::id::{BuildingId, BuildingPartId, JunctionId, LaneId, ObjectId, RoadId};
+use roadgen_core::id::{
+    BuildingId, BuildingPartId, JunctionId, LandCoverId, LaneId, ObjectId, RoadId, SiteId,
+    TinSurfaceId,
+};
 use roadgen_core::map::{MapMetadata, Projection, TrafficHandedness};
-use roadgen_core::semantics::{BoundaryMarking, LaneType, MarkingColor, RoadMarking, RoadType};
+use roadgen_core::semantics::{
+    BoundaryMarking, LaneType, MarkingColor, Pavement, PavementProfile, RoadMarking, RoadType,
+};
 use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd};
 use roadgen_core::units::{GeoOrigin, PositiveWidth, SpeedLimit};
 use roadgen_core::validation::{UnvalidatedMap, ValidatedMap};
@@ -459,6 +464,9 @@ pub struct PyMap {
     /// Held rather than applied, because a lot is cut out of generated geometry and
     /// there is none until the map is built.
     buildings: Option<BuildingRules>,
+    /// The mines laid out on the builder, whose land is generated once the roads
+    /// are: the land is built round the roads' generated edges.
+    mines: Vec<roadgen_mine::Plan>,
 }
 
 /// Where a map comes from: the builder its roads are added to, or a file it was
@@ -524,6 +532,7 @@ impl PyMap {
             built: None,
             fingerprint: None,
             buildings: None,
+            mines: Vec::new(),
         })
     }
 
@@ -540,6 +549,7 @@ impl PyMap {
         speed_limit_kph = None,
         superelevation = None,
         cross_sections = None,
+        pavement = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_road(
@@ -554,6 +564,7 @@ impl PyMap {
         speed_limit_kph: Option<f64>,
         superelevation: Option<Vec<(f64, f64)>>,
         cross_sections: Option<Vec<(f64, Vec<PyLane>)>>,
+        pavement: Option<Vec<(f64, String)>>,
     ) -> PyResult<PyRoad> {
         let reference_line = match (start, end, points, alignment) {
             (Some(start), Some(end), None, None) => {
@@ -602,6 +613,20 @@ impl PyMap {
             // the shape a caller describes a bank in.
             spec = spec
                 .with_superelevation(Poly3Profile::piecewise_linear(points).map_err(value_error)?);
+        }
+        if let Some(spans) = pavement {
+            // `(station, surface)` pairs, each surface holding to the next station.
+            let spans = spans
+                .into_iter()
+                .map(|(station, surface)| {
+                    Pavement::parse(&surface)
+                        .map(|pavement| (station, pavement))
+                        .ok_or_else(|| {
+                            PyValueError::new_err(format!("unknown surface {surface:?}"))
+                        })
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            spec = spec.with_pavement(PavementProfile::new(spans).map_err(PyValueError::new_err)?);
         }
         let lane_count = spec.all_lanes().count();
         let id = self.builder_mut()?.add_road(spec).map_err(value_error)?;
@@ -1639,6 +1664,279 @@ impl PyMap {
             .map_err(runtime_error)
     }
 
+    /// Lays out an open-pit mine: a pit stepped down in benches, a ramp spiralling
+    /// down its wall, haul roads from the top of the ramp to a waste dump and a
+    /// stockpile, and the land round all of it as one TIN.
+    ///
+    /// The roads are added now; the land is generated with the map, round the
+    /// roads' generated edges. A heap is `(bearing_degrees, distance, radius,
+    /// height)`, measured from the junction at the top of the ramp.
+    ///
+    /// Returns `{"site", "ramp", "haul_roads", "junction"}`.
+    #[pyo3(signature = (
+        name = "mine",
+        centre = (0.0, 0.0, 0.0),
+        heading = 0.0,
+        floor = (220.0, 140.0),
+        benches = 6,
+        bench_height = 12.0,
+        bench_width = 10.0,
+        face_angle = 70.0,
+        ramp_grade = 0.1,
+        ramp_start = -90.0,
+        clockwise = true,
+        lane_width = 7.5,
+        shoulder_width = 3.0,
+        berm_height = 1.5,
+        speed_limit_kph = 40.0,
+        surface = "gravel",
+        waste_dump = None,
+        stockpile = None,
+        ground_margin = 150.0,
+        ground_cell = 10.0,
+        relief = 6.0,
+        seed = 0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn generate_mine<'py>(
+        &mut self,
+        py: Python<'py>,
+        name: &str,
+        centre: (f64, f64, f64),
+        heading: f64,
+        floor: (f64, f64),
+        benches: usize,
+        bench_height: f64,
+        bench_width: f64,
+        face_angle: f64,
+        ramp_grade: f64,
+        ramp_start: f64,
+        clockwise: bool,
+        lane_width: f64,
+        shoulder_width: f64,
+        berm_height: f64,
+        speed_limit_kph: f64,
+        surface: &str,
+        waste_dump: Option<(f64, f64, f64, f64)>,
+        stockpile: Option<(f64, f64, f64, f64)>,
+        ground_margin: f64,
+        ground_cell: f64,
+        relief: f64,
+        seed: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let defaults = roadgen_mine::MineSpec::default();
+        let heap =
+            |given: Option<(f64, f64, f64, f64)>, default: roadgen_mine::HeapSpec| match given {
+                Some((bearing, distance, radius, height)) => roadgen_mine::HeapSpec {
+                    bearing,
+                    distance,
+                    radius,
+                    height,
+                    ..default
+                },
+                None => default,
+            };
+        let spec = roadgen_mine::MineSpec {
+            name: name.to_owned(),
+            centre: point(centre),
+            heading: heading.to_radians(),
+            pit: roadgen_mine::PitSpec {
+                floor_length: floor.0,
+                floor_width: floor.1,
+                benches,
+                bench_height,
+                bench_width,
+                face_angle,
+            },
+            ramp: roadgen_mine::RampSpec {
+                grade: ramp_grade,
+                start: ramp_start,
+                clockwise,
+            },
+            haul_road: roadgen_mine::HaulRoadSpec {
+                lane_width,
+                shoulder_width,
+                berm_height,
+                speed_limit_kph,
+                surface: Pavement::parse(surface)
+                    .ok_or_else(|| PyValueError::new_err(format!("unknown surface {surface:?}")))?,
+            },
+            waste_dump: heap(waste_dump, defaults.waste_dump.clone()),
+            stockpile: heap(stockpile, defaults.stockpile.clone()),
+            ground: roadgen_mine::GroundSpec {
+                margin: ground_margin,
+                cell: ground_cell,
+                relief,
+                ..defaults.ground.clone()
+            },
+            seed,
+        };
+        let plan = roadgen_mine::lay_out(self.builder_mut()?, &spec).map_err(value_error)?;
+        self.invalidate();
+        let result = PyDict::new(py);
+        result.set_item("site", plan.site.to_string())?;
+        result.set_item("ramp", plan.ramp.to_string())?;
+        result.set_item(
+            "haul_roads",
+            plan.haul_roads
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )?;
+        result.set_item("junction", plan.hub.to_string())?;
+        self.mines.push(plan);
+        Ok(result)
+    }
+
+    /// Identifiers of every site: the places made of several features.
+    fn site_ids(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(map.sites.iter().map(|site| site.id.to_string()).collect())
+    }
+
+    /// A site as `{"name", "kind", "land_covers", "surfaces", "roads"}`.
+    fn site<'py>(&mut self, py: Python<'py>, site: String) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let entry = map
+            .sites
+            .get(&SiteId::parse_printed(&site))
+            .ok_or_else(|| PyValueError::new_err(format!("no such site: {site}")))?;
+        let result = PyDict::new(py);
+        result.set_item("name", entry.name.clone())?;
+        result.set_item("kind", entry.kind.clone())?;
+        let names = |ids: &mut dyn Iterator<Item = String>| ids.collect::<Vec<_>>();
+        result.set_item(
+            "land_covers",
+            names(&mut entry.land_covers.iter().map(ToString::to_string)),
+        )?;
+        result.set_item(
+            "surfaces",
+            names(&mut entry.surfaces.iter().map(ToString::to_string)),
+        )?;
+        result.set_item(
+            "roads",
+            names(&mut entry.roads.iter().map(ToString::to_string)),
+        )?;
+        Ok(result)
+    }
+
+    /// Identifiers of every TIN surface of the terrain.
+    fn tin_surface_ids(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(map
+            .tin_surfaces
+            .iter()
+            .map(|surface| surface.id.to_string())
+            .collect())
+    }
+
+    /// A TIN surface's geometry: its nodes, and its triangles as three node indices
+    /// each, anticlockwise seen from above.
+    #[allow(clippy::type_complexity)]
+    fn tin_mesh(
+        &mut self,
+        surface: String,
+    ) -> PyResult<(Vec<(f64, f64, f64)>, Vec<(u32, u32, u32)>)> {
+        let entry = self.find_surface(&surface)?;
+        Ok((
+            entry.tin.nodes().iter().map(|p| (p.x, p.y, p.z)).collect(),
+            entry
+                .tin
+                .triangles()
+                .iter()
+                .map(|t| (t[0], t[1], t[2]))
+                .collect(),
+        ))
+    }
+
+    /// The breaklines of a TIN surface, as `(id, kind, points)`.
+    #[allow(clippy::type_complexity)]
+    fn tin_breaklines(
+        &mut self,
+        surface: String,
+    ) -> PyResult<Vec<(String, String, Vec<(f64, f64, f64)>)>> {
+        let ids = self.find_surface(&surface)?.breaklines.clone();
+        let map = self.built.as_ref().expect("just built");
+        Ok(ids
+            .iter()
+            .filter_map(|id| map.tin_breaklines.get(id))
+            .map(|line| {
+                (
+                    line.id.to_string(),
+                    line.kind.clone(),
+                    line.line.points().iter().map(|p| (p.x, p.y, p.z)).collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// The land's height at `(x, y)`, read off the first TIN surface over it.
+    fn terrain_height(&mut self, x: f64, y: f64) -> PyResult<Option<f64>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(map
+            .tin_surfaces
+            .iter()
+            .find_map(|surface| surface.tin.locator().height_at(x, y)))
+    }
+
+    /// Identifiers of every land cover.
+    fn land_cover_ids(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(map
+            .land_covers
+            .iter()
+            .map(|cover| cover.id.to_string())
+            .collect())
+    }
+
+    /// A land cover as `{"kind", "site", "draped_on", "outline"}`.
+    fn land_cover<'py>(&mut self, py: Python<'py>, cover: String) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let entry = map
+            .land_covers
+            .get(&LandCoverId::parse_printed(&cover))
+            .ok_or_else(|| PyValueError::new_err(format!("no such land cover: {cover}")))?;
+        let result = PyDict::new(py);
+        result.set_item("kind", entry.kind.clone())?;
+        result.set_item("site", entry.site.as_ref().map(ToString::to_string))?;
+        result.set_item(
+            "draped_on",
+            entry.draped_on.as_ref().map(ToString::to_string),
+        )?;
+        result.set_item(
+            "outline",
+            entry
+                .area
+                .points()
+                .iter()
+                .map(|p| (p.x, p.y, p.z))
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(result)
+    }
+
+    /// A road's pavement as `(station, surface)` pairs, each holding to the next;
+    /// empty when nobody said.
+    fn road_pavement(&mut self, road: String) -> PyResult<Vec<(f64, String)>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let entry = map
+            .road(&RoadId::parse_printed(&road))
+            .ok_or_else(|| PyValueError::new_err(format!("no such road: {road}")))?;
+        Ok(entry
+            .pavement
+            .spans()
+            .iter()
+            .map(|&(station, pavement)| (station, pavement.surface_str().to_owned()))
+            .collect())
+    }
+
     /// Identifiers of every road, including generated junction connectors.
     fn road_ids(&mut self) -> PyResult<Vec<String>> {
         self.ensure_built()?;
@@ -1764,6 +2062,16 @@ impl PyMap {
             .ok_or_else(|| PyValueError::new_err(format!("no such building part: {part}")))
     }
 
+    fn find_surface(&mut self, surface: &str) -> PyResult<&roadgen_core::TinSurface> {
+        self.ensure_built()?;
+        self.built
+            .as_ref()
+            .expect("just built")
+            .tin_surfaces
+            .get(&TinSurfaceId::parse_printed(surface))
+            .ok_or_else(|| PyValueError::new_err(format!("no such TIN surface: {surface}")))
+    }
+
     fn build(&self) -> PyResult<UnvalidatedMap> {
         let mut map = match &self.source {
             Source::Built(builder) => (**builder).clone().finish().map_err(value_error)?,
@@ -1772,6 +2080,9 @@ impl PyMap {
         // After the roads and before validation, which is the only moment buildings
         // can be generated: a lot is measured against generated geometry, and
         // validation has something to say about what comes out.
+        for plan in &self.mines {
+            roadgen_mine::generate(&mut map, plan).map_err(value_error)?;
+        }
         if let Some(rules) = &self.buildings {
             roadgen_buildings::generate(&mut map, rules).map_err(value_error)?;
         }
@@ -1986,6 +2297,7 @@ fn read_opendrive(
         built: None,
         fingerprint: None,
         buildings: None,
+        mines: Vec::new(),
     })
 }
 

@@ -34,7 +34,7 @@
 use roadgen_core::geometry::{Grid, Point3};
 use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation};
 
-use crate::ground::Field;
+use crate::ground::Ground;
 use crate::materials;
 use crate::mesh::Mesh;
 use crate::surfaces::Ordinals;
@@ -105,7 +105,7 @@ impl Land {
     /// metres out from every road. `None` when there is no road to build it round.
     pub fn mesh(
         &self,
-        field: Option<&Field>,
+        field: Option<&Ground>,
         verge: f64,
         map_name: &str,
         ordinals: &mut Ordinals,
@@ -135,7 +135,7 @@ impl Land {
                 if roads.contains(toe.x, toe.y) || edges.within(&toe, Some((index, vertex))) {
                     continue;
                 }
-                let z = field.map_or(toe.z, |field| field.height(toe.x, toe.y));
+                let z = field.map_or(toe.z, |field| field.height(toe.x, toe.y, toe.z));
                 points.push(Vertex::free(Point3::new(toe.x, toe.y, z)));
             }
         }
@@ -170,23 +170,64 @@ impl Land {
             }
         }
 
+        // The lines a stated terrain breaks along — the crest and toe of every
+        // bench and heap — kept as edges here too, or a triangle across a crest
+        // would round it off. Wherever one comes nearer a road than the verge it
+        // is left to the road's own edge.
+        if let Some(ground) = field {
+            for line in ground.breaklines() {
+                let mut previous: Option<(spade::handles::FixedVertexHandle, Point3)> = None;
+                for &point in line.iter() {
+                    let clear = !roads.contains(point.x, point.y) && !edges.within(&point, None);
+                    let handle = clear
+                        .then(|| cdt.insert(Vertex::free(point)).ok())
+                        .flatten();
+                    if let (Some((from, start)), Some(to)) = (previous, handle) {
+                        if from != to {
+                            cdt.add_constraint_and_split(from, to, |at| {
+                                let t = fraction_along(start, point, [at.x, at.y]);
+                                Vertex::free(Point3::new(at.x, at.y, start.lerp(point, t).z))
+                            });
+                        }
+                    }
+                    previous = handle.map(|handle| (handle, point));
+                }
+            }
+        }
+
         // Every triangle outside the roads, with the vertices it needs and no other.
         // A triangle with a free corner is outside every road already: a free
         // point is, and no triangle crosses an outline.
-        let mut positions = Vec::with_capacity(cdt.num_vertices());
-        let mut renumbered = vec![u32::MAX; cdt.num_vertices()];
-        let mut triangles = Vec::with_capacity(cdt.num_inner_faces());
+        // Grouped by what each triangle is surfaced with: grass, unless a stated
+        // terrain says the land there is a pit, a heap or a yard.
+        let mut groups: Vec<Group> = Vec::new();
         for face in cdt.inner_faces() {
             let corners = face.vertices();
-            if corners.iter().all(|corner| corner.data().on_road) {
-                let centre = corners.iter().fold([0.0, 0.0], |sum, corner| {
-                    let at = corner.position();
-                    [sum[0] + at.x / 3.0, sum[1] + at.y / 3.0]
-                });
-                if roads.contains(centre[0], centre[1]) {
-                    continue;
-                }
+            let centre = corners.iter().fold([0.0, 0.0], |sum, corner| {
+                let at = corner.position();
+                [sum[0] + at.x / 3.0, sum[1] + at.y / 3.0]
+            });
+            if corners.iter().all(|corner| corner.data().on_road)
+                && roads.contains(centre[0], centre[1])
+            {
+                continue;
             }
+            let material = field.map_or(materials::GRASS, |ground| {
+                ground.material_at(centre[0], centre[1])
+            });
+            let group = match groups.iter().position(|group| group.0 == material) {
+                Some(index) => index,
+                None => {
+                    groups.push((
+                        material,
+                        Vec::new(),
+                        vec![u32::MAX; cdt.num_vertices()],
+                        Vec::new(),
+                    ));
+                    groups.len() - 1
+                }
+            };
+            let (_, positions, renumbered, triangles) = &mut groups[group];
             // Spade winds an inner face anticlockwise in the plane, which is
             // anticlockwise seen from above: the face is up.
             let triangle = corners.map(|corner| {
@@ -199,18 +240,28 @@ impl Land {
             });
             triangles.push(triangle);
         }
-        if triangles.is_empty() {
+        if groups.is_empty() {
             return None;
         }
+        // Grass first, so a map with no stated terrain writes exactly what it did.
+        groups.sort_by_key(|group| group.0 != materials::GRASS);
         let mut mesh = Mesh::new(
             mesh_name(map_name, Role::Terrain, ordinals.take(Role::Terrain)),
             Role::Terrain,
-            materials::GRASS,
+            groups[0].0,
         );
-        mesh.sheet(&positions, &triangles, 0);
+        for (material, positions, _, triangles) in &groups {
+            let slot = mesh.slot_for(*material);
+            mesh.sheet(positions, triangles, slot);
+        }
         Some(mesh)
     }
 }
+
+/// The triangles of the land surfaced with one material: the material, the
+/// vertices they use, each land vertex's index among those (or `u32::MAX`), and the
+/// triangles.
+type Group = (usize, Vec<Point3>, Vec<u32>, Vec<[u32; 3]>);
 
 /// How far along the segment `a..b` the point `p` falls, in plan, clamped to the
 /// segment: `0` at `a`, `1` at `b`.

@@ -77,6 +77,7 @@ use opendrive::lane::lane_type::LaneType as OdLaneType;
 use opendrive::lane::lanes::Lanes;
 use opendrive::lane::left::Left;
 use opendrive::lane::left_lane::LeftLane;
+use opendrive::lane::material::Material as LaneMaterial;
 use opendrive::lane::offset::Offset as LaneOffset;
 use opendrive::lane::predecessor_successor::PredecessorSuccessor as LanePredecessorSuccessor;
 use opendrive::lane::right::Right;
@@ -94,6 +95,7 @@ use opendrive::object::objects::Objects;
 use opendrive::object::orientation::{ObjectType, Orientation};
 use opendrive::object::outline::Outline;
 use opendrive::object::outlines::Outlines;
+use opendrive::object::repeat::Repeat;
 use opendrive::object::Object;
 use opendrive::road::country_code::CountryCode;
 use opendrive::road::element_type::ElementType;
@@ -149,6 +151,7 @@ use roadgen_core::GeometryError;
 mod bulbs;
 pub mod controllers;
 mod error;
+mod materials;
 pub mod options;
 pub mod read;
 pub mod road_coordinates;
@@ -397,6 +400,14 @@ pub fn lane_id(map: &ValidatedMap, lane: &LaneId) -> Option<(String, i64)> {
 /// the boundary.
 pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = Vec::new();
+    if !map.tin_surfaces.is_empty() || !map.land_covers.is_empty() {
+        problems.push(format!(
+            "OpenDRIVE describes the road's own elevation and nothing of the ground beside it, so \
+             the map's {} TIN surfaces and {} land covers are not written",
+            map.tin_surfaces.len(),
+            map.land_covers.len()
+        ));
+    }
 
     // An `<outline>` is a ring of corners with a height each. There is no ridge in
     // it, so a roof that has one cannot be written and the volume it encloses is all
@@ -1054,6 +1065,34 @@ impl<'a> Exporter<'a> {
         })
     }
 
+    /// `<material>` for a lane: its road's pavement over the lane's stretch, each
+    /// change rebased onto the lane section the way `<width>` is. Empty for a road
+    /// whose pavement nobody stated, which is what this writer always wrote.
+    fn materials(&self, lane: &Lane) -> Vec<LaneMaterial> {
+        let Some(road) = self.map.road(&lane.road) else {
+            return Vec::new();
+        };
+        let spans = road.pavement.spans();
+        let (from, to) = lane.station_range;
+        spans
+            .iter()
+            .enumerate()
+            .filter(|&(index, &(start, _))| {
+                let end = spans.get(index + 1).map_or(f64::INFINITY, |next| next.0);
+                start < to && end > from
+            })
+            .map(|(_, &(start, pavement))| {
+                let (friction, roughness) = materials::nominal(pavement);
+                LaneMaterial {
+                    friction,
+                    roughness: Some(roughness),
+                    s_offset: Length::new::<meter>((start - from).max(0.0)),
+                    surface: Some(pavement.surface_str().to_owned()),
+                }
+            })
+            .collect()
+    }
+
     fn lane(&self, lane: &Lane) -> Result<OdLane, ExportError> {
         // The `<roadMark>` of a lane describes its outer border — the one away from
         // the reference line.
@@ -1082,7 +1121,7 @@ impl<'a> Exporter<'a> {
                 })
                 .collect(),
             road_mark: vec![road_mark(outer.marking, outer.color)],
-            material: Vec::new(),
+            material: self.materials(lane),
             speed: lane
                 .speed_limit
                 .map(|limit| LaneSpeed {
@@ -1585,6 +1624,92 @@ impl<'a> Exporter<'a> {
                             choice,
                             additional_data: AdditionalData::default(),
                         }),
+                        outlines: None,
+                        material: Vec::new(),
+                        validity: self.validity(object, road)?,
+                        parking_space: None,
+                        markings: None,
+                        borders: None,
+                        surface: None,
+                        additional_data: AdditionalData::default(),
+                    }
+                }
+                // A berm or a rail runs along the road, so it is a continuous
+                // `<repeat>` — distance zero — from one end of its band to the other,
+                // as wide as the band and as high as the barrier stands.
+                MapObjectKind::Barrier { kind, height } => {
+                    let ObjectGeometry::Band { left, right } = &object.geometry else {
+                        continue;
+                    };
+                    let at = |point: Point3| road_coordinates::locate(self.map, road, point);
+                    let (Some(start_left), Some(start_right), Some(end_left), Some(end_right)) = (
+                        at(left.start_point()),
+                        at(right.start_point()),
+                        at(left.end_point()),
+                        at(right.end_point()),
+                    ) else {
+                        continue;
+                    };
+                    let mut start = (start_left.s + start_right.s) / 2.0;
+                    let mut end = (end_left.s + end_right.s) / 2.0;
+                    let mut t = [
+                        (start_left.t + start_right.t) / 2.0,
+                        (end_left.t + end_right.t) / 2.0,
+                    ];
+                    let mut width = [
+                        (start_left.t - start_right.t).abs(),
+                        (end_left.t - end_right.t).abs(),
+                    ];
+                    let mut z = [
+                        (start_left.height + start_right.height) / 2.0,
+                        (end_left.height + end_right.height) / 2.0,
+                    ];
+                    // A band drawn against the road's direction still starts at the
+                    // lower `s`, which is where a repeat counts from.
+                    if end < start {
+                        std::mem::swap(&mut start, &mut end);
+                        t.swap(0, 1);
+                        width.swap(0, 1);
+                        z.swap(0, 1);
+                    }
+                    let metres = Length::new::<meter>;
+                    Object {
+                        dynamic: Some(false),
+                        hdg: None,
+                        height: Some(metres(*height)),
+                        id: self.object_id(&object.id)?.to_owned(),
+                        length: Some(metres(end - start)),
+                        name: Some(object.id.to_string()),
+                        orientation: Some(Orientation::None),
+                        perp_to_road: None,
+                        pitch: None,
+                        radius: None,
+                        roll: None,
+                        s: metres(start),
+                        subtype: Some(kind.clone()),
+                        t: metres(t[0]),
+                        r#type: Some(ObjectType::Barrier),
+                        valid_length: None,
+                        width: Some(metres(width[0])),
+                        z_offset: metres(z[0]),
+                        repeat: vec![Repeat {
+                            distance: metres(0.0),
+                            height_end: metres(*height),
+                            height_start: metres(*height),
+                            length: metres(end - start),
+                            length_end: None,
+                            length_start: None,
+                            radius_end: None,
+                            radius_start: None,
+                            s: metres(start),
+                            t_end: metres(t[1]),
+                            t_start: metres(t[0]),
+                            width_end: Some(metres(width[1])),
+                            width_start: Some(metres(width[0])),
+                            z_offset_end: Some(metres(z[1])),
+                            z_offset_start: Some(metres(z[0])),
+                        }],
+                        outline: None,
                         outlines: None,
                         material: Vec::new(),
                         validity: self.validity(object, road)?,

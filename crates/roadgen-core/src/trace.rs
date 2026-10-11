@@ -18,7 +18,10 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
+use crate::id::{
+    BuildingId, BuildingPartId, ConnectionId, JunctionId, LandCoverId, LaneId, ObjectId, RoadId,
+    SiteId, TinBreaklineId, TinSurfaceId,
+};
 
 /// Any element of the IR, by its identifier.
 ///
@@ -34,6 +37,10 @@ pub enum IrRef {
     Building(BuildingId),
     BuildingPart(BuildingPartId),
     Rule(usize),
+    Site(SiteId),
+    TinSurface(TinSurfaceId),
+    TinBreakline(TinBreaklineId),
+    LandCover(LandCoverId),
 }
 
 impl IrRef {
@@ -56,6 +63,10 @@ impl IrRef {
             BuildingId::PREFIX => IrRef::Building(BuildingId::from_raw(text)),
             BuildingPartId::PREFIX => IrRef::BuildingPart(BuildingPartId::from_raw(text)),
             IrRef::RULE_PREFIX => IrRef::Rule(rest.parse().ok()?),
+            SiteId::PREFIX => IrRef::Site(SiteId::from_raw(text)),
+            TinSurfaceId::PREFIX => IrRef::TinSurface(TinSurfaceId::from_raw(text)),
+            TinBreaklineId::PREFIX => IrRef::TinBreakline(TinBreaklineId::from_raw(text)),
+            LandCoverId::PREFIX => IrRef::LandCover(LandCoverId::from_raw(text)),
             _ => return None,
         })
     }
@@ -72,6 +83,10 @@ impl fmt::Display for IrRef {
             IrRef::Building(id) => f.write_str(id.as_str()),
             IrRef::BuildingPart(id) => f.write_str(id.as_str()),
             IrRef::Rule(index) => write!(f, "{}/{index}", IrRef::RULE_PREFIX),
+            IrRef::Site(id) => f.write_str(id.as_str()),
+            IrRef::TinSurface(id) => f.write_str(id.as_str()),
+            IrRef::TinBreakline(id) => f.write_str(id.as_str()),
+            IrRef::LandCover(id) => f.write_str(id.as_str()),
         }
     }
 }
@@ -109,6 +124,26 @@ impl From<BuildingId> for IrRef {
 impl From<BuildingPartId> for IrRef {
     fn from(id: BuildingPartId) -> Self {
         IrRef::BuildingPart(id)
+    }
+}
+impl From<SiteId> for IrRef {
+    fn from(id: SiteId) -> Self {
+        IrRef::Site(id)
+    }
+}
+impl From<TinSurfaceId> for IrRef {
+    fn from(id: TinSurfaceId) -> Self {
+        IrRef::TinSurface(id)
+    }
+}
+impl From<TinBreaklineId> for IrRef {
+    fn from(id: TinBreaklineId) -> Self {
+        IrRef::TinBreakline(id)
+    }
+}
+impl From<LandCoverId> for IrRef {
+    fn from(id: LandCoverId) -> Self {
+        IrRef::LandCover(id)
     }
 }
 

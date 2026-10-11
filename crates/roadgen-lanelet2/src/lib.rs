@@ -126,6 +126,14 @@ pub fn write_traced(map: &ValidatedMap, path: impl AsRef<Path>) -> Result<Trace,
 pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = Vec::new();
     let config = map.metadata.sampling;
+    if !map.tin_surfaces.is_empty() || !map.land_covers.is_empty() {
+        problems.push(format!(
+            "Lanelet2 has no terrain and no land cover, so \
+             the map's {} TIN surfaces and {} land covers are not written",
+            map.tin_surfaces.len(),
+            map.land_covers.len()
+        ));
+    }
 
     if !map.buildings.is_empty() {
         problems.push(format!(
@@ -751,6 +759,10 @@ impl<'a> Exporter<'a> {
                     if let Some(height) = head.height {
                         attributes.push(("height", format!("{height:.6}")));
                     }
+                }
+                MapObjectKind::Barrier { kind, height } => {
+                    attributes.push(("subtype", kind.clone()));
+                    attributes.push(("height", format!("{height:.6}")));
                 }
                 _ => {}
             }

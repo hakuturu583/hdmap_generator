@@ -2177,3 +2177,44 @@ def test_a_package_comes_with_the_script_that_imports_it(tmp_path):
         [sys.executable, str(script), "--carla", str(tmp_path / "nowhere")], capture_output=True, text=True
     )
     assert result.returncode != 0 and "CarlaUnreal.uproject" in result.stderr
+
+
+def test_a_mine_states_its_land_and_the_roads_lie_on_it(tmp_path):
+    m = roadgen.Map(name="quarry")
+    mine = m.generate_mine(name="North Pit", seed=1)
+    assert mine["site"] == "site/north_pit"
+    assert mine["ramp"] == "road/north_pit_ramp"
+    assert len(mine["haul_roads"]) == 2
+
+    site = m.site(mine["site"])
+    assert site["kind"] == "open_pit_mine"
+    kinds = [m.land_cover(cover)["kind"] for cover in site["land_covers"]]
+    assert kinds == ["pit", "waste_dump", "stockpile", "pad"]
+    assert m.road_pavement(mine["ramp"]) == [(0.0, "gravel")]
+
+    surface = site["surfaces"][0]
+    nodes, triangles = m.tin_mesh(surface)
+    assert len(triangles) > 1000
+    depth = min(z for _, _, z in nodes)
+    assert depth == -72.0  # six benches of twelve metres
+    kinds = {kind for _, kind, _ in m.tin_breaklines(surface)}
+    assert kinds == {"crest", "toe", "road_edge"}
+    # The floor of the pit is where the land is lowest.
+    assert m.terrain_height(0.0, 0.0) == -72.0
+
+    package = m.export_carla(str(tmp_path / "carla"), use_carla_materials=False)
+    assert package["meshes"] > 0
+
+
+def test_a_road_can_say_what_it_is_surfaced_with():
+    m = roadgen.Map()
+    lanes = [roadgen.Lane(width=3.5, direction="forward")]
+    road = m.add_road(
+        start=(0.0, 0.0, 0.0),
+        end=(100.0, 0.0, 0.0),
+        lanes=lanes,
+        pavement=[(0.0, "asphalt"), (60.0, "gravel")],
+    )
+    assert m.road_pavement(road.id) == [(0.0, "asphalt"), (60.0, "gravel")]
+    with pytest.raises(ValueError):
+        m.add_road(start=(0.0, 10.0, 0.0), end=(50.0, 10.0, 0.0), lanes=lanes, pavement=[(0.0, "lava")])

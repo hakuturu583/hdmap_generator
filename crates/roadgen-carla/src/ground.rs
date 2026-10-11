@@ -199,6 +199,166 @@ impl Field {
     }
 }
 
+/// How far out from a road the land is drawn down to the stated terrain, metres,
+/// at most. A stated terrain already meets its roads — their edges are breaklines
+/// of it — so there is no verge to slope down; only the seam between the road's
+/// surface as this exporter samples it and as the generator did.
+pub const STATED_VERGE: f64 = 1.0;
+
+/// The land as the map states it: its TIN surfaces, the breaklines across them, and
+/// what each stretch of land is.
+pub struct Stated<'a> {
+    locators: Vec<roadgen_core::terrain::TinLocator<'a>>,
+    nodes: Vec<Point3>,
+    /// Every breakline but the roads' edges, which the land takes from the roads
+    /// themselves, and the outline of every land cover.
+    breaklines: Vec<Vec<Point3>>,
+    /// Each land cover's outline in plan, with the material it is surfaced with.
+    covers: Vec<(Vec<[f64; 2]>, usize)>,
+}
+
+impl<'a> Stated<'a> {
+    /// `None` for a map that states no terrain.
+    pub fn of(map: &'a Map) -> Option<Stated<'a>> {
+        if map.tin_surfaces.is_empty() {
+            return None;
+        }
+        let covers = map
+            .land_covers
+            .iter()
+            .map(|cover| {
+                let material = match cover.kind.as_str() {
+                    "pit" | "quarry" | "waste_dump" | "spoil_heap" | "stockpile" => {
+                        crate::materials::ROCK
+                    }
+                    "pad" | "yard" => crate::materials::GRAVEL,
+                    _ => crate::materials::GRASS,
+                };
+                let ring = cover.area.points().iter().map(|p| [p.x, p.y]).collect();
+                (ring, material)
+            })
+            .collect();
+        Some(Stated {
+            locators: map
+                .tin_surfaces
+                .iter()
+                .map(|surface| surface.tin.locator())
+                .collect(),
+            nodes: map
+                .tin_surfaces
+                .iter()
+                .flat_map(|surface| surface.tin.nodes().iter().copied())
+                .collect(),
+            breaklines: map
+                .tin_breaklines
+                .iter()
+                .filter(|line| line.kind != "road_edge")
+                .map(|line| line.line.points().to_vec())
+                .collect(),
+            covers,
+        })
+        .map(|mut stated| {
+            // Each land cover's outline too, draped on the land, so that where the
+            // surface changes from grass to rock it changes along the outline
+            // rather than along whichever triangles straddle it.
+            let outlines: Vec<Vec<Point3>> = map
+                .land_covers
+                .iter()
+                .map(|cover| stated.drape(cover.area.points()))
+                .collect();
+            stated.breaklines.extend(outlines);
+            stated
+        })
+    }
+
+    pub fn height(&self, x: f64, y: f64) -> Option<f64> {
+        self.locators
+            .iter()
+            .find_map(|locator| locator.height_at(x, y))
+    }
+
+    /// A closed outline laid on the land: a vertex every few metres along it, each
+    /// at the land's height there.
+    fn drape(&self, ring: &[Point3]) -> Vec<Point3> {
+        const STEP: f64 = 5.0;
+        let mut out = Vec::new();
+        for (index, &from) in ring.iter().enumerate() {
+            let to = ring[(index + 1) % ring.len()];
+            let steps = (from.horizontal_distance_to(to) / STEP).ceil().max(1.0) as usize;
+            for step in 0..steps {
+                let p = from.lerp(to, step as f64 / steps as f64);
+                out.push(Point3::new(p.x, p.y, self.height(p.x, p.y).unwrap_or(p.z)));
+            }
+        }
+        if let Some(&first) = out.first() {
+            out.push(first);
+        }
+        out
+    }
+
+    /// What the land at `(x, y)` is surfaced with: the last land cover over it, or
+    /// grass.
+    pub fn material_at(&self, x: f64, y: f64) -> usize {
+        self.covers
+            .iter()
+            .rev()
+            .find(|(ring, _)| contains(ring, x, y))
+            .map_or(crate::materials::GRASS, |&(_, material)| material)
+    }
+}
+
+fn contains(ring: &[[f64; 2]], x: f64, y: f64) -> bool {
+    let mut inside = false;
+    for i in 0..ring.len() {
+        let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
+        if (a[1] > y) != (b[1] > y) && x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0] {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Where the land's heights come from: the map's own terrain, or the flattest
+/// ground under its roads.
+pub enum Ground<'a> {
+    Field(Field),
+    Stated(Stated<'a>),
+}
+
+impl Ground<'_> {
+    /// The ground's own points, to triangulate the land through.
+    pub fn vertices(&self) -> Box<dyn Iterator<Item = Point3> + '_> {
+        match self {
+            Ground::Field(field) => Box::new(field.vertices()),
+            Ground::Stated(stated) => Box::new(stated.nodes.iter().copied()),
+        }
+    }
+
+    /// The height at `(x, y)`, or `fallback` off a stated terrain.
+    pub fn height(&self, x: f64, y: f64, fallback: f64) -> f64 {
+        match self {
+            Ground::Field(field) => field.height(x, y),
+            Ground::Stated(stated) => stated.height(x, y).unwrap_or(fallback),
+        }
+    }
+
+    /// The lines the land breaks along, which it is triangulated to keep.
+    pub fn breaklines(&self) -> &[Vec<Point3>] {
+        match self {
+            Ground::Field(_) => &[],
+            Ground::Stated(stated) => &stated.breaklines,
+        }
+    }
+
+    /// What the land at `(x, y)` is surfaced with.
+    pub fn material_at(&self, x: f64, y: f64) -> usize {
+        match self {
+            Ground::Field(_) => crate::materials::GRASS,
+            Ground::Stated(stated) => stated.material_at(x, y),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
