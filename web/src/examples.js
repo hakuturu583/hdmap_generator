@@ -272,18 +272,40 @@ for warning in m.carla_warnings(name="Town01"):
 `,
   },
   {
-    name: 'An open-pit mine, generated',
-    description: 'Benches, a ramp down the wall, haul roads, heaps — and the land as a TIN.',
-    code: `# Not a town: a quarry. generate_mine() lays out the roads a pit needs —
-# a ramp spiralling down its wall, haul roads to a waste dump and a
-# stockpile — and, once the roads are built, the land round all of it as
-# one TIN whose breaklines are every bench's crest and toe and every
-# road's edge.
+    name: 'An open-pit mine, from parts',
+    description: 'A pit, a ramp, haul roads, heaps and a yard, as parts — and the land as a TIN.',
+    code: `# Not a town: a quarry, put together from parts. A pit is a shape of
+# the land; the roads into it are roads like any other, drawn with
+# add_road. Once the roads are built, the land round all of it is one
+# TIN whose breaklines are every bench's crest and toe and every road's
+# edge.
 import roadgen
 
 m = roadgen.Map(name="quarry", origin=(-23.36, 119.73, 0.0))
-mine = m.generate_mine(name="North Pit", benches=5, ground_cell=15.0, seed=2)
-print(mine)
+pit = m.add_pit(name="North Pit", benches=5)
+m.generate_land(cell=15.0, seed=2)
+
+haul = [
+    roadgen.Lane(width=7.5, direction="forward", left_marking="none", right_marking="none"),
+    roadgen.Lane(width=3.0, direction="forward", type_="shoulder", left_marking="none", right_marking="none"),
+    roadgen.Lane(width=7.5, direction="backward", left_marking="none", right_marking="none"),
+    roadgen.Lane(width=3.0, direction="backward", type_="shoulder", left_marking="none", right_marking="none"),
+]
+gravel = [(0.0, "gravel")]
+# The usual ramp: a spiral down the wall at 10 %. Any points will do.
+ramp = m.add_road(points=pit.ramp(grade=0.1), lanes=haul, name="ramp",
+                  type_="low_speed", pavement=gravel, site="North Pit")
+m.add_barrier(ramp.lane(1), kind="berm", height=1.5)
+haul_road = m.add_road(start=(100.0, -260.0, 0.0), end=(300.0, -260.0, 0.0),
+                       lanes=haul, name="haul", type_="low_speed",
+                       pavement=gravel, site="North Pit")
+m.add_heap("waste_dump", centre=(440.0, -260.0, 0.0), radius=110.0,
+           height=30.0, site="North Pit")
+m.add_heap("stockpile", centre=(260.0, 40.0, 0.0), radius=38.0,
+           height=14.0, site="North Pit")
+m.add_pad([(140.0, -320.0, 0.0), (260.0, -320.0, 0.0),
+           (260.0, -272.5, 0.0), (140.0, -272.5, 0.0)],
+          buildings="industrial", site="North Pit")
 
 m.validate()
 
@@ -296,12 +318,12 @@ m.export_gpudrive("scene.json")
 # Off, or CARLA repaints the gravel haul roads as its own asphalt.
 m.export_carla("Import/", name="Quarry", use_carla_materials=False)
 
-site = m.site(mine["site"])
+site = m.site("site/north_pit")
 print("land covers:", [m.land_cover(c)["kind"] for c in site["land_covers"]])
 nodes, triangles = m.tin_mesh(site["surfaces"][0])
 print(len(nodes), "nodes,", len(triangles), "triangles,",
       "floor at", min(z for _, _, z in nodes), "m")
-print("the ramp is", m.road_pavement(mine["ramp"]))
+print("the ramp is", m.road_pavement(ramp.id))
 
 for warning in m.carla_warnings(name="Quarry", use_carla_materials=False):
     print("carla:", warning)

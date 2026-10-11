@@ -30,7 +30,7 @@ use roadgen_core::units::{GeoOrigin, PositiveWidth, SpeedLimit};
 use roadgen_core::validation::{UnvalidatedMap, ValidatedMap};
 
 use roadgen_buildings::Rules as BuildingRules;
-use roadgen_carla::environment::{self, mine, Environment};
+use roadgen_carla::environment::{self, HeapSpec, PadSpec, PitSpec, RampSpec};
 
 mod trace;
 
@@ -349,6 +349,91 @@ impl PyLaneRef {
     }
 }
 
+/// The identifier a pit's, heap's or pad's land cover is given.
+fn land_cover_of(name: &str) -> String {
+    roadgen_core::id::LandCoverId::new(format!("{}/{}", environment::LAND, environment::slug(name)))
+        .to_string()
+}
+
+/// An open pit on the map, for drawing the roads into it.
+#[pyclass(name = "Pit", module = "roadgen", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyPit {
+    spec: PitSpec,
+}
+
+#[pymethods]
+impl PyPit {
+    #[getter]
+    fn name(&self) -> String {
+        self.spec.name.clone()
+    }
+
+    /// The land cover the pit is, once the map is built.
+    #[getter]
+    fn land_cover(&self) -> String {
+        land_cover_of(&self.spec.name)
+    }
+
+    #[getter]
+    fn rim_height(&self) -> f64 {
+        self.spec.rim_height()
+    }
+
+    #[getter]
+    fn floor_height(&self) -> f64 {
+        self.spec.floor_height()
+    }
+
+    /// The usual ramp into the pit, as the points of a road: an approach curving
+    /// in over `approach` metres from clear of the rim, then a spiral down the wall
+    /// at `grade` to the floor, winding `clockwise` or not, from `start` degrees
+    /// round the pit. Pass them to `add_road(points=...)` with lanes `width` wide
+    /// in all. A grade too gentle to reach the floor in four turns is refused.
+    #[pyo3(signature = (start = -90.0, grade = 0.1, clockwise = true, width = 21.0, approach = 80.0))]
+    fn ramp(
+        &self,
+        start: f64,
+        grade: f64,
+        clockwise: bool,
+        width: f64,
+        approach: f64,
+    ) -> PyResult<Vec<(f64, f64, f64)>> {
+        let spec = RampSpec {
+            start,
+            grade,
+            clockwise,
+            width,
+            approach,
+        };
+        Ok(self
+            .spec
+            .ramp(&spec)
+            .map_err(PyValueError::new_err)?
+            .into_iter()
+            .map(|p| (p.x, p.y, p.z))
+            .collect())
+    }
+
+    /// The rim's crest, a vertex about every `spacing` metres.
+    #[pyo3(signature = (spacing = 5.0))]
+    fn rim(&self, spacing: f64) -> PyResult<Vec<(f64, f64, f64)>> {
+        if !(spacing.is_finite() && spacing > 0.0) {
+            return Err(PyValueError::new_err("spacing must be positive"));
+        }
+        Ok(self
+            .spec
+            .rim(spacing)
+            .into_iter()
+            .map(|p| (p.x, p.y, p.z))
+            .collect())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Pit({:?})", self.spec.name)
+    }
+}
+
 /// A road alignment built one piece at a time.
 ///
 /// Each call appends a piece starting where the last one ended, pointing and curving
@@ -465,13 +550,13 @@ pub struct PyMap {
     /// Held rather than applied, because a lot is cut out of generated geometry and
     /// there is none until the map is built.
     buildings: Option<BuildingRules>,
-    /// The country round a town, when asked for, and its seed.
+    /// The land, when asked for, and its seed.
     land: Option<(environment::GroundSpec, u64)>,
-    /// The places laid out on the builder — a mine, say — whose land is generated
-    /// once the roads are, because it is built round the roads' generated edges.
-    /// A town's buildings are the same kind of thing, held in `buildings` so that
-    /// they can be switched off again.
-    environments: Vec<roadgen_carla::environment::Plan>,
+    /// The pits, heaps, pads and site roads put on the map, generated with the
+    /// buildings and the land once the roads are built, because the land is built
+    /// round the roads' generated edges. `town`, `ground` and `seed` are left
+    /// empty here and come from `buildings` and `land`.
+    places: environment::Places,
 }
 
 /// Where a map comes from: the builder its roads are added to, or a file it was
@@ -538,7 +623,7 @@ impl PyMap {
             fingerprint: None,
             buildings: None,
             land: None,
-            environments: Vec::new(),
+            places: environment::Places::default(),
         })
     }
 
@@ -556,6 +641,7 @@ impl PyMap {
         superelevation = None,
         cross_sections = None,
         pavement = None,
+        site = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_road(
@@ -571,6 +657,7 @@ impl PyMap {
         superelevation: Option<Vec<(f64, f64)>>,
         cross_sections: Option<Vec<(f64, Vec<PyLane>)>>,
         pavement: Option<Vec<(f64, String)>>,
+        site: Option<String>,
     ) -> PyResult<PyRoad> {
         let reference_line = match (start, end, points, alignment) {
             (Some(start), Some(end), None, None) => {
@@ -636,6 +723,9 @@ impl PyMap {
         }
         let lane_count = spec.all_lanes().count();
         let id = self.builder_mut()?.add_road(spec).map_err(value_error)?;
+        if let Some(site) = site {
+            self.places.site_roads.push((id.clone(), site));
+        }
         self.invalidate();
         Ok(PyRoad {
             id,
@@ -856,10 +946,11 @@ impl PyMap {
         Ok(())
     }
 
-    /// States the land round the map's roads as a TIN, the way a mine's is built
-    /// but shaped by nothing except the roads: at their height near them, rolling
-    /// by `relief` metres away from them. Off by default, when the CARLA export
-    /// lays its own ground under the roads.
+    /// States the land round the map's roads as a TIN: at their height near them,
+    /// rolling by `relief` metres away from them, and shaped by every pit and heap
+    /// on the map. Off by default, when the CARLA export lays its own ground under
+    /// the roads — unless a pit or heap is on the map, which is a shape of the land
+    /// and turns it on with these defaults; call this to change them.
     #[pyo3(signature = (
         enabled = true,
         relief = 6.0,
@@ -1708,17 +1799,17 @@ impl PyMap {
             .map_err(runtime_error)
     }
 
-    /// Lays out an open-pit mine: a pit stepped down in benches, a ramp spiralling
-    /// down its wall, haul roads from the top of the ramp to a waste dump and a
-    /// stockpile, and the land round all of it as one TIN.
+    /// Puts an open pit on the map: a floor `floor` metres long and wide, and
+    /// `benches` benches stepped up from it to the rim, which is at `centre`'s
+    /// height — the country's. `heading` turns the pit's long axis, degrees
+    /// anticlockwise from `+x`.
     ///
-    /// The roads are added now; the land is generated with the map, round the
-    /// roads' generated edges. A heap is `(bearing_degrees, distance, radius,
-    /// height)`, measured from the junction at the top of the ramp.
-    ///
-    /// Returns `{"site", "ramp", "haul_roads", "junction"}`.
+    /// A pit is a shape of the land and lays out no road: draw the roads into it
+    /// with `add_road`, any shape. `Pit.ramp()` gives the points of the usual one,
+    /// a spiral down the wall. The pit belongs to the site `site`, its own name
+    /// when none is given.
     #[pyo3(signature = (
-        name = "mine",
+        name = "pit",
         centre = (0.0, 0.0, 0.0),
         heading = 0.0,
         floor = (220.0, 140.0),
@@ -1726,26 +1817,11 @@ impl PyMap {
         bench_height = 12.0,
         bench_width = 10.0,
         face_angle = 70.0,
-        ramp_grade = 0.1,
-        ramp_start = -90.0,
-        clockwise = true,
-        lane_width = 7.5,
-        shoulder_width = 3.0,
-        berm_height = 1.5,
-        speed_limit_kph = 40.0,
-        surface = "gravel",
-        waste_dump = None,
-        stockpile = None,
-        ground_margin = 150.0,
-        ground_cell = 10.0,
-        relief = 6.0,
-        yard_buildings = true,
-        seed = 0,
+        site = None,
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn generate_mine<'py>(
+    fn add_pit(
         &mut self,
-        py: Python<'py>,
         name: &str,
         centre: (f64, f64, f64),
         heading: f64,
@@ -1754,92 +1830,112 @@ impl PyMap {
         bench_height: f64,
         bench_width: f64,
         face_angle: f64,
-        ramp_grade: f64,
-        ramp_start: f64,
-        clockwise: bool,
-        lane_width: f64,
-        shoulder_width: f64,
-        berm_height: f64,
-        speed_limit_kph: f64,
-        surface: &str,
-        waste_dump: Option<(f64, f64, f64, f64)>,
-        stockpile: Option<(f64, f64, f64, f64)>,
-        ground_margin: f64,
-        ground_cell: f64,
-        relief: f64,
-        yard_buildings: bool,
-        seed: u64,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let defaults = mine::MineSpec::default();
-        let heap = |given: Option<(f64, f64, f64, f64)>, default: mine::HeapSpec| match given {
-            Some((bearing, distance, radius, height)) => mine::HeapSpec {
-                bearing,
-                distance,
-                radius,
-                height,
-                ..default
-            },
-            None => default,
-        };
-        let spec = mine::MineSpec {
+        site: Option<String>,
+    ) -> PyResult<PyPit> {
+        let spec = PitSpec {
             name: name.to_owned(),
             centre: point(centre),
             heading: heading.to_radians(),
-            pit: mine::PitSpec {
-                floor_length: floor.0,
-                floor_width: floor.1,
-                benches,
-                bench_height,
-                bench_width,
-                face_angle,
-            },
-            ramp: mine::RampSpec {
-                grade: ramp_grade,
-                start: ramp_start,
-                clockwise,
-            },
-            haul_road: mine::HaulRoadSpec {
-                lane_width,
-                shoulder_width,
-                berm_height,
-                speed_limit_kph,
-                surface: Pavement::parse(surface)
-                    .ok_or_else(|| PyValueError::new_err(format!("unknown surface {surface:?}")))?,
-            },
-            waste_dump: heap(waste_dump, defaults.waste_dump.clone()),
-            stockpile: heap(stockpile, defaults.stockpile.clone()),
-            ground: mine::GroundSpec {
-                margin: ground_margin,
-                cell: ground_cell,
-                relief,
-                ..defaults.ground.clone()
-            },
-            buildings: if yard_buildings {
-                defaults.buildings.clone()
-            } else {
-                None
-            },
-            seed,
+            floor_length: floor.0,
+            floor_width: floor.1,
+            benches,
+            bench_height,
+            bench_width,
+            face_angle,
+            site,
         };
-        let plan = environment::lay_out(self.builder_mut()?, &Environment::Mine(Box::new(spec)))
-            .map_err(value_error)?;
-        let environment::Plan::Mine(mine) = &plan else {
-            unreachable!("a mine lays out as a mine");
-        };
+        spec.check().map_err(PyValueError::new_err)?;
+        self.builder_mut()?;
+        self.places.pits.push(spec.clone());
         self.invalidate();
-        let result = PyDict::new(py);
-        result.set_item("site", mine.site.to_string())?;
-        result.set_item("ramp", mine.ramp.to_string())?;
-        result.set_item(
-            "haul_roads",
-            mine.haul_roads
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-        )?;
-        result.set_item("junction", mine.hub.to_string())?;
-        self.environments.push(plan);
-        Ok(result)
+        Ok(PyPit { spec })
+    }
+
+    /// Puts a heap of broken rock on the map: a frustum `radius` metres round its
+    /// toe and `height` high, its sides at `repose` degrees, standing at `centre`.
+    /// `kind` is what it is a heap of — `waste_dump`, `stockpile` — and becomes its
+    /// land cover's kind. Returns the land cover's identifier.
+    #[pyo3(signature = (kind, centre, radius, height, repose = 37.0, name = None, site = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_heap(
+        &mut self,
+        kind: &str,
+        centre: (f64, f64, f64),
+        radius: f64,
+        height: f64,
+        repose: f64,
+        name: Option<String>,
+        site: Option<String>,
+    ) -> PyResult<String> {
+        let spec = HeapSpec {
+            name: name.unwrap_or_else(|| kind.to_owned()),
+            kind: kind.to_owned(),
+            centre: point(centre),
+            radius,
+            height,
+            repose,
+            site,
+        };
+        spec.check().map_err(PyValueError::new_err)?;
+        self.builder_mut()?;
+        let id = land_cover_of(&spec.name);
+        self.places.heaps.push(spec);
+        self.invalidate();
+        Ok(id)
+    }
+
+    /// Puts a pad on the map: a levelled yard inside `outline`, anticlockwise, with
+    /// `buildings` on it — a built-in set of rules, `roadgen.building_presets()`,
+    /// or a grammar written out — on lots along the roads beside it, kept to the
+    /// pad. Returns the land cover's identifier.
+    #[pyo3(signature = (outline, buildings = None, seed = 0, name = "pad", site = None))]
+    fn add_pad(
+        &mut self,
+        outline: Vec<(f64, f64, f64)>,
+        buildings: Option<&str>,
+        seed: u64,
+        name: &str,
+        site: Option<String>,
+    ) -> PyResult<String> {
+        let buildings = match buildings {
+            Some(text) => {
+                let rules = BuildingRules::parse(text)
+                    .map_err(value_error)?
+                    .with_seed(seed);
+                rules.compile().map_err(value_error)?;
+                Some(rules)
+            }
+            None => None,
+        };
+        let spec = PadSpec {
+            name: name.to_owned(),
+            outline: outline.into_iter().map(point).collect(),
+            buildings,
+            site,
+        };
+        spec.check().map_err(PyValueError::new_err)?;
+        self.builder_mut()?;
+        let id = land_cover_of(&spec.name);
+        self.places.pads.push(spec);
+        self.invalidate();
+        Ok(id)
+    }
+
+    /// Stands a barrier along the whole of `lane`: a berm of broken rock on a haul
+    /// road's shoulder (`berm`, `bund`, `windrow`), a wall (`wall`, `jersey`), a
+    /// guard rail (anything else). `height` is how far its top stands above the
+    /// lane. Returns the object's identifier.
+    #[pyo3(signature = (lane, kind = "berm", height = 1.5))]
+    fn add_barrier(&mut self, lane: &PyLaneRef, kind: &str, height: f64) -> PyResult<String> {
+        if !(height.is_finite() && height > 0.0) {
+            return Err(PyValueError::new_err(format!("a barrier {height} m high")));
+        }
+        let id = self
+            .builder_mut()?
+            .add_barrier(&lane.reference, kind, height)
+            .map_err(value_error)?;
+        self.invalidate();
+        Ok(id.to_string())
     }
 
     /// Identifiers of every site: the places made of several features.
@@ -2134,19 +2230,14 @@ impl PyMap {
         // After the roads and before validation, which is the only moment buildings
         // can be generated: a lot is measured against generated geometry, and
         // validation has something to say about what comes out.
-        for plan in &self.environments {
-            environment::generate(&mut map, plan).map_err(value_error)?;
-        }
-        // The town, through the same stages a mine's buildings and land go through.
-        if self.buildings.is_some() || self.land.is_some() {
-            let spec = environment::UrbanSpec {
-                name: self.source.metadata().name.clone().unwrap_or_default(),
-                buildings: self.buildings.clone(),
-                ground: self.land.as_ref().map(|(ground, _)| ground.clone()),
-                seed: self.land.as_ref().map_or(0, |&(_, seed)| seed),
-            };
-            environment::generate(&mut map, &environment::Plan::Urban(spec))
-                .map_err(value_error)?;
+        let places = environment::Places {
+            town: self.buildings.clone(),
+            ground: self.land.as_ref().map(|(ground, _)| ground.clone()),
+            seed: self.land.as_ref().map_or(0, |&(_, seed)| seed),
+            ..self.places.clone()
+        };
+        if places != environment::Places::default() {
+            environment::generate(&mut map, &places).map_err(value_error)?;
         }
         Ok(map)
     }
@@ -2360,7 +2451,7 @@ fn read_opendrive(
         fingerprint: None,
         buildings: None,
         land: None,
-        environments: Vec::new(),
+        places: environment::Places::default(),
     })
 }
 
@@ -2458,6 +2549,7 @@ fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRoad>()?;
     module.add_class::<PyJunction>()?;
     module.add_class::<PyLaneRef>()?;
+    module.add_class::<PyPit>()?;
     module.add_class::<PyAlignment>()?;
     module.add_class::<trace::PyTrace>()?;
     module.add_function(wrap_pyfunction!(read_opendrive, module)?)?;

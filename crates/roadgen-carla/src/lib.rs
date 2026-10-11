@@ -99,7 +99,7 @@ use roadgen_core::semantics::MapObjectKind;
 use roadgen_core::trace::{Relation, Trace};
 use roadgen_core::ValidatedMap;
 
-pub use environment::{Environment, MineSpec};
+pub use environment::{HeapSpec, PadSpec, PitSpec, Places, RampSpec};
 pub use error::ExportError;
 pub use furniture::{FurnitureConfig, SignKind};
 pub use materials::Material;

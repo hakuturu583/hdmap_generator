@@ -1,25 +1,16 @@
-//! The environments a CARLA map is generated for — a town, a mine — and what
-//! comes of them in every exporter.
+//! What is generated onto a CARLA map once its roads are built — pits, heaps,
+//! pads, buildings, the land — and what comes of it in every exporter.
 //!
-//! The mine is the one map in the workspace whose IR states the land, so it is the
-//! test of what each format makes of that: CARLA builds its ground from the TIN,
+//! The mine is the map in the workspace whose IR states the land, so it is the test
+//! of what each format makes of that: CARLA builds its ground from the TIN,
 //! OpenDRIVE writes the gravel and the berm, OpenStreetMap writes the quarry, and
 //! the formats with no word for any of it still write the roads.
 
-use roadgen_carla::environment::{self, Environment, MineSpec};
+use roadgen_carla::environment::{self, PitSpec, Places};
 use roadgen_carla::{materials, PackageConfig, Role};
 use roadgen_core::prelude::*;
 use roadgen_core::semantics::{MapObjectKind, Pavement, UnpavedSurface};
-
-fn mine() -> ValidatedMap {
-    let mut builder = MapBuilder::default();
-    // The mine is one branch of the environment a CARLA map is generated for.
-    let plan =
-        environment::lay_out(&mut builder, &Environment::Mine(Box::default())).expect("lays out");
-    let mut map = builder.finish().expect("builds");
-    environment::generate(&mut map, &plan).expect("generates");
-    map.validate().expect("validates")
-}
+use roadgen_integration_tests::mine::{mine, open_pit_mine};
 
 #[test]
 fn carla_builds_its_ground_from_the_terrain_the_map_states() {
@@ -36,8 +27,8 @@ fn carla_builds_its_ground_from_the_terrain_the_map_states() {
 
     // The land goes as deep as the pit's floor, which a ground made from the roads
     // alone never could: the ramp reaches the floor, and the benches step down to it.
-    let spec = MineSpec::default();
-    let depth = spec.pit.benches as f64 * spec.pit.bench_height;
+    let spec = PitSpec::default();
+    let depth = spec.depth();
     let lowest = terrain
         .positions
         .iter()
@@ -170,9 +161,9 @@ fn mine_with_a_street() -> ValidatedMap {
             ),
         )
         .unwrap();
-    let plan = environment::lay_out(&mut builder, &Environment::Mine(Box::default())).unwrap();
+    let places = open_pit_mine(&mut builder, "mine", Point3::ORIGIN);
     let mut map = builder.finish().unwrap();
-    environment::generate(&mut map, &plan).unwrap();
+    environment::generate(&mut map, &places).unwrap();
     map.validate().expect("validates")
 }
 
@@ -305,7 +296,7 @@ fn a_mine_puts_buildings_on_its_yard_from_the_towns_grammar() {
 
 #[test]
 fn a_town_builds_its_land_the_way_a_mine_does() {
-    use roadgen_carla::environment::{GroundSpec, UrbanSpec};
+    use roadgen_carla::environment::GroundSpec;
     use roadgen_core::topology::Direction;
     use roadgen_core::units::PositiveWidth;
 
@@ -327,15 +318,14 @@ fn a_town_builds_its_land_the_way_a_mine_does() {
             .with_name("high_street"),
         )
         .unwrap();
-    let town = Environment::Urban(UrbanSpec {
-        name: "town".into(),
-        buildings: roadgen_buildings::Rules::preset("town"),
+    let town = Places {
+        town: roadgen_buildings::Rules::preset("town"),
         ground: Some(GroundSpec::default()),
         seed: 3,
-    });
-    let plan = environment::lay_out(&mut builder, &town).unwrap();
+        ..Places::default()
+    };
     let mut map = builder.finish().unwrap();
-    environment::generate(&mut map, &plan).unwrap();
+    environment::generate(&mut map, &town).unwrap();
     let map = map.validate().expect("validates");
 
     assert!(!map.buildings.is_empty());
@@ -364,22 +354,14 @@ fn a_town_builds_its_land_the_way_a_mine_does() {
 
 #[test]
 fn a_town_beside_a_mine_does_not_line_the_mines_roads() {
-    use roadgen_carla::environment::UrbanSpec;
-
     let map = {
         let mut builder = MapBuilder::default();
-        let mine = environment::lay_out(&mut builder, &Environment::Mine(Box::default())).unwrap();
-        let town = environment::lay_out(
-            &mut builder,
-            &Environment::Urban(UrbanSpec {
-                buildings: roadgen_buildings::Rules::preset("town"),
-                ..UrbanSpec::default()
-            }),
-        )
-        .unwrap();
+        let places = Places {
+            town: roadgen_buildings::Rules::preset("town"),
+            ..open_pit_mine(&mut builder, "mine", Point3::ORIGIN)
+        };
         let mut map = builder.finish().unwrap();
-        environment::generate(&mut map, &mine).unwrap();
-        environment::generate(&mut map, &town).unwrap();
+        environment::generate(&mut map, &places).unwrap();
         map.validate().expect("validates")
     };
     // Every building is the mine's own, on its yard: the town has no street of its
@@ -388,4 +370,61 @@ fn a_town_beside_a_mine_does_not_line_the_mines_roads() {
         let road = &building.frontage.as_ref().unwrap().road;
         assert!(road.as_str().contains("haul_waste_dump"), "{road}");
     }
+}
+
+#[test]
+fn two_mines_lie_on_one_land() {
+    let mut builder = MapBuilder::default();
+    let north = open_pit_mine(&mut builder, "North Pit", Point3::ORIGIN);
+    let south = open_pit_mine(&mut builder, "South Pit", Point3::new(0.0, -900.0, 0.0));
+    let places = Places {
+        pits: [north.pits, south.pits].concat(),
+        heaps: [north.heaps, south.heaps].concat(),
+        pads: [north.pads, south.pads].concat(),
+        site_roads: [north.site_roads, south.site_roads].concat(),
+        ..Places::default()
+    };
+    let mut map = builder.finish().unwrap();
+    environment::generate(&mut map, &places).unwrap();
+    let map = map.validate().expect("validates");
+
+    assert_eq!(map.tin_surfaces.len(), 1);
+    assert_eq!(map.sites.len(), 2);
+    let surface = map.tin_surfaces.iter().next().unwrap();
+    for site in map.sites.iter() {
+        assert_eq!(site.kind, "open_pit_mine");
+        assert_eq!(site.surfaces, std::slice::from_ref(&surface.id));
+        assert_eq!(site.land_covers.len(), 4, "{}", site.id);
+    }
+    // Both floors are in the one land.
+    let locator = surface.tin.locator();
+    let floor = -PitSpec::default().depth();
+    for y in [0.0, -900.0] {
+        let z = locator.height_at(0.0, y).unwrap();
+        assert!((z - floor).abs() < 1e-6, "{y}: {z}");
+    }
+    // And every connector through a hub is its mine's.
+    let north = map.sites.get(&SiteId::new("north_pit")).unwrap();
+    assert!(north
+        .roads
+        .iter()
+        .any(|road| map.road(road).unwrap().is_connector()));
+}
+
+#[test]
+fn parts_that_overlap_are_refused() {
+    let mut map = MapBuilder::default().finish().unwrap();
+    let places = Places {
+        pits: vec![
+            PitSpec::default(),
+            PitSpec {
+                name: "other".into(),
+                centre: Point3::new(150.0, 0.0, 0.0),
+                ..PitSpec::default()
+            },
+        ],
+        ..Places::default()
+    };
+    let error = environment::generate(&mut map, &places).unwrap_err();
+    assert!(error.to_string().contains("overlap"), "{error}");
 }

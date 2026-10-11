@@ -547,8 +547,10 @@ fn check_sites(map: &Map, issues: &mut Vec<ValidationIssue>) {
             }
         }
         for surface in &site.surfaces {
+            // A surface no site owns is the whole map's land, which every site
+            // on it lies on.
             match map.tin_surfaces.get(surface) {
-                Some(entry) if entry.site.as_ref() == Some(&site.id) => {}
+                Some(entry) if entry.site.as_ref().is_none_or(|own| own == &site.id) => {}
                 Some(_) => issues.push(ValidationIssue::ImplausibleFeature {
                     feature: surface.to_string(),
                     detail: format!("listed by {} but does not name it", site.id),

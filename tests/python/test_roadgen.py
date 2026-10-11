@@ -2179,31 +2179,99 @@ def test_a_package_comes_with_the_script_that_imports_it(tmp_path):
     assert result.returncode != 0 and "CarlaUnreal.uproject" in result.stderr
 
 
-def test_a_mine_states_its_land_and_the_roads_lie_on_it(tmp_path):
-    m = roadgen.Map(name="quarry")
-    mine = m.generate_mine(name="North Pit", seed=1)
-    assert mine["site"] == "site/north_pit"
-    assert mine["ramp"] == "road/north_pit_ramp"
-    assert len(mine["haul_roads"]) == 2
+def haul_lanes():
+    lane = lambda width, direction, type_: roadgen.Lane(
+        width=width, direction=direction, type_=type_, left_marking="none", right_marking="none"
+    )
+    return [
+        lane(7.5, "forward", "driving"),
+        lane(3.0, "forward", "shoulder"),
+        lane(7.5, "backward", "driving"),
+        lane(3.0, "backward", "shoulder"),
+    ]
 
-    site = m.site(mine["site"])
+
+def quarry(m, name="North Pit", centre=(0.0, 0.0, 0.0), buildings="industrial"):
+    """A pit, the ramp down it and a haul road out to a waste dump, from parts."""
+    pit = m.add_pit(name=name, centre=centre)
+    ramp = m.add_road(
+        points=pit.ramp(start=-90, grade=0.1, clockwise=True, width=21.0),
+        lanes=haul_lanes(),
+        name=f"{name} ramp",
+        type_="low_speed",
+        pavement=[(0.0, "gravel")],
+        site=name,
+    )
+    m.add_barrier(ramp.lane(1), kind="berm", height=1.5)
+    x, y, z = centre
+    haul = m.add_road(
+        start=(x + 100.0, y - 260.0, z),
+        end=(x + 300.0, y - 260.0, z),
+        lanes=haul_lanes(),
+        name=f"{name} haul",
+        type_="low_speed",
+        pavement=[(0.0, "gravel")],
+        site=name,
+    )
+    m.add_heap("waste_dump", centre=(x + 440.0, y - 260.0, z), radius=110.0, height=30.0,
+               name=f"{name} dump", site=name)
+    m.add_pad(
+        [(x + 140.0, y - 320.0, z), (x + 260.0, y - 320.0, z),
+         (x + 260.0, y - 272.5, z), (x + 140.0, y - 272.5, z)],
+        buildings=buildings, name=f"{name} yard", site=name,
+    )
+    return pit, ramp, haul
+
+
+def test_a_mine_is_put_together_from_parts_and_its_roads_lie_on_the_land(tmp_path):
+    m = roadgen.Map(name="quarry")
+    pit, ramp, haul = quarry(m)
+    assert pit.floor_height == -72.0  # six benches of twelve metres
+    assert pit.land_cover == "landcover/land/north_pit"
+
+    site = m.site("site/north_pit")
     assert site["kind"] == "open_pit_mine"
     kinds = [m.land_cover(cover)["kind"] for cover in site["land_covers"]]
-    assert kinds == ["pit", "waste_dump", "stockpile", "pad"]
-    assert m.road_pavement(mine["ramp"]) == [(0.0, "gravel")]
+    assert kinds == ["pit", "waste_dump", "pad"]
+    assert set(site["roads"]) == {ramp.id, haul.id}
+    assert m.road_pavement(ramp.id) == [(0.0, "gravel")]
 
     surface = site["surfaces"][0]
     nodes, triangles = m.tin_mesh(surface)
     assert len(triangles) > 1000
-    depth = min(z for _, _, z in nodes)
-    assert depth == -72.0  # six benches of twelve metres
+    assert min(z for _, _, z in nodes) == -72.0
     kinds = {kind for _, kind, _ in m.tin_breaklines(surface)}
     assert kinds == {"crest", "toe", "road_edge"}
     # The floor of the pit is where the land is lowest.
     assert m.terrain_height(0.0, 0.0) == -72.0
+    # And the ramp's own points are on the land, all the way down.
+    for x, y, z in pit.ramp()[::10]:
+        assert abs(m.terrain_height(x, y) - z) < 0.3
 
     package = m.export_carla(str(tmp_path / "carla"), use_carla_materials=False)
     assert package["meshes"] > 0
+
+
+def test_a_ramp_too_gentle_for_its_pit_is_refused():
+    m = roadgen.Map()
+    pit = m.add_pit(benches=10)
+    with pytest.raises(ValueError, match="cannot reach"):
+        pit.ramp(grade=0.01)
+    with pytest.raises(ValueError):
+        m.add_pit(benches=0)
+
+
+def test_two_mines_lie_on_one_land():
+    m = roadgen.Map(name="quarries")
+    quarry(m, "North Pit")
+    quarry(m, "South Pit", centre=(0.0, -1200.0, 0.0))
+    assert m.site_ids() == ["site/north_pit", "site/south_pit"]
+    assert len(m.tin_surface_ids()) == 1
+    assert m.terrain_height(0.0, -1200.0) == -72.0
+    # Two parts in one place are refused when the map is built.
+    m.add_pit(name="Too Close", centre=(50.0, 0.0, 0.0))
+    with pytest.raises(ValueError, match="overlap"):
+        m.validate()
 
 
 def test_a_road_can_say_what_it_is_surfaced_with():
@@ -2223,11 +2291,11 @@ def test_a_road_can_say_what_it_is_surfaced_with():
 def test_a_mine_and_a_town_share_their_buildings_and_their_land():
     # The mine's yard gets buildings from the same grammar a town's streets do.
     m = roadgen.Map(name="quarry")
-    m.generate_mine(name="North Pit", seed=2)
+    quarry(m)
     assert m.building_ids()
-    assert all("haul_waste_dump" in m.building_frontage(b)[0] for b in m.building_ids())
+    assert all("haul" in m.building_frontage(b)[0] for b in m.building_ids())
     bare = roadgen.Map(name="quarry")
-    bare.generate_mine(name="North Pit", seed=2, yard_buildings=False)
+    quarry(bare, buildings=None)
     assert bare.building_ids() == []
 
     # A town's land is built the way a mine's is: a TIN with the roads' edges in it.

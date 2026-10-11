@@ -90,8 +90,10 @@ impl GroundSpec {
 pub enum Base {
     /// One height everywhere: a mine's rim, which is the country's.
     Level(f64),
-    /// The height of the roads nearest: the flattest ground that stays under every
-    /// road, as a town's land is when nothing else is said about it.
+    /// The height of the roads nearest, and of the [`Landforms::anchors`]: the
+    /// flattest ground that meets every road and every rim. What lies inside a
+    /// hole — a ramp down a pit — is the hole's to shape, and is left out. With
+    /// nothing to read a height from, the country is at zero.
     Roads,
 }
 
@@ -124,6 +126,20 @@ pub struct Landforms {
     pub holes: Vec<Vec<PlanPoint>>,
     /// Regions that do not roll, and are not otherwise shaped: a yard.
     pub flats: Vec<Vec<PlanPoint>>,
+    /// Heights the country meets besides the roads': a pit's rim, a heap's toe.
+    /// Read by [`Base::Roads`] only; a level base has its height already.
+    pub anchors: Vec<Point3>,
+}
+
+impl Landforms {
+    /// Both places' forms, as one.
+    pub fn extend(&mut self, other: Landforms) {
+        self.lines.extend(other.lines);
+        self.levels.extend(other.levels);
+        self.holes.extend(other.holes);
+        self.flats.extend(other.flats);
+        self.anchors.extend(other.anchors);
+    }
 }
 
 /// Which land, for which place.
@@ -370,6 +386,7 @@ pub fn generate(
         levels,
         holes,
         flats,
+        anchors,
     } = forms;
     // The roads' edges first: where anything else would cross one, the road wins.
     let mut constraints: Vec<Constraint> = roads
@@ -444,12 +461,12 @@ pub fn generate(
                 .filter_map(|lane| lane.centerline.to_polyline(source.metadata.sampling).ok())
                 .flat_map(|line| line.points().to_vec())
                 .collect();
-            Field::from_samples(
-                with_reference_lines(source, samples),
-                &[],
-                ground.margin + ground.cell,
-                ground.cell,
-            )
+            let samples = with_reference_lines(source, samples)
+                .into_iter()
+                .filter(|p| !holes.iter().any(|ring| ring_contains(ring, [p.x, p.y])))
+                .chain(anchors)
+                .collect();
+            Field::from_samples(samples, &[], ground.margin + ground.cell, ground.cell)
         }
     };
     let base = |x: f64, y: f64| match (land.base, &field) {
