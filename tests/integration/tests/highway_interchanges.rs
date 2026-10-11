@@ -859,29 +859,30 @@ fn a_stack_says_how_much_reach_its_flyovers_need() {
 }
 
 #[test]
-fn a_stack_bridges_its_crossroad_however_little_it_lifts_it_and_refuses_one_over_it() {
+fn a_stack_bridges_its_crossroad_however_little_it_lifts_it_and_carries_one_over_it_as_it_is() {
     // A crossroad nearly at its level already is lifted the little it lacks,
     // and still crosses on a bridge: the bridge says which is carried over.
-    let mut spec = stack_spec();
-    spec.interchanges[0].crossroad = vec![
-        Point3::new(0.0, -1300.0, 7.2),
-        Point3::new(0.0, 1300.0, 7.2),
-    ];
-    let plan = spec.plan(TrafficHandedness::RightHand).expect("plans");
-    assert!(
-        plan.structures.iter().any(|structure| structure
-            .spans
-            .iter()
-            .any(|(road, _, _)| road.starts_with("minami_ic_branch_"))),
-        "no bridge on the crossroad"
-    );
-    // One that stands over where the stack would lift it is refused.
-    spec.interchanges[0].crossroad = vec![
-        Point3::new(0.0, -1300.0, 12.0),
-        Point3::new(0.0, 1300.0, 12.0),
-    ];
-    let error = spec.plan(TrafficHandedness::RightHand).unwrap_err();
-    assert!(error.contains("stands"), "{error}");
+    // One standing over where the stack would lift it is carried over as it
+    // is, on a bridge all the same — its flyovers climbing that much higher,
+    // with the reach to.
+    for (height, reach) in [(7.2, STACK_REACH), (12.0, 530.0)] {
+        let mut spec = stack_spec();
+        spec.interchanges[0].crossroad = vec![
+            Point3::new(0.0, -1300.0, height),
+            Point3::new(0.0, 1300.0, height),
+        ];
+        spec.interchanges[0].reach = reach;
+        let plan = spec
+            .plan(TrafficHandedness::RightHand)
+            .unwrap_or_else(|error| panic!("{height} m: {error}"));
+        assert!(
+            plan.structures.iter().any(|structure| structure
+                .spans
+                .iter()
+                .any(|(road, _, _)| road.starts_with("minami_ic_branch_"))),
+            "{height} m: no bridge on the crossroad"
+        );
+    }
 }
 
 #[test]
@@ -916,4 +917,87 @@ fn a_stack_on_a_graded_crossroad_keeps_its_levels_spare_half_metre_where_flyover
             );
         }
     }
+}
+
+/// A stack on `crossroad`, its flyovers' noses `reach` from the middle, built
+/// with the land round it, validated and drawn for CARLA, both ways round: no
+/// notes, and every crossing on a structure with the clearance under it. With
+/// `grounded`, both motorways stand near enough the land to be on the ground
+/// throughout, and no slip road is on a deck where it leaves or joins one,
+/// beside its embankment or down in its cutting.
+fn a_stack_on(crossroad: Vec<Point3>, reach: f64, grounded: bool) {
+    let mut spec = stack_spec();
+    spec.interchanges[0].crossroad = crossroad;
+    spec.interchanges[0].reach = reach;
+    for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+        let (map, notes) = generate_spec(spec.clone(), handedness);
+        assert!(notes.is_empty(), "{handedness:?}: {notes:#?}");
+        let crossings = roadgen_core::structure::crossings(map.as_map());
+        assert!(crossings.len() >= 16, "{}", crossings.len());
+        for crossing in &crossings {
+            let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
+            assert!(
+                crossing.carried_by(map.as_map()).is_some(),
+                "{handedness:?}: {upper} at {us:.0} m over {lower} at {ls:.0} m"
+            );
+            let clear = uz - lz - roadgen_core::structure::depth_at(map.as_map(), upper, us);
+            assert!(
+                clear >= roadgen_core::structure::CLEARANCE - 0.01,
+                "{handedness:?}: {upper} at {us:.0} m clears {lower} by {clear:.2} m"
+            );
+        }
+        for ramp in slip_roads(&map).into_iter().filter(|_| grounded) {
+            let road = road(&map, &format!("minami_ic_{ramp}")).unwrap();
+            let length = road.horizontal_length().unwrap();
+            for station in [0.0, length] {
+                assert!(
+                    road.structure.at(station).is_none(),
+                    "{handedness:?}: {ramp} is on a deck at {station:.0} m"
+                );
+            }
+        }
+        let meshes = roadgen_carla::to_meshes(&map, &roadgen_carla::PackageConfig::new("e5"));
+        assert!(meshes.iter().any(|m| m.role == roadgen_carla::Role::Road));
+    }
+}
+
+/// The other motorway through a stack climbing at `grade` all the way, crossing
+/// the corridor at its level, and long enough for a stack whose flyovers' noses
+/// are `reach` from the middle.
+fn graded(grade: f64, reach: f64) -> Vec<Point3> {
+    let end = reach + 900.0;
+    vec![
+        Point3::new(0.0, -end, -end * grade),
+        Point3::new(0.0, end, end * grade),
+    ]
+}
+
+#[test]
+fn a_stack_on_a_crossroad_climbing_at_one_and_a_half_percent_stands_clear_of_the_land() {
+    // Beside a motorway on a grade the land is its embankment on the way up and
+    // its cutting on the way down, not the straight between a slip road's ends:
+    // a flyover is on a viaduct only where it stands clear of that land. The
+    // flyovers need the room to climb from the low end: a reach of 610 m.
+    a_stack_on(graded(0.015, 610.0), 610.0, false);
+}
+
+#[test]
+fn a_stack_on_a_crossroad_climbing_as_steeply_as_the_standard_allows_stands_clear_of_the_land() {
+    // At 100 km/h, 3 %; the flyovers need a reach of 940 m.
+    let grade = stack_spec().standard.max_grade;
+    assert_eq!(grade, 0.03);
+    a_stack_on(graded(grade, 940.0), 940.0, false);
+}
+
+#[test]
+fn a_stack_on_a_crossroad_from_higher_ground_stands_clear_of_its_embankment() {
+    // The other motorway 7 m over the corridor, short of the level the stack
+    // lifts it to: the slip roads leave it beside its embankment, and climb off
+    // it before they go on a viaduct. And 12 m over, past that level: carried
+    // over the corridor as it is, its flyovers climbing a reach of 530 m — and
+    // so high over the land the whole way that it is on a viaduct, and the slip
+    // roads join it on theirs.
+    let level = |z: f64| vec![Point3::new(0.0, -1300.0, z), Point3::new(0.0, 1300.0, z)];
+    a_stack_on(level(7.0), STACK_REACH, true);
+    a_stack_on(level(12.0), 530.0, false);
 }

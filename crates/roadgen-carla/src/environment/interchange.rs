@@ -835,9 +835,23 @@ const FLYOVER_GRADE: f64 = 0.06;
 /// How far before and after what it crosses a flyover stays level, metres: room
 /// for the vertical curves either side.
 const LEVEL_MARGIN: f64 = 25.0;
-/// How high above the straight between its ends a flyover is carried on a
-/// viaduct rather than an embankment, metres.
-const VIADUCT_HEIGHT: f64 = 5.0;
+
+/// A flyover's viaduct as the plan has it: over the stretch `level` of its
+/// stations, where it is at its level over what it crosses, and no further. How
+/// much farther out it is carried is the land's to say, where the corridor's
+/// structures are chosen from the land: where it stands high over the land the
+/// roads round it leave, it reaches on out on a bridge, and the rest is an
+/// embankment (see `highway::choose_structures`). A rule read off the flyover's
+/// own ends — so high over the straight between them — would put a deck on a
+/// motorway's embankment beside it, or down in its cutting.
+fn carried(name: &str, points: &[Point3], level: (f64, f64)) -> StructurePlan {
+    let total = length_of(points);
+    StructurePlan {
+        spans: vec![(name.into(), level.0.max(0.0), level.1.min(total))],
+        bridge: Some(BridgeForm::Viaduct),
+        tunnel: None,
+    }
+}
 
 /// Plan stations along a polyline, from its start.
 fn stations_of(points: &[Point3]) -> Vec<f64> {
@@ -916,9 +930,10 @@ impl CorridorSpec {
     /// they split and merge, the slip roads a quarter turn on to and off the near
     /// carriageway, and the two flyovers across the motorway to and from the far
     /// one, stacked where they cross — the slip road off the far carriageway a
-    /// level over the one on to it — each carried on a viaduct where it stands
-    /// high. The other motorway ends as far out as the flyovers need to come down
-    /// to it at an easy grade.
+    /// level over the one on to it — each carried on a viaduct over what it
+    /// crosses, and out as far as it stands high over the land (see
+    /// [`carried`]). The other motorway ends as far out as the flyovers need to
+    /// come down to it at an easy grade.
     pub(super) fn directional(
         &self,
         cx: Directional<'_>,
@@ -1066,7 +1081,7 @@ impl CorridorSpec {
         // Farther out the other motorway ends, the longer the flyovers have to
         // climb from it: out as far as an easy grade needs.
         let (mut b_end, ..) = quarter_turns(&dims, site.terminal.max(corner + 10.0))?;
-        let (on_points, on_z, off_points, off_z, ground) = loop {
+        let (on_points, on_z, on_level, off_points, off_z, off_level, ground) = loop {
             if b_end > 5000.0 {
                 return Err(format!(
                     "{}: the flyovers cannot be laid out at an easy grade",
@@ -1080,22 +1095,12 @@ impl CorridorSpec {
                 return Err(format!("{}: the flyovers do not cross", site.name));
             };
             let curve = ramp.crest_radius;
-            let (on_z, on_climb, on_descent) = flyover(
-                &on_stations,
-                ground,
-                level_on,
-                level_at(&on_points, &on_stations, on_cross),
-                join.z,
-                curve,
-            )?;
-            let (off_z, off_climb, off_descent) = flyover(
-                &off_stations,
-                leave.z,
-                level_off,
-                level_at(&off_points, &off_stations, off_cross),
-                ground,
-                curve,
-            )?;
+            let on_level = level_at(&on_points, &on_stations, on_cross);
+            let off_level = level_at(&off_points, &off_stations, off_cross);
+            let (on_z, on_climb, on_descent) =
+                flyover(&on_stations, ground, level_on, on_level, join.z, curve)?;
+            let (off_z, off_climb, off_descent) =
+                flyover(&off_stations, leave.z, level_off, off_level, ground, curve)?;
             // Grades either way: the branch's ground may stand above the flyovers'
             // levels, and a flyover down to it as steep as one up is as bad.
             let (on_climb, on_descent, off_climb, off_descent) = (
@@ -1117,35 +1122,22 @@ impl CorridorSpec {
                 ));
             }
             if on_climb <= FLYOVER_GRADE && off_descent <= FLYOVER_GRADE {
-                break (on_points, on_z, off_points, off_z, ground);
+                break (
+                    on_points, on_z, on_level, off_points, off_z, off_level, ground,
+                );
             }
             b_end += 10.0;
         };
         let (b_end, near_off, near_on) = quarter_turns(&dims, b_end)?;
 
-        // The flyovers, on a viaduct where they stand high.
+        // The flyovers, on a viaduct over what they cross.
         let names = |side: Side, suffix: &str| format!("{ic}_{}_{suffix}", side.as_str());
         let (on_name, off_name) = (names(far, "on"), names(far, "off"));
-        for (name, points, heights) in [
-            (&on_name, &on_points, &on_z),
-            (&off_name, &off_points, &off_z),
+        for (name, points, level) in [
+            (&on_name, &on_points, on_level),
+            (&off_name, &off_points, off_level),
         ] {
-            let stations = stations_of(points);
-            let total = stations[stations.len() - 1];
-            let (first, last) = (heights[0], heights[heights.len() - 1]);
-            let high: Vec<f64> = stations
-                .iter()
-                .zip(heights)
-                .filter(|(s, z)| **z - (first + (last - first) * **s / total) >= VIADUCT_HEIGHT)
-                .map(|(s, _)| *s)
-                .collect();
-            if let (Some(from), Some(to)) = (high.first(), high.last()) {
-                plan.structures.push(StructurePlan {
-                    spans: vec![(name.clone(), *from, *to)],
-                    bridge: Some(BridgeForm::Viaduct),
-                    tunnel: None,
-                });
-            }
+            plan.structures.push(carried(name, points, level));
         }
         let with_heights = |points: &[Point3], heights: &[f64]| -> Vec<Point3> {
             points
@@ -1363,6 +1355,9 @@ struct StackRamp {
     nose: f64,
     other: Side,
     other_nose: f64,
+    /// A flyover's stations from where it is at its level to where it leaves
+    /// it: what it has to be carried over.
+    level: (f64, f64),
 }
 
 impl CorridorSpec {
@@ -1435,17 +1430,10 @@ impl CorridorSpec {
             across - deck,
             across + deck,
         );
-        let lift = under + level - low;
-        if lift < 0.0 {
-            return Err(format!(
-                "{}: the crossroad of a stack stands {:.1} m over the corridor where they                  cross, higher than the level the stack lifts it to; give it a profile                  nearer the corridor's",
-                site.name,
-                low - under
-            ));
-        }
-        // Always on a bridge where it crosses, however little it is lifted: the
+        // A crossroad already standing that high is carried over as it is;
+        // always on a bridge where it crosses, however little it is lifted: the
         // bridge is what says which of the two is carried over the other.
-        let lift = lift.max(0.5);
+        let lift = (under + level - low).max(0.5);
         let half = edge + 10.0 + other.lift(lift);
         other.elevated = vec![(across - half, across + half)];
         other.elevated_height = lift;
@@ -1583,6 +1571,7 @@ impl CorridorSpec {
                     nose: t_far + reach,
                     other: inbound,
                     other_nose: t_in - reach,
+                    level: (0.0, 0.0),
                 });
                 // And the one off the far carriageway: in from beside it, round
                 // the middle, and on out beside the other motorway.
@@ -1605,6 +1594,7 @@ impl CorridorSpec {
                     nose: t_far - reach,
                     other: outbound,
                     other_nose: t_out + reach,
+                    level: (0.0, 0.0),
                 });
                 // The quarter turns: off the near carriageway out beside the
                 // other motorway, and in from it on to the near carriageway.
@@ -1627,6 +1617,7 @@ impl CorridorSpec {
                     nose: t_near - reach_q,
                     other: outbound,
                     other_nose: t_out + reach_q,
+                    level: (0.0, 0.0),
                 });
                 let start = leave(&b_in, t_in - reach_q);
                 let end = join(&a_near, t_near + reach_q);
@@ -1647,6 +1638,7 @@ impl CorridorSpec {
                     nose: t_near + reach_q,
                     other: inbound,
                     other_nose: t_in - reach_q,
+                    level: (0.0, 0.0),
                 });
             }
 
@@ -1721,14 +1713,9 @@ impl CorridorSpec {
                     ));
                 };
                 let top = second + level * if ramp_line.on { 1.0 } else { 2.0 };
-                let (heights, climb, descent) = flyover(
-                    &stations,
-                    from,
-                    top,
-                    (lo - LEVEL_MARGIN, hi + LEVEL_MARGIN),
-                    to,
-                    ramp.crest_radius,
-                )?;
+                ramp_line.level = (lo - LEVEL_MARGIN, hi + LEVEL_MARGIN);
+                let (heights, climb, descent) =
+                    flyover(&stations, from, top, ramp_line.level, to, ramp.crest_radius)?;
                 if climb.abs().max(descent.abs()) > FLYOVER_GRADE || heights.is_empty() {
                     return Ok(None);
                 }
@@ -1769,7 +1756,7 @@ impl CorridorSpec {
             }
         };
 
-        // The flyovers, on a viaduct where they stand high; and every slip road
+        // The flyovers, on a viaduct over what they cross; and every slip road
         // as an access to the corridor's carriageway and a join to the other
         // motorway's.
         let mut joins = Vec::new();
@@ -1784,24 +1771,10 @@ impl CorridorSpec {
                 nose,
                 other: other_side,
                 other_nose,
+                level,
             } = ramp_line;
             if flyover {
-                let stations = stations_of(&points);
-                let total = stations[stations.len() - 1];
-                let (first, last) = (points[0].z, points[points.len() - 1].z);
-                let high: Vec<f64> = stations
-                    .iter()
-                    .zip(&points)
-                    .filter(|(s, p)| p.z - (first + (last - first) * **s / total) >= VIADUCT_HEIGHT)
-                    .map(|(s, _)| *s)
-                    .collect();
-                if let (Some(from), Some(to)) = (high.first(), high.last()) {
-                    plan.structures.push(StructurePlan {
-                        spans: vec![(name.clone(), *from, *to)],
-                        bridge: Some(BridgeForm::Viaduct),
-                        tunnel: None,
-                    });
-                }
+                plan.structures.push(carried(&name, &points, level));
             }
             joins.push(Join {
                 ramp: name.clone(),
@@ -1824,7 +1797,39 @@ impl CorridorSpec {
 
         // The other motorway, its carriageways split where the slip roads leave
         // and join, each with its speed-change lane.
-        let other_plan = other.plan_joined(cx.handedness, &joins)?;
+        let mut other_plan = other.plan_joined(cx.handedness, &joins)?;
+        // Its viaduct only where it crosses the corridor, the deck's width either
+        // side: the lift's own rule reads its height off the other motorway's
+        // profile, and on a grade, or off ground that is not the profile's, the
+        // land there is not the profile. Where the lift stands high over the land
+        // the roads round it leave, the land says to go on reaching out on a
+        // bridge, as it does for a flyover.
+        for structure in &mut other_plan.structures {
+            structure.spans.retain_mut(|(name, from, to)| {
+                let Some(road) = other_plan.roads.iter().find(|road| &road.name == name) else {
+                    return false;
+                };
+                let stations = stations_of(&road.points);
+                let over: Vec<f64> = road
+                    .points
+                    .iter()
+                    .zip(&stations)
+                    .filter(|(p, s)| {
+                        **s >= *from && **s <= *to && cx.track.locate([p.x, p.y]).1.abs() <= deck
+                    })
+                    .map(|(_, s)| *s)
+                    .collect();
+                let (Some(first), Some(last)) = (over.first(), over.last()) else {
+                    return false;
+                };
+                // A point's spacing on, to be past the deck's edge.
+                (*from, *to) = ((first - STEP).max(*from), (last + STEP).min(*to));
+                true
+            });
+        }
+        other_plan
+            .structures
+            .retain(|structure| !structure.spans.is_empty());
         let mut ic_roads: Vec<String> = other_plan.roads.iter().map(|r| r.name.clone()).collect();
         ic_roads.extend(roads);
         plan.roads.extend(other_plan.roads);
