@@ -1139,7 +1139,8 @@ pub fn shared_sides(map: &Map, spans: &[RoadSpan], index: usize) -> [bool; 2] {
     let beside: Vec<f64> = spans
         .iter()
         .enumerate()
-        .filter(|(other, _)| *other != index)
+        // Another stretch of the same road is further along it, not beside it.
+        .filter(|(other, stretch)| *other != index && stretch.road != span.road)
         .filter_map(|(_, other)| Strip::of(map, other).ok())
         .filter_map(|strip| {
             let (row, _) = strip.locate(frame.origin);
@@ -1228,9 +1229,23 @@ fn parapets(
                 .clone()
                 .filter_map(|section| edge_lane(map, &span.road, section, side))
                 .collect();
+            // A road the structure carries more than one stretch of has a parapet
+            // per stretch, told apart by the stretch's place among them.
+            let repeats = spans.iter().filter(|other| other.road == span.road).count() > 1;
+            let stretch = if repeats {
+                format!(
+                    "/{}",
+                    spans[..index]
+                        .iter()
+                        .filter(|other| other.road == span.road)
+                        .count()
+                )
+            } else {
+                String::new()
+            };
             out.push(MapObject {
                 id: ObjectId::new(format!(
-                    "{PARAPET_KIND}/{key}/{}/{name}",
+                    "{PARAPET_KIND}/{key}/{}{stretch}/{name}",
                     span.road.local_name()
                 )),
                 kind: MapObjectKind::Barrier {

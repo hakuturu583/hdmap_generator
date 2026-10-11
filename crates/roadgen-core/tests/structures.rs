@@ -678,6 +678,27 @@ fn reach(parapet: &MapObject) -> ((f64, f64), (f64, f64)) {
 }
 
 #[test]
+fn a_bridge_over_two_stretches_of_one_road_stands_parapets_along_each() {
+    let (mut builder, motorway, _) = crossing(9.0);
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(motorway.clone(), 50.0, 150.0),
+                RoadSpan::new(motorway.clone(), 250.0, 400.0),
+            ],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let parapets = parapets(&map);
+    assert_eq!(parapets.len(), 4, "one each side of each stretch");
+    let mut ids: Vec<_> = parapets.iter().map(|p| p.id.as_str().to_owned()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 4, "{ids:?}");
+}
+
+#[test]
 fn a_bridge_stands_a_parapet_on_the_curb_along_each_side_of_its_deck() {
     let (mut builder, motorway, _) = crossing(9.0);
     builder
