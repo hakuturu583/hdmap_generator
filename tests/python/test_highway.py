@@ -192,3 +192,47 @@ def test_a_trumpet_says_which_side_it_stops_on():
     with pytest.raises(ValueError, match="side="):
         corridor.add_interchange("T", at=1500.0, crossroad=[(1500.0, -500.0, 0.0), (1500.0, 500.0, 0.0)],
                                  crossroad_lanes=street_lanes(), kind="trumpet")
+
+
+def ordinary_road_across_a_valley_and_through_a_hill(**extra):
+    m = roadgen.Map(name="pass")
+    m.add_river(centre=[(0.0, -400.0, 0.0), (0.0, 400.0, 0.0)], width=60.0, depth=6.0,
+                name="Naka")
+    m.add_hill(crest=[(1600.0, 0.0, 0.0)], width=900.0, height=60.0, name="Kobu")
+    m.add_road(points=[(-600.0, 0.0, 0.0), (-200.0, 0.0, 12.0), (200.0, 0.0, 12.0),
+                       (600.0, 0.0, 0.0), (2400.0, 0.0, 0.0)],
+               lanes=street_lanes(), name="pass", **extra)
+    return m
+
+
+def test_an_ordinary_road_asked_to_have_its_structures_chosen_bridges_and_tunnels():
+    m = ordinary_road_across_a_valley_and_through_a_hill(structures="auto")
+    m.validate()
+    assert m.generation_notes() == []
+    forms = sorted(m.structure(s)["form"] for s in m.structure_ids())
+    assert forms == ["bored", "bridge"]
+    [tunnel] = [s for s in m.structure_ids() if m.structure(s)["form"] == "bored"]
+    portals = [p[1] for p in m.structure(tunnel)["portals"]]
+    # The hill stands about 2200 m along the road.
+    assert 1750.0 < portals[0] < portals[1] < 2650.0
+    assert any(g["under"] == "landcover/land/naka" for g in m.grade_separations())
+    assert m.road_form("pass") != "motorway"
+    kinds = {m.land_cover(c)["kind"] for c in m.land_cover_ids()}
+    assert {"embankment", "cutting"} <= kinds
+    assert m.site_ids() == []
+
+
+def test_an_ordinary_road_not_asked_to_have_its_structures_chosen_gets_none():
+    m = ordinary_road_across_a_valley_and_through_a_hill()
+    m.validate()
+    assert m.structure_ids() == []
+
+
+def test_a_corridors_road_has_its_structures_chosen_by_its_corridor():
+    m = roadgen.Map()
+    with pytest.raises(ValueError, match="by its corridor"):
+        m.add_road(start=(0.0, 0.0, 0.0), end=(100.0, 0.0, 0.0), lanes=two_way(),
+                   corridor="E1", structures="auto")
+    with pytest.raises(ValueError, match="structures is auto"):
+        m.add_road(start=(0.0, 0.0, 0.0), end=(100.0, 0.0, 0.0), lanes=two_way(),
+                   structures="always")

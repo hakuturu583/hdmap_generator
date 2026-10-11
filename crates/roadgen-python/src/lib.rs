@@ -660,6 +660,7 @@ impl PyMap {
         site = None,
         form = None,
         corridor = None,
+        structures = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_road(
@@ -678,7 +679,24 @@ impl PyMap {
         site: Option<String>,
         form: Option<&str>,
         corridor: Option<String>,
+        structures: Option<&str>,
     ) -> PyResult<PyRoad> {
+        // Whether the road's structures are chosen from the land, as a corridor's
+        // are: a corridor's road has its corridor's say.
+        let structured = match structures {
+            None => false,
+            Some("auto") if corridor.is_some() => {
+                return Err(PyValueError::new_err(
+                    "a corridor's road has its structures chosen by its corridor",
+                ))
+            }
+            Some("auto") => true,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "structures is auto, not {other:?}"
+                )))
+            }
+        };
         let reference_line = match (start, end, points, alignment) {
             (Some(start), Some(end), None, None) => {
                 Curve3::line(point(start), point(end)).map_err(value_error)?
@@ -751,6 +769,9 @@ impl PyMap {
         }
         if let Some(corridor) = corridor {
             self.places.corridor_roads.push((id.clone(), corridor));
+        }
+        if structured {
+            self.places.structured_roads.push(id.clone());
         }
         self.invalidate();
         Ok(PyRoad {

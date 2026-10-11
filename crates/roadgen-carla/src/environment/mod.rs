@@ -96,6 +96,12 @@ pub struct Places {
     /// Roads the land is cut and filled to meet, rather than read its height from,
     /// that are no corridor's: a crossroad lifted over a motorway.
     pub fitted_roads: Vec<RoadId>,
+    /// Ordinary roads whose structures are chosen from the land, as a corridor's
+    /// are, though they are no motorway and belong to no corridor: a stretch far
+    /// above the natural land or over water goes on a bridge, one far below it
+    /// through a bored tunnel, and the rest is fitted to the land by cuttings and
+    /// embankments — on the road's site, if it has one ([`Places::site_roads`]).
+    pub structured_roads: Vec<RoadId>,
     /// Heights the land meets where they are known: the ground a crossroad was
     /// drawn on, before it was lifted.
     pub anchors: Vec<roadgen_core::geometry::Point3>,
@@ -291,11 +297,12 @@ fn corridor_junctions(map: &roadgen_core::map::Map, places: &Places) -> Vec<(Str
 ///
 /// 1. the natural land — the country, the hills, the rivers and the parts —
 ///    before anything is fitted to it;
-/// 2. the structures a corridor's roads need to cross it: a bridge where a road is
+/// 2. the structures a corridor's roads, and the roads asked to have them chosen
+///    ([`Places::structured_roads`]), need to cross it: a bridge where a road is
 ///    far above it or over water, a tunnel where it is far below;
 /// 3. an overpass wherever one road crosses over another with nothing carrying it,
 ///    and every grade separation;
-/// 4. the cuttings and embankments that fit the rest of the corridor to the land;
+/// 4. the cuttings and embankments that fit the rest of those roads to the land;
 /// 5. the buildings — off the corridors, the structures and the parts;
 /// 6. one land round all of it;
 /// 7. what each part's land is, and the sites.
@@ -312,7 +319,8 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     }
 
     // Everything that shapes the land, and the roads the land does not take its
-    // height from: a corridor's, and the movements through its junctions.
+    // height from: a corridor's, the movements through its junctions, and those
+    // whose structures are chosen.
     let mut forms = Landforms::default();
     for part in &parts {
         forms.extend(part.forms.clone());
@@ -324,7 +332,11 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     for (corridor, roads) in corridor_junctions(map.as_map(), places) {
         corridor_roads.extend(roads.into_iter().map(|road| (road, corridor.clone())));
     }
-    for (road, _) in &corridor_roads {
+    for road in corridor_roads
+        .iter()
+        .map(|(road, _)| road)
+        .chain(&places.structured_roads)
+    {
         if !map.as_map().roads.contains(road) {
             return Err(Error::Spec(format!("{road} is no road on the map")));
         }
@@ -334,6 +346,11 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
         .map(|(road, _)| road.clone())
         .collect();
     forms.floating.extend(places.fitted_roads.iter().cloned());
+    for road in &places.structured_roads {
+        if !forms.floating.contains(road) {
+            forms.floating.push(road.clone());
+        }
+    }
     // And the movements through a junction whose roads are all fitted to the land:
     // a ramp terminal on a lifted crossroad is as far off the ground as they are.
     let through: Vec<RoadId> = map
@@ -353,8 +370,10 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
 
     // The structures and the separations: what the corridors ask for, and what any
     // road crossing another does. A map with none of either — no corridor, no
-    // structure, no motorway — is left exactly as it was.
+    // structure, no motorway, no road asked to have its structures chosen — is
+    // left exactly as it was.
     let separates = !places.corridors.is_empty()
+        || !places.structured_roads.is_empty()
         || !map.as_map().structures.is_empty()
         || map
             .as_map()
@@ -392,21 +411,41 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
                 )
             })
             .collect();
+        // A corridor's roads by their corridor, and then the roads of none.
+        let chosen: Vec<(RoadId, Option<String>)> = places
+            .corridor_roads
+            .iter()
+            .map(|(road, corridor)| (road.clone(), Some(corridor.clone())))
+            .chain(
+                places
+                    .structured_roads
+                    .iter()
+                    .filter(|road| !places.corridor_roads.iter().any(|(id, _)| id == *road))
+                    .map(|road| (road.clone(), None)),
+            )
+            .collect();
         let target = map.as_map_mut();
         report.notes.extend(highway::choose_structures(
-            target,
-            &places.corridor_roads,
-            &modes,
-            &natural,
-            &water,
+            target, &chosen, &modes, &natural, &water,
         ));
         report.notes.extend(highway::separate(target));
         // Every road the land is fitted to; the movements among them are skipped,
         // as the land does not take its slopes from a junction.
         if !forms.floating.is_empty() {
-            earthworks = Some(highway::earthworks(target, &forms.floating, &natural));
+            earthworks = Some(highway::earthworks(
+                target,
+                &forms.floating,
+                &places.structured_roads,
+                &natural,
+            ));
         }
-        embanked = highway::off_the_land(target, &places.fitted_roads, &natural);
+        let fitted: Vec<RoadId> = places
+            .fitted_roads
+            .iter()
+            .chain(&places.structured_roads)
+            .cloned()
+            .collect();
+        embanked = highway::off_the_land(target, &fitted, &natural);
     }
     if let Some(works) = &earthworks {
         forms.lines.extend(works.lines.clone());
@@ -494,6 +533,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     let shaped = !parts.is_empty()
         || !places.hills.is_empty()
         || !places.corridors.is_empty()
+        || !places.structured_roads.is_empty()
         || !map.as_map().structures.is_empty();
     let surface = if !shaped && places.ground.is_none() {
         None
@@ -624,7 +664,8 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         // Each slope is its road's corridor's: a corridor road's own, or — for a
         // crossroad the corridor fitted to the land — the corridor whose slip
-        // roads meet it at a junction.
+        // roads meet it at a junction. A road of no corridor whose structures were
+        // chosen keeps its slopes on its own site, or on none.
         let corridor_of = |road: &RoadId| -> Option<&String> {
             if let Some((_, name)) = corridor_roads.iter().find(|(id, _)| id == road) {
                 return Some(name);
@@ -645,6 +686,16 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
             .owners
             .iter()
             .map(|road| {
+                let own = !corridor_roads.iter().any(|(id, _)| id == road)
+                    && places.structured_roads.contains(road);
+                if own {
+                    return places
+                        .site_roads
+                        .iter()
+                        .find(|(id, _)| id == road)
+                        .map(|(_, name)| site_of(name))
+                        .transpose();
+                }
                 corridor_of(road)
                     .or_else(|| places.corridors.first().map(|corridor| &corridor.name))
                     .map(|name| site_of(name))
