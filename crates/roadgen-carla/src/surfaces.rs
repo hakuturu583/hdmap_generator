@@ -174,6 +174,7 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
     if let Some(terrain) = land.mesh(ground.as_ref(), verge, map_name, &mut ordinal) {
         meshes.push(terrain);
     }
+    meshes.extend(crate::water::meshes(map, map_name, &mut ordinal));
     meshes.extend(crate::structures::meshes(
         map,
         ground.as_ref(),

@@ -344,6 +344,7 @@ pub fn cover_material(kind: &str) -> usize {
     match kind {
         "pit" | "quarry" | "waste_dump" | "spoil_heap" | "stockpile" => crate::materials::ROCK,
         "pad" | "yard" => crate::materials::GRAVEL,
+        kind if crate::water::is_water(kind) => crate::materials::RIVERBED,
         _ => crate::materials::GRASS,
     }
 }

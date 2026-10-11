@@ -13,6 +13,7 @@
 //!   underside of the deck.
 
 use roadgen_core::geometry::plan::{ring_contains, PlanPoint, Segments};
+use roadgen_core::geometry::Grid;
 use roadgen_core::map::Map;
 use roadgen_core::structure::StructureKind;
 
@@ -37,9 +38,20 @@ struct Zone {
     ring: Vec<PlanPoint>,
     edges: Segments,
     bounds: [f64; 4],
-    /// The carried road down its middle: where, how high, and whether the place is
-    /// clear of the structure's ends.
-    rows: Vec<(PlanPoint, f64, bool)>,
+    /// The carried road down its middle, a row every two metres.
+    rows: Vec<Row>,
+    /// The rows filed by where they are, for the nearest to a point.
+    index: Grid<usize>,
+}
+
+struct Row {
+    at: PlanPoint,
+    z: f64,
+    /// Clear of the structure's ends, where it meets the ground.
+    interior: bool,
+    /// At a portal, the way out of the structure, in plan: a point ahead of it is
+    /// in front of the mouth, not over the bore.
+    mouth: Option<PlanPoint>,
 }
 
 /// Every structure's demand on the land.
@@ -48,6 +60,23 @@ pub(crate) struct Zones {
     /// How far past an outline its demand reaches in full: about a cell and a
     /// half, so no triangle of the land reaches across it.
     reach: f64,
+}
+
+impl Zone {
+    /// The row nearest `p`, looked for within `reach` and past it if need be.
+    fn nearest(&self, p: PlanPoint, reach: f64) -> Option<&Row> {
+        let distance = |row: &Row| (row.at[0] - p[0]).powi(2) + (row.at[1] - p[1]).powi(2);
+        let near = self
+            .index
+            .covering([p[0] - reach, p[1] - reach], [p[0] + reach, p[1] + reach])
+            .map(|&slot| &self.rows[slot])
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)));
+        near.or_else(|| {
+            self.rows
+                .iter()
+                .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+        })
+    }
 }
 
 impl Zones {
@@ -78,14 +107,29 @@ impl Zones {
                 let count = (span.length() / 2.0).ceil().max(1.0) as usize;
                 for index in 0..=count {
                     let station = span.from + span.length() * index as f64 / count as f64;
-                    if let Ok(sample) = road
+                    let Ok(sample) = road
                         .reference_line
                         .sample_at(station, map.metadata.sampling)
-                    {
-                        let interior = station >= span.from + margin && station <= span.to - margin;
-                        rows.push(([sample.point.x, sample.point.y], sample.point.z, interior));
-                    }
+                    else {
+                        continue;
+                    };
+                    let tangent = sample.tangent.get();
+                    let mouth = match index {
+                        0 => Some([-tangent.x, -tangent.y]),
+                        last if last == count => Some([tangent.x, tangent.y]),
+                        _ => None,
+                    };
+                    rows.push(Row {
+                        at: [sample.point.x, sample.point.y],
+                        z: sample.point.z,
+                        interior: station >= span.from + margin && station <= span.to - margin,
+                        mouth,
+                    });
                 }
+            }
+            let mut index = Grid::new(40.0);
+            for (slot, row) in rows.iter().enumerate() {
+                index.insert(row.at, row.at, slot);
             }
             if !rows.is_empty() {
                 zones.push(Zone {
@@ -94,6 +138,7 @@ impl Zones {
                     edges,
                     bounds,
                     rows,
+                    index,
                 });
             }
         }
@@ -128,21 +173,25 @@ impl Zones {
                     None => continue,
                 }
             };
-            let Some(&(_, z, interior)) = zone.rows.iter().min_by(|a, b| {
-                let da = (a.0[0] - x).powi(2) + (a.0[1] - y).powi(2);
-                let db = (b.0[0] - x).powi(2) + (b.0[1] - y).powi(2);
-                da.total_cmp(&db)
-            }) else {
+            let Some(row) = zone.nearest(p, far) else {
                 continue;
             };
+            let z = row.z;
             match zone.need {
                 Need::Over(rise) => {
+                    // In front of a portal the land is the approach's cutting, not
+                    // the cover over the bore.
+                    if let Some(out) = row.mouth {
+                        if (x - row.at[0]) * out[0] + (y - row.at[1]) * out[1] > 0.0 {
+                            continue;
+                        }
+                    }
                     let top = z + rise;
                     let t = smoothstep(self.reach, self.reach + SHOULDER, distance);
                     height = height.max(top * (1.0 - t) + height * t);
                 }
                 Need::Under(drop) => {
-                    if interior && distance <= self.reach {
+                    if row.interior && distance <= self.reach {
                         height = height.min(z - drop);
                     }
                 }

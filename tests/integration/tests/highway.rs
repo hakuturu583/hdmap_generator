@@ -244,6 +244,22 @@ fn carla_draws_the_decks_piers_and_tunnels() {
         .map(|p| p.z)
         .fold(f64::MIN, f64::max);
     assert!(top > 40.0, "the ridge reaches {top:.1} m");
+    // The river's channel is riverbed, and water lies over it below its banks.
+    assert!(terrain.materials.contains(&materials::RIVERBED));
+    let water: Vec<_> = meshes
+        .iter()
+        .filter(|mesh| mesh.materials == [materials::WATER])
+        .collect();
+    assert_eq!(water.len(), 1, "one river, one sheet of water");
+    let level = water[0].positions[0].z;
+    assert!(water[0]
+        .positions
+        .iter()
+        .all(|p| (p.z - level).abs() < 1e-9));
+    assert!(
+        level > -6.0 && level < 0.0,
+        "the water stands at {level:.2} m"
+    );
 }
 
 #[test]
