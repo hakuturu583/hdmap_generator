@@ -276,7 +276,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     // What each part's land is, and which site it belongs to.
     let mut sites: BTreeMap<String, (String, Vec<LandCoverId>, Vec<RoadId>, bool)> =
         BTreeMap::new();
-    let mut site_of = |name: &str| -> Result<SiteId, Error> {
+    let site_of = |name: &str| -> Result<SiteId, Error> {
         let key = slug(name);
         if key.is_empty() {
             return Err(Error::Spec(format!(
@@ -287,7 +287,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     };
     let target = map.as_map_mut();
     for part in &parts {
-        let site = part.site.as_deref().map(&mut site_of).transpose()?;
+        let site = part.site.as_deref().map(site_of).transpose()?;
         let id = land::cover(
             target,
             LAND,
