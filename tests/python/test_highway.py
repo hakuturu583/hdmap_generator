@@ -187,6 +187,46 @@ def test_a_parclo_and_a_trumpet_turn_on_by_loops(kind, side, loops):
     assert m.interchange(interchange)["kind"] == kind
 
 
+@pytest.mark.parametrize("kind,side,slip_roads", [
+    ("trumpet", "right", 4),
+    # Four slip roads a side, and a collector-distributor road in five pieces.
+    ("cloverleaf", None, 18),
+])
+def test_a_trumpet_and_a_cloverleaf_flow_freely(kind, side, slip_roads):
+    m = roadgen.Map(name="free")
+    e5 = m.add_corridor("E5", [(-1500.0, 0.0, 0.0), (1500.0, 0.0, 0.0)], design_speed=100.0)
+    e5.add_interchange("Minami IC", at=1500.0, crossroad=[(0.0, -500.0, 0.0), (0.0, 500.0, 0.0)],
+                       crossroad_lanes=street_lanes(), kind=kind, side=side)
+    plan = e5.plan()
+    assert plan.notes == []
+    assert sum(road["form"] == "slip_road" for road in plan.roads) == slip_roads
+    m.add_plan(plan)
+    m.validate()
+    [interchange] = m.interchange_ids()
+    assert m.interchange(interchange)["kind"] == kind
+    assert [s["form"] for s in map(m.structure, m.structure_ids())].count("overpass") == 1
+
+
+def test_a_directional_t_ends_another_motorway_on_flyovers():
+    m = roadgen.Map(name="junction")
+    e5 = m.add_corridor("E5", [(-1500.0, 0.0, 0.0), (1500.0, 0.0, 0.0)], design_speed=100.0)
+    e5.add_interchange("Minami JCT", at=1500.0, crossroad=[(0.0, 700.0, 0.0), (0.0, -20.0, 0.0)],
+                       crossroad_lanes=street_lanes(), kind="directional", side="left")
+    plan = e5.plan()
+    assert plan.notes == []
+    forms = {road["name"]: road["form"] for road in plan.roads}
+    assert forms["minami_jct_branch_in"] == "motorway"
+    assert sum(form == "slip_road" for form in forms.values()) == 4
+    assert [form for form, _ in plan.structures].count("viaduct") == 2
+    m.add_plan(plan)
+    m.validate()
+    [interchange] = m.interchange_ids()
+    assert m.interchange(interchange)["kind"] == "directional"
+    with pytest.raises(ValueError, match="side="):
+        e5.add_interchange("T", at=1500.0, crossroad=[(0.0, 700.0, 0.0), (0.0, -20.0, 0.0)],
+                           crossroad_lanes=street_lanes(), kind="directional")
+
+
 def test_a_trumpet_says_which_side_it_stops_on():
     corridor = roadgen.Map().add_corridor("E5", [(0.0, 0.0, 0.0), (3000.0, 0.0, 0.0)])
     with pytest.raises(ValueError, match="side="):

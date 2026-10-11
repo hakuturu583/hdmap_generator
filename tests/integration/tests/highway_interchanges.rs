@@ -1,6 +1,8 @@
 //! The interchanges a corridor plans beyond the diamond: a partial cloverleaf,
-//! whose turns on across the crossroad are loops, and a trumpet, whose crossroad
-//! stops at the motorway.
+//! whose turns on across the crossroad are loops; a trumpet, whose crossroad
+//! stops at the motorway and splits round a loop; a full cloverleaf with its
+//! collector–distributor roads; and a directional T, where another motorway ends
+//! at this one on flyovers.
 
 use roadgen_carla::environment::{
     self, CorridorSpec, InterchangeKind, InterchangeSite, Places, Side,
@@ -121,8 +123,43 @@ fn a_parclo_turns_on_across_the_crossroad_by_a_loop_each_side() {
     }
 }
 
+/// Whether anything at the map's junctions is controlled: a signal, a stop line,
+/// or a rule of who gives way.
+fn controlled(map: &ValidatedMap) -> bool {
+    !map.rules.is_empty()
+        || map.objects.iter().any(|o| {
+            o.kind.is_traffic_light() || matches!(o.kind, roadgen_core::MapObjectKind::StopLine)
+        })
+}
+
+/// The interchange's roads that are slip roads, by name without the prefix.
+fn slip_roads(map: &ValidatedMap) -> Vec<String> {
+    let mut names: Vec<String> = map
+        .roads
+        .iter()
+        .filter(|r| !r.is_connector() && r.form == FormOfWay::SlipRoad)
+        .map(|r| {
+            r.id.as_str()
+                .trim_start_matches("road/minami_ic_")
+                .to_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether a grade separation carries a road whose name begins `over` over one
+/// whose name begins `under`.
+fn separated(map: &ValidatedMap, over: &str, under: &str) -> bool {
+    map.grade_separations.iter().any(|g| {
+        g.over.road.as_str().starts_with(&format!("road/{over}"))
+            && matches!(&g.under, roadgen_core::Underneath::Road(span)
+                if span.road.as_str().starts_with(&format!("road/{under}")))
+    })
+}
+
 #[test]
-fn a_trumpets_crossroad_stops_at_the_far_terminal() {
+fn a_trumpets_stem_splits_round_a_loop_with_nothing_at_grade() {
     for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
         let (map, notes) = generate(InterchangeKind::Trumpet { side: Side::Right }, handedness);
         assert!(notes.is_empty(), "{notes:#?}");
@@ -130,37 +167,211 @@ fn a_trumpets_crossroad_stops_at_the_far_terminal() {
             panic!("one interchange");
         };
         assert_eq!(interchange.kind, "trumpet");
-        // The near side a diamond's pair, the far side an off and a loop.
-        for name in ["left_off", "left_on", "right_off", "right_loop"] {
-            assert!(
-                road(&map, &format!("minami_ic_{name}")).is_some(),
-                "no {name}"
-            );
-        }
-        assert!(road(&map, "minami_ic_right_on").is_none());
-        assert!(road(&map, "minami_ic_left_loop").is_none());
-        // The crossroad is two pieces, not three: nothing beyond the far
-        // terminal.
+        // The near side a slip road off and one on; the far side a loop off and
+        // a semi-direct slip road on round it. Nothing else.
+        assert_eq!(
+            slip_roads(&map),
+            ["left_off", "left_on", "right_loop", "right_on"]
+        );
+        // The loop turns three quarters round; the semi-direct slip road turns
+        // half round one way and a quarter back.
+        let looped = turn(road(&map, "minami_ic_right_loop").unwrap());
+        assert!(
+            (looped.abs() - 1.5 * std::f64::consts::PI).abs() < 0.3,
+            "{looped:.2}"
+        );
+        let semi = turn(road(&map, "minami_ic_right_on").unwrap());
+        assert!(
+            (semi.abs() - std::f64::consts::FRAC_PI_2).abs() < 0.3,
+            "{semi:.2}"
+        );
+        // The crossroad is two pieces: up to the near junction, and the stem
+        // over the motorway to where it splits.
         let pieces = map
             .roads
             .iter()
             .filter(|r| r.id.as_str().starts_with("road/minami_ic_cross_"))
             .count();
         assert_eq!(pieces, 2);
-        // Nothing at a trumpet is signalled.
-        assert!(!map.objects.iter().any(|o| o.kind.is_traffic_light()));
+        // Every movement merges or diverges: no signal, nothing to give way to.
+        assert!(!controlled(&map));
+        // The stem crosses on its overpass, and nothing else needs a structure.
+        assert!(map.structures.iter().any(|s| s.kind.form() == "overpass"));
+        assert!(separated(&map, "minami_ic_cross_", "e5_"));
     }
 }
 
 #[test]
-fn carla_draws_both() {
-    for kind in [
-        InterchangeKind::Parclo,
-        InterchangeKind::Trumpet { side: Side::Left },
-    ] {
-        let (map, _) = generate(kind, TrafficHandedness::RightHand);
-        let meshes = roadgen_carla::to_meshes(&map, &roadgen_carla::PackageConfig::new("e5"));
-        assert!(meshes.iter().any(|m| m.role == roadgen_carla::Role::Road));
+fn a_cloverleaf_has_a_loop_in_each_quadrant_off_a_collector_distributor_road() {
+    for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+        let (map, notes) = generate(InterchangeKind::Cloverleaf, handedness);
+        assert!(notes.is_empty(), "{notes:#?}");
+        let [interchange] = map.interchanges.iter().collect::<Vec<_>>()[..] else {
+            panic!("one interchange");
+        };
+        assert_eq!(interchange.kind, "cloverleaf");
+        // Each side: a loop on and a loop off, a slip road outside each, and a
+        // collector–distributor road in five pieces between their noses.
+        let mut expected = Vec::new();
+        for side in ["left", "right"] {
+            for k in 0..5 {
+                expected.push(format!("{side}_cd_{k}"));
+            }
+            for ramp in ["loop_off", "loop_on", "off", "on"] {
+                expected.push(format!("{side}_{ramp}"));
+            }
+        }
+        expected.sort();
+        assert_eq!(slip_roads(&map), expected);
+        for side in ["left", "right"] {
+            for ramp in ["loop_on", "loop_off"] {
+                let name = format!("minami_ic_{side}_{ramp}");
+                let looped = road(&map, &name).unwrap();
+                assert!(turn(looped).abs() > 4.0, "{name}: {:.2}", turn(looped));
+                assert!(tightest(looped) >= LOOP_REFERENCE, "{name}");
+            }
+        }
+        // The carriageways are joined only by the collector–distributor roads:
+        // each carriageway has one junction off and one on.
+        let carriageway_junctions = map
+            .junctions
+            .iter()
+            .filter(|j| {
+                j.incoming_roads
+                    .iter()
+                    .any(|r| r.as_str().starts_with("road/e5_"))
+            })
+            .count();
+        assert_eq!(carriageway_junctions, 4);
+        assert!(!controlled(&map));
+        // The crossroad's overpass carries it over the carriageways and over the
+        // collector–distributor roads between the loops.
+        assert!(map.structures.iter().any(|s| s.kind.form() == "overpass"));
+        for side in ["left", "right"] {
+            assert!(separated(
+                &map,
+                "minami_ic_cross_",
+                &format!("minami_ic_{side}_cd_2")
+            ));
+        }
+    }
+}
+
+fn directional(handedness: TrafficHandedness) -> (ValidatedMap, Vec<String>) {
+    // The other motorway comes from the north and ends at this one.
+    let mut spec = corridor(InterchangeKind::Directional { side: Side::Left }, 80.0);
+    spec.interchanges[0].crossroad =
+        vec![Point3::new(0.0, 700.0, 0.0), Point3::new(0.0, -20.0, 0.0)];
+    generate_spec(spec, handedness)
+}
+
+#[test]
+fn a_directional_t_stacks_its_flyovers_over_the_motorway() {
+    for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+        let (map, notes) = directional(handedness);
+        assert!(notes.is_empty(), "{notes:#?}");
+        let [interchange] = map.interchanges.iter().collect::<Vec<_>>()[..] else {
+            panic!("one interchange");
+        };
+        assert_eq!(interchange.kind, "directional");
+        // A slip road on and off the near carriageway, a flyover on and off the
+        // far one, and the other motorway's two carriageways.
+        assert_eq!(
+            slip_roads(&map),
+            ["left_off", "left_on", "right_off", "right_on"]
+        );
+        for name in ["minami_ic_branch_in", "minami_ic_branch_out"] {
+            let branch = road(&map, name).unwrap_or_else(|| panic!("no {name}"));
+            assert_eq!(branch.form, FormOfWay::Motorway, "{name}");
+        }
+        assert!(!controlled(&map));
+        // Each flyover is on a viaduct over the motorway, and where they cross
+        // the one off the far carriageway is over the one on to it: three levels.
+        let viaducts = map
+            .structures
+            .iter()
+            .filter(|s| s.kind.form() == "viaduct")
+            .count();
+        assert!(viaducts >= 2, "{viaducts}");
+        for flyover in ["minami_ic_right_on", "minami_ic_right_off"] {
+            assert!(separated(&map, flyover, "e5_"), "{flyover}");
+        }
+        assert!(separated(&map, "minami_ic_right_off", "minami_ic_right_on"));
+        assert!(!separated(
+            &map,
+            "minami_ic_right_on",
+            "minami_ic_right_off"
+        ));
+    }
+}
+
+#[test]
+fn a_directional_ts_flyovers_need_room_to_climb_from_the_far_carriageway() {
+    let mut spec = corridor(InterchangeKind::Directional { side: Side::Left }, 80.0);
+    spec.interchanges[0].reach = 140.0;
+    let error = spec.plan(TrafficHandedness::RightHand).unwrap_err();
+    assert!(error.contains("reach of"), "{error}");
+}
+
+#[test]
+fn a_directional_ts_flyovers_come_down_to_a_branch_on_high_ground_no_steeper_than_up() {
+    // The branch drawn on ground well above both flyovers' levels, and long
+    // enough to come down from it at the flyovers' grade.
+    let mut spec = corridor(InterchangeKind::Directional { side: Side::Left }, 80.0);
+    for p in &mut spec.interchanges[0].crossroad {
+        p.y *= 3.0;
+        p.z = 40.0;
+    }
+    let plan = spec.plan(TrafficHandedness::RightHand).unwrap();
+    for road in plan
+        .roads
+        .iter()
+        .filter(|road| road.name.ends_with("_on") || road.name.ends_with("_off"))
+    {
+        for pair in road.points.windows(2) {
+            let run = pair[0].horizontal_distance_to(pair[1]);
+            if run > 1e-6 {
+                let grade = (pair[1].z - pair[0].z).abs() / run;
+                assert!(grade < 0.065, "{} at {:.1} %", road.name, grade * 100.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_cloverleaf_says_how_much_reach_its_collector_distributor_roads_need() {
+    let mut spec = corridor(InterchangeKind::Cloverleaf, 80.0);
+    spec.interchanges[0].reach = 200.0;
+    let error = spec.plan(TrafficHandedness::RightHand).unwrap_err();
+    let least: f64 = error
+        .split("reach of ")
+        .nth(1)
+        .and_then(|rest| rest.split(" m").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{error}"));
+    spec.interchanges[0].reach = least;
+    let plan = spec
+        .plan(TrafficHandedness::RightHand)
+        .unwrap_or_else(|error| panic!("{least}: {error}"));
+    assert!(plan.notes.is_empty(), "{:#?}", plan.notes);
+}
+
+#[test]
+fn carla_draws_them_all() {
+    for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+        let mut maps = Vec::new();
+        for kind in [
+            InterchangeKind::Parclo,
+            InterchangeKind::Trumpet { side: Side::Left },
+            InterchangeKind::Cloverleaf,
+        ] {
+            maps.push(generate(kind, handedness).0);
+        }
+        maps.push(directional(handedness).0);
+        for map in maps {
+            let meshes = roadgen_carla::to_meshes(&map, &roadgen_carla::PackageConfig::new("e5"));
+            assert!(meshes.iter().any(|m| m.role == roadgen_carla::Role::Road));
+        }
     }
 }
 
@@ -258,6 +469,7 @@ fn loops_fit_with_the_terminals_at_the_default_80_m() {
         for kind in [
             InterchangeKind::Parclo,
             InterchangeKind::Trumpet { side: Side::Right },
+            InterchangeKind::Cloverleaf,
         ] {
             for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
                 let case = format!("{lanes} lanes, {kind:?}, {handedness:?}");
@@ -267,12 +479,18 @@ fn loops_fit_with_the_terminals_at_the_default_80_m() {
                 spec.lanes = lanes;
                 let (map, notes) = generate_spec(spec, handedness);
                 assert!(notes.is_empty(), "{case}: {notes:#?}");
-                let sides: &[&str] = match kind {
-                    InterchangeKind::Parclo => &["left", "right"],
-                    _ => &["right"],
+                let loops: &[&str] = match kind {
+                    InterchangeKind::Parclo => &["left_loop", "right_loop"],
+                    InterchangeKind::Cloverleaf => &[
+                        "left_loop_on",
+                        "left_loop_off",
+                        "right_loop_on",
+                        "right_loop_off",
+                    ],
+                    _ => &["right_loop"],
                 };
-                for side in sides {
-                    let name = format!("minami_ic_{side}_loop");
+                for looped in loops {
+                    let name = format!("minami_ic_{looped}");
                     let looped = road(&map, &name).unwrap_or_else(|| panic!("no {name}"));
                     // Still a loop, and no tighter than a loop may be.
                     assert!(

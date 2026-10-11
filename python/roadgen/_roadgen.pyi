@@ -128,10 +128,20 @@ class Corridor:
         reach: float = 320.0,
     ) -> None:
         """`kind` is `diamond`, `half_diamond` (with `side`), `parclo` — a diamond
-        whose turns on across the crossroad are loops — or `trumpet`, whose
-        crossroad stops beyond the motorway on `side`. A loop is 30 m round
-        whatever the terminal; it needs the terminal about 76 m out or more (79 m
-        beside three lanes each way), and the default 80 m will do."""
+        whose turns on across the crossroad are loops — `trumpet`, whose
+        crossroad stops beyond the motorway on `side` and splits there round a
+        loop with nothing at grade, `cloverleaf` — a loop in each quadrant, off
+        and on to a collector–distributor road beside each carriageway, which
+        needs a `reach` of about 300 m — or `directional` (with `side`), where
+        another motorway drawn by `crossroad` comes from `side` and ends at this
+        one on flyovers stacked three levels high; it is built as two
+        carriageways of this corridor's standard, `crossroad_lanes` unused. A
+        loop is 30 m round whatever the terminal; it needs the terminal about
+        76 m out or more (79 m beside three lanes each way), and the default 80 m
+        will do. A trumpet's junction on the side its crossroad comes from, and
+        the end of a directional's other motorway, are `terminal` out or farther;
+        a cloverleaf's junctions and a trumpet's stem end are as near as the
+        overpass lets them be."""
     def add_ramp(
         self, name: str, at: float, end: Point, side: str = "right", on: bool = False
     ) -> None: ...

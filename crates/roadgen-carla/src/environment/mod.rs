@@ -39,6 +39,7 @@ pub mod foundation;
 pub mod heap;
 pub(crate) mod highway;
 pub mod hill;
+mod interchange;
 pub mod land;
 pub mod noise;
 pub mod pad;

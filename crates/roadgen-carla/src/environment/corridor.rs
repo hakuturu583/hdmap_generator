@@ -34,6 +34,8 @@ use roadgen_core::structure::{
 use roadgen_core::topology::{Direction, LaneEnd};
 use roadgen_core::units::{PositiveWidth, SpeedLimit};
 
+use super::interchange::{self, Directional, FreeFlow};
+
 /// The geometry a road is designed to, by design speed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesignStandard {
@@ -132,14 +134,14 @@ impl Side {
         }
     }
 
-    fn sign(self) -> f64 {
+    pub(super) fn sign(self) -> f64 {
         match self {
             Side::Left => 1.0,
             Side::Right => -1.0,
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Side::Left => "left",
             Side::Right => "right",
@@ -177,11 +179,31 @@ pub enum InterchangeKind {
     /// before the crossing, and a slip road on after it for traffic from the
     /// near side.
     Parclo,
-    /// A crossroad that ends at the motorway: it comes from one side, crosses,
-    /// and stops at a terminal on `side`. The side it comes from has a slip
-    /// road off and one on, as a diamond's; the side it stops on a slip road
-    /// off to the crossroad and a loop on from it.
+    /// A crossroad that ends at the motorway, every movement free-flowing: it
+    /// comes from the side opposite `side`, where a slip road off merges into it
+    /// and one on leaves it, crosses the motorway on its overpass as the stem,
+    /// and on `side` splits, with no terminal, into a loop off the far
+    /// carriageway and a semi-direct slip road on to it that goes round the loop.
     Trumpet { side: Side },
+    /// A full cloverleaf: in each quadrant a loop, for the turn across the
+    /// crossroad on (before it) or off (after it), and outside the loop a slip
+    /// road for the turn the other way. The loops and the slip roads leave and
+    /// join a collector–distributor road beside each carriageway, so the
+    /// weaving between a loop on and a loop off is kept off the through lanes;
+    /// the collector–distributor road leaves the carriageway once and joins it
+    /// once. On the crossroad every slip road merges or diverges: nothing is
+    /// signalled and nothing gives way.
+    Cloverleaf,
+    /// A junction of two motorways where one ends at the other — a directional
+    /// T. The crossroad is the other motorway's line: it comes from `side` and
+    /// ends short of the corridor, and the plan builds it as two carriageways of
+    /// the corridor's standard and lanes, its own `crossroad_lanes` unused. Its
+    /// carriageway in splits into a slip road on to the near carriageway and a
+    /// flyover across the motorway on to the far one; its carriageway out is
+    /// joined by a slip road off the near carriageway and a flyover off the far
+    /// one. The two flyovers cross each other beside the motorway, one stacked
+    /// over the other: three levels.
+    Directional { side: Side },
 }
 
 impl InterchangeKind {
@@ -191,6 +213,8 @@ impl InterchangeKind {
             InterchangeKind::HalfDiamond { .. } => "half_diamond",
             InterchangeKind::Parclo => "parclo",
             InterchangeKind::Trumpet { .. } => "trumpet",
+            InterchangeKind::Cloverleaf => "cloverleaf",
+            InterchangeKind::Directional { .. } => "directional",
         }
     }
 }
@@ -315,16 +339,16 @@ impl CorridorSpec {
 // -----------------------------------------------------------------------------------
 
 /// How far apart the plan's points are, metres.
-const STEP: f64 = 5.0;
+pub(super) const STEP: f64 = 5.0;
 /// The length of a junction where a slip road leaves or joins, metres.
-const GAP: f64 = 20.0;
+pub(super) const GAP: f64 = 20.0;
 /// The radius of a loop slip road along the middle of its lane, metres: the
 /// Road Structure Ordinance's least radius (art. 15) for 30 km/h, the speed a
 /// loop is designed to — slower than the 40 km/h of the other slip roads, whose
 /// 60 m would need the terminals half as far out again.
-const LOOP_RADIUS: f64 = 30.0;
+pub(super) const LOOP_RADIUS: f64 = 30.0;
 /// The room kept between a loop and the off slip road outside it, metres.
-const LOOP_CLEARANCE: f64 = 2.0;
+pub(super) const LOOP_CLEARANCE: f64 = 2.0;
 /// How much farther out than the terminal an off slip road may end, metres, to
 /// make room for the loop inside it: the junction at the terminal reaches
 /// [`GAP`] / 2 along the crossroad each side, and the off slip road's lanes stay
@@ -606,7 +630,7 @@ fn marking(marking: RoadMarking) -> BoundaryMarking {
 
 /// A one-way cross-section, outwards from the reference line: the median-side
 /// shoulder, the driving lanes, an optional speed-change lane, the outer shoulder.
-fn one_way(
+pub(super) fn one_way(
     standard: &DesignStandard,
     lanes: usize,
     extra: Option<WidthProfile>,
@@ -661,13 +685,13 @@ fn one_way(
 }
 
 /// A carriageway's cross-section width, shoulders included.
-fn carriageway_width(standard: &DesignStandard, lanes: usize) -> f64 {
+pub(super) fn carriageway_width(standard: &DesignStandard, lanes: usize) -> f64 {
     standard.inner_shoulder + standard.lane_width * lanes as f64 + standard.outer_shoulder
 }
 
 /// A cubic in plan from `a` heading `ha` to `b` heading `hb`, sampled every
 /// [`STEP`], with heights eased from `za` to `zb`.
-fn link(a: [f64; 2], ha: f64, za: f64, b: [f64; 2], hb: f64, zb: f64) -> Vec<Point3> {
+pub(super) fn link(a: [f64; 2], ha: f64, za: f64, b: [f64; 2], hb: f64, zb: f64) -> Vec<Point3> {
     let chord = (b[0] - a[0]).hypot(b[1] - a[1]);
     let handle = chord * 0.4;
     let p = [
@@ -690,8 +714,18 @@ fn link(a: [f64; 2], ha: f64, za: f64, b: [f64; 2], hb: f64, zb: f64) -> Vec<Poi
         .collect()
 }
 
+/// Where the lanes of a road's last cross-section begin in its list of lanes.
+fn last_section(road: &RoadPlan) -> usize {
+    match road.cross_sections.split_last() {
+        None => 0,
+        Some((_, earlier)) => {
+            road.lanes.len() + earlier.iter().map(|(_, l)| l.len()).sum::<usize>()
+        }
+    }
+}
+
 /// Plan length of a polyline.
-fn length_of(points: &[Point3]) -> f64 {
+pub(super) fn length_of(points: &[Point3]) -> f64 {
     points
         .windows(2)
         .map(|pair| pair[0].horizontal_distance_to(pair[1]))
@@ -699,7 +733,7 @@ fn length_of(points: &[Point3]) -> f64 {
 }
 
 /// The steepest grade along a polyline.
-fn steepest(points: &[Point3]) -> f64 {
+pub(super) fn steepest(points: &[Point3]) -> f64 {
     points
         .windows(2)
         .filter_map(|pair| {
@@ -728,25 +762,43 @@ struct Piece {
 
 /// Where a slip road leaves or joins a carriageway.
 #[derive(Debug, Clone)]
-struct Nose {
+pub(super) struct Nose {
     /// Travel station of the nose.
-    at: f64,
-    on: bool,
+    pub at: f64,
+    pub on: bool,
 }
 
-/// One carriageway of the corridor.
-struct Carriageway {
-    side: Side,
+/// One carriageway of the corridor, or a collector–distributor road beside one.
+pub(super) struct Carriageway {
+    pub side: Side,
     /// Whether traffic goes the centre line's way.
-    along: bool,
+    pub along: bool,
     /// The reference line's offset to the left of the centre line.
-    offset: f64,
-    noses: Vec<Nose>,
+    pub offset: f64,
+    pub noses: Vec<Nose>,
+    /// What it is built to, and its driving lanes: the motorway's, or a slip
+    /// road's for a collector–distributor road.
+    pub standard: DesignStandard,
+    pub lanes: usize,
+    /// The travel stations it runs between: the corridor's ends, or where a
+    /// collector–distributor road leaves the carriageway and joins it again.
+    pub span: (f64, f64),
+    /// What its pieces are named after, numbered.
+    pub name: String,
+    /// How far a collector–distributor road's reference line moves out, away from
+    /// the carriageway it runs beside, over [`DRIFT_LENGTH`] from each end: the
+    /// room that keeps it apart from the through lanes. Nothing for a carriageway.
+    pub drift: f64,
+    pub collector: bool,
 }
+
+/// How far a collector–distributor road takes to move out from beside the
+/// carriageway, and back, metres.
+const DRIFT_LENGTH: f64 = 60.0;
 
 impl Carriageway {
     /// The way traffic heads at centre-line station `s`.
-    fn heading(&self, track: &Track, s: f64) -> f64 {
+    pub fn heading(&self, track: &Track, s: f64) -> f64 {
         let (_, _, h) = track.at(s);
         if self.along {
             h
@@ -754,6 +806,44 @@ impl Carriageway {
             h + std::f64::consts::PI
         }
     }
+
+    /// How far its reference line has moved out at travel station `t`.
+    fn drift_at(&self, t: f64) -> f64 {
+        if self.drift == 0.0 {
+            return 0.0;
+        }
+        let x = ((t - self.span.0).min(self.span.1 - t) / DRIFT_LENGTH).clamp(0.0, 1.0);
+        self.drift * (0.5 - 0.5 * (std::f64::consts::PI * x).cos())
+    }
+}
+
+/// How a slip road's points are made.
+pub(super) enum Shape {
+    /// A cubic from the nose to its open end, the heights eased.
+    Link,
+    /// The cubic to `lead`, the points between it and the open end — from the
+    /// open end on a slip road on, to it on one off — at one even grade.
+    Lead(Vec<Point3>),
+    /// The road whole, heights and all, from its open end to the nose's end of
+    /// the junction on a slip road on, and from there to the open end off.
+    Whole(Vec<Point3>),
+    /// No road of its own: the slip road is the first (off) or last (on) piece
+    /// of a collector–distributor road.
+    Collector,
+}
+
+/// Where a slip road leaves or joins a carriageway, and the slip road.
+pub(super) struct Access {
+    pub ramp: String,
+    pub carriageway: usize,
+    pub on: bool,
+    pub nose: f64,
+    /// Its open end — or, beside a lead, the lead's end at the link — and the
+    /// height and heading there.
+    pub end: [f64; 2],
+    pub end_z: f64,
+    pub end_heading: f64,
+    pub shape: Shape,
 }
 
 impl CorridorSpec {
@@ -941,6 +1031,12 @@ impl CorridorSpec {
                 along: (side == Side::Right) == forward_right,
                 offset: side.sign() * standard.median / 2.0,
                 noses: Vec::new(),
+                standard: standard.clone(),
+                lanes: self.lanes,
+                span: (0.0, length),
+                name: format!("{key}_{}", side.as_str()),
+                drift: 0.0,
+                collector: false,
             })
             .collect();
         // The side a carriageway's lanes lie on, as a sign to the left of travel.
@@ -949,20 +1045,6 @@ impl CorridorSpec {
         let centre_of = |c: &Carriageway, t: f64| if c.along { t } else { length - t };
 
         // Interchanges and ramps: where each slip road leaves or joins.
-        struct Access {
-            ramp: String,
-            carriageway: usize,
-            on: bool,
-            nose: f64,
-            // Its open end, and the height and heading there.
-            end: [f64; 2],
-            end_z: f64,
-            end_heading: f64,
-            // A slip road on that does not run straight from its open end — a
-            // loop: the points from the open end up to `end`, which the link
-            // to the nose then carries on from.
-            lead: Vec<Point3>,
-        }
         let mut accesses: Vec<Access> = Vec::new();
         for site in &self.interchanges {
             let ic = super::slug(&site.name);
@@ -1020,8 +1102,42 @@ impl CorridorSpec {
                     site.name, site.at
                 ));
             }
+            // A directional T's crossroad is a motorway that ends short of the
+            // corridor, and nothing of it crosses.
+            if let InterchangeKind::Directional { side: near } = site.kind {
+                self.directional(
+                    Directional {
+                        site,
+                        ic: &ic,
+                        near,
+                        c_station,
+                        centre_station,
+                        cross_length,
+                        track: &track,
+                        z: &z,
+                        point_at: &point_at,
+                        ground_at: &ground_at,
+                        at_lateral: &at_lateral,
+                        cw_width,
+                        outward,
+                        handedness,
+                        ramp_standard: &ramp_standard,
+                    },
+                    &mut plan,
+                    &carriageways,
+                    &mut accesses,
+                )?;
+                continue;
+            }
             let motorway_z = z(centre_station);
-            let half_corridor = standard.median / 2.0 + cw_width + 3.0;
+            // A cloverleaf's collector–distributor roads, an auxiliary lane wide,
+            // pass under the crossroad too.
+            let collector_room = if site.kind == InterchangeKind::Cloverleaf {
+                0.5 + interchange::DRIFT + carriageway_width(&ramp_standard, 2)
+            } else {
+                0.0
+            };
+            let half_corridor = standard.median / 2.0 + cw_width + collector_room + 3.0;
             // Over the motorway: an overpass's deck and the clearance under it;
             // under it: the clearance under the motorway's own overpass.
             let target = if site.over {
@@ -1071,43 +1187,95 @@ impl CorridorSpec {
                 Point3::new(p[0], p[1], cross_profile.height(s))
             };
 
-            // The terminals: one each side, where the ramps meet the crossroad.
+            let (centre_plan, centre_heading) = {
+                let (x, y, h) = track.at(centre_station);
+                ([x, y], h)
+            };
+            // A free-flowing interchange is laid out side by side: its slip roads,
+            // and where they meet the crossroad.
+            let free = matches!(
+                site.kind,
+                InterchangeKind::Cloverleaf | InterchangeKind::Trumpet { .. }
+            );
+            let mut layouts: Vec<(Side, interchange::SideLayout)> = Vec::new();
+            if free {
+                for side in [Side::Left, Side::Right] {
+                    // The crossroad's traffic heading out on this side goes the way
+                    // it was drawn if this side is past the crossing.
+                    let after = at_lateral(side.sign() * 5.0).is_some_and(|s| s > c_station);
+                    let width_of = |direction: Direction| {
+                        site.crossroad_lanes
+                            .iter()
+                            .filter(|lane| lane.direction == direction)
+                            .map(|lane| lane.width.evaluate(0.0).metres())
+                            .sum::<f64>()
+                    };
+                    let (forward, backward) =
+                        (width_of(Direction::Forward), width_of(Direction::Backward));
+                    let dims = interchange::Dims {
+                        edge: standard.median / 2.0 + cw_width,
+                        ramp_width: carriageway_width(&ramp_standard, 1),
+                        lane_middle: ramp_standard.inner_shoulder + ramp_standard.lane_width / 2.0,
+                        ramp_radius: ramp_standard.min_radius,
+                        loop_radius: LOOP_RADIUS,
+                        out: if after { forward } else { backward },
+                        inward: if after { backward } else { forward },
+                        least: half_corridor + GAP / 2.0 + 1.0,
+                        terminal: site.terminal,
+                        reach: site.reach,
+                    };
+                    let layout = match site.kind {
+                        InterchangeKind::Trumpet { side: far } if far == side => {
+                            interchange::trumpet_far(&dims)
+                        }
+                        InterchangeKind::Trumpet { .. } => interchange::trumpet_near(&dims),
+                        _ => interchange::cloverleaf(&dims),
+                    }
+                    .map_err(|error| format!("{}: {error}", site.name))?;
+                    layouts.push((side, layout));
+                }
+            }
+            // The junctions on the crossroad, by station: a terminal each side,
+            // or where a free-flowing layout puts them.
             let sides: Vec<Side> = match site.kind {
                 InterchangeKind::HalfDiamond { side } => vec![side],
                 _ => vec![Side::Left, Side::Right],
             };
-            let mut cuts: Vec<(f64, Side)> = Vec::new();
+            let mut cuts: Vec<(f64, Side, usize)> = Vec::new();
             for &side in &sides {
-                let s = at_lateral(side.sign() * site.terminal).ok_or_else(|| {
-                    format!(
-                        "{}: the crossroad does not reach {:.0} m to the {} of the corridor",
-                        site.name,
-                        site.terminal,
-                        side.as_str()
-                    )
-                })?;
-                cuts.push((s, side));
+                let spots: Vec<f64> = match layouts.iter().find(|(s, _)| *s == side) {
+                    Some((_, layout)) => layout.junctions.iter().map(|j| j.b).collect(),
+                    None => vec![site.terminal],
+                };
+                for (k, b) in spots.into_iter().enumerate() {
+                    let s = at_lateral(side.sign() * b).ok_or_else(|| {
+                        format!(
+                            "{}: the crossroad does not reach {b:.0} m to the {} of the corridor",
+                            site.name,
+                            side.as_str()
+                        )
+                    })?;
+                    cuts.push((s, side, k));
+                }
             }
             cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
             // The crossroad in pieces between the terminals.
             let mut bounds = vec![0.0];
-            for (s, _) in &cuts {
+            for (s, _, _) in &cuts {
                 bounds.push(s - GAP / 2.0);
                 bounds.push(s + GAP / 2.0);
             }
             bounds.push(cross_length);
-            // A trumpet's crossroad stops at its far terminal: the piece beyond
-            // is not built.
-            let stop = match site.kind {
-                InterchangeKind::Trumpet { side } => {
-                    let k = cuts
+            // A crossroad that ends at the interchange stops at the junction it
+            // ends at: the piece beyond is not built.
+            let stop = cuts
+                .iter()
+                .position(|(_, side, k)| {
+                    layouts
                         .iter()
-                        .position(|(_, s)| *s == side)
-                        .expect("both sides");
-                    Some((cuts[k].0, if cuts[k].0 > c_station { k + 1 } else { k }))
-                }
-                _ => None,
-            };
+                        .any(|(s, layout)| s == side && layout.junctions[*k].stop)
+                })
+                .map(|k| (cuts[k].0, if cuts[k].0 > c_station { k + 1 } else { k }));
             let beyond_stop =
                 |s: f64| stop.is_some_and(|(at, _)| (s - at) * (at - c_station) > 0.0);
             let mut cross_names: Vec<Option<String>> = Vec::new();
@@ -1181,16 +1349,35 @@ impl CorridorSpec {
                     site.name
                 ));
             };
-            // Which way across the corridor is in towards it, for a piece of the
-            // crossroad: a terminal's inner piece runs to the corridor, its outer
-            // piece away from it.
-            let (centre_plan, centre_heading) = {
-                let (x, y, h) = track.at(centre_station);
-                ([x, y], h)
-            };
+            if free {
+                self.free_flow(
+                    FreeFlow {
+                        site,
+                        ic: &ic,
+                        cuts: &cuts,
+                        layouts: &layouts,
+                        cross_names: &cross_names,
+                        c_station,
+                        centre_station,
+                        centre_plan,
+                        centre_heading,
+                        track: &track,
+                        cw_width,
+                        outward,
+                        ramp_standard: &ramp_standard,
+                        at_lateral: &at_lateral,
+                        crossroad_point: &crossroad_point,
+                        roads: ic_roads,
+                    },
+                    &mut plan,
+                    &mut carriageways,
+                    &mut accesses,
+                )?;
+                continue;
+            }
 
             // The ramps at each terminal, and the movements there.
-            for (index, (s, side)) in cuts.iter().enumerate() {
+            for (index, (s, side, _)) in cuts.iter().enumerate() {
                 let junction = format!("{ic}_{}", side.as_str());
                 plan.junctions.push(junction.clone());
                 ic_junctions.push(junction.clone());
@@ -1265,14 +1452,9 @@ impl CorridorSpec {
                 let on_name = format!("{ic}_{}_on", side.as_str());
                 let loop_name = format!("{ic}_{}_loop", side.as_str());
                 let travel_at = travel(carriageway, centre_station);
-                // What this terminal has: the off slip road always; a slip road on
-                // and a loop on as the kind says.
-                let far_trumpet =
-                    matches!(site.kind, InterchangeKind::Trumpet { side: far } if far == *side);
-                let near_trumpet =
-                    matches!(site.kind, InterchangeKind::Trumpet { .. }) && !far_trumpet;
-                let looped = matches!(site.kind, InterchangeKind::Parclo) || far_trumpet;
-                let diagonal_on = !far_trumpet;
+                // What this terminal has: the slip roads off and on always, and a
+                // loop on at a parclo.
+                let looped = matches!(site.kind, InterchangeKind::Parclo);
                 // Beside a loop the off slip road ends a ramp's width out, the
                 // loop leaving the terminal a ramp's width in.
                 let apart = ramp_width / 2.0 + 1.0;
@@ -1329,22 +1511,20 @@ impl CorridorSpec {
                     end: off_end,
                     end_z: terminal.z,
                     end_heading: heading_travel,
-                    lead: Vec::new(),
+                    shape: Shape::Link,
                 });
                 ic_roads.push(off_name.clone());
-                if diagonal_on {
-                    accesses.push(Access {
-                        ramp: on_name.clone(),
-                        carriageway: c,
-                        on: true,
-                        nose: travel_at + site.reach,
-                        end: shift(ahead(setback)),
-                        end_z: terminal.z,
-                        end_heading: heading_travel,
-                        lead: Vec::new(),
-                    });
-                    ic_roads.push(on_name.clone());
-                }
+                accesses.push(Access {
+                    ramp: on_name.clone(),
+                    carriageway: c,
+                    on: true,
+                    nose: travel_at + site.reach,
+                    end: shift(ahead(setback)),
+                    end_z: terminal.z,
+                    end_heading: heading_travel,
+                    shape: Shape::Link,
+                });
+                ic_roads.push(on_name.clone());
                 if looped {
                     // The turns, as headings in the plane of along the traffic
                     // and towards the corridor, the loop turning from the one to
@@ -1410,7 +1590,7 @@ impl CorridorSpec {
                         end: [end.x, end.y],
                         end_z: terminal.z,
                         end_heading: heading_travel,
-                        lead,
+                        shape: Shape::Lead(lead),
                     });
                     ic_roads.push(loop_name.clone());
                 }
@@ -1434,30 +1614,20 @@ impl CorridorSpec {
                     })
                 };
                 let off = Some((off_name.clone(), ramp_lane));
-                // Off: out and in, but at a trumpet only the way the crossroad
-                // goes on — out on its near side, in on its far.
-                let off_to = if near_trumpet {
-                    vec![leave_out.clone()]
-                } else if far_trumpet {
-                    vec![Some(leave_in.clone())]
-                } else {
-                    vec![Some(leave_in.clone()), leave_out.clone()]
-                };
+                // Off: out and in.
+                let off_to = vec![Some(leave_in.clone()), leave_out.clone()];
                 plan.connections
                     .extend(off_to.into_iter().filter_map(|to| lanes(off.clone(), to)));
                 // On: from both arrivals by the slip road, unless a loop takes the
-                // traffic arriving from across the corridor — or, at a trumpet's
-                // near terminal, that traffic only goes on along the crossroad.
-                if diagonal_on {
-                    let on = Some((on_name.clone(), ramp_lane));
-                    let from = if looped || near_trumpet {
-                        vec![arrive_in.clone()]
-                    } else {
-                        vec![Some(arrive_out.clone()), arrive_in.clone()]
-                    };
-                    plan.connections
-                        .extend(from.into_iter().filter_map(|from| lanes(from, on.clone())));
-                }
+                // traffic arriving from across the corridor.
+                let on = Some((on_name.clone(), ramp_lane));
+                let from = if looped {
+                    vec![arrive_in.clone()]
+                } else {
+                    vec![Some(arrive_out.clone()), arrive_in.clone()]
+                };
+                plan.connections
+                    .extend(from.into_iter().filter_map(|from| lanes(from, on.clone())));
                 if looped {
                     plan.connections.extend(lanes(
                         Some(arrive_out.clone()),
@@ -1465,24 +1635,18 @@ impl CorridorSpec {
                     ));
                 }
                 // Traffic off the ramp is controlled; the crossroad is signalled too
-                // where the ramp is — except at a trumpet, whose slip roads off
-                // give way to the crossroad.
+                // where the ramp is.
                 let arrivals: Vec<(String, usize)> = std::iter::once(arrive_out.clone())
                     .chain(arrive_in.clone())
                     .collect();
-                let trumpet = near_trumpet || far_trumpet;
                 plan.controls.push(ControlPlan {
                     road: off_name.clone(),
                     lane: ramp_lane,
                     end: LaneEnd::End,
-                    control: if trumpet {
-                        Control::Yield
-                    } else {
-                        site.control
-                    },
+                    control: site.control,
                     priority: arrivals.clone(),
                 });
-                if site.control == Control::Signal && !trumpet {
+                if site.control == Control::Signal {
                     for (road, lane) in arrivals {
                         let end = end_at(&road);
                         plan.controls.push(ControlPlan {
@@ -1523,7 +1687,7 @@ impl CorridorSpec {
                 end: [ramp.end.x, ramp.end.y],
                 end_z: ramp.end.z,
                 end_heading: heading,
-                lead: Vec::new(),
+                shape: Shape::Link,
             });
         }
         for access in &accesses {
@@ -1540,8 +1704,14 @@ impl CorridorSpec {
         let speed = standard.design_speed;
         let mut piece_names: Vec<Vec<(String, Piece)>> = Vec::new();
         for c in &carriageways {
+            // A collector–distributor road is held to the slip roads' limit.
+            let speed = if c.collector {
+                60.0_f64.min(speed)
+            } else {
+                speed
+            };
             let mut pieces = Vec::new();
-            let mut from = 0.0;
+            let mut from = c.span.0;
             let mut accelerates = false;
             for nose in &c.noses {
                 if nose.at - GAP / 2.0 - from < 30.0 {
@@ -1564,7 +1734,7 @@ impl CorridorSpec {
                 from = nose.at + GAP / 2.0;
                 accelerates = nose.on;
             }
-            if length - from < 30.0 {
+            if c.span.1 - from < 30.0 {
                 return Err(format!(
                     "{}: a slip road is too close to the corridor's end",
                     self.name
@@ -1572,19 +1742,19 @@ impl CorridorSpec {
             }
             pieces.push(Piece {
                 from,
-                to: length,
+                to: c.span.1,
                 accelerates,
                 decelerates: false,
                 speed,
                 motorway: true,
             });
-            if let Some(transition) = self.end_transition {
+            if let (Some(transition), false) = (self.end_transition, c.collector) {
                 self.stage(c.along, transition, &mut pieces, &mut plan.notes);
             }
             let named = pieces
                 .into_iter()
                 .enumerate()
-                .map(|(index, piece)| (format!("{key}_{}_{index}", c.side.as_str()), piece))
+                .map(|(index, piece)| (format!("{}_{index}", c.name), piece))
                 .collect();
             piece_names.push(named);
         }
@@ -1595,11 +1765,15 @@ impl CorridorSpec {
             // To the left of travel is to the left of the centre line along it,
             // and to its right against it.
             let travel_left = if c.along { 1.0 } else { -1.0 };
-            let p = track.offset(s, c.offset + travel_left * extra);
+            let p = track.offset(
+                s,
+                c.offset + travel_left * (extra + outward * c.drift_at(t)),
+            );
             Point3::new(p[0], p[1], z(s))
         };
         let heading_on = |c: &Carriageway, t: f64| c.heading(&track, centre_of(c, t));
         for (c, pieces) in carriageways.iter().zip(&piece_names) {
+            let standard = &c.standard;
             for (name, piece) in pieces {
                 let count = ((piece.to - piece.from) / STEP).ceil().max(1.0) as usize;
                 let points: Vec<Point3> = (0..=count)
@@ -1649,35 +1823,35 @@ impl CorridorSpec {
                     )
                     .ok()
                 };
-                let plain = one_way(standard, self.lanes, None, handedness);
-                let (lanes, cross_sections) =
-                    if piece.accelerates && piece.decelerates && accel_end >= decel_start {
-                        // The two meet: one auxiliary lane all the way.
-                        (
-                            one_way(
-                                standard,
-                                self.lanes,
-                                Some(WidthProfile::constant(width(lane_width))),
-                                handedness,
-                            ),
-                            Vec::new(),
-                        )
+                let plain = one_way(standard, c.lanes, None, handedness);
+                let (lanes, cross_sections) = if piece.accelerates
+                    && piece.decelerates
+                    && accel_end >= decel_start
+                {
+                    // The two meet: one auxiliary lane all the way.
+                    (
+                        one_way(
+                            standard,
+                            c.lanes,
+                            Some(WidthProfile::constant(width(lane_width))),
+                            handedness,
+                        ),
+                        Vec::new(),
+                    )
+                } else {
+                    let mut sections = Vec::new();
+                    let first = if piece.accelerates {
+                        sections.push((accel_end, plain.clone()));
+                        one_way(standard, c.lanes, accel(), handedness)
                     } else {
-                        let mut sections = Vec::new();
-                        let first = if piece.accelerates {
-                            sections.push((accel_end, plain.clone()));
-                            one_way(standard, self.lanes, accel(), handedness)
-                        } else {
-                            plain.clone()
-                        };
-                        if piece.decelerates {
-                            sections.push((
-                                decel_start,
-                                one_way(standard, self.lanes, decel(), handedness),
-                            ));
-                        }
-                        (first, sections)
+                        plain.clone()
                     };
+                    if piece.decelerates {
+                        sections
+                            .push((decel_start, one_way(standard, c.lanes, decel(), handedness)));
+                    }
+                    (first, sections)
+                };
                 plan.roads.push(RoadPlan {
                     name: name.clone(),
                     points,
@@ -1688,7 +1862,11 @@ impl CorridorSpec {
                     } else {
                         RoadType::Rural
                     },
-                    form: if piece.motorway {
+                    // A collector–distributor road is a slip road all the way:
+                    // entered only from the carriageway and its own slip roads.
+                    form: if c.collector {
+                        FormOfWay::SlipRoad
+                    } else if piece.motorway {
                         FormOfWay::Motorway
                     } else {
                         FormOfWay::MultipleCarriageway
@@ -1722,80 +1900,105 @@ impl CorridorSpec {
                 .iter()
                 .find(|r| &r.name == before)
                 .expect("planned");
-            // Where the lanes of the piece's last cross-section begin in its list.
-            let offset_last = match lanes_before.cross_sections.split_last() {
-                None => 0,
-                Some((_, earlier)) => {
-                    lanes_before.lanes.len() + earlier.iter().map(|(_, l)| l.len()).sum::<usize>()
-                }
-            };
+            let offset_last = last_section(lanes_before);
             // A slip road runs beside the plain carriageway, half a metre clear of it.
-            let edge = cw_width + 0.5;
+            let edge = carriageway_width(&c.standard, c.lanes) + 0.5;
             let junction = format!("{}_{}", key, access.ramp);
             plan.junctions.push(junction.clone());
             let (start_t, end_t) = (access.nose - GAP / 2.0, access.nose + GAP / 2.0);
-            let points = if access.on {
-                let end = point_on(c, start_t, outward * edge);
-                let heading = heading_on(c, start_t);
-                let tail = link(
-                    access.end,
-                    access.end_heading,
-                    access.end_z,
-                    [end.x, end.y],
-                    heading,
-                    end.z,
-                );
-                match access.lead.split_last() {
-                    None => tail,
-                    // A loop, then the link: one even grade from the loop's open
-                    // end down (or up) to the nose.
-                    Some((_, lead)) => {
-                        let mut points: Vec<Point3> = lead.iter().copied().chain(tail).collect();
-                        let total = length_of(&points).max(1e-9);
-                        let start = points[0].z;
-                        let mut run = 0.0;
-                        for index in 0..points.len() {
-                            if index > 0 {
-                                run += points[index - 1].horizontal_distance_to(points[index]);
-                            }
-                            points[index].z = start + (end.z - start) * run / total;
-                        }
-                        points
+            // Spreads the heights of `points` at one grade from the first to the
+            // last.
+            let even = |mut points: Vec<Point3>| {
+                let total = length_of(&points).max(1e-9);
+                let (start, end) = (points[0].z, points[points.len() - 1].z);
+                let mut run = 0.0;
+                for index in 0..points.len() {
+                    if index > 0 {
+                        run += points[index - 1].horizontal_distance_to(points[index]);
+                    }
+                    points[index].z = start + (end - start) * run / total;
+                }
+                points
+            };
+            let points = match (&access.shape, access.on) {
+                (Shape::Collector, _) => None,
+                (Shape::Whole(points), _) => Some(points.clone()),
+                (shape, true) => {
+                    let end = point_on(c, start_t, outward * edge);
+                    let heading = heading_on(c, start_t);
+                    let tail = link(
+                        access.end,
+                        access.end_heading,
+                        access.end_z,
+                        [end.x, end.y],
+                        heading,
+                        end.z,
+                    );
+                    match shape {
+                        // A loop, then the link: one even grade from the loop's
+                        // open end down (or up) to the nose.
+                        Shape::Lead(lead) if lead.len() > 1 => Some(even(
+                            lead[..lead.len() - 1].iter().copied().chain(tail).collect(),
+                        )),
+                        _ => Some(tail),
                     }
                 }
-            } else {
-                let start = point_on(c, end_t, outward * edge);
-                let heading = heading_on(c, end_t);
-                link(
-                    [start.x, start.y],
-                    heading,
-                    start.z,
-                    access.end,
-                    access.end_heading,
-                    access.end_z,
-                )
+                (shape, false) => {
+                    let start = point_on(c, end_t, outward * edge);
+                    let heading = heading_on(c, end_t);
+                    let head = link(
+                        [start.x, start.y],
+                        heading,
+                        start.z,
+                        access.end,
+                        access.end_heading,
+                        access.end_z,
+                    );
+                    match shape {
+                        // The link, then the lead on to the open end.
+                        Shape::Lead(lead) if lead.len() > 1 => Some(even(
+                            head.into_iter().chain(lead[1..].iter().copied()).collect(),
+                        )),
+                        _ => Some(head),
+                    }
+                }
             };
-            if steepest(&points) > ramp_standard.max_grade + 1e-9 {
-                plan.notes.push(format!(
-                    "{}: the slip road climbs {:.1} %, steeper than {:.0} %",
-                    access.ramp,
-                    steepest(&points) * 100.0,
-                    ramp_standard.max_grade * 100.0
-                ));
+            if let Some(points) = points {
+                if steepest(&points) > ramp_standard.max_grade + 1e-9 {
+                    plan.notes.push(format!(
+                        "{}: the slip road climbs {:.1} %, steeper than {:.0} %",
+                        access.ramp,
+                        steepest(&points) * 100.0,
+                        ramp_standard.max_grade * 100.0
+                    ));
+                }
+                plan.roads.push(RoadPlan {
+                    name: access.ramp.clone(),
+                    points,
+                    lanes: one_way(&ramp_standard, 1, None, handedness),
+                    cross_sections: Vec::new(),
+                    road_type: RoadType::Motorway,
+                    form: FormOfWay::SlipRoad,
+                    speed_limit: Some(60.0_f64.min(speed)),
+                    corridor: true,
+                });
             }
-            plan.roads.push(RoadPlan {
-                name: access.ramp.clone(),
-                points,
-                lanes: one_way(&ramp_standard, 1, None, handedness),
-                cross_sections: Vec::new(),
-                road_type: RoadType::Motorway,
-                form: FormOfWay::SlipRoad,
-                speed_limit: Some(60.0_f64.min(speed)),
-                corridor: true,
-            });
+            // The slip road's lane: on a collector–distributor road's last piece,
+            // the one of its last cross-section.
+            let ramp_lane = match access.shape {
+                Shape::Collector if access.on => {
+                    let road = plan
+                        .roads
+                        .iter()
+                        .find(|r| r.name == access.ramp)
+                        .expect("planned");
+                    last_section(road) + 1
+                }
+                _ => 1,
+            };
             // Through: driving lane k to driving lane k. Off: the deceleration lane
             // onto the slip road; on: the slip road onto the acceleration lane.
-            for k in 1..=self.lanes {
+            for k in 1..=c.lanes {
                 plan.connections.push(ConnectionPlan::Lanes {
                     from: (before.clone(), offset_last + k),
                     to: (after.clone(), k),
@@ -1804,14 +2007,14 @@ impl CorridorSpec {
             }
             if access.on {
                 plan.connections.push(ConnectionPlan::Lanes {
-                    from: (access.ramp.clone(), 1),
-                    to: (after.clone(), self.lanes + 1),
+                    from: (access.ramp.clone(), ramp_lane),
+                    to: (after.clone(), c.lanes + 1),
                     junction: junction.clone(),
                 });
             } else {
                 plan.connections.push(ConnectionPlan::Lanes {
-                    from: (before.clone(), offset_last + self.lanes + 1),
-                    to: (access.ramp.clone(), 1),
+                    from: (before.clone(), offset_last + c.lanes + 1),
+                    to: (access.ramp.clone(), ramp_lane),
                     junction: junction.clone(),
                 });
             }
@@ -1841,7 +2044,12 @@ impl CorridorSpec {
                 }
                 // Each carried stretch, with the centre-line stretch it runs beside.
                 let mut stretches: Vec<Stretch> = Vec::new();
-                for (side, (c, pieces)) in carriageways.iter().zip(&piece_names).enumerate() {
+                for (side, (c, pieces)) in carriageways
+                    .iter()
+                    .zip(&piece_names)
+                    .enumerate()
+                    .filter(|(_, (c, _))| !c.collector)
+                {
                     let (t0, t1) = {
                         let (a, b) = (travel(c, from), travel(c, to));
                         (a.min(b), a.max(b))
