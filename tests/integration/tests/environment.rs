@@ -428,3 +428,85 @@ fn parts_that_overlap_are_refused() {
     let error = environment::generate(&mut map, &places).unwrap_err();
     assert!(error.to_string().contains("overlap"), "{error}");
 }
+
+#[test]
+fn a_pad_is_levelled_at_its_own_height() {
+    use roadgen_carla::environment::PadSpec;
+    let mut map = MapBuilder::default().finish().unwrap();
+    let places = Places {
+        pads: vec![PadSpec {
+            name: "yard".into(),
+            outline: vec![
+                Point3::new(0.0, 0.0, 5.0),
+                Point3::new(80.0, 0.0, 5.0),
+                Point3::new(80.0, 40.0, 5.0),
+                Point3::new(0.0, 40.0, 5.0),
+            ],
+            buildings: None,
+            site: None,
+        }],
+        ground: Some(Default::default()),
+        ..Places::default()
+    };
+    environment::generate(&mut map, &places).unwrap();
+    let map = map.validate().expect("validates");
+    let locator = map.tin_surfaces.iter().next().unwrap().tin.locator();
+    for (x, y) in [(40.0, 20.0), (5.0, 5.0), (75.0, 35.0)] {
+        let z = locator.height_at(x, y).unwrap();
+        assert!((z - 5.0).abs() < 1e-6, "({x}, {y}): {z}");
+    }
+}
+
+#[test]
+fn parts_whose_edges_cross_are_refused() {
+    use roadgen_carla::environment::PadSpec;
+    // A plus: neither holds a corner of the other, but they cross.
+    let pad = |name: &str, (w, h): (f64, f64)| PadSpec {
+        name: name.into(),
+        outline: vec![
+            Point3::new(-w, -h, 0.0),
+            Point3::new(w, -h, 0.0),
+            Point3::new(w, h, 0.0),
+            Point3::new(-w, h, 0.0),
+        ],
+        buildings: None,
+        site: None,
+    };
+    let mut map = MapBuilder::default().finish().unwrap();
+    let places = Places {
+        pads: vec![pad("long", (100.0, 5.0)), pad("tall", (5.0, 100.0))],
+        ..Places::default()
+    };
+    let error = environment::generate(&mut map, &places).unwrap_err();
+    assert!(error.to_string().contains("overlap"), "{error}");
+}
+
+#[test]
+fn a_road_alone_makes_a_site() {
+    let mut builder = MapBuilder::default();
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(100.0, 0.0, 0.0),
+                vec![LaneSpec::new(
+                    PositiveWidth::new(3.5).unwrap(),
+                    Direction::Forward,
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let places = Places {
+        site_roads: vec![(road.clone(), "Plant".into())],
+        ..Places::default()
+    };
+    let mut map = builder.finish().unwrap();
+    environment::generate(&mut map, &places).unwrap();
+    let map = map.validate().expect("validates");
+    let site = map.sites.get(&SiteId::new("plant")).expect("the site");
+    assert_eq!(site.kind, "works");
+    assert_eq!(site.roads, [road]);
+    assert!(site.surfaces.is_empty());
+    assert!(map.tin_surfaces.is_empty());
+}

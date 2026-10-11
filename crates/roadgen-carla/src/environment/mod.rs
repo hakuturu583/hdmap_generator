@@ -179,7 +179,7 @@ impl Places {
             pad.check().map_err(Error::Spec)?;
             let key = named(&pad.name, "pad")?;
             parts.push(Part {
-                forms: pad.landforms(),
+                forms: pad.landforms(&key, spacing),
                 outline: pad.outline.clone(),
                 kind: "pad".into(),
                 site: pad.site.clone(),
@@ -209,8 +209,31 @@ impl Places {
     }
 }
 
+/// Whether two outlines share any ground: one holds a vertex of the other, or
+/// their edges cross — two long, narrow pads laid across each other do, with every
+/// vertex outside the other.
 fn overlap(a: &[PlanPoint], b: &[PlanPoint]) -> bool {
-    a.iter().any(|&p| ring_contains(b, p)) || b.iter().any(|&p| ring_contains(a, p))
+    let edges = |ring: &[PlanPoint]| {
+        (0..ring.len())
+            .map(|i| (ring[i], ring[(i + 1) % ring.len()]))
+            .collect::<Vec<_>>()
+    };
+    a.iter().any(|&p| ring_contains(b, p))
+        || b.iter().any(|&p| ring_contains(a, p))
+        || edges(a)
+            .iter()
+            .any(|&(p, q)| edges(b).iter().any(|&(r, s)| segments_cross(p, q, r, s)))
+}
+
+/// Whether the segments `p..q` and `r..s` cross, each passing strictly between
+/// the other's ends.
+fn segments_cross(p: PlanPoint, q: PlanPoint, r: PlanPoint, s: PlanPoint) -> bool {
+    let side = |a: PlanPoint, b: PlanPoint, c: PlanPoint| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    let (d1, d2) = (side(p, q, r), side(p, q, s));
+    let (d3, d4) = (side(r, s, p), side(r, s, q));
+    d1 * d2 < 0.0 && d3 * d4 < 0.0
 }
 
 /// Generates the places onto `map`, once its roads are built and before it is
@@ -255,23 +278,26 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     }
     report.buildings = map.as_map().buildings.len() - before;
 
-    // The land: one, round everything.
-    if parts.is_empty() && places.ground.is_none() {
-        return Ok(report);
-    }
-    let mut forms = Landforms::default();
-    for part in &parts {
-        forms.extend(part.forms.clone());
-    }
-    let land = Land {
-        name: LAND.into(),
-        site: None,
-        base: Base::Roads,
-        ground,
-        seed: places.seed,
+    // The land: one, round everything — when there is anything to shape it, or it
+    // was asked for.
+    let surface = if parts.is_empty() && places.ground.is_none() {
+        None
+    } else {
+        let mut forms = Landforms::default();
+        for part in &parts {
+            forms.extend(part.forms.clone());
+        }
+        let land = Land {
+            name: LAND.into(),
+            site: None,
+            base: Base::Roads,
+            ground,
+            seed: places.seed,
+        };
+        let (surface, built) = land::generate(map, &land, forms)?;
+        report.land = Some(built);
+        Some(surface)
     };
-    let (surface, built) = land::generate(map, &land, forms)?;
-    report.land = Some(built);
 
     // What each part's land is, and which site it belongs to.
     let mut sites: BTreeMap<String, (String, Vec<LandCoverId>, Vec<RoadId>, bool)> =
@@ -295,7 +321,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
             &part.kind,
             part.outline.clone(),
             site.as_ref(),
-            Some(&surface),
+            surface.as_ref(),
         )?;
         report.land_covers += 1;
         if let (Some(site), Some(name)) = (site, &part.site) {
@@ -346,7 +372,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
                     name: Some(name),
                     kind: if pit { "open_pit_mine" } else { "works" }.into(),
                     land_covers,
-                    surfaces: vec![surface.clone()],
+                    surfaces: surface.iter().cloned().collect(),
                     roads,
                 },
             )

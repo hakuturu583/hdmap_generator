@@ -2241,7 +2241,7 @@ def test_a_mine_is_put_together_from_parts_and_its_roads_lie_on_the_land(tmp_pat
     assert len(triangles) > 1000
     assert min(z for _, _, z in nodes) == -72.0
     kinds = {kind for _, kind, _ in m.tin_breaklines(surface)}
-    assert kinds == {"crest", "toe", "road_edge"}
+    assert kinds == {"crest", "toe", "edge", "road_edge"}
     # The floor of the pit is where the land is lowest.
     assert m.terrain_height(0.0, 0.0) == -72.0
     # And the ramp's own points are on the land, all the way down.
