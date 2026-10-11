@@ -534,6 +534,11 @@ pub struct CorridorPlan {
     pub controls: Vec<ControlPlan>,
     pub structures: Vec<StructurePlan>,
     pub interchanges: Vec<InterchangePlan>,
+    /// Roads the land is fitted to rather than read from, besides the corridor's
+    /// own: a crossroad lifted onto an embankment to clear the motorway.
+    pub fitted: Vec<String>,
+    /// The ground's height where it is known: under a crossroad, as drawn.
+    pub anchors: Vec<Point3>,
     /// Where the plan departs from the design standard.
     pub notes: Vec<String>,
 }
@@ -958,6 +963,7 @@ impl CorridorSpec {
                         tunnel: None,
                     });
                 }
+                plan.fitted.push(name.clone());
                 plan.roads.push(RoadPlan {
                     name: name.clone(),
                     points,
@@ -969,6 +975,16 @@ impl CorridorSpec {
                     corridor: false,
                 });
                 cross_names.push(name);
+            }
+            // The ground the crossroad was drawn on, away from the motorway: what
+            // its embankment stands on.
+            let mut s = 0.0;
+            while s <= cross_length {
+                if (s - c_station).abs() > half_corridor {
+                    let p = point_at(s);
+                    plan.anchors.push(Point3::new(p[0], p[1], ground_at(s)));
+                }
+                s += 10.0;
             }
             let mut ic_roads = cross_names.clone();
             let mut ic_junctions = Vec::new();
@@ -1500,7 +1516,7 @@ impl CorridorPlan {
     pub fn apply(
         &self,
         builder: &mut MapBuilder,
-        corridor_roads: &mut Vec<(RoadId, String)>,
+        places: &mut super::Places,
     ) -> Result<Vec<RoadId>, String> {
         let mut ids = Vec::new();
         for road in &self.roads {
@@ -1521,10 +1537,15 @@ impl CorridorPlan {
                 .add_road(spec)
                 .map_err(|e| format!("{}: {e}", road.name))?;
             if road.corridor {
-                corridor_roads.push((id.clone(), self.corridor.clone()));
+                places
+                    .corridor_roads
+                    .push((id.clone(), self.corridor.clone()));
+            } else if self.fitted.contains(&road.name) {
+                places.fitted_roads.push(id.clone());
             }
             ids.push(id);
         }
+        places.anchors.extend(self.anchors.iter().copied());
         let road = |name: &str| RoadId::new(name);
         let mut junctions = std::collections::HashMap::new();
         for name in &self.junctions {

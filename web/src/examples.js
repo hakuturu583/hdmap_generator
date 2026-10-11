@@ -329,4 +329,56 @@ for warning in m.carla_warnings(name="Quarry", use_carla_materials=False):
     print("carla:", warning)
 `,
   },
+  {
+    name: 'A motorway through a town, on a viaduct',
+    description: 'A corridor plans the carriageways, slip roads and an interchange; the rules lift it over the streets.',
+    code: `# A motorway is a corridor: its line, its design speed, and where it is
+# lifted onto a viaduct. The corridor plans every road it needs — both
+# carriageways, split where a slip road leaves or joins, the speed-change
+# lanes, the slip roads, the crossroad over it — and the plan is put on
+# the map with add_plan. Bridges, overpasses and piers come from the rules
+# when the map is built: no pier stands on a street, no building under the
+# deck, none faces the motorway.
+import roadgen
+
+def street():
+    return [
+        roadgen.Lane(width=3.5, direction="backward"),
+        roadgen.Lane(width=2.5, direction="backward", type_="sidewalk"),
+        roadgen.Lane(width=3.5, direction="forward"),
+        roadgen.Lane(width=2.5, direction="forward", type_="sidewalk"),
+    ]
+
+m = roadgen.Map(name="shuto", origin=(35.6586, 139.7454, 0.0), handedness="lht")
+for name, x in (("first", -100.0), ("second", 200.0)):
+    m.add_road(start=(x, -300.0, 0.0), end=(x, 300.0, 0.0), lanes=street(), name=name)
+
+shuto = m.add_corridor("Shuto", [(-800.0, 0.0, 0.0), (1300.0, 0.0, 0.0)],
+                       design_speed=60.0, elevated=[(200.0, 1400.0)])
+# Two slip roads down to a crossroad east of the town.
+shuto.add_interchange("East", at=1700.0, kind="half_diamond", side="right",
+                      crossroad=[(900.0, -250.0, 0.0), (900.0, 250.0, 0.0)],
+                      crossroad_lanes=street(), terminal=60.0, reach=180.0)
+plan = shuto.plan()
+print("planned:", [road["name"] for road in plan.roads])
+m.add_plan(plan)
+m.generate_buildings()
+
+m.validate()
+
+m.export_opendrive("map.xodr")
+m.export_lanelet2("lanelet2.osm")
+m.export_osm("openstreetmap.osm")
+m.export_sumo("sumo/")
+m.export_clipgt("clip/")
+m.export_gpudrive("scene.json")
+m.export_carla("Import/", name="Shuto")
+
+for structure in m.structure_ids():
+    s = m.structure(structure)
+    print(structure, s["form"], len(s.get("supports", [])), "supports")
+print(len(m.grade_separations()), "grade separations,",
+      len(m.building_ids()), "buildings")
+`,
+  },
 ]

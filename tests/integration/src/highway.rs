@@ -109,7 +109,7 @@ pub fn build(
     });
     let mut places = places();
     plan(handedness)
-        .apply(&mut builder, &mut places.corridor_roads)
+        .apply(&mut builder, &mut places)
         .expect("the plan goes on the map");
     let mut map = builder.finish().expect("the roads build");
     let report = roadgen_carla::environment::generate(&mut map, &places).expect("generates");

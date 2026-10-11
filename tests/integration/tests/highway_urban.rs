@@ -56,8 +56,7 @@ fn generate(
         ..Places::default()
     };
     let plan = spec.plan(TrafficHandedness::RightHand).expect("plans");
-    plan.apply(&mut builder, &mut places.corridor_roads)
-        .expect("applies");
+    plan.apply(&mut builder, &mut places).expect("applies");
     let mut map = builder.finish().expect("builds");
     let report = environment::generate(&mut map, &places).expect("generates");
     let map = map.validate().unwrap_or_else(|error| panic!("{error}"));

@@ -92,6 +92,12 @@ pub struct Places {
     pub corridors: Vec<CorridorSpec>,
     /// Roads that belong to a corridor, by the corridor's name.
     pub corridor_roads: Vec<(RoadId, String)>,
+    /// Roads the land is cut and filled to meet, rather than read its height from,
+    /// that are no corridor's: a crossroad lifted over a motorway.
+    pub fitted_roads: Vec<RoadId>,
+    /// Heights the land meets where they are known: the ground a crossroad was
+    /// drawn on, before it was lifted.
+    pub anchors: Vec<roadgen_core::geometry::Point3>,
 }
 
 /// What [`generate`] came to.
@@ -335,6 +341,23 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
         .iter()
         .map(|(road, _)| road.clone())
         .collect();
+    forms.floating.extend(places.fitted_roads.iter().cloned());
+    // And the movements through a junction whose roads are all fitted to the land:
+    // a ramp terminal on a lifted crossroad is as far off the ground as they are.
+    let through: Vec<RoadId> = map
+        .as_map()
+        .junctions
+        .iter()
+        .filter(|junction| {
+            junction
+                .incoming_roads
+                .iter()
+                .all(|road| forms.floating.contains(road))
+        })
+        .flat_map(|junction| junction.connecting_roads.iter().cloned())
+        .collect();
+    forms.floating.extend(through);
+    forms.anchors.extend(places.anchors.iter().copied());
 
     // The structures and the separations: what the corridors ask for, and what any
     // road crossing another does. A map with none of either — no corridor, no
@@ -377,8 +400,18 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
             &water,
         ));
         report.notes.extend(highway::separate(target));
-        if !corridor_roads.is_empty() {
-            earthworks = Some(highway::earthworks(target, &corridor_roads, &natural));
+        let fitted: Vec<(RoadId, String)> = corridor_roads
+            .iter()
+            .cloned()
+            .chain(
+                places
+                    .fitted_roads
+                    .iter()
+                    .map(|road| (road.clone(), String::new())),
+            )
+            .collect();
+        if !fitted.is_empty() {
+            earthworks = Some(highway::earthworks(target, &fitted, &natural));
         }
     }
     if let Some(works) = &earthworks {

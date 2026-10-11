@@ -2166,17 +2166,17 @@ impl PyMap {
                 plan.spec.name
             )));
         }
-        let mut corridor_roads = Vec::new();
+        let mut places = self.places.clone();
         let builder = self.builder_mut()?;
-        // Applied to a copy, so a plan that fails half way leaves the map as it was.
+        // Applied to copies, so a plan that fails half way leaves the map as it was.
         let mut trial = builder.clone();
         let ids = plan
             .plan
-            .apply(&mut trial, &mut corridor_roads)
+            .apply(&mut trial, &mut places)
             .map_err(PyValueError::new_err)?;
         *builder = trial;
-        self.places.corridor_roads.extend(corridor_roads);
-        self.places.corridors.push(plan.spec.clone());
+        places.corridors.push(plan.spec.clone());
+        self.places = places;
         self.invalidate();
         Ok(ids.into_iter().map(|id| id.to_string()).collect())
     }
