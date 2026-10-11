@@ -349,8 +349,19 @@ impl PyLaneRef {
     }
 }
 
+/// Refuses a name that leaves nothing to name a part's features after.
+fn part_name(name: &str) -> PyResult<()> {
+    if environment::slug(name).is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "{name:?} has nothing to name a part's features after: use letters or digits"
+        )));
+    }
+    Ok(())
+}
+
 /// The identifier a pit's, heap's or pad's land cover is given.
 fn land_cover_of(name: &str) -> String {
+    debug_assert!(!environment::slug(name).is_empty());
     roadgen_core::id::LandCoverId::new(format!("{}/{}", environment::LAND, environment::slug(name)))
         .to_string()
 }
@@ -947,10 +958,12 @@ impl PyMap {
     }
 
     /// States the land round the map's roads as a TIN: at their height near them,
-    /// rolling by `relief` metres away from them, and shaped by every pit and heap
-    /// on the map. Off by default, when the CARLA export lays its own ground under
-    /// the roads — unless a pit or heap is on the map, which is a shape of the land
-    /// and turns it on with these defaults; call this to change them.
+    /// rolling by `relief` metres away from them, and shaped by every pit, heap and
+    /// pad on the map. Off by default, when the CARLA export lays its own ground
+    /// under the roads — unless a pit, heap or pad is on the map, which is a shape
+    /// of the land and turns it on with these defaults; call this to change them.
+    /// `enabled=False` then only drops these settings: a map with parts on it
+    /// always states its land.
     #[pyo3(signature = (
         enabled = true,
         relief = 6.0,
@@ -1845,6 +1858,7 @@ impl PyMap {
             site,
         };
         spec.check().map_err(PyValueError::new_err)?;
+        part_name(&spec.name)?;
         self.builder_mut()?;
         self.places.pits.push(spec.clone());
         self.invalidate();
@@ -1854,7 +1868,8 @@ impl PyMap {
     /// Puts a heap of broken rock on the map: a frustum `radius` metres round its
     /// toe and `height` high, its sides at `repose` degrees, standing at `centre`.
     /// `kind` is what it is a heap of — `waste_dump`, `stockpile` — and becomes its
-    /// land cover's kind. Returns the land cover's identifier.
+    /// land cover's kind. `name` defaults to `kind`, so two heaps of one kind need
+    /// names of their own. Returns the land cover's identifier.
     #[pyo3(signature = (kind, centre, radius, height, repose = 37.0, name = None, site = None))]
     #[allow(clippy::too_many_arguments)]
     fn add_heap(
@@ -1877,6 +1892,7 @@ impl PyMap {
             site,
         };
         spec.check().map_err(PyValueError::new_err)?;
+        part_name(&spec.name)?;
         self.builder_mut()?;
         let id = land_cover_of(&spec.name);
         self.places.heaps.push(spec);
@@ -1914,6 +1930,7 @@ impl PyMap {
             site,
         };
         spec.check().map_err(PyValueError::new_err)?;
+        part_name(&spec.name)?;
         self.builder_mut()?;
         let id = land_cover_of(&spec.name);
         self.places.pads.push(spec);

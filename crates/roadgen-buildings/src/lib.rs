@@ -155,10 +155,12 @@ impl Placement {
         let inside = |ring: &Vec<plane::Point2>, corner: &plane::Point2| {
             roadgen_core::geometry::plan::ring_contains(ring, *corner)
         };
+        // Any ground shared — a corner of the lot in the outline, the outline
+        // across the lot, or a small outline wholly on it.
         if self
             .outside
             .iter()
-            .any(|ring| corners.iter().any(|corner| inside(ring, corner)))
+            .any(|ring| roadgen_core::geometry::plan::rings_overlap(ring, &corners))
         {
             return false;
         }

@@ -2261,6 +2261,41 @@ def test_a_ramp_too_gentle_for_its_pit_is_refused():
         m.add_pit(benches=0)
 
 
+def test_a_ramp_into_a_long_narrow_pit_is_a_road_that_builds():
+    m = roadgen.Map()
+    pit = m.add_pit(floor=(200.0, 20.0))
+    m.add_road(points=pit.ramp(), lanes=haul_lanes(), site="pit")
+    m.validate()
+    with pytest.raises(ValueError):
+        pit.ramp(approach=float("inf"))
+
+
+def test_a_part_needs_a_name_to_name_its_features_after():
+    m = roadgen.Map()
+    for add in (
+        lambda: m.add_pit(name="!!!"),
+        lambda: m.add_heap("stockpile", centre=(0.0, 0.0, 0.0), radius=20.0, height=5.0, name="  "),
+        lambda: m.add_pad([(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 10.0, 0.0)], name="--"),
+    ):
+        with pytest.raises(ValueError, match="nothing to name"):
+            add()
+
+
+def test_no_town_building_stands_on_a_heap_smaller_than_its_lot():
+    m = street(length=400.0)
+    m.generate_buildings()
+    lots = len(m.building_ids())
+    assert lots > 0
+    # A small heap in among the lots on one side: every lot it touches goes.
+    m.add_heap("stockpile", centre=(200.0, -16.0, 0.0), radius=4.0, height=1.0, repose=30.0)
+    heap = [(200.0 + 4.0 * math.cos(a / 8 * math.tau), -16.0 + 4.0 * math.sin(a / 8 * math.tau)) for a in range(8)]
+    for building in m.building_ids():
+        for part in m.building_parts(building):
+            ring = [(x, y) for x, y, _ in m.building_footprint(part)]
+            xs, ys = [p[0] for p in ring], [p[1] for p in ring]
+            assert not any(min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys) for x, y in heap), building
+
+
 def test_two_mines_lie_on_one_land():
     m = roadgen.Map(name="quarries")
     quarry(m, "North Pit")

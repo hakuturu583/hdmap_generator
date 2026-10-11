@@ -44,7 +44,7 @@ pub mod tin;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use roadgen_core::geometry::plan::{ring_contains, PlanPoint};
+use roadgen_core::geometry::plan::rings_overlap;
 use roadgen_core::id::{LandCoverId, RoadId, SiteId};
 use roadgen_core::site::Site;
 use roadgen_core::validation::UnvalidatedMap;
@@ -67,10 +67,10 @@ pub struct Places {
     /// Buildings along every road that is no site's, from a CGA shape grammar —
     /// a town — kept off the pits, heaps and pads.
     pub town: Option<roadgen_buildings::Rules>,
-    /// The land. Pits and heaps are shapes of it, so with any of them on the map it
-    /// is built with [`GroundSpec::default`] when nothing else is said; with none,
-    /// and nothing said, the map states no land and the CARLA export lays its own
-    /// ground under the roads.
+    /// The land. Pits, heaps and pads are shapes of it, so with any of them on the
+    /// map it is built — with [`GroundSpec::default`] when nothing else is said;
+    /// with none, and nothing said, the map states no land and the CARLA export
+    /// lays its own ground under the roads.
     pub ground: Option<GroundSpec>,
     pub seed: u64,
 }
@@ -180,7 +180,12 @@ impl Places {
             let key = named(&pad.name, "pad")?;
             parts.push(Part {
                 forms: pad.landforms(&key, spacing),
-                outline: pad.outline.clone(),
+                // At the height it is levelled to, which is the land's under it.
+                outline: pad
+                    .outline
+                    .iter()
+                    .map(|p| roadgen_core::geometry::Point3::new(p.x, p.y, pad.height()))
+                    .collect(),
                 kind: "pad".into(),
                 site: pad.site.clone(),
                 key,
@@ -197,7 +202,7 @@ impl Places {
             let ring_a = plan_of(&a.outline);
             for b in &parts[..index] {
                 let ring_b = plan_of(&b.outline);
-                if overlap(&ring_a, &ring_b) {
+                if rings_overlap(&ring_a, &ring_b) {
                     return Err(Error::Spec(format!(
                         "{} and {} overlap; a part has to stand clear of the others",
                         a.key, b.key
@@ -209,31 +214,24 @@ impl Places {
     }
 }
 
-/// Whether two outlines share any ground: one holds a vertex of the other, or
-/// their edges cross — two long, narrow pads laid across each other do, with every
-/// vertex outside the other.
-fn overlap(a: &[PlanPoint], b: &[PlanPoint]) -> bool {
-    let edges = |ring: &[PlanPoint]| {
-        (0..ring.len())
-            .map(|i| (ring[i], ring[(i + 1) % ring.len()]))
-            .collect::<Vec<_>>()
-    };
-    a.iter().any(|&p| ring_contains(b, p))
-        || b.iter().any(|&p| ring_contains(a, p))
-        || edges(a)
-            .iter()
-            .any(|&(p, q)| edges(b).iter().any(|&(r, s)| segments_cross(p, q, r, s)))
-}
-
-/// Whether the segments `p..q` and `r..s` cross, each passing strictly between
-/// the other's ends.
-fn segments_cross(p: PlanPoint, q: PlanPoint, r: PlanPoint, s: PlanPoint) -> bool {
-    let side = |a: PlanPoint, b: PlanPoint, c: PlanPoint| {
-        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-    };
-    let (d1, d2) = (side(p, q, r), side(p, q, s));
-    let (d3, d4) = (side(r, s, p), side(r, s, q));
-    d1 * d2 < 0.0 && d3 * d4 < 0.0
+/// The roads through every junction whose roads all belong to one site, by that
+/// site's key: they are the site's too.
+fn site_junctions(map: &roadgen_core::map::Map, places: &Places) -> Vec<(String, Vec<RoadId>)> {
+    map.junctions
+        .iter()
+        .filter_map(|junction| {
+            let owners = junction
+                .incoming_roads
+                .iter()
+                .map(|road| places.site_roads.iter().find(|(id, _)| id == road))
+                .collect::<Option<Vec<_>>>()?;
+            let first = slug(&owners.first()?.1);
+            owners
+                .iter()
+                .all(|(_, name)| slug(name) == first)
+                .then(|| (first, junction.connecting_roads.clone()))
+        })
+        .collect()
 }
 
 /// Generates the places onto `map`, once its roads are built and before it is
@@ -261,11 +259,13 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
         }
     }
     if let Some(rules) = &places.town {
+        let taken = site_junctions(map.as_map(), places);
         let roads = map
             .as_map()
             .roads
             .iter()
             .filter(|road| !places.site_roads.iter().any(|(id, _)| id == &road.id))
+            .filter(|road| !taken.iter().any(|(_, roads)| roads.contains(&road.id)))
             .map(|road| road.id.clone())
             .collect();
         let placement = roadgen_buildings::Placement {
@@ -342,23 +342,9 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
             .or_insert_with(|| (name.clone(), Vec::new(), Vec::new(), false));
         entry.2.push(road.clone());
     }
-    // A junction every one of whose roads is a site's is the site's, and so is
-    // every road through it.
-    for junction in target.junctions.iter() {
-        let owner = junction
-            .incoming_roads
-            .iter()
-            .map(|road| places.site_roads.iter().find(|(id, _)| id == road))
-            .collect::<Option<Vec<_>>>()
-            .and_then(|owners| {
-                let first = slug(&owners.first()?.1);
-                owners
-                    .iter()
-                    .all(|(_, name)| slug(name) == first)
-                    .then_some(first)
-            });
-        if let Some(entry) = owner.and_then(|key| sites.get_mut(&key)) {
-            entry.2.extend(junction.connecting_roads.iter().cloned());
+    for (key, roads) in site_junctions(target, places) {
+        if let Some(entry) = sites.get_mut(&key) {
+            entry.2.extend(roads);
         }
     }
     for (key, (name, land_covers, roads, pit)) in sites {

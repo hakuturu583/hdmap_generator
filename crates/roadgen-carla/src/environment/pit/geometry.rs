@@ -77,6 +77,15 @@ impl Ellipse {
         [-normal[1], normal[0]]
     }
 
+    /// The radius of curvature at `theta`. The parallel curve at `offset` curves
+    /// with this plus `offset`, so an *inward* one — a negative offset — folds where
+    /// the offset reaches past it: at the ends of the long axis first, where the
+    /// radius is `b² / a`.
+    pub fn radius(&self, theta: f64) -> f64 {
+        let (sin, cos) = theta.sin_cos();
+        (self.a * self.a * sin * sin + self.b * self.b * cos * cos).powf(1.5) / (self.a * self.b)
+    }
+
     /// About how long the parallel curve at `offset` is.
     pub fn perimeter(&self, offset: f64) -> f64 {
         // Ramanujan's approximation, for the ellipse whose half-axes the parallel

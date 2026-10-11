@@ -29,6 +29,32 @@ pub fn ring_contains(ring: &[PlanPoint], p: PlanPoint) -> bool {
     inside
 }
 
+/// Whether two closed rings share any ground: one holds a vertex of the other, or
+/// their edges cross. Two long, narrow rectangles laid across each other do, with
+/// every vertex outside the other; so does a small ring wholly inside a large one.
+pub fn rings_overlap(a: &[PlanPoint], b: &[PlanPoint]) -> bool {
+    let edges = |ring: &[PlanPoint]| {
+        (0..ring.len())
+            .map(|i| (ring[i], ring[(i + 1) % ring.len()]))
+            .collect::<Vec<_>>()
+    };
+    if a.iter().any(|&p| ring_contains(b, p)) || b.iter().any(|&p| ring_contains(a, p)) {
+        return true;
+    }
+    let (ea, eb) = (edges(a), edges(b));
+    ea.iter()
+        .any(|&(p, q)| eb.iter().any(|&(r, s)| segments_cross(p, q, r, s)))
+}
+
+/// Whether the segments `p..q` and `r..s` cross, each passing strictly between the
+/// other's ends.
+pub fn segments_cross(p: PlanPoint, q: PlanPoint, r: PlanPoint, s: PlanPoint) -> bool {
+    let side = |a: PlanPoint, b: PlanPoint, c: PlanPoint| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    side(p, q, r) * side(p, q, s) < 0.0 && side(r, s, p) * side(r, s, q) < 0.0
+}
+
 /// The distance from `p` to the segment `a..b`.
 pub fn segment_distance(p: PlanPoint, a: PlanPoint, b: PlanPoint) -> f64 {
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
@@ -113,6 +139,18 @@ mod tests {
         let square = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
         assert!(ring_contains(&square, [5.0, 5.0]));
         assert!(!ring_contains(&square, [15.0, 5.0]));
+    }
+
+    #[test]
+    fn rings_overlap_when_they_cross_or_one_holds_the_other() {
+        let rect = |w: f64, h: f64| [[-w, -h], [w, -h], [w, h], [-w, h]];
+        // A plus: no vertex of either inside the other.
+        assert!(rings_overlap(&rect(100.0, 5.0), &rect(5.0, 100.0)));
+        // One wholly inside the other.
+        assert!(rings_overlap(&rect(100.0, 100.0), &rect(1.0, 1.0)));
+        assert!(rings_overlap(&rect(1.0, 1.0), &rect(100.0, 100.0)));
+        let far = [[200.0, 0.0], [210.0, 0.0], [210.0, 10.0], [200.0, 10.0]];
+        assert!(!rings_overlap(&rect(10.0, 10.0), &far));
     }
 
     #[test]

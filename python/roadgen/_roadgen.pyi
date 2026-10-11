@@ -290,7 +290,8 @@ class Map:
         site: Optional[str] = None,
     ) -> str:
         """Puts a heap of `kind` (`waste_dump`, `stockpile`) on the map; returns
-        its land cover's id."""
+        its land cover's id. `name` defaults to `kind`, so two heaps of one kind
+        need names of their own."""
     def add_pad(
         self,
         outline: Sequence[Point],
@@ -312,8 +313,9 @@ class Map:
         wavelength: float = 180.0,
         seed: int = 0,
     ) -> None:
-        """States the land round the map's roads as a TIN, shaped by every pit and
-        heap on the map. A pit or heap turns it on with these defaults."""
+        """States the land round the map's roads as a TIN, shaped by every pit,
+        heap and pad on the map. A pit, heap or pad turns it on with these defaults,
+        and `enabled=False` does not turn it off then: such a map always has land."""
     def site_ids(self) -> list[str]: ...
     def site(self, site: str) -> dict[str, Any]: ...
     def tin_surface_ids(self) -> list[str]: ...

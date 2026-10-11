@@ -104,6 +104,11 @@ impl Default for RampSpec {
 const EASE: f64 = 40.0;
 /// How far out from the rim, past the road's own half width, the approach starts.
 const APPROACH_OUT: f64 = 35.0;
+/// The longest approach, metres: it runs along the rim, so a longer one would wind
+/// round the pit rather than lead into it.
+const MAX_APPROACH: f64 = 1000.0;
+/// The tightest the ramp's inner edge turns, metres.
+const INNER_RADIUS: f64 = 4.0;
 /// How far apart the ramp's points are, metres.
 const RAMP_SPACING: f64 = 4.0;
 
@@ -233,7 +238,8 @@ impl PitSpec {
     ///
     /// At each height the ramp's outer edge runs where the wall, on average, is at
     /// that height, so it is cut into the wall above and stands out over the bench
-    /// below. A grade too gentle to reach the floor in four turns of the pit is
+    /// below — except where the floor turns too tightly for a road that wide, where
+    /// the ramp keeps out from it so that its inner edge does not fold. A grade too gentle to reach the floor in four turns of the pit is
     /// refused.
     pub fn ramp(&self, ramp: &RampSpec) -> Result<Vec<Point3>, String> {
         self.check()?;
@@ -243,8 +249,17 @@ impl PitSpec {
                 ramp.grade
             ));
         }
-        if !(ramp.width.is_finite() && ramp.width > 0.0 && ramp.approach >= 0.0) {
-            return Err("a ramp's width must be positive and its approach not negative".into());
+        if !(ramp.width.is_finite() && ramp.width > 0.0) {
+            return Err(format!("a ramp {} m wide", ramp.width));
+        }
+        if !(ramp.approach.is_finite() && (0.0..=MAX_APPROACH).contains(&ramp.approach)) {
+            return Err(format!(
+                "an approach of {} m: it runs along the rim, between 0 and {MAX_APPROACH} m",
+                ramp.approach
+            ));
+        }
+        if !ramp.start.is_finite() {
+            return Err(format!("a ramp starting at {} degrees", ramp.start));
         }
         let (frame, floor) = (self.frame(), self.floor());
         let (rim, bottom, depth, top) = (
@@ -257,6 +272,14 @@ impl PitSpec {
         let wall = |z: f64| ((z - bottom) / depth).clamp(0.0, 1.0) * top - half;
         let sense = if ramp.clockwise { -1.0 } else { 1.0 };
         let theta0 = ramp.start.to_radians();
+        // The ramp's path at any offset from the floor is a parallel curve of it,
+        // turning at the floor's radius plus the offset; the road's inner edge turns
+        // `half` tighter still. One bound for the whole ramp, from the floor's
+        // tightest turn, keeps it a parallel curve — no kink where it applies.
+        let tightest = floor
+            .radius(0.0)
+            .min(floor.radius(std::f64::consts::FRAC_PI_2));
+        let innermost = half + INNER_RADIUS - tightest;
 
         // Down the wall in small steps of the ellipse's parameter, keeping the
         // horizontal distance travelled, which is what the grade is over.
@@ -274,6 +297,10 @@ impl PitSpec {
             // turns into the pit rather than kinking into it.
             let ease = smoothstep(0.0, EASE, travelled);
             let offset = top - half + (wall(z_guess) - (top - half)) * ease;
+            // Never so far in that the road's inner edge would fold: where the
+            // floor's outline turns tighter than the road is wide — the ends of a
+            // long, narrow pit — the road keeps out, cut into the wall.
+            let offset = offset.max(innermost);
             let here = floor.at(theta, offset);
             let length = (here[0] - last[0]).hypot(here[1] - last[1]);
             travelled += length;
@@ -281,6 +308,11 @@ impl PitSpec {
             last = here;
             let z = rim - ramp.grade * travelled;
             if z <= bottom {
+                // The floor, in place of a vertex just before it: a chord much
+                // shorter than the rest leaves a corner no room to be rounded in.
+                if since < RAMP_SPACING / 2.0 && spiral.len() > 1 {
+                    spiral.pop();
+                }
                 spiral.push([here[0], here[1], bottom]);
                 reached = true;
                 break;
@@ -350,6 +382,42 @@ mod tests {
         for pair in &falling[..falling.len() - 1] {
             let grade = (pair[0].z - pair[1].z) / pair[0].horizontal_distance_to(pair[1]);
             assert!((grade - ramp.grade).abs() < 1e-3, "{grade}");
+        }
+    }
+
+    #[test]
+    fn a_ramp_into_a_narrow_pit_does_not_fold() {
+        let pit = PitSpec {
+            floor_length: 200.0,
+            floor_width: 20.0,
+            ..PitSpec::default()
+        };
+        let points = pit.ramp(&RampSpec::default()).unwrap();
+        // No vertex turns back on the one before it.
+        for window in points.windows(3) {
+            let (a, b, c) = (window[0], window[1], window[2]);
+            let (u, v) = ([b.x - a.x, b.y - a.y], [c.x - b.x, c.y - b.y]);
+            assert!(u[0] * v[0] + u[1] * v[1] > 0.0, "{a:?} {b:?} {c:?}");
+        }
+    }
+
+    #[test]
+    fn a_ramp_with_no_end_to_its_approach_is_refused() {
+        for ramp in [
+            RampSpec {
+                approach: f64::INFINITY,
+                ..RampSpec::default()
+            },
+            RampSpec {
+                approach: 1e12,
+                ..RampSpec::default()
+            },
+            RampSpec {
+                start: f64::NAN,
+                ..RampSpec::default()
+            },
+        ] {
+            assert!(PitSpec::default().ramp(&ramp).is_err());
         }
     }
 
