@@ -17,6 +17,8 @@
 //!   crosswalk         → <objects>/<object>
 //!   Building          → <objects>/<object type="building"> with an <outline> per part
 //!   Right of way      → <junction>/<priority>
+//!   Bridge, viaduct   → <objects>/<bridge> on each road it carries
+//!   Tunnel, underpass → <objects>/<tunnel> on each road it carries
 //! ```
 //!
 //! The same table is read the other way by [`read()`]: an OpenDRIVE document becomes
@@ -48,6 +50,23 @@
 //! corner in one frame — the road's, at the building's own station — so the shape
 //! that comes back is the shape that went in.
 //!
+//! # Structures, which OpenDRIVE knows only as stretches of road
+//!
+//! A `<bridge>` or a `<tunnel>` is a range of `s` on one road and a word for what it
+//! is made of — nothing else. The IR's structure is a feature of its own, with an
+//! outline, piers and abutments or portals, and a list of the roads it carries; what
+//! survives the trip is the list, one element per carried stretch, and the words. A
+//! bridge's material picks its `type` (`concrete`, `steel`, `brick` for masonry,
+//! `wood` for timber); a tunnel is `underpass` when it is one and `standard`
+//! otherwise, lit when the IR says it is, and with no daylight inside. The finer
+//! form the schema has no word for — a viaduct or an overpass rather than a bridge,
+//! a covered cutting rather than a bore — goes in a `<userData>` with the code
+//! [`STRUCTURE_FORM_CODE`], which a reader that does not know it passes over. The
+//! element carries the structure's name, when it has one, so the reader can tell
+//! the two stretches one deck carries are one bridge. [`check`] says what is lost: the
+//! outline, the supports and the road's form of way, which OpenDRIVE has no word
+//! for beyond `<type>`.
+//!
 //! Format-specific decisions stay on this side of the boundary. OpenDRIVE's numeric
 //! ids, its insistence that `s` be measured in the xy-plane, and its rule that a
 //! split needs a junction are all handled here; none of them reaches the IR.
@@ -59,6 +78,7 @@ use std::path::Path;
 use opendrive::core::additional_data::AdditionalData;
 use opendrive::core::geo_reference::GeoReference;
 use opendrive::core::header::Header;
+use opendrive::core::user_data::UserData;
 use opendrive::core::OpenDrive;
 use opendrive::junction::connection::Connection;
 use opendrive::junction::contact_point::ContactPoint;
@@ -88,6 +108,8 @@ use opendrive::lane::road_mark::RoadMark;
 use opendrive::lane::speed::Speed as LaneSpeed;
 use opendrive::lane::width::Width;
 use opendrive::lane::Lane as OdLane;
+use opendrive::object::bridge::Bridge as OdBridge;
+use opendrive::object::bridge_type::BridgeType;
 use opendrive::object::corner::Corner;
 use opendrive::object::corner_local::CornerLocal;
 use opendrive::object::lane_validity::LaneValidity;
@@ -96,6 +118,8 @@ use opendrive::object::orientation::{ObjectType, Orientation};
 use opendrive::object::outline::Outline;
 use opendrive::object::outlines::Outlines;
 use opendrive::object::repeat::Repeat;
+use opendrive::object::tunnel::Tunnel as OdTunnel;
+use opendrive::object::tunnel_type::TunnelType;
 use opendrive::object::Object;
 use opendrive::road::country_code::CountryCode;
 use opendrive::road::element_type::ElementType;
@@ -136,12 +160,13 @@ use ll2_projection::utmups;
 use roadgen_core::buildings::{Building, BuildingPart};
 use roadgen_core::geometry::{Curve3, Point3, Sample};
 use roadgen_core::id::ObjectId;
-use roadgen_core::id::{BuildingId, ConnectionId, JunctionId, LaneId, RoadId};
+use roadgen_core::id::{BuildingId, ConnectionId, JunctionId, LaneId, RoadId, StructureId};
 use roadgen_core::map::{Lane, Map, Projection, Road, TrafficHandedness};
 use roadgen_core::semantics::{
-    LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType,
-    TrafficRule,
+    FormOfWay, LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
+    RoadType, TrafficRule,
 };
+use roadgen_core::structure::{StructureKind, StructureMaterial, TunnelForm};
 use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd, RoadLinkTarget};
 use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::units::GeoOrigin;
@@ -186,6 +211,11 @@ const TRAFFIC_LIGHT_SUBTYPE: &str = "-1";
 /// The `subtype` a stop line is written with, on a `roadMark` object — the one
 /// string that tells a reader a stop line from any other paint.
 const STOP_LINE_SUBTYPE: &str = "stopLine";
+
+/// The `<userData>` code a `<bridge>` or `<tunnel>` says its form under —
+/// `viaduct`, `overpass`, `cut_and_cover` — where the schema's `type` has only
+/// the material or `standard`.
+pub const STRUCTURE_FORM_CODE: &str = "structureForm";
 
 /// The number OpenDRIVE gives a lane: positive to the left of the reference line,
 /// negative to the right, counting outwards from 1, with 0 reserved for the centre.
@@ -409,6 +439,38 @@ pub fn check(map: &ValidatedMap) -> Vec<String> {
         ));
     }
 
+    // A `<bridge>` or `<tunnel>` is a range of `s` and a type. The structure's own
+    // shape — the deck or bore outline, the piers and abutments — has nowhere to go,
+    // and a reader that wants it lays it out again from the road.
+    if !map.structures.is_empty() {
+        let supports: usize = map
+            .structures
+            .iter()
+            .filter_map(|structure| structure.kind.bridge())
+            .map(|bridge| bridge.supports.len())
+            .sum();
+        problems.push(format!(
+            "a <bridge> or <tunnel> is a stretch of road and a type, so the {} structures \
+             are written without their outlines or their {supports} piers and abutments, \
+             and a structure carrying several roads is written once on each",
+            map.structures.len()
+        ));
+    }
+    // What part a road plays in the network is not where it is: `<type>` says the
+    // second and nothing in the schema says the first.
+    let formed = map
+        .roads
+        .iter()
+        .filter(|road| road.form != FormOfWay::Unspecified)
+        .count();
+    if formed > 0 {
+        problems.push(format!(
+            "OpenDRIVE has no form of way, only the road's <type>, so whether each of the \
+             {formed} roads that say so is a motorway carriageway, a slip road or a \
+             service road is not written"
+        ));
+    }
+
     // An `<outline>` is a ring of corners with a height each. There is no ridge in
     // it, so a roof that has one cannot be written and the volume it encloses is all
     // that survives.
@@ -462,6 +524,9 @@ struct Numbering {
     objects: HashMap<ObjectId, String>,
     /// Buildings share the object id space, numbered after the furniture.
     buildings: HashMap<BuildingId, String>,
+    /// Each stretch a structure carries is an element of its own, numbered after
+    /// the buildings: the structure, and which of its stretches.
+    structures: HashMap<(StructureId, usize), String>,
 }
 
 impl Numbering {
@@ -492,12 +557,21 @@ impl Numbering {
         for (index, building) in map.buildings.iter().enumerate() {
             buildings.insert(building.id.clone(), (map.objects.len() + index).to_string());
         }
+        let mut structures = HashMap::new();
+        let mut next = map.objects.len() + map.buildings.len();
+        for structure in map.structures.iter() {
+            for index in 0..structure.carries.len() {
+                structures.insert((structure.id.clone(), index), next.to_string());
+                next += 1;
+            }
+        }
         Numbering {
             roads,
             junctions,
             lanes,
             objects,
             buildings,
+            structures,
         }
     }
 }
@@ -1734,16 +1808,99 @@ impl<'a> Exporter<'a> {
                 objects.push(entry);
             }
         }
-        if objects.is_empty() {
+        let (tunnel, bridge) = self.structures(road)?;
+        if objects.is_empty() && tunnel.is_empty() && bridge.is_empty() {
             return Ok(None);
         }
         Ok(Some(Objects {
             object: objects,
             object_reference: Vec::new(),
-            tunnel: Vec::new(),
-            bridge: Vec::new(),
+            tunnel,
+            bridge,
             additional_data: AdditionalData::default(),
         }))
+    }
+
+    /// The `<tunnel>`s and `<bridge>`s on a road: one for every stretch of it a
+    /// structure carries, in the order the road meets them.
+    ///
+    /// The element is the stretch, not the structure. A deck that carries both
+    /// carriageways of a motorway is two `<bridge>`s, one on each road, each with
+    /// the structure's name — which is what the reader goes by to put them back
+    /// together. A structure with no name is written without one: its IR id is a
+    /// made-up one, and a reader that took it for a name would make up another
+    /// from it.
+    ///
+    /// No structure is traced, because the trace has no kind for one; the road
+    /// the element hangs off is traced already.
+    fn structures(&self, road: &Road) -> Result<(Vec<OdTunnel>, Vec<OdBridge>), ExportError> {
+        let (mut tunnels, mut bridges) = (Vec::new(), Vec::new());
+        for span in road.structure.spans() {
+            let Some(structure) = self.map.structures.get(&span.structure) else {
+                continue;
+            };
+            let index = structure
+                .carries
+                .iter()
+                .position(|carried| {
+                    carried.road == road.id && (carried.from - span.from).abs() < 1e-6
+                })
+                .unwrap_or(0);
+            let id = self
+                .numbering
+                .structures
+                .get(&(structure.id.clone(), index))
+                .cloned()
+                .ok_or_else(|| ExportError::Unknown(structure.id.to_string()))?;
+            let s = Length::new::<meter>(span.from);
+            let length = Length::new::<meter>(span.to - span.from);
+            let name = structure.name.clone();
+            let additional_data = AdditionalData {
+                user_data: vec![UserData {
+                    code: STRUCTURE_FORM_CODE.to_owned(),
+                    value: Some(structure.kind.form().to_owned()),
+                    elements: Vec::new(),
+                }],
+                ..AdditionalData::default()
+            };
+            match &structure.kind {
+                StructureKind::Bridge(bridge) => bridges.push(OdBridge {
+                    id,
+                    length,
+                    name,
+                    s,
+                    r#type: match bridge.material {
+                        StructureMaterial::Concrete => BridgeType::Concrete,
+                        StructureMaterial::Steel => BridgeType::Steel,
+                        StructureMaterial::Masonry => BridgeType::Brick,
+                        StructureMaterial::Timber => BridgeType::Wood,
+                    },
+                    validity: Vec::new(),
+                    additional_data: additional_data.clone(),
+                }),
+                StructureKind::Tunnel(tunnel) => tunnels.push(OdTunnel {
+                    // How much daylight reaches the road, 0 to 1. A bored tunnel and
+                    // a covered cutting are both closed overhead; an underpass is
+                    // short enough that the light at its mouths reaches in.
+                    daylight: Some(match tunnel.form {
+                        TunnelForm::Underpass => 0.5,
+                        TunnelForm::Bored | TunnelForm::CutAndCover => 0.0,
+                    }),
+                    id,
+                    length,
+                    lighting: Some(if tunnel.lighting { 1.0 } else { 0.0 }),
+                    name,
+                    s,
+                    r#type: match tunnel.form {
+                        TunnelForm::Underpass => TunnelType::Underpass,
+                        TunnelForm::Bored | TunnelForm::CutAndCover => TunnelType::Standard,
+                    },
+                    validity: Vec::new(),
+                    additional_data,
+                }),
+            }
+        }
+        Ok((tunnels, bridges))
     }
 
     /// `<priority>` entries for a junction, from the map's right-of-way rules.

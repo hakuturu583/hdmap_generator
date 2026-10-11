@@ -253,6 +253,13 @@ pub fn check(map: &ValidatedMap, config: Option<&ClipConfig>) -> Vec<String> {
             map.building_parts.len()
         ));
     }
+    if !map.structures.is_empty() {
+        problems.push(format!(
+            "ClipGT's layers have no bridges or tunnels, so the map's {} structures are \
+             not written; the lanes they carry keep their heights in their points",
+            map.structures.len()
+        ));
+    }
     if !map.connections.is_empty() {
         problems.push(format!(
             "ClipGT holds no lane topology, so the map's {} lane connections are not \
