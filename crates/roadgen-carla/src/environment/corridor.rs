@@ -66,10 +66,18 @@ impl DesignStandard {
                 "a design speed of {kph} km/h is not one a road is designed to"
             ));
         }
+        // The Road Structure Ordinance (道路構造令) for a type 1 road, its standard
+        // values rather than its special ones: the radius (art. 15), the grade for
+        // an ordinary road (art. 20), the vertical curves (art. 22), the lane
+        // (art. 5, 3.5 m; 3.75 m only as a special value), the shoulders (art. 8)
+        // and the median (art. 6), as MLIT's tables of them give them. The speed-
+        // change lanes are not in the Ordinance but in its commentary, and are
+        // round figures of the same order, not checked against it.
+        //
         // speed, radius, grade, crest, sag, lane, outer, inner, median, decel, accel, taper
         const ROWS: [[f64; 12]; 6] = [
             [
-                120.0, 710.0, 0.02, 11000.0, 4000.0, 3.75, 2.5, 1.25, 4.5, 110.0, 200.0, 70.0,
+                120.0, 710.0, 0.02, 11000.0, 4000.0, 3.5, 2.5, 1.25, 4.5, 110.0, 200.0, 70.0,
             ],
             [
                 100.0, 460.0, 0.03, 6500.0, 3000.0, 3.5, 2.5, 1.25, 4.5, 90.0, 180.0, 60.0,
@@ -1672,7 +1680,7 @@ mod tests {
     #[test]
     fn the_standard_for_a_speed_is_the_row_at_or_below_it() {
         assert_eq!(DesignStandard::for_speed(110.0).unwrap().min_radius, 460.0);
-        assert_eq!(DesignStandard::for_speed(120.0).unwrap().lane_width, 3.75);
+        assert_eq!(DesignStandard::for_speed(120.0).unwrap().min_radius, 710.0);
         assert!(DesignStandard::for_speed(10.0).is_err());
     }
 }
