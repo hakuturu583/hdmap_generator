@@ -424,6 +424,36 @@ fn the_land_beside_the_motorway_is_no_strip_of_slivers() {
 }
 
 #[test]
+fn the_ground_has_no_flat_triangle_where_two_roads_meet() {
+    // Flat: a triangle whose height over its longest side is under a hundredth of
+    // that side. Where a slip road's edge met the motorway's, or a connector's the
+    // road it joins, the two edges were the same line worked out twice — their
+    // points a hair apart, or a few millimetres — and the ground took every point
+    // of both, with a triangle of next to no area between each pair.
+    let map = highway();
+    let meshes = roadgen_carla::to_meshes(map, &PackageConfig::new("Expressway"));
+    let ground = meshes
+        .iter()
+        .find(|mesh| mesh.role == Role::Terrain && mesh.materials.contains(&materials::GRASS))
+        .expect("land");
+    let flat: Vec<Point3> = ground
+        .triangles
+        .iter()
+        .map(|triangle| triangle.map(|i| ground.positions[i as usize]))
+        .filter(|&[a, b, c]| {
+            let longest = [(a, b), (b, c), (c, a)]
+                .map(|(p, q)| p.horizontal_distance_to(q))
+                .into_iter()
+                .fold(0.0, f64::max);
+            let area = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() / 2.0;
+            2.0 * area / longest < 0.01 * longest
+        })
+        .map(|[a, ..]| a)
+        .collect();
+    assert!(flat.is_empty(), "flat triangles of the ground at {flat:?}");
+}
+
+#[test]
 fn every_building_stands_on_the_land_on_a_foundation_where_it_falls_away() {
     let map = highway();
     let tin = map.tin_surfaces.iter().next().expect("land").tin.locator();

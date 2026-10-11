@@ -11,6 +11,7 @@ use roadgen_carla::{materials, PackageConfig, Role};
 use roadgen_core::prelude::*;
 use roadgen_core::semantics::{MapObjectKind, Pavement, UnpavedSurface};
 use roadgen_integration_tests::mine::{mine, open_pit_mine};
+use roadgen_integration_tests::scenarios::crossroads_builder;
 
 #[test]
 fn carla_builds_its_ground_from_the_terrain_the_map_states() {
@@ -351,6 +352,52 @@ fn a_town_builds_its_land_the_way_a_mine_does() {
         warnings.iter().any(|w| w.contains("TIN surfaces")),
         "{warnings:#?}"
     );
+}
+
+#[test]
+fn neither_a_mines_ground_nor_a_towns_has_a_flat_triangle() {
+    // Flat: a triangle whose height over its longest side is under a hundredth of
+    // that side. In the mine they stood where the ramp's edge ran a few
+    // millimetres off a haul road's, and along the pit's rim, where the quarry's
+    // outline draped on the land has a point halfway along each stretch of the
+    // crest it follows.
+    let town = {
+        let builder = crossroads_builder("Town", 300.0);
+        let places = Places {
+            town: roadgen_buildings::Rules::preset("town"),
+            ground: Some(environment::GroundSpec::default()),
+            seed: 3,
+            ..Places::default()
+        };
+        let mut map = builder.finish().unwrap();
+        environment::generate(&mut map, &places).unwrap();
+        map.validate().expect("validates")
+    };
+    for (name, map) in [("NorthPit", mine()), ("Town", town)] {
+        let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new(name));
+        let ground = meshes
+            .iter()
+            .find(|mesh| mesh.role == Role::Terrain && mesh.materials.contains(&materials::GRASS))
+            .expect("land");
+        let flat: Vec<Point3> = ground
+            .triangles
+            .iter()
+            .map(|triangle| triangle.map(|i| ground.positions[i as usize]))
+            .filter(|&[a, b, c]| {
+                let longest = [(a, b), (b, c), (c, a)]
+                    .map(|(p, q)| p.horizontal_distance_to(q))
+                    .into_iter()
+                    .fold(0.0, f64::max);
+                let area = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() / 2.0;
+                2.0 * area / longest < 0.01 * longest
+            })
+            .map(|[a, ..]| a)
+            .collect();
+        assert!(
+            flat.is_empty(),
+            "{name}: flat triangles of the ground at {flat:?}"
+        );
+    }
 }
 
 #[test]
