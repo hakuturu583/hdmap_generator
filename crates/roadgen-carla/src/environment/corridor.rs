@@ -988,6 +988,11 @@ pub(super) enum Shape {
     /// The cubic to `lead`, the points between it and the open end — from the
     /// open end on a slip road on, to it on one off — at one even grade.
     Lead(Vec<Point3>),
+    /// A lead whose heights go evenly from its open end to the access's end
+    /// height where it meets the cubic, which runs on from that height: a loop
+    /// that has done its climbing by the time it reaches the carriageway. On a
+    /// slip road on only.
+    Loop(Vec<Point3>),
     /// The road whole, heights and all, from its open end to the nose's end of
     /// the junction on a slip road on, and from there to the open end off.
     Whole(Vec<Point3>),
@@ -1466,10 +1471,13 @@ impl CorridorSpec {
                 0.0
             };
             let half_corridor = standard.median / 2.0 + cw_width + collector_room + 3.0;
-            // Over the motorway: an overpass's deck and the clearance under it;
-            // under it: the clearance under the motorway's own overpass.
+            // Over the motorway: an overpass's deck and the clearance under it,
+            // and half a metre to spare, which the vertical curves rounding the
+            // ends of the level stretch eat into over what passes under near
+            // them — a parclo's loops; under it: the clearance under the
+            // motorway's own overpass.
             let target = if site.over {
-                motorway_z + CLEARANCE + OVERPASS_DECK
+                motorway_z + CLEARANCE + OVERPASS_DECK + 0.5
             } else {
                 motorway_z - OVERPASS_DECK - 0.5 - CLEARANCE
             };
@@ -1909,16 +1917,19 @@ impl CorridorSpec {
                     let end = *lead.last().expect("points");
                     // On to the nose 25 m on from where the loop starts, which
                     // is as far on as the loop goes: the merge is past the
-                    // crossroad, not under it.
+                    // crossroad, not under it. The loop comes down round its
+                    // turns to the motorway's level on the merge line, and runs
+                    // on under the crossroad at that level, with all of the
+                    // clearance under the overpass.
                     accesses.push(Access {
                         ramp: loop_name.clone(),
                         carriageway: c,
                         on: true,
                         nose: travel_at - setback + 25.0 + GAP / 2.0,
                         end: [end.x, end.y],
-                        end_z: terminal.z,
+                        end_z: z(track.locate([end.x, end.y]).0),
                         end_heading: heading_travel,
-                        shape: Shape::Lead(lead),
+                        shape: Shape::Loop(lead),
                     });
                     ic_roads.push(loop_name.clone());
                 }
@@ -2284,6 +2295,14 @@ impl CorridorSpec {
                         Shape::Lead(lead) if lead.len() > 1 => Some(even(
                             lead[..lead.len() - 1].iter().copied().chain(tail).collect(),
                         )),
+                        // The loop at one even grade to where it meets the
+                        // link, and the link on from there.
+                        Shape::Loop(lead) if lead.len() > 1 => {
+                            let mut lead = lead.clone();
+                            lead.last_mut().expect("points").z = access.end_z;
+                            let lead = even(lead);
+                            Some(lead[..lead.len() - 1].iter().copied().chain(tail).collect())
+                        }
                         _ => Some(tail),
                     }
                 }

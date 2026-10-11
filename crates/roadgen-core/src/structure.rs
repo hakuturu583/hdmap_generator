@@ -1909,7 +1909,12 @@ const STEEPEST: f64 = 0.12;
 
 /// Everything about the map's structures, separations and interchanges that only
 /// becomes wrong once they are put together.
-pub(crate) fn check(map: &Map, tolerance: f64, issues: &mut Vec<ValidationIssue>) {
+pub(crate) fn check(
+    map: &Map,
+    tolerance: f64,
+    clearance: Option<f64>,
+    issues: &mut Vec<ValidationIssue>,
+) {
     let implausible =
         |feature: String, detail: String| ValidationIssue::ImplausibleFeature { feature, detail };
     let dangling = |referrer: String, feature: String| ValidationIssue::DanglingFeatureReference {
@@ -2129,7 +2134,7 @@ pub(crate) fn check(map: &Map, tolerance: f64, issues: &mut Vec<ValidationIssue>
         }
     }
 
-    check_crossings(map, issues);
+    check_crossings(map, clearance, issues);
 }
 
 /// A bridge's deck clears the land under it, and the land over a tunnel clears its
@@ -2201,7 +2206,10 @@ fn check_against_land(
 ///
 /// A crossing between two ordinary roads at grade is left alone. A map may draw
 /// streets that cross without a junction, and always could.
-fn check_crossings(map: &Map, issues: &mut Vec<ValidationIssue>) {
+///
+/// Where a structure does carry one over the other, the lower road keeps its clear
+/// height ([`check_clearance`]).
+fn check_crossings(map: &Map, clearance: Option<f64>, issues: &mut Vec<ValidationIssue>) {
     if !separates(map) {
         return;
     }
@@ -2234,8 +2242,146 @@ fn check_crossings(map: &Map, issues: &mut Vec<ValidationIssue>) {
                     )
                 },
             });
+        } else {
+            check_clearance(map, &crossing, clearance, issues);
         }
     }
+}
+
+/// How far a clearance may fall short of what it should be, metres: what the
+/// heights of two roads are rounded to, not room anything could use.
+const CLEARANCE_TOLERANCE: f64 = 0.01;
+
+/// The room a road carried over another leaves it, measured where the two cross.
+///
+/// Under a bridge the upper road is on, from the lower road's surface up to the
+/// underside of the deck — the upper surface less the deck's depth — has to be at
+/// least `clearance`, [`CLEARANCE`] unless the validation says otherwise; with no
+/// clearance asked for, only the deck has to clear the road. Over a tunnel the lower road is in, the upper road (or the
+/// underside of its deck, if it is on a bridge too) has to stand clear of the
+/// tunnel's roof: the lower surface, the tunnel's clear height and its lining. A
+/// tunnel's own clear height is what the road in it has; [`CLEARANCE`] is not asked
+/// of it twice.
+fn check_clearance(
+    map: &Map,
+    crossing: &Crossing,
+    clearance: Option<f64>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if crossing.carried_by(map).is_none() {
+        return;
+    }
+    let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
+    let at = |road: &RoadId, station: f64| {
+        map.road(road)
+            .and_then(|r| r.structure.at(station))
+            .and_then(|id| map.structures.get(id))
+    };
+    // How far the upper road comes down into the room the lower one keeps, at
+    // one pair of stations: positive is short.
+    let short = |us: f64, uz: f64, ls: f64, lz: f64| {
+        let underside = uz - depth_at(map, upper, us);
+        let top = match at(lower, ls).and_then(|s| s.kind.tunnel()) {
+            Some(tunnel) => lz + tunnel.clear_height + tunnel.lining,
+            None => lz + clearance.unwrap_or(0.0),
+        };
+        top - underside
+    };
+    // Where the two cross, and across the whole of the ground they share: a
+    // road that climbs or falls across the other is nearer it at one edge.
+    let mut worst = (short(us, uz, ls, lz), us, uz, ls, lz);
+    for (us, uz, ls, lz) in shared_ground(map, upper, us, lower, ls) {
+        let here = short(us, uz, ls, lz);
+        if here > worst.0 {
+            worst = (here, us, uz, ls, lz);
+        }
+    }
+    let (shortfall, us, uz, ls, lz) = worst;
+    if shortfall <= CLEARANCE_TOLERANCE {
+        return;
+    }
+    let upper_on = at(upper, us).filter(|s| s.kind.bridge().is_some());
+    let what = match upper_on {
+        Some(structure) => format!("the underside of {} under {upper}", structure.id),
+        None => format!("{upper}"),
+    };
+    issues.push(ValidationIssue::InsufficientClearance {
+        over: upper.clone(),
+        under: lower.clone(),
+        detail: match at(lower, ls).filter(|s| s.kind.tunnel().is_some()) {
+            Some(tunnel) => format!(
+                "{what} at {us:.1} m comes {shortfall:.2} m down into the roof of {} round \
+                 {lower} at {ls:.1} m",
+                tunnel.id
+            ),
+            None => format!(
+                "{what} at {us:.1} m clears {lower} at {ls:.1} m by only {:.2} m, not \
+                 {:.1} m",
+                uz - depth_at(map, upper, us) - lz,
+                clearance.unwrap_or(0.0)
+            ),
+        },
+    });
+}
+
+/// How far either way of a crossing [`shared_ground`] looks for the two roads'
+/// shared ground, metres along each.
+const SHARED_REACH: f64 = 60.0;
+
+/// The ground two crossing roads share, as (upper station, upper height, lower
+/// station, lower height) pairs: each road's edges, a metre apart along it near
+/// the crossing, wherever they lie over or under the other road.
+fn shared_ground(
+    map: &Map,
+    upper: &RoadId,
+    us: f64,
+    lower: &RoadId,
+    ls: f64,
+) -> Vec<(f64, f64, f64, f64)> {
+    let mut out = Vec::new();
+    for (own, at, other, flip) in [(lower, ls, upper, false), (upper, us, lower, true)] {
+        let (Some(road), Some(other_road)) = (map.road(own), map.road(other)) else {
+            continue;
+        };
+        let other_track = track(map, other);
+        let length = track(map, own).last().map_or(0.0, |(station, _)| *station);
+        let steps = SHARED_REACH as i64;
+        for k in -steps..=steps {
+            let station = at + k as f64;
+            if !(0.0..=length).contains(&station) {
+                continue;
+            }
+            let (Ok(frame), Some((left, right))) = (
+                road.frame_at(station, map.metadata.sampling),
+                road_extent(map, own, station),
+            ) else {
+                continue;
+            };
+            for edge in [left, right] {
+                let point = frame.offset(edge);
+                let Some((there, height)) = project(&other_track, point) else {
+                    continue;
+                };
+                let (Ok(other_frame), Some((other_left, other_right))) = (
+                    other_road.frame_at(there, map.metadata.sampling),
+                    road_extent(map, other, there),
+                ) else {
+                    continue;
+                };
+                let [along, across, _] = other_frame.to_local(point);
+                if along.abs() > 0.5 || across > other_left || across < other_right {
+                    continue;
+                }
+                let own_height = frame.origin.z;
+                out.push(if flip {
+                    (station, own_height, there, height)
+                } else {
+                    (there, height, station, own_height)
+                });
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

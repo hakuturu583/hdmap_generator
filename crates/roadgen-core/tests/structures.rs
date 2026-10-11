@@ -3,9 +3,12 @@
 use roadgen_core::prelude::*;
 use roadgen_core::structure::{
     BridgeForm, BridgeSpec, RoadSpan, StructureKind, SupportKind, TunnelForm, TunnelSpec,
-    Underneath, PARAPET, PARAPET_KIND,
+    Underneath, CLEARANCE, PARAPET, PARAPET_KIND,
 };
-use roadgen_core::{FormOfWay, MapObject, StructureId, ValidationIssue, VerticalProfile};
+use roadgen_core::{
+    FormOfWay, MapObject, StructureId, ValidatedMap, ValidationConfig, ValidationError,
+    ValidationIssue, VerticalProfile,
+};
 
 fn two_way() -> Vec<LaneSpec> {
     vec![
@@ -120,6 +123,95 @@ fn a_motorway_above_a_street_with_nothing_under_it_is_refused() {
         issue,
         ValidationIssue::UnseparatedCrossing { detail, .. } if detail.contains("nothing")
     )));
+}
+
+/// The motorway of [`crossing`] at `height` on a viaduct over the street, validated.
+fn on_a_viaduct(height: f64) -> Result<ValidatedMap, ValidationError> {
+    on_a_viaduct_with(height, ValidationConfig::default())
+}
+
+fn on_a_viaduct_with(
+    height: f64,
+    config: ValidationConfig,
+) -> Result<ValidatedMap, ValidationError> {
+    let (mut builder, motorway, _) = crossing(height);
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway, 200.0, 400.0)],
+            BridgeSpec::for_form(BridgeForm::Viaduct),
+        )
+        .unwrap();
+    builder.finish().unwrap().validate_with(config)
+}
+
+#[test]
+fn a_deck_that_comes_down_within_the_clearance_of_the_road_under_it_is_refused() {
+    let deck = BridgeSpec::for_form(BridgeForm::Viaduct).deck_depth;
+    // Clear of the street by more than its deck, but not by its deck and the
+    // clearance.
+    let error = on_a_viaduct(deck + CLEARANCE - 0.5).unwrap_err();
+    assert!(
+        error.issues.iter().any(|issue| matches!(
+            issue,
+            ValidationIssue::InsufficientClearance { over, under, detail }
+                if over.local_name() == "motorway"
+                    && under.local_name() == "street"
+                    && detail.contains("4.00 m")
+        )),
+        "{error}"
+    );
+    on_a_viaduct(deck + CLEARANCE).unwrap();
+    // A map drawn to a lower standard says so, or asks for none.
+    for clearance in [Some(CLEARANCE - 0.5), None] {
+        on_a_viaduct_with(
+            deck + CLEARANCE - 0.5,
+            ValidationConfig {
+                clearance,
+                ..ValidationConfig::default()
+            },
+        )
+        .unwrap();
+    }
+    // But no standard lets a deck down on to the road under it.
+    assert!(on_a_viaduct_with(
+        deck - 0.5,
+        ValidationConfig {
+            clearance: None,
+            ..ValidationConfig::default()
+        },
+    )
+    .is_err());
+}
+
+/// The street of [`crossing`] in a cut-and-cover tunnel under the motorway at
+/// `height`, validated.
+fn over_a_tunnel(height: f64) -> Result<ValidatedMap, ValidationError> {
+    let (mut builder, _, street) = crossing(height);
+    builder
+        .add_tunnel(
+            vec![RoadSpan::new(street, 150.0, 250.0)],
+            TunnelSpec {
+                form: TunnelForm::CutAndCover,
+                ..TunnelSpec::default()
+            },
+        )
+        .unwrap();
+    builder.finish().unwrap().validate()
+}
+
+#[test]
+fn a_road_that_dips_into_the_roof_of_a_tunnel_under_it_is_refused() {
+    let tunnel = TunnelSpec::default();
+    let roof = tunnel.clear_height + tunnel.lining;
+    let error = over_a_tunnel(roof - 0.5).unwrap_err();
+    assert!(
+        error.issues.iter().any(|issue| matches!(
+            issue,
+            ValidationIssue::InsufficientClearance { detail, .. } if detail.contains("roof")
+        )),
+        "{error}"
+    );
+    over_a_tunnel(roof).unwrap();
 }
 
 #[test]
@@ -831,4 +923,58 @@ fn a_parapet_of_a_bridge_the_map_does_not_have_is_refused() {
         ValidationIssue::DanglingFeatureReference { referrer, feature }
             if *referrer == id.to_string() && feature == "structure/nowhere"
     )));
+}
+
+#[test]
+fn a_graded_deck_over_a_wide_road_keeps_the_clearance_at_its_low_edge_too() {
+    // A motorway climbing at 6 % on a viaduct over an eight-lane avenue: where the
+    // two centre lines cross it clears the avenue, but the avenue is 28 m wide,
+    // and at its edge downhill the deck is 0.84 m lower.
+    let deck = BridgeSpec::for_form(BridgeForm::Viaduct).deck_depth;
+    let middle = deck + CLEARANCE + 0.3;
+    let lane = |direction| LaneSpec::new(PositiveWidth::new(3.5).unwrap(), direction);
+    let mut builder = MapBuilder::default();
+    let motorway = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, middle - 18.0),
+                Point3::new(300.0, 0.0, middle + 18.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -200.0, 0.0),
+                Point3::new(0.0, 200.0, 0.0),
+                [Direction::Forward; 4]
+                    .into_iter()
+                    .chain([Direction::Backward; 4])
+                    .map(lane)
+                    .collect(),
+            )
+            .unwrap()
+            .with_name("avenue"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway, 200.0, 400.0)],
+            BridgeSpec::for_form(BridgeForm::Viaduct),
+        )
+        .unwrap();
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    assert!(
+        error.issues.iter().any(|issue| matches!(
+            issue,
+            ValidationIssue::InsufficientClearance { under, .. }
+                if under.local_name() == "avenue"
+        )),
+        "{error}"
+    );
 }
