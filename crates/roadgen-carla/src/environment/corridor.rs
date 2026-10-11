@@ -324,22 +324,27 @@ impl Town {
                     .iter()
                     .map(|sample| [sample.point.x, sample.point.y])
                     .collect();
-                // Every lane on one side at its widest: no edge stands farther off.
+                // The wider side's lanes, each at its widest: no edge stands
+                // farther off the line than that.
+                let handedness = builder.metadata().handedness;
                 let reach = spec
                     .cross_sections
                     .iter()
                     .map(|section| {
-                        section
-                            .lanes
-                            .iter()
-                            .map(|lane| {
-                                lane.width
-                                    .knots()
-                                    .iter()
-                                    .map(|k| k.1.metres())
-                                    .fold(0.0, f64::max)
-                            })
-                            .sum::<f64>()
+                        let mut sides = [0.0_f64; 2];
+                        for lane in &section.lanes {
+                            let widest = lane
+                                .width
+                                .knots()
+                                .iter()
+                                .map(|k| k.1.metres())
+                                .fold(0.0, f64::max);
+                            let side = roadgen_core::layout::side_of(lane, handedness);
+                            sides[usize::from(
+                                side == roadgen_core::topology::LateralSide::Right,
+                            )] += widest;
+                        }
+                        sides[0].max(sides[1])
                     })
                     .fold(0.0, f64::max);
                 Some((line, reach))
@@ -2285,13 +2290,18 @@ impl CorridorSpec {
         for (stretches, bridge) in [(&self.elevated, true), (&self.sunken, false)] {
             for &(from, to) in stretches.iter() {
                 // Only where the lift is most of the way up: the ends of the ramp up
-                // to it are earthworks.
+                // to it are earthworks. A viaduct starts where the climb has lifted
+                // the deck's underside 2 m clear of the profile — read off the
+                // climb's own curve, so the land, rolling a little either side of
+                // the profile, never stands above the deck.
                 let margin = if bridge {
-                    self.elevated_height
+                    let need = BridgeSpec::for_form(BridgeForm::Viaduct).deck_depth + 2.0;
+                    let share = (need / self.elevated_height).min(1.0);
+                    (1.0 - 2.0 * share).acos() / std::f64::consts::PI
+                        * self.lift(self.elevated_height)
                 } else {
-                    self.sunken_depth
-                } / (0.8 * standard.max_grade.max(0.02))
-                    * 0.35;
+                    self.sunken_depth / (0.8 * standard.max_grade.max(0.02)) * 0.35
+                };
                 let (from, to) = (from + margin, to - margin);
                 if to - from < 20.0 {
                     continue;

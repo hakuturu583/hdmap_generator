@@ -187,6 +187,24 @@ fn planned_stretches(spec: &CorridorSpec) -> (Vec<(f64, f64)>, Vec<String>) {
 }
 
 #[test]
+fn a_motorway_61_m_from_a_streets_edge_is_out_of_town() {
+    // Beside the first street (6 m of lanes and pavement each side of its line),
+    // 67 m from its line and so 61 m from its edge: just outside the town.
+    let mut spec = CorridorSpec::new(
+        "Beside",
+        vec![
+            Point3::new(-167.0, -1500.0, 0.0),
+            Point3::new(-167.0, 1500.0, 0.0),
+        ],
+        60.0,
+    )
+    .unwrap();
+    spec.urban = Some(Urban::Elevated);
+    let (stretches, _) = planned_stretches(&spec);
+    assert!(stretches.is_empty(), "{stretches:?}");
+}
+
+#[test]
 fn an_urban_motorway_finds_the_streets_and_passes_over_them_on_a_viaduct() {
     let spec = urban_corridor(Urban::Elevated);
     // One stretch over both streets, 700 m and 1000 m along the centre line, with
