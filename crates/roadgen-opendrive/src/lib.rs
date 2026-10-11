@@ -1713,7 +1713,7 @@ impl<'a> Exporter<'a> {
                 // A berm or a rail runs along the road, so it is a continuous
                 // `<repeat>` — distance zero — from one end of its band to the other,
                 // as wide as the band and as high as the barrier stands.
-                MapObjectKind::Barrier { kind, height } => {
+                MapObjectKind::Barrier { kind, height, .. } => {
                     let ObjectGeometry::Band { left, right } = &object.geometry else {
                         continue;
                     };

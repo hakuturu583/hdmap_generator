@@ -857,7 +857,15 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
     let berms = map
         .objects
         .iter()
-        .filter(|object| matches!(object.kind, MapObjectKind::Barrier { .. }))
+        .filter(|object| {
+            matches!(
+                object.kind,
+                MapObjectKind::Barrier {
+                    structure: None,
+                    ..
+                }
+            )
+        })
         .count();
     if berms > 0 {
         warnings.push(format!(

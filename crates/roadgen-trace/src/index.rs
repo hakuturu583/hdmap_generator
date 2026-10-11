@@ -488,14 +488,16 @@ impl TraceIndex {
 /// The IR elements one step from each element of `catalog`, for
 /// [`TraceIndex::neighbours`]: a lane's road and the connections that join it, a
 /// road's lanes and its junction, a connection's two lanes and its junction, a
-/// junction's connecting roads, an object's lanes, a rule's objects and then its
-/// lanes, a building's parts, a part's building, the roads a structure carries, a
-/// grade separation's upper road and the structure it is made by, and an
-/// interchange's junctions, roads and structures.
+/// junction's connecting roads, an object's lanes and the structure it is part of,
+/// a rule's objects and then its lanes, a building's parts, a part's building, the
+/// roads a structure carries, a grade separation's upper road and the structure it
+/// is made by, and an interchange's junctions, roads and structures.
 ///
 /// The structures and what they join are only stepped out from, never into: a
 /// road's neighbours are the same with a bridge on it as without, so a lookup that
 /// steps from a lane to its road does not also reach every bridge along the road.
+/// The one way in is from a bridge's parapet, which is part of the bridge the way a
+/// building part is part of its building.
 ///
 /// An element is taken by the kind its id names, as [`IrRef::parse`] reads it, and
 /// where two entries share an id the first is the one described — as a search of
@@ -560,9 +562,11 @@ fn neighbour_table(catalog: &IrCatalog) -> HashMap<String, Vec<String>> {
     }
     for object in &catalog.objects {
         if is(&object.id, |r| matches!(r, IrRef::Object(_))) {
-            table
-                .entry(object.id.clone())
-                .or_insert_with(|| object.lanes.clone());
+            table.entry(object.id.clone()).or_insert_with(|| {
+                let mut out = object.lanes.clone();
+                out.extend(object.structure.clone());
+                out
+            });
         }
     }
     for rule in &catalog.rules {

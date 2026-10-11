@@ -494,11 +494,14 @@ mod building_tests {
 }
 
 /// The tags of a barrier's way. OSM's `barrier` values cover the common built
-/// ones; a berm has none, so it is `barrier=yes` with the IR's word beside it.
+/// ones — a bridge's parapet is a wall — and a berm has none, so it is
+/// `barrier=yes` with the IR's word beside it.
 pub fn barrier_tags(kind: &str, height: f64) -> Tags {
     let mut tags = Tags::new();
     let value = match kind {
         "guard_rail" | "wall" | "fence" | "kerb" => kind,
+        // A bridge's parapet is the low wall along its deck.
+        "parapet" => "wall",
         _ => "yes",
     };
     tags.insert("barrier".into(), value.into());

@@ -264,6 +264,7 @@ fn a_barrier_is_built_the_way_its_kind_is() {
     map.objects.get_mut(&berm).unwrap().kind = MapObjectKind::Barrier {
         kind: "wall".into(),
         height: 1.0,
+        structure: None,
     };
     assert!(draw(&map).contains(&materials::CURB));
 }

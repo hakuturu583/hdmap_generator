@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 use roadgen_carla::{materials, PackageConfig, Role};
 use roadgen_core::geometry::plan::ring_contains;
 use roadgen_core::prelude::*;
-use roadgen_core::structure::{BridgeForm, TunnelForm, Underneath};
-use roadgen_core::FormOfWay;
+use roadgen_core::structure::{BridgeForm, StructureKind, TunnelForm, Underneath};
+use roadgen_core::{FormOfWay, MapObject, StructureId};
 use roadgen_integration_tests::highway::build;
 
 /// Built once: generating the land round five kilometres of motorway is the slow
@@ -245,6 +245,98 @@ fn every_format_writes_the_motorway() {
     roadgen_gpudrive::to_scene(map, &scene).expect("GPUDrive");
     let trace = roadgen_trace::IrCatalog::of(map);
     assert_eq!(trace.structures.len(), map.structures.len());
+}
+
+/// The parapets the map has along `structure`: its barriers that belong to it.
+fn parapets_of<'m>(map: &'m Map, structure: &StructureId) -> Vec<&'m MapObject> {
+    map.objects
+        .iter()
+        .filter(|object| {
+            matches!(
+                &object.kind,
+                MapObjectKind::Barrier { kind, structure: Some(of), .. }
+                    if kind == "parapet" && of == structure
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn every_bridge_the_rules_build_stands_a_parapet_each_side_and_every_format_writes_them() {
+    let map = highway();
+    let mut all = 0;
+    for structure in map.structures.iter() {
+        let parapets = parapets_of(map, &structure.id).len();
+        match &structure.kind {
+            // The rules give each carriageway a deck of its own.
+            StructureKind::Bridge(_) => {
+                assert_eq!(parapets, 2 * structure.carries.len(), "{}", structure.id)
+            }
+            StructureKind::Tunnel(_) => assert_eq!(parapets, 0, "{}", structure.id),
+        }
+        all += parapets;
+    }
+    assert!(all > 0);
+
+    let xml = roadgen_opendrive::to_xml(map).expect("OpenDRIVE");
+    assert_eq!(xml.matches("subtype=\"parapet\"").count(), all);
+    let osm = roadgen_osm::to_xml(map).expect("OSM");
+    assert_eq!(osm.matches("v=\"wall\"").count(), all);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("e1.osm");
+    roadgen_lanelet2::write(map, &path).expect("Lanelet2");
+    let lanelet2 = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        lanelet2.matches("v=\"parapet\"").count(),
+        2 * all,
+        "each a road border down both edges of its band"
+    );
+
+    // The IR dump says whose parapet each is, and a lookup steps from one to it.
+    let document = roadgen_trace::IrDocument::of(map);
+    let owned: Vec<_> = document
+        .body
+        .objects
+        .iter()
+        .filter(|object| object.structure.is_some())
+        .collect();
+    assert_eq!(owned.len(), all);
+    let mut index = roadgen_trace::TraceIndex::new();
+    index.add_ir(document.clone()).unwrap();
+    for object in owned {
+        let structure = object.structure.clone().unwrap();
+        assert!(map.structures.contains(&StructureId::from_raw(&structure)));
+        assert!(index.neighbours(&object.id).contains(&structure));
+    }
+}
+
+#[test]
+fn a_map_without_a_bridge_has_no_parapet_and_dumps_its_barriers_as_before() {
+    let mut builder = MapBuilder::default();
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(200.0, 0.0, 0.0),
+                roadgen_integration_tests::highway::street_lanes(),
+            )
+            .unwrap()
+            .with_name("haul"),
+        )
+        .unwrap();
+    let berm = builder
+        .add_barrier(&LaneRef::new(road, 0), "berm", 2.0)
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    assert_eq!(map.objects.len(), 1, "the berm and nothing else");
+    let json = serde_json::to_string(&roadgen_trace::IrCatalog::of(&map).objects).unwrap();
+    assert_eq!(
+        json,
+        format!(
+            "[{{\"id\":\"{berm}\",\"kind\":\"barrier\",\"code\":null,\"lanes\":[\"{}\"]}}]",
+            map.objects.get(&berm).unwrap().lanes[0]
+        )
+    );
 }
 
 #[test]

@@ -39,12 +39,13 @@ use crate::buildings::Footprint;
 use crate::error::GeometryError;
 use crate::error::ValidationIssue;
 use crate::geometry::plan::{bounds, ring_contains, rings_overlap, segments_cross, PlanPoint};
-use crate::geometry::{Frame3, Point3};
+use crate::geometry::{Curve3, Frame3, Point3};
 use crate::id::{
-    GradeSeparationId, InterchangeId, JunctionId, LandCoverId, RoadId, SiteId, StructureId,
+    GradeSeparationId, InterchangeId, JunctionId, LandCoverId, LaneId, ObjectId, RoadId, SiteId,
+    StructureId,
 };
 use crate::map::Map;
-use crate::semantics::LaneType;
+use crate::semantics::{LaneType, MapObject, MapObjectKind, ObjectGeometry};
 use crate::topology::LateralSide;
 
 /// A stretch of one road, by horizontal station.
@@ -408,6 +409,15 @@ pub struct BridgeSpec {
     pub site: Option<SiteId>,
 }
 
+/// How tall a bridge's parapet stands above its deck, metres.
+pub const PARAPET: f64 = 1.1;
+/// What a bridge's parapets are called, as a [`MapObjectKind::Barrier`]'s kind.
+pub const PARAPET_KIND: &str = "parapet";
+/// The widest gap between two roads one deck carries side by side, metres: a
+/// median. Wider than this, the two are on the same structure but each at its own
+/// edge of it.
+pub const MEDIAN: f64 = 15.0;
+
 /// The clear height a road needs under anything that crosses over it, metres.
 pub const CLEARANCE: f64 = 4.5;
 /// An overpass's deck: a short span, so a shallower one than a viaduct's, metres.
@@ -761,7 +771,8 @@ pub fn slug(name: &str) -> String {
 
 /// Puts a structure under (or round) `spans`, lays out its geometry — its outline,
 /// and a bridge's abutments and piers or a tunnel's portals — and records it on
-/// each road it carries.
+/// each road it carries. A bridge's parapets go on the map with it, as barriers
+/// that belong to it (see [`shared_sides`] for where there is none).
 ///
 /// Piers are spaced evenly at no more than the spec's spacing and kept off the
 /// carriageway of every road below; one that has nowhere to stand within half a
@@ -1051,6 +1062,19 @@ fn place_with(
         }
     };
 
+    // A bridge's parapets, worked out before anything is changed, so a clash leaves
+    // the map as it was.
+    let parapets = match spec {
+        StructureSpec::Bridge(bridge) => parapets(map, &id, &spans, bridge.curb)?,
+        StructureSpec::Tunnel(_) => Vec::new(),
+    };
+    if let Some(clash) = parapets
+        .iter()
+        .find(|parapet| map.objects.contains(&parapet.id))
+    {
+        return Err(StructureError::Duplicate(clash.id.to_string()));
+    }
+
     for span in &spans {
         let road = map.roads.get_mut(&span.road).expect("checked");
         road.structure
@@ -1079,7 +1103,150 @@ fn place_with(
             },
         )
         .map_err(|duplicate| StructureError::Duplicate(duplicate.0.to_string()))?;
+    for parapet in parapets {
+        map.objects
+            .insert(parapet.id.clone(), parapet)
+            .map_err(|duplicate| StructureError::Duplicate(duplicate.0.to_string()))?;
+    }
     Ok(id)
+}
+
+/// Which sides of the road `spans[index]` carries have another of the carried
+/// roads running beside them on the same deck, left then right: the side of a
+/// carriageway that faces the other across the median.
+///
+/// Decided once, in the middle of the stretch, where the roads beside it are
+/// nearest: two carriageways on one deck run side by side the length of it. A road
+/// is beside a side when its nearer edge is no further out from that side's edge
+/// than [`MEDIAN`].
+pub fn shared_sides(map: &Map, spans: &[RoadSpan], index: usize) -> [bool; 2] {
+    let Some(span) = spans.get(index) else {
+        return [false, false];
+    };
+    let Some(road) = map.road(&span.road) else {
+        return [false, false];
+    };
+    let middle = (span.from + span.to) / 2.0;
+    let (Ok(frame), Some((left, right))) = (
+        road.frame_at(middle, map.metadata.sampling),
+        road_extent(map, &span.road, middle),
+    ) else {
+        return [false, false];
+    };
+    let across = frame.left.get();
+    let norm = (across.x * across.x + across.y * across.y).sqrt().max(1e-9);
+    // The other roads' edges where they pass nearest, as offsets to this one's left.
+    let beside: Vec<f64> = spans
+        .iter()
+        .enumerate()
+        .filter(|(other, _)| *other != index)
+        .filter_map(|(_, other)| Strip::of(map, other).ok())
+        .filter_map(|strip| {
+            let (row, _) = strip.locate(frame.origin);
+            strip.rows.get(row).copied()
+        })
+        .flat_map(|(_, near, l, r)| [near.offset(l), near.offset(r)])
+        .map(|p| ((p.x - frame.origin.x) * across.x + (p.y - frame.origin.y) * across.y) / norm)
+        .collect();
+    [(left, 1.0), (right, -1.0)].map(|(edge, side)| {
+        beside
+            .iter()
+            .map(|lateral| (lateral - edge) * side)
+            .any(|gap| gap > -1e-6 && gap <= MEDIAN)
+    })
+}
+
+/// The lane nearest one side's edge of a road in a section: its outermost lane on
+/// that side, or, where the road has none on that side — a one-way carriageway's
+/// left — its innermost on the other.
+fn edge_lane(map: &Map, road: &RoadId, section: usize, side: LateralSide) -> Option<LaneId> {
+    let lanes = map.lanes_of_section(road, section);
+    lanes
+        .iter()
+        .filter(|lane| lane.side == side)
+        .max_by_key(|lane| lane.ordinal)
+        .or_else(|| {
+            lanes
+                .iter()
+                .filter(|lane| lane.side != side)
+                .min_by_key(|lane| lane.ordinal)
+        })
+        .map(|lane| lane.id.clone())
+}
+
+/// A bridge's parapets: one along each outer side of each road its deck carries,
+/// standing on the curb from the road's edge to the deck's, except down a side that
+/// faces another of the carried roads across the median.
+///
+/// Each is a [`MapObjectKind::Barrier`] of kind [`PARAPET_KIND`] belonging to the
+/// bridge, as GDF holds a safety barrier: road furniture, related to the road it
+/// lines — through the lanes along it, one per cross-section — and to the
+/// structure it is part of.
+fn parapets(
+    map: &Map,
+    structure: &StructureId,
+    spans: &[RoadSpan],
+    curb: f64,
+) -> Result<Vec<MapObject>, StructureError> {
+    let key = structure
+        .as_str()
+        .strip_prefix("structure/")
+        .unwrap_or(structure.as_str());
+    let mut out = Vec::new();
+    for (index, span) in spans.iter().enumerate() {
+        let shared = shared_sides(map, spans, index);
+        let strip = Strip::of(map, span)?;
+        let road = map
+            .road(&span.road)
+            .ok_or_else(|| StructureError::NoSuchRoad(span.road.clone()))?;
+        let sections = road.section_at(span.from).unwrap_or(0)
+            ..=road
+                .section_at(span.to - 1e-6)
+                .unwrap_or(road.sections.len().saturating_sub(1));
+        for (shared, side, name) in [
+            (shared[0], LateralSide::Left, "left"),
+            (shared[1], LateralSide::Right, "right"),
+        ] {
+            if shared {
+                continue;
+            }
+            // Its band, left edge and right edge looking along the road: on the left
+            // the deck's edge is the band's left; on the right, the road's is.
+            let (inner, outer): (Vec<Point3>, Vec<Point3>) = strip
+                .rows
+                .iter()
+                .map(|(_, frame, left, right)| match side {
+                    LateralSide::Left => (frame.offset(*left), frame.offset(left + curb)),
+                    LateralSide::Right => (frame.offset(*right), frame.offset(right - curb)),
+                })
+                .unzip();
+            let (left, right) = match side {
+                LateralSide::Left => (outer, inner),
+                LateralSide::Right => (inner, outer),
+            };
+            let lanes = sections
+                .clone()
+                .filter_map(|section| edge_lane(map, &span.road, section, side))
+                .collect();
+            out.push(MapObject {
+                id: ObjectId::new(format!(
+                    "{PARAPET_KIND}/{key}/{}/{name}",
+                    span.road.local_name()
+                )),
+                kind: MapObjectKind::Barrier {
+                    kind: PARAPET_KIND.to_owned(),
+                    height: PARAPET,
+                    structure: Some(structure.clone()),
+                },
+                geometry: ObjectGeometry::Band {
+                    left: Curve3::polyline(left)?,
+                    right: Curve3::polyline(right)?,
+                },
+                lanes,
+            });
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------

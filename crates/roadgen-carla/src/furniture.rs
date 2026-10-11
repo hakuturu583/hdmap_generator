@@ -458,10 +458,35 @@ fn stand(
 /// Where a post stands on a structure, beside a road with no pavement: on top
 /// of a bridge's parapet, or on a tunnel's walkway — not out on a verge that is
 /// not there. How far out from the road's outer edge, and how high.
+///
+/// The parapet is the map's own, the barrier the bridge stands along this road,
+/// so the post's foot is on the top the barriers draw; on a bridge with none along
+/// this road, the post stands on the bare curb.
 fn ledge(map: &Map, road: &Road, station: f64) -> Option<(f64, f64)> {
-    let structure = map.structures.get(road.structure.at(station)?)?;
+    let id = road.structure.at(station)?;
+    let structure = map.structures.get(id)?;
     match (structure.kind.bridge(), structure.kind.tunnel()) {
-        (Some(bridge), _) => Some((bridge.curb / 2.0, crate::structures::PARAPET)),
+        (Some(bridge), _) => {
+            let parapet = map
+                .objects
+                .iter()
+                .filter_map(|object| match &object.kind {
+                    MapObjectKind::Barrier {
+                        height,
+                        structure: Some(of),
+                        ..
+                    } if of == id
+                        && object.lanes.iter().any(|lane| {
+                            map.lanes.get(lane).is_some_and(|lane| lane.road == road.id)
+                        }) =>
+                    {
+                        Some(*height)
+                    }
+                    _ => None,
+                })
+                .fold(0.0, f64::max);
+            Some((bridge.curb / 2.0, parapet))
+        }
         (_, Some(tunnel)) => Some((tunnel.walkway / 2.0, 0.0)),
         _ => None,
     }
