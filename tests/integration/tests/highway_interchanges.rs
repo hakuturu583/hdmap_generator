@@ -845,3 +845,63 @@ fn a_stack_says_how_much_reach_its_flyovers_need() {
     let error = spec.plan(TrafficHandedness::RightHand).unwrap_err();
     assert!(error.contains("each side of the corridor"), "{error}");
 }
+
+#[test]
+fn a_stack_bridges_its_crossroad_however_little_it_lifts_it_and_refuses_one_over_it() {
+    // A crossroad nearly at its level already is lifted the little it lacks,
+    // and still crosses on a bridge: the bridge says which is carried over.
+    let mut spec = stack_spec();
+    spec.interchanges[0].crossroad = vec![
+        Point3::new(0.0, -1300.0, 7.2),
+        Point3::new(0.0, 1300.0, 7.2),
+    ];
+    let plan = spec.plan(TrafficHandedness::RightHand).expect("plans");
+    assert!(
+        plan.structures.iter().any(|structure| structure
+            .spans
+            .iter()
+            .any(|(road, _, _)| road.starts_with("minami_ic_branch_"))),
+        "no bridge on the crossroad"
+    );
+    // One that stands over where the stack would lift it is refused.
+    spec.interchanges[0].crossroad = vec![
+        Point3::new(0.0, -1300.0, 12.0),
+        Point3::new(0.0, 1300.0, 12.0),
+    ];
+    let error = spec.plan(TrafficHandedness::RightHand).unwrap_err();
+    assert!(error.contains("stands"), "{error}");
+}
+
+#[test]
+fn a_stack_on_a_graded_crossroad_keeps_its_levels_spare_half_metre_where_flyovers_cross() {
+    // The other motorway climbs through at 2 %: where a flyover crosses it, it
+    // stands higher than where it crosses the corridor. Every level is a
+    // clearance and a deck over the one under it with half a metre to spare,
+    // there as much as in the middle. The roads as planned, before any land:
+    // on a grade the land is another matter.
+    let mut spec = stack_spec();
+    spec.interchanges[0].crossroad = vec![
+        Point3::new(0.0, -2000.0, -40.0),
+        Point3::new(0.0, 2000.0, 40.0),
+    ];
+    spec.interchanges[0].reach = 900.0;
+    for handedness in [TrafficHandedness::RightHand, TrafficHandedness::LeftHand] {
+        let plan = spec.plan(handedness).expect("plans");
+        let mut builder = MapBuilder::new(MapMetadata {
+            handedness,
+            ..MapMetadata::default()
+        });
+        plan.apply(&mut builder, &mut Places::default())
+            .expect("applies");
+        let built = builder.finish().expect("builds");
+        let map = built.as_map();
+        for crossing in &roadgen_core::structure::crossings(map) {
+            let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
+            let clear = uz - lz - roadgen_core::structure::depth_at(map, upper, us);
+            assert!(
+                clear >= roadgen_core::structure::CLEARANCE + 0.5 - 0.01,
+                "{upper} at {us:.0} m clears {lower} at {ls:.0} m by {clear:.2} m"
+            );
+        }
+    }
+}

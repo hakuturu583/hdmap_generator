@@ -1394,7 +1394,6 @@ impl CorridorSpec {
         // A level over another: the clearance under a viaduct's deck, and half a
         // metre to spare.
         let level = CLEARANCE + BridgeSpec::for_form(BridgeForm::Viaduct).deck_depth + 0.5;
-        let base = (cx.z)(cx.centre_station);
         let (ox, oy, oh) = cx.track.at(cx.centre_station);
 
         // The other motorway: a corridor of this one's standard along the
@@ -1417,13 +1416,36 @@ impl CorridorSpec {
                 site.name
             ));
         }
-        let lift = base + level - other_profile.height(across);
-        let mut half = 0.0;
-        if lift > 0.5 {
-            half = edge + 10.0 + other.lift(lift);
-            other.elevated = vec![(across - half, across + half)];
-            other.elevated_height = lift;
+        // Lifted to a level over the corridor where the two cross: over the
+        // corridor's highest under the deck, from the crossroad's lowest there,
+        // both on their grades.
+        let deck = edge + 5.0;
+        let highest = |z: &dyn Fn(f64) -> f64, from: f64, to: f64| {
+            let steps = ((to - from) / 5.0).ceil().max(1.0) as usize;
+            (0..=steps)
+                .map(|k| z(from + (to - from) * k as f64 / steps as f64))
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        let under = highest(cx.z, cx.centre_station - deck, cx.centre_station + deck);
+        let low = -highest(
+            &|s: f64| -other_profile.height(s),
+            across - deck,
+            across + deck,
+        );
+        let lift = under + level - low;
+        if lift < 0.0 {
+            return Err(format!(
+                "{}: the crossroad of a stack stands {:.1} m over the corridor where they                  cross, higher than the level the stack lifts it to; give it a profile                  nearer the corridor's",
+                site.name,
+                low - under
+            ));
         }
+        // Always on a bridge where it crosses, however little it is lifted: the
+        // bridge is what says which of the two is carried over the other.
+        let lift = lift.max(0.5);
+        let half = edge + 10.0 + other.lift(lift);
+        other.elevated = vec![(across - half, across + half)];
+        other.elevated_height = lift;
         let other_z = |s: f64| other.height_at(&other_profile, s);
         let forward_right = cx.handedness == TrafficHandedness::RightHand;
         let other_way = |side: Side| Way {
@@ -1630,6 +1652,27 @@ impl CorridorSpec {
             // it the fourth — and climbs and descends each side; a quarter turn
             // is at one grade all the way.
             let lines: Vec<Vec<Point3>> = ramps.iter().map(|r| r.points.clone()).collect();
+            // The second level, the one the flyovers stand over: the other
+            // motorway's, at its highest where a flyover crosses it, and a level
+            // over the corridor's highest where one crosses that. On a grade a
+            // motorway stands higher where a flyover crosses it than where the
+            // two motorways cross, by more than a level has to spare.
+            let mut second = under + level;
+            for ramp_line in ramps.iter().filter(|ramp| ramp.flyover) {
+                for point in &ramp_line.points {
+                    if (point.x - ox).hypot(point.y - oy) > MIDDLE {
+                        continue;
+                    }
+                    let (s, off) = cx.track.locate([point.x, point.y]);
+                    if off.abs() < edge + 3.0 {
+                        second = second.max((cx.z)(s) + level);
+                    }
+                    let (s, off) = other_track.locate([point.x, point.y]);
+                    if off.abs() < edge + 3.0 {
+                        second = second.max(other_z(s));
+                    }
+                }
+            }
             for (index, ramp_line) in ramps.iter_mut().enumerate() {
                 let stations = stations_of(&ramp_line.points);
                 let (from, to) = (
@@ -1674,7 +1717,7 @@ impl CorridorSpec {
                         site.name
                     ));
                 };
-                let top = base + level * if ramp_line.on { 2.0 } else { 3.0 };
+                let top = second + level * if ramp_line.on { 1.0 } else { 2.0 };
                 let (heights, climb, descent) = flyover(
                     &stations,
                     from,
