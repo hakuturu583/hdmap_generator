@@ -253,7 +253,12 @@ jobs:
     name: test the tagged commit
     needs: [resolve]
     if: ${{ !cancelled() && needs.resolve.outputs.proceed == 'true' }}
-    runs-on: ubuntu-latest
+    # Both architectures a wheel is published for, so the aarch64 wheel is not the
+    # one nobody ran.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
