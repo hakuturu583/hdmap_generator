@@ -425,3 +425,74 @@ fn a_river_falls_along_its_length_and_its_water_with_it() {
     }
     assert!(along.first().unwrap().z - along.last().unwrap().z > 8.0);
 }
+
+#[test]
+fn one_bridge_over_both_carriageways_is_one_deck_across_the_median() {
+    use roadgen_core::structure::{BridgeSpec, RoadSpan};
+    let one_way = || {
+        vec![LaneSpec::new(
+            PositiveWidth::new(3.5).unwrap(),
+            Direction::Forward,
+        )]
+    };
+    let mut builder = MapBuilder::default();
+    // Drawn opposite ways, each lane outside its line: a 12 m median between.
+    let east = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -6.0, 9.0),
+                Point3::new(300.0, -6.0, 9.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("east"),
+        )
+        .unwrap();
+    let west = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(300.0, 6.0, 9.0),
+                Point3::new(0.0, 6.0, 9.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("west"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(east, 0.0, 300.0),
+                RoadSpan::new(west, 0.0, 300.0),
+            ],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder
+        .finish()
+        .unwrap()
+        .validate()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("deck"));
+    let deck: Vec<Point3> = meshes
+        .iter()
+        .filter(|mesh| mesh.role == Role::Terrain && mesh.materials == [materials::ROAD_CONCRETE])
+        .flat_map(|mesh| mesh.positions.iter().copied())
+        .collect();
+    assert!(!deck.is_empty());
+    let parapet = 9.0 + roadgen_carla::structures::PARAPET;
+    // Parapets along the two outer edges only, none down the median.
+    assert!(deck
+        .iter()
+        .any(|p| (p.z - parapet).abs() < 1e-6 && p.y.abs() > 9.0));
+    assert!(
+        !deck
+            .iter()
+            .any(|p| (p.z - parapet).abs() < 1e-6 && p.y.abs() < 6.0 - 1e-6),
+        "a parapet down the median"
+    );
+    // The slab is there across the middle of the median, at the road's height.
+    assert!(deck
+        .iter()
+        .any(|p| p.y.abs() < 1e-6 && (p.z - 9.0).abs() < 1e-6));
+}

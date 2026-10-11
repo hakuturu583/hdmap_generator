@@ -151,3 +151,53 @@ fn carla_draws_both() {
         assert!(meshes.iter().any(|m| m.role == roadgen_carla::Role::Road));
     }
 }
+
+#[test]
+fn two_corridors_each_keep_their_own_cuttings_and_embankments() {
+    let corridor = |name: &str, y: f64| {
+        let mut spec = CorridorSpec::new(
+            name,
+            vec![Point3::new(-1500.0, y, 0.0), Point3::new(1500.0, y, 0.0)],
+            100.0,
+        )
+        .unwrap();
+        // Over a rise in the middle, so the land is cut and filled to it.
+        spec.profile = vec![(0.0, 0.0), (1500.0, 12.0), (3000.0, 0.0)];
+        spec
+    };
+    let specs = [corridor("E5", 0.0), corridor("E6", 1200.0)];
+    let mut places = Places {
+        corridors: specs.to_vec(),
+        ..Places::default()
+    };
+    let mut builder = MapBuilder::default();
+    for spec in &specs {
+        spec.plan(TrafficHandedness::RightHand)
+            .unwrap()
+            .apply(&mut builder, &mut places)
+            .unwrap();
+    }
+    let mut map = builder.finish().unwrap();
+    environment::generate(&mut map, &places).expect("generates");
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
+    for name in ["e5", "e6"] {
+        let site = map
+            .sites
+            .iter()
+            .find(|site| site.id.as_str() == format!("site/{name}"))
+            .unwrap_or_else(|| panic!("no site {name}"));
+        let slopes = site
+            .land_covers
+            .iter()
+            .filter_map(|id| map.land_covers.get(id))
+            .filter(|cover| cover.kind == "cutting" || cover.kind == "embankment")
+            .collect::<Vec<_>>();
+        assert!(!slopes.is_empty(), "{name} has no slopes of its own");
+        // And they are beside its own road, not the other's.
+        let y = if name == "e5" { 0.0 } else { 1200.0 };
+        for cover in slopes {
+            let p = cover.area.centroid();
+            assert!((p.y - y).abs() < 200.0, "{name}: a slope at {p:?}");
+        }
+    }
+}

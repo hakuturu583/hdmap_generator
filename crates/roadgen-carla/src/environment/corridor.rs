@@ -994,6 +994,14 @@ impl CorridorSpec {
                 format!("{}: the crossroad does not cross the corridor", site.name)
             })?;
             let (centre_station, _) = track.locate(point_at(c_station));
+            // The ramps are laid out round where the crossroad really crosses.
+            if (centre_station - site.at).abs() > 1.0 {
+                plan.notes.push(format!(
+                    "{}: the crossroad crosses the corridor at {centre_station:.0} m, not at \
+                     {:.0} m; the interchange is built where it crosses",
+                    site.name, site.at
+                ));
+            }
             let motorway_z = z(centre_station);
             let half_corridor = standard.median / 2.0 + cw_width + 3.0;
             // Over the motorway: an overpass's deck and the clearance under it;
@@ -1159,7 +1167,7 @@ impl CorridorSpec {
             // crossroad: a terminal's inner piece runs to the corridor, its outer
             // piece away from it.
             let (centre_plan, centre_heading) = {
-                let (x, y, h) = track.at(site.at);
+                let (x, y, h) = track.at(centre_station);
                 ([x, y], h)
             };
 
@@ -1211,7 +1219,7 @@ impl CorridorSpec {
                     .position(|c| c.side == *side)
                     .expect("both sides");
                 let carriageway = &carriageways[c];
-                let heading_travel = carriageway.heading(&track, site.at);
+                let heading_travel = carriageway.heading(&track, centre_station);
                 let u = [heading_travel.cos(), heading_travel.sin()];
                 let back = |d: f64| [terminal.x - u[0] * d, terminal.y - u[1] * d];
                 let ahead = |d: f64| [terminal.x + u[0] * d, terminal.y + u[1] * d];
@@ -1238,7 +1246,7 @@ impl CorridorSpec {
                 let off_name = format!("{ic}_{}_off", side.as_str());
                 let on_name = format!("{ic}_{}_on", side.as_str());
                 let loop_name = format!("{ic}_{}_loop", side.as_str());
-                let travel_at = travel(carriageway, site.at);
+                let travel_at = travel(carriageway, centre_station);
                 // What this terminal has: the off slip road always; a slip road on
                 // and a loop on as the kind says.
                 let far_trumpet =
@@ -2009,6 +2017,50 @@ mod tests {
             (corner - 690.0 * (2f64.sqrt() - 1.0)).abs() < 1.0,
             "{corner}"
         );
+    }
+
+    #[test]
+    fn an_interchange_is_built_where_its_crossroad_crosses() {
+        let mut spec = CorridorSpec::new(
+            "E7",
+            vec![
+                Point3::new(-1500.0, 0.0, 0.0),
+                Point3::new(1500.0, 0.0, 0.0),
+            ],
+            100.0,
+        )
+        .unwrap();
+        // Said to be at 1000 m; the crossroad crosses at 1700 m, x = 200.
+        let lane = |direction| LaneSpec::new(width(3.5), direction);
+        spec.interchanges.push(InterchangeSite {
+            name: "Higashi".into(),
+            kind: InterchangeKind::Diamond,
+            at: 1000.0,
+            crossroad: vec![
+                Point3::new(200.0, -500.0, 0.0),
+                Point3::new(200.0, 500.0, 0.0),
+            ],
+            crossroad_lanes: vec![lane(Direction::Backward), lane(Direction::Forward)],
+            over: true,
+            control: Control::Signal,
+            terminal: 80.0,
+            reach: 320.0,
+        });
+        let plan = spec.plan(TrafficHandedness::RightHand).unwrap();
+        assert!(
+            plan.notes.iter().any(|note| note.contains("at 1700 m")),
+            "{:?}",
+            plan.notes
+        );
+        for road in plan
+            .roads
+            .iter()
+            .filter(|r| r.name.starts_with("higashi_") && !r.name.contains("cross"))
+        {
+            for p in &road.points {
+                assert!((p.x - 200.0).abs() < 400.0, "{} at {p:?}", road.name);
+            }
+        }
     }
 
     #[test]

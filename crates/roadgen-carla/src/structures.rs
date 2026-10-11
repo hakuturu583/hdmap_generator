@@ -127,8 +127,20 @@ pub fn meshes(
         );
         match &structure.kind {
             StructureKind::Bridge(bridge) => {
-                for span in &structure.carries {
-                    deck(&mut mesh, &rows(map, span), bridge);
+                let carried: Vec<Vec<Row>> = structure
+                    .carries
+                    .iter()
+                    .map(|span| rows(map, span))
+                    .collect();
+                for (index, own) in carried.iter().enumerate() {
+                    let others: Vec<&[Row]> = carried
+                        .iter()
+                        .enumerate()
+                        .filter(|(other, _)| *other != index)
+                        .map(|(_, rows)| rows.as_slice())
+                        .collect();
+                    let [left, right] = joins(own, &others);
+                    deck(&mut mesh, own, bridge, left.as_deref(), right.as_deref());
                 }
                 for support in &bridge.supports {
                     let ring = support.footprint.points();
@@ -153,35 +165,103 @@ pub fn meshes(
     out
 }
 
+/// The widest gap between two roads one deck carries, metres: a median.
+const MEDIAN: f64 = 15.0;
+
+/// Where a road's deck runs on into another's, side by side on one deck: for each
+/// of its two sides, left then right, how far out — to halfway across the gap to
+/// the other road — row by row, or `None` on a side with no road beside it.
+fn joins(rows: &[Row], others: &[&[Row]]) -> [Option<Vec<f64>>; 2] {
+    // The other roads' edges beside each row, as offsets to its left.
+    let beside = |row: &Row| -> Vec<f64> {
+        let left = row.frame.left.get();
+        let norm = (left.x * left.x + left.y * left.y).sqrt().max(1e-9);
+        others
+            .iter()
+            .filter_map(|other| {
+                other.iter().min_by(|a, b| {
+                    a.frame
+                        .origin
+                        .horizontal_distance_to(row.frame.origin)
+                        .total_cmp(&b.frame.origin.horizontal_distance_to(row.frame.origin))
+                })
+            })
+            .flat_map(|near| [near.at(near.left, 0.0), near.at(near.right, 0.0)])
+            .map(|p| {
+                let (dx, dy) = (p.x - row.frame.origin.x, p.y - row.frame.origin.y);
+                (dx * left.x + dy * left.y) / norm
+            })
+            .collect()
+    };
+    let gap = |row: &Row, side: f64| -> Option<f64> {
+        let edge = if side > 0.0 { row.left } else { row.right };
+        beside(row)
+            .into_iter()
+            .map(|lateral| (lateral - edge) * side)
+            .filter(|&d| d > -1e-6 && d <= MEDIAN)
+            .min_by(f64::total_cmp)
+            .map(|d| edge + side * d / 2.0)
+    };
+    [1.0, -1.0].map(|side| {
+        // Decided once, in the middle: the carriageways run side by side the
+        // length of the deck.
+        let middle = rows.get(rows.len() / 2)?;
+        gap(middle, side)?;
+        Some(
+            rows.iter()
+                .map(|row| gap(row, side).unwrap_or(if side > 0.0 { row.left } else { row.right }))
+                .collect(),
+        )
+    })
+}
+
 /// A deck's parapets and underside. The curb under each parapet is the parapet's
-/// own footprint.
-fn deck(mesh: &mut Mesh, rows: &[Row], bridge: &Bridge) {
+/// own footprint. A side running on into another road on the same deck has no
+/// parapet: the slab goes on across, at the road's height, to `left_to` or
+/// `right_to`, where the other road's half of it begins.
+fn deck(
+    mesh: &mut Mesh,
+    rows: &[Row],
+    bridge: &Bridge,
+    left_to: Option<&[f64]>,
+    right_to: Option<&[f64]>,
+) {
     if rows.len() < 2 {
         return;
     }
     let curb = bridge.curb;
     let depth = bridge.deck_depth;
-    let line = |lateral: &dyn Fn(&Row) -> f64, rise: f64| -> Vec<Point3> {
-        rows.iter().map(|row| row.at(lateral(row), rise)).collect()
+    let at = |lateral: &dyn Fn(usize, &Row) -> f64, rise: f64| -> Vec<Point3> {
+        rows.iter()
+            .enumerate()
+            .map(|(index, row)| row.at(lateral(index, row), rise))
+            .collect()
     };
-    let left_inner = |row: &Row| row.left;
-    let left_outer = |row: &Row| row.left + curb;
-    let right_inner = |row: &Row| row.right;
-    let right_outer = |row: &Row| row.right - curb;
-    // The parapet's inner faces, facing the road; its top; its outer face, which
-    // runs down the side of the deck to its underside.
-    mesh.strip(&line(&left_inner, PARAPET), &line(&left_inner, 0.0), 0);
-    mesh.strip(&line(&right_inner, 0.0), &line(&right_inner, PARAPET), 0);
-    mesh.strip(&line(&left_outer, PARAPET), &line(&left_inner, PARAPET), 0);
-    mesh.strip(
-        &line(&right_inner, PARAPET),
-        &line(&right_outer, PARAPET),
-        0,
-    );
-    mesh.strip(&line(&left_outer, -depth), &line(&left_outer, PARAPET), 0);
-    mesh.strip(&line(&right_outer, PARAPET), &line(&right_outer, -depth), 0);
+    let left_inner = |_: usize, row: &Row| row.left;
+    let right_inner = |_: usize, row: &Row| row.right;
+    let left_outer = |index: usize, row: &Row| left_to.map_or(row.left + curb, |to| to[index]);
+    let right_outer = |index: usize, row: &Row| right_to.map_or(row.right - curb, |to| to[index]);
+    match left_to {
+        // The slab across to the next road, facing up.
+        Some(_) => mesh.strip(&at(&left_outer, 0.0), &at(&left_inner, 0.0), 0),
+        // The parapet's inner face, facing the road; its top; its outer face,
+        // which runs down the side of the deck to its underside.
+        None => {
+            mesh.strip(&at(&left_inner, PARAPET), &at(&left_inner, 0.0), 0);
+            mesh.strip(&at(&left_outer, PARAPET), &at(&left_inner, PARAPET), 0);
+            mesh.strip(&at(&left_outer, -depth), &at(&left_outer, PARAPET), 0);
+        }
+    }
+    match right_to {
+        Some(_) => mesh.strip(&at(&right_inner, 0.0), &at(&right_outer, 0.0), 0),
+        None => {
+            mesh.strip(&at(&right_inner, 0.0), &at(&right_inner, PARAPET), 0);
+            mesh.strip(&at(&right_inner, PARAPET), &at(&right_outer, PARAPET), 0);
+            mesh.strip(&at(&right_outer, PARAPET), &at(&right_outer, -depth), 0);
+        }
+    }
     // The underside, facing down.
-    mesh.strip(&line(&right_outer, -depth), &line(&left_outer, -depth), 0);
+    mesh.strip(&at(&right_outer, -depth), &at(&left_outer, -depth), 0);
 }
 
 /// A column standing on `base` up to `top`: its sides, facing out, and its top.
