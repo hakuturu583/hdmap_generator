@@ -1306,7 +1306,8 @@ impl CorridorSpec {
                 // the off slip road's inner one.
                 let push = (rise - (ramp_width + 2.0 - LOOP_CLEARANCE)).max(0.0);
                 if looped && push > LOOP_PUSH {
-                    let least = site.terminal + push - LOOP_PUSH;
+                    // Rounded up, so that the distance it names is enough.
+                    let least = (site.terminal + push - LOOP_PUSH).ceil();
                     return Err(format!(
                         "{}: the terminal is too near the motorway for a loop of {LOOP_RADIUS:.0} m; \
                          put it {least:.0} m out or farther",

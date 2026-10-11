@@ -313,22 +313,28 @@ fn a_loops_radius_does_not_follow_the_terminal() {
 
 #[test]
 fn a_terminal_with_no_room_for_a_loop_is_refused_with_how_far_out_to_put_it() {
-    let error = corridor(InterchangeKind::Parclo, 60.0)
-        .plan(TrafficHandedness::RightHand)
-        .unwrap_err();
-    assert!(
-        error.contains("too near the motorway for a loop"),
-        "{error}"
-    );
-    // Where it says to put it is enough.
-    let least: f64 = error
-        .split("put it ")
-        .nth(1)
-        .and_then(|rest| rest.split(" m").next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("{error}"));
-    let plan = corridor(InterchangeKind::Parclo, least + 0.5)
-        .plan(TrafficHandedness::RightHand)
-        .unwrap();
-    assert!(plan.notes.is_empty(), "{:#?}", plan.notes);
+    // At 80 km/h the least distance falls between whole metres.
+    for speed in [100.0, 80.0] {
+        let spec = |terminal: f64| {
+            let mut spec = corridor(InterchangeKind::Parclo, terminal);
+            spec.standard = roadgen_carla::environment::DesignStandard::for_speed(speed).unwrap();
+            spec
+        };
+        let error = spec(60.0).plan(TrafficHandedness::RightHand).unwrap_err();
+        assert!(
+            error.contains("too near the motorway for a loop"),
+            "{error}"
+        );
+        // Where it says to put it is enough.
+        let least: f64 = error
+            .split("put it ")
+            .nth(1)
+            .and_then(|rest| rest.split(" m").next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{error}"));
+        let plan = spec(least)
+            .plan(TrafficHandedness::RightHand)
+            .unwrap_or_else(|error| panic!("{speed} km/h at {least} m: {error}"));
+        assert!(plan.notes.is_empty(), "{:#?}", plan.notes);
+    }
 }
