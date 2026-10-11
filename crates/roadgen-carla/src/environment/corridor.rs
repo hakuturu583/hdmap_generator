@@ -513,6 +513,9 @@ pub enum ConnectionPlan {
         b_end: roadgen_core::topology::RoadEnd,
         junction: String,
     },
+    /// One road's end on to the next road's start, lane for lane, with no
+    /// junction between: a road that changes what it is part of the way along.
+    Follows { from: String, to: String },
 }
 
 /// A signal or a give-way at a lane's end.
@@ -685,6 +688,11 @@ struct Piece {
     to: f64,
     accelerates: bool,
     decelerates: bool,
+    /// The limit on it, km/h, and whether it is still the motorway: a stage of
+    /// the transition at the corridor's far end is slower, and its last is an
+    /// ordinary road.
+    speed: f64,
+    motorway: bool,
 }
 
 /// Where a slip road leaves or joins a carriageway.
@@ -743,6 +751,98 @@ impl CorridorSpec {
 
     /// Works out the roads, junctions, movements and structures the corridor asks
     /// for. See the module documentation.
+    /// Splits the piece at the corridor's far end into the stages of its
+    /// transition to an ordinary road: the limit stepped down 20 km/h at a
+    /// time to 60, each stage an equal share of `transition`, and the last no
+    /// longer the motorway. `along` says which way traffic on the carriageway
+    /// goes: towards the far end, whose piece is the last, or away from it,
+    /// whose piece is the first. A speed-change lane on the piece stays on the
+    /// stretch of it at the design speed.
+    fn stage(
+        &self,
+        along: bool,
+        transition: f64,
+        pieces: &mut Vec<Piece>,
+        notes: &mut Vec<String>,
+    ) {
+        let standard = &self.standard;
+        let mut speeds = Vec::new();
+        let mut limit = standard.design_speed - 20.0;
+        while limit > 60.0 + 1e-6 {
+            speeds.push(limit);
+            limit -= 20.0;
+        }
+        speeds.push(60.0_f64.min(standard.design_speed));
+        let piece = if along {
+            pieces.pop()
+        } else {
+            (!pieces.is_empty()).then(|| pieces.remove(0))
+        };
+        let Some(piece) = piece else { return };
+        // What the design-speed stretch keeps: its speed-change lane, or a road's
+        // worth of length.
+        let keep = if piece.accelerates {
+            standard.acceleration + standard.taper + 10.0
+        } else if piece.decelerates {
+            standard.deceleration + standard.taper + 10.0
+        } else {
+            30.0
+        };
+        let room = (piece.to - piece.from - keep).max(0.0);
+        if room + 1e-6 < transition {
+            notes.push(format!(
+                "{}: only {room:.0} m of the {transition:.0} m transition at the corridor's end fits",
+                self.name
+            ));
+        }
+        let length = transition.min(room);
+        let share = length / speeds.len() as f64;
+        let stage = |from: f64, to: f64, speed: f64, last: bool| Piece {
+            from,
+            to,
+            accelerates: false,
+            decelerates: false,
+            speed,
+            motorway: !last,
+        };
+        let count = speeds.len();
+        if share < 10.0 {
+            // No room for stages: the whole piece is the ordinary road.
+            pieces.insert(
+                if along { pieces.len() } else { 0 },
+                Piece {
+                    speed: speeds[count - 1],
+                    motorway: false,
+                    ..piece
+                },
+            );
+            return;
+        }
+        if along {
+            let start = piece.to - length;
+            pieces.push(Piece { to: start, ..piece });
+            for (k, &speed) in speeds.iter().enumerate() {
+                let from = start + share * k as f64;
+                pieces.push(stage(from, from + share, speed, k + 1 == count));
+            }
+        } else {
+            let mut staged: Vec<Piece> = speeds
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(k, &speed)| {
+                    let from = piece.from + share * k as f64;
+                    stage(from, from + share, speed, k == 0)
+                })
+                .collect();
+            staged.push(Piece {
+                from: piece.from + length,
+                ..piece
+            });
+            pieces.splice(0..0, staged);
+        }
+    }
+
     pub fn plan(&self, handedness: TrafficHandedness) -> Result<CorridorPlan, String> {
         self.check()?;
         let key = self.key();
@@ -1193,6 +1293,8 @@ impl CorridorSpec {
                     to: nose.at - GAP / 2.0,
                     accelerates,
                     decelerates: !nose.on,
+                    speed,
+                    motorway: true,
                 });
                 from = nose.at + GAP / 2.0;
                 accelerates = nose.on;
@@ -1208,7 +1310,12 @@ impl CorridorSpec {
                 to: length,
                 accelerates,
                 decelerates: false,
+                speed,
+                motorway: true,
             });
+            if let Some(transition) = self.end_transition {
+                self.stage(c.along, transition, &mut pieces, &mut plan.notes);
+            }
             let named = pieces
                 .into_iter()
                 .enumerate()
@@ -1311,11 +1418,28 @@ impl CorridorSpec {
                     points,
                     lanes,
                     cross_sections,
-                    road_type: RoadType::Motorway,
-                    form: FormOfWay::Motorway,
-                    speed_limit: Some(speed),
+                    road_type: if piece.motorway {
+                        RoadType::Motorway
+                    } else {
+                        RoadType::Rural
+                    },
+                    form: if piece.motorway {
+                        FormOfWay::Motorway
+                    } else {
+                        FormOfWay::MultipleCarriageway
+                    },
+                    speed_limit: Some(piece.speed),
                     corridor: true,
                 });
+            }
+            // Stages of the transition follow on from each other with no junction.
+            for pair in pieces.windows(2) {
+                if (pair[1].1.from - pair[0].1.to).abs() < 1e-6 {
+                    plan.connections.push(ConnectionPlan::Follows {
+                        from: pair[0].0.clone(),
+                        to: pair[1].0.clone(),
+                    });
+                }
             }
         }
 
@@ -1463,30 +1587,6 @@ impl CorridorSpec {
             }
         }
 
-        // The far end becoming an ordinary road: lower limits in steps, and the
-        // last stretch no motorway.
-        if let Some(transition) = self.end_transition {
-            for (c, pieces) in carriageways.iter().zip(&piece_names) {
-                // The end the corridor's far end is at, in travel terms.
-                let at_end = if c.along {
-                    pieces.last()
-                } else {
-                    pieces.first()
-                };
-                let Some((name, _)) = at_end else { continue };
-                if let Some(road) = plan.roads.iter_mut().find(|r| &r.name == name) {
-                    let total = length_of(&road.points);
-                    if total < transition {
-                        plan.notes.push(format!(
-                            "{name}: shorter than the {transition:.0} m transition at the corridor's end"
-                        ));
-                    }
-                    road.form = FormOfWay::MultipleCarriageway;
-                    road.road_type = RoadType::Rural;
-                    road.speed_limit = Some(60.0_f64.min(speed));
-                }
-            }
-        }
         Ok(plan)
     }
 }
@@ -1564,6 +1664,11 @@ impl CorridorPlan {
                         .connect_ends(&road(a), *a_end, &road(b), *b_end, Some(&junction(j)?))
                         .map_err(|e| e.to_string())?;
                 }
+                ConnectionPlan::Follows { from, to } => {
+                    builder
+                        .connect(&road(from), &road(to))
+                        .map_err(|e| e.to_string())?;
+                }
             }
         }
         for control in &self.controls {
@@ -1634,6 +1739,49 @@ impl CorridorPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_far_end_steps_down_to_an_ordinary_road() {
+        let mut spec = CorridorSpec::new(
+            "E9",
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(3000.0, 0.0, 0.0)],
+            120.0,
+        )
+        .unwrap();
+        spec.end_transition = Some(900.0);
+        let plan = spec.plan(TrafficHandedness::RightHand).unwrap();
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+        for side in ["right", "left"] {
+            // In the order traffic meets them.
+            let roads: Vec<&RoadPlan> = plan
+                .roads
+                .iter()
+                .filter(|r| r.name.contains(&format!("_{side}_")))
+                .collect();
+            let limits: Vec<f64> = roads.iter().map(|r| r.speed_limit.unwrap()).collect();
+            let forms: Vec<FormOfWay> = roads.iter().map(|r| r.form).collect();
+            // Away from the far end the stages come first, slowest first.
+            let (limits, forms) = if limits[0] == 60.0 {
+                (
+                    limits.into_iter().rev().collect::<Vec<_>>(),
+                    forms.into_iter().rev().collect::<Vec<_>>(),
+                )
+            } else {
+                (limits, forms)
+            };
+            assert_eq!(limits, [120.0, 100.0, 80.0, 60.0], "{side}");
+            assert_eq!(forms.last(), Some(&FormOfWay::MultipleCarriageway));
+            assert!(forms[..3].iter().all(|f| *f == FormOfWay::Motorway));
+            let stage = roads.iter().find(|r| r.speed_limit == Some(80.0)).unwrap();
+            assert!((length_of(&stage.points) - 300.0).abs() < 1.0);
+        }
+        let follows = plan
+            .connections
+            .iter()
+            .filter(|c| matches!(c, ConnectionPlan::Follows { .. }))
+            .count();
+        assert_eq!(follows, 6, "three joins on each carriageway");
+    }
 
     #[test]
     fn a_bend_is_rounded_at_the_radius_the_speed_asks_for() {

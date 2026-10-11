@@ -167,6 +167,30 @@ fn the_far_end_becomes_an_ordinary_road() {
         .collect();
     assert!(forms.contains(&FormOfWay::MultipleCarriageway));
     assert!(forms.contains(&FormOfWay::Motorway));
+    // On the way: an 80 km/h stage of the motorway, joined end to end to the
+    // stretches either side of it with no junction between.
+    let stages: Vec<_> = map
+        .roads
+        .iter()
+        .filter(|road| {
+            road.id.as_str().starts_with("road/e1_")
+                && road
+                    .speed_limit
+                    .map(|limit| (limit.kph() - 80.0).abs() < 1e-6)
+                    == Some(true)
+        })
+        .collect();
+    assert_eq!(stages.len(), 2, "one on each carriageway");
+    for stage in stages {
+        assert_eq!(stage.form, FormOfWay::Motorway);
+        for link in [&stage.link.predecessor, &stage.link.successor] {
+            assert!(
+                matches!(link, Some(roadgen_core::topology::RoadLinkTarget::Road(_))),
+                "{link:?}"
+            );
+        }
+        assert!(stage.junction.is_none());
+    }
 }
 
 #[test]

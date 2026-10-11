@@ -561,7 +561,7 @@ PR 1 と 2 だけでも、利用者が手で描いた道路に橋・トンネル
 | インターチェンジの形式 | diamond / half_diamond / parclo / trumpet（cloverleaf / directional は後） | **diamond と half_diamond のみ**。parclo・trumpet・cloverleaf・directional は未実装。単独ランプ `Corridor.add_ramp()` を追加した（都市高速の出入口に使う） |
 | 都市部の既定（`urban="elevated"`） | 市街地の範囲を自動で判定して高架にする | 自動判定は未実装。`elevated=[(s0, s1)]` / `sunken=[(s0, s1)]` で区間を指定する（縦断に高さを足し、その区間を高架・開削トンネルにする） |
 | 上下線の床版 | 高架は 1 つの構造物が上下線を載せる | 規則で作る橋・高架は**上下線で別の床版**。builder の `add_bridge` に 2 区間を渡せば 1 枚にできる |
-| 終点の移行 | 100 → 80 → 60 km/h と段階的に下げる | 最後の区間を `MultipleCarriageway`・60 km/h にする 1 段だけ |
+| 終点の移行 | 100 → 80 → 60 km/h と段階的に下げる | 設計どおり、設計速度から 20 km/h ずつ 60 km/h まで下げる。`end_transition` の長さを段の数で等分し、各段を別の道路にして交差点なしで直接つなぐ（`ConnectionPlan::Follows`）。最後の段だけ `MultipleCarriageway`。加速・減速車線は設計速度の区間に残し、入りきらないときは `notes` に書く |
 | 高欄 | `Barrier { kind: "parapet" }` を自動で置く | CARLA のメッシュとして床版と一緒に描く（IR の地物にはしない） |
 | 交差道路の土工 | — | 交差道路を持ち上げた場合、土地はその道路の高さを読まず、盛土で合わせる（`Places.fitted_roads`）。交差道路の元の地盤高は `Places.anchors` として渡す。ランプ端の交差点の接続道路も同じ扱い |
 | 跨道橋の長さ | 下の道路の全幅＋両側の余裕 | 下の道路の全幅＋2 m＋（高さの差）×1.8。橋台から下の道路まで盛土の勾配で下りられる長さにした（短いと桁下に地面が入る） |
