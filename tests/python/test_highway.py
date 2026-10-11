@@ -134,6 +134,41 @@ def test_a_sunken_corridor_runs_under_the_town():
     assert forms.count("cut_and_cover") == 2
 
 
+def test_an_urban_corridor_finds_the_town_and_crosses_it_on_viaducts():
+    m = roadgen.Map(name="shuto")
+    corridor = urban_corridor(m, urban="elevated")
+    corridor.add_ramp("West Off", at=150.0, end=(-450.0, -70.0, 0.0), side="right")
+    corridor.add_interchange("East", at=1700.0, crossroad=[(900.0, -250.0, 0.0), (900.0, 250.0, 0.0)],
+                             crossroad_lanes=street_lanes(), kind="half_diamond", side="left",
+                             control="yield", terminal=60.0, reach=180.0)
+    plan = corridor.plan()
+    assert plan.notes == []
+    # No stretch given by hand: the viaducts are where the streets are.
+    assert [form for form, _ in plan.structures].count("viaduct") == 2
+    m.add_plan(plan)
+    m.validate()
+    assert m.generation_notes() == []
+    under = [g["under"][0] for g in m.grade_separations() if isinstance(g["under"], tuple)]
+    assert under.count("road/first") == 2 and under.count("road/second") == 2
+    [interchange] = m.interchange_ids()
+    assert m.interchange(interchange)["kind"] == "half_diamond"
+
+
+def test_an_urban_corridor_can_be_sunk_under_the_town_instead():
+    m = roadgen.Map(name="shuto")
+    corridor = urban_corridor(m, urban="sunken")
+    m.add_plan(corridor.plan())
+    m.validate()
+    forms = [m.structure(s)["form"] for s in m.structure_ids()]
+    assert forms.count("cut_and_cover") == 2 and "viaduct" not in forms
+
+
+def test_an_urban_corridor_is_elevated_or_sunken():
+    m = roadgen.Map()
+    with pytest.raises(ValueError, match="elevated or sunken"):
+        m.add_corridor("Shuto", [(0.0, 0.0, 0.0), (1000.0, 0.0, 0.0)], urban="floating")
+
+
 def test_a_plan_is_put_on_the_map_whole_or_not_at_all():
     m = roadgen.Map(name="shuto")
     corridor = urban_corridor(m)

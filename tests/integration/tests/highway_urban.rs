@@ -3,7 +3,8 @@
 
 use roadgen_buildings::Rules;
 use roadgen_carla::environment::{
-    self, Control, CorridorSpec, InterchangeKind, InterchangeSite, Places, RampSite, Side,
+    self, Control, CorridorSpec, InterchangeKind, InterchangeSite, Places, RampSite, Side, Town,
+    Urban,
 };
 use roadgen_core::geometry::plan::ring_contains;
 use roadgen_core::prelude::*;
@@ -47,6 +48,15 @@ fn generate(
     spec: CorridorSpec,
     extra: impl FnOnce(&mut MapBuilder),
 ) -> (ValidatedMap, Vec<String>) {
+    let (map, _, notes) = build(spec, extra);
+    (map, notes)
+}
+
+/// The map, what its plan departed from, and what generating it did.
+fn build(
+    spec: CorridorSpec,
+    extra: impl FnOnce(&mut MapBuilder),
+) -> (ValidatedMap, Vec<String>, Vec<String>) {
     let mut builder = MapBuilder::default();
     streets(&mut builder);
     extra(&mut builder);
@@ -55,12 +65,16 @@ fn generate(
         town: Some(Rules::preset("town").unwrap()),
         ..Places::default()
     };
-    let plan = spec.plan(TrafficHandedness::RightHand).expect("plans");
+    // The town is what is on the map before the corridor: the streets.
+    let town = Town::of(&builder, &places);
+    let plan = spec
+        .plan_in(TrafficHandedness::RightHand, &town)
+        .expect("plans");
     plan.apply(&mut builder, &mut places).expect("applies");
     let mut map = builder.finish().expect("builds");
     let report = environment::generate(&mut map, &places).expect("generates");
     let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
-    (map, report.notes)
+    (map, plan.notes, report.notes)
 }
 
 #[test]
@@ -153,9 +167,137 @@ fn a_sunken_motorway_passes_under_the_streets_in_a_cut_and_cover_tunnel() {
     assert_eq!(through, 4);
 }
 
-#[test]
-fn a_lone_slip_road_and_a_half_diamond_join_the_streets() {
+/// The corridor of [`corridor`] with nothing given by hand: it finds the town.
+fn urban_corridor(urban: Urban) -> CorridorSpec {
     let mut spec = corridor(true);
+    spec.elevated.clear();
+    spec.urban = Some(urban);
+    spec
+}
+
+/// The stretches of a corridor's centre line it finds through the two streets,
+/// and what it notes in finding them.
+fn planned_stretches(spec: &CorridorSpec) -> (Vec<(f64, f64)>, Vec<String>) {
+    let mut builder = MapBuilder::default();
+    streets(&mut builder);
+    let town = Town::of(&builder, &Places::default());
+    let mut notes = Vec::new();
+    let stretches = spec.urban_stretches(&town, &mut notes).expect("finds");
+    (stretches, notes)
+}
+
+#[test]
+fn an_urban_motorway_finds_the_streets_and_passes_over_them_on_a_viaduct() {
+    let spec = urban_corridor(Urban::Elevated);
+    // One stretch over both streets, 700 m and 1000 m along the centre line, with
+    // the climb onto it and the descent off it either side.
+    let (stretches, notes) = planned_stretches(&spec);
+    assert!(notes.is_empty(), "{notes:#?}");
+    assert_eq!(stretches.len(), 1, "{stretches:?}");
+    let (from, to) = stretches[0];
+    assert!(from > 0.0 && from < 700.0 - 300.0, "{from}");
+    assert!(to > 1000.0 + 300.0 && to < 1700.0, "{to}");
+
+    let (map, planned, notes) = build(spec, |_| {});
+    assert!(
+        planned.is_empty() && notes.is_empty(),
+        "{planned:#?} {notes:#?}"
+    );
+    let viaducts: Vec<_> = map
+        .structures
+        .iter()
+        .filter(|s| s.kind.form() == "viaduct")
+        .collect();
+    assert_eq!(viaducts.len(), 2, "one deck per carriageway");
+    for street in ["road/first", "road/second"] {
+        let under = map
+            .grade_separations
+            .iter()
+            .filter(|g| matches!(&g.under, Underneath::Road(span) if span.road.as_str() == street))
+            .filter(|g| viaducts.iter().any(|v| v.id == g.via))
+            .count();
+        assert_eq!(under, 2, "both carriageways pass over {street}");
+    }
+    // And it goes to CARLA: the decks are in its meshes, at their full height
+    // over the streets.
+    let meshes = roadgen_carla::to_meshes(&map, &roadgen_carla::PackageConfig::new("shuto"));
+    let deck = meshes
+        .iter()
+        .flat_map(|mesh| mesh.positions.iter())
+        .any(|p| (p.x + 100.0).abs() < 5.0 && p.y.abs() < 10.0 && (p.z - 9.0).abs() < 0.05);
+    assert!(deck, "no deck over the first street");
+}
+
+#[test]
+fn an_urban_motorway_sunk_under_the_town_passes_under_the_streets_in_a_cut_and_cover_tunnel() {
+    let (map, planned, notes) = build(urban_corridor(Urban::Sunken), |_| {});
+    assert!(
+        planned.is_empty() && notes.is_empty(),
+        "{planned:#?} {notes:#?}"
+    );
+    let tunnels: Vec<_> = map
+        .structures
+        .iter()
+        .filter(|s| s.kind.form() == "cut_and_cover")
+        .collect();
+    assert_eq!(tunnels.len(), 2);
+    let through = map
+        .grade_separations
+        .iter()
+        .filter(|g| tunnels.iter().any(|t| t.id == g.via))
+        .count();
+    assert_eq!(through, 4);
+    assert!(!map.structures.iter().any(|s| s.kind.form() == "viaduct"));
+}
+
+#[test]
+fn an_urban_motorway_far_from_the_streets_stays_on_the_ground() {
+    let mut spec = urban_corridor(Urban::Elevated);
+    for p in &mut spec.centre {
+        p.y = 1000.0;
+    }
+    let (stretches, notes) = planned_stretches(&spec);
+    assert!(stretches.is_empty() && notes.is_empty(), "{stretches:?}");
+    let (map, planned, notes) = build(spec, |_| {});
+    assert!(
+        planned.is_empty() && notes.is_empty(),
+        "{planned:#?} {notes:#?}"
+    );
+    assert!(!map
+        .structures
+        .iter()
+        .any(|s| matches!(s.kind.form(), "viaduct" | "cut_and_cover")));
+}
+
+#[test]
+fn an_urban_motorway_planned_without_the_town_says_so() {
+    let plan = urban_corridor(Urban::Elevated)
+        .plan(TrafficHandedness::RightHand)
+        .expect("plans");
+    assert!(plan.structures.is_empty());
+    assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
+}
+
+#[test]
+fn a_town_given_by_hand_the_other_way_wins_over_the_one_found() {
+    let mut spec = urban_corridor(Urban::Elevated);
+    spec.sunken = vec![(200.0, 1400.0)];
+    let (map, planned, notes) = build(spec, |_| {});
+    assert_eq!(planned.len(), 1, "{planned:#?}");
+    assert!(notes.is_empty(), "{notes:#?}");
+    assert!(!map.structures.iter().any(|s| s.kind.form() == "viaduct"));
+    assert_eq!(
+        map.structures
+            .iter()
+            .filter(|s| s.kind.form() == "cut_and_cover")
+            .count(),
+        2
+    );
+}
+
+/// The corridor of [`a_lone_slip_road_and_a_half_diamond_join_the_streets`]:
+/// a slip road off before the town, and a half diamond after it.
+fn with_slip_roads(mut spec: CorridorSpec) -> CorridorSpec {
     spec.centre[1] = Point3::new(1300.0, 0.0, 0.0);
     // Off the right carriageway before the town, to a point the caller joins up.
     spec.ramps.push(RampSite {
@@ -179,6 +321,41 @@ fn a_lone_slip_road_and_a_half_diamond_join_the_streets() {
         terminal: 60.0,
         reach: 180.0,
     });
+    spec
+}
+
+#[test]
+fn an_urban_motorway_keeps_its_slip_roads_and_half_diamond_beside_the_viaduct_it_finds() {
+    let (map, planned, notes) = build(with_slip_roads(urban_corridor(Urban::Elevated)), |_| {});
+    assert!(
+        planned.is_empty() && notes.is_empty(),
+        "{planned:#?} {notes:#?}"
+    );
+    assert_eq!(
+        map.road(&RoadId::new("west_off")).map(|r| r.form),
+        Some(FormOfWay::SlipRoad)
+    );
+    let interchange = map.interchanges.iter().next().expect("the half diamond");
+    assert_eq!(interchange.kind, "half_diamond");
+    // The crossroad is the corridor's own, so not part of the town: the viaduct
+    // is over the two streets only, and the crossroad goes over the motorway.
+    let viaducts: Vec<_> = map
+        .structures
+        .iter()
+        .filter(|s| s.kind.form() == "viaduct")
+        .collect();
+    assert_eq!(viaducts.len(), 2, "one deck per carriageway");
+    for street in ["road/first", "road/second"] {
+        assert!(map
+            .grade_separations
+            .iter()
+            .any(|g| matches!(&g.under, Underneath::Road(span) if span.road.as_str() == street)));
+    }
+}
+
+#[test]
+fn a_lone_slip_road_and_a_half_diamond_join_the_streets() {
+    let spec = with_slip_roads(corridor(true));
     let (map, notes) = generate(spec, |_| {});
     assert!(notes.is_empty(), "{notes:#?}");
     let ramp = map
@@ -347,4 +524,16 @@ fn carriageways_leaving_the_viaduct_at_different_places_share_its_deck_wherever_
         assert_eq!(roads.iter().filter(|r| r.contains("_left_")).count(), 1);
         assert_eq!(roads.iter().filter(|r| r.contains("_right_")).count(), 1);
     }
+}
+
+#[test]
+fn the_town_leaves_out_every_corridors_roads_and_crossroads() {
+    let mut builder = MapBuilder::default();
+    streets(&mut builder);
+    let mut places = Places::default();
+    let spec = with_slip_roads(corridor(true));
+    let plan = spec.plan(TrafficHandedness::RightHand).expect("plans");
+    plan.apply(&mut builder, &mut places).expect("applies");
+    let town = Town::of(&builder, &places);
+    assert_eq!(town.streets.len(), 2, "the two streets only");
 }

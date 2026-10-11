@@ -22,7 +22,10 @@
 //! drawn outside them is reported in the plan's notes rather than refused.
 
 use roadgen_core::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
-use roadgen_core::geometry::{Curve3, Point3, Taper, VerticalProfile, WidthProfile};
+use roadgen_core::geometry::plan::{bounds, polyline_distance, ring_contains, within_bounds};
+use roadgen_core::geometry::{
+    Curve3, Point3, SamplingConfig, Taper, VerticalProfile, WidthProfile,
+};
 use roadgen_core::id::{JunctionId, RoadId};
 use roadgen_core::map::TrafficHandedness;
 use roadgen_core::semantics::{
@@ -255,6 +258,127 @@ pub struct RampSite {
     pub end: Point3,
 }
 
+/// What a corridor does where it runs through a town, when it finds the town's
+/// stretches itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Urban {
+    /// Lifted onto a viaduct, by [`CorridorSpec::elevated_height`].
+    Elevated,
+    /// Dropped into a cut-and-cover tunnel, by [`CorridorSpec::sunken_depth`].
+    Sunken,
+}
+
+impl Urban {
+    pub fn parse(text: &str) -> Option<Urban> {
+        match text {
+            "elevated" => Some(Urban::Elevated),
+            "sunken" => Some(Urban::Sunken),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Urban::Elevated => "elevated",
+            Urban::Sunken => "sunken",
+        }
+    }
+}
+
+/// The town a corridor runs through, as it finds its urban stretches by: the
+/// streets on the map, and the areas built on.
+///
+/// The plan is drawn before it is put on the map, so the town is handed to it
+/// rather than read from the map: [`Town::of`] gathers it from a map being
+/// built. A street is any road on it that is no corridor's — neither a
+/// carriageway or slip road of one nor a crossroad one has lifted or dropped —
+/// and no site's; the corridor's own crossroads and slip roads are in its plan,
+/// not yet on the map, and so are never among them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Town {
+    /// Each street's line in plan, and the farthest its edge can stand off the
+    /// line, metres.
+    pub streets: Vec<(Vec<[f64; 2]>, f64)>,
+    /// The outlines in plan of the areas built on: the pads buildings stand on.
+    pub areas: Vec<Vec<[f64; 2]>>,
+}
+
+impl Town {
+    /// The town on a map being built: its streets, and the pads with buildings
+    /// on them.
+    pub fn of(builder: &MapBuilder, places: &super::Places) -> Town {
+        let theirs = |id: &RoadId| {
+            places.corridor_roads.iter().any(|(road, _)| road == id)
+                || places.site_roads.iter().any(|(road, _)| road == id)
+                || places.fitted_roads.contains(id)
+        };
+        let config = SamplingConfig::new(STEP).expect("a positive step");
+        let streets = builder
+            .roads()
+            .filter(|(id, _)| !theirs(id))
+            .filter_map(|(_, spec)| {
+                let line: Vec<[f64; 2]> = spec
+                    .reference_line
+                    .samples(config)
+                    .ok()?
+                    .iter()
+                    .map(|sample| [sample.point.x, sample.point.y])
+                    .collect();
+                // Every lane on one side at its widest: no edge stands farther off.
+                let reach = spec
+                    .cross_sections
+                    .iter()
+                    .map(|section| {
+                        section
+                            .lanes
+                            .iter()
+                            .map(|lane| {
+                                lane.width
+                                    .knots()
+                                    .iter()
+                                    .map(|k| k.1.metres())
+                                    .fold(0.0, f64::max)
+                            })
+                            .sum::<f64>()
+                    })
+                    .fold(0.0, f64::max);
+                Some((line, reach))
+            })
+            .collect();
+        let areas = places
+            .pads
+            .iter()
+            .filter(|pad| pad.buildings.is_some())
+            .map(|pad| pad.outline.iter().map(|p| [p.x, p.y]).collect())
+            .collect();
+        Town { streets, areas }
+    }
+
+    /// Whether `p` is within `reach` of the town: of a street's edge, or of a
+    /// built-up area or in it.
+    fn near(&self, p: [f64; 2], reach: f64) -> bool {
+        self.streets.iter().any(|(line, half)| {
+            within_bounds(&bounds(line), p, reach + half)
+                && polyline_distance(p, line) <= reach + half
+        }) || self.areas.iter().any(|ring| {
+            let mut closed = ring.clone();
+            closed.extend(ring.first().copied());
+            within_bounds(&bounds(ring), p, reach)
+                && (ring_contains(ring, p) || polyline_distance(p, &closed) <= reach)
+        })
+    }
+}
+
+/// How near the town a stretch of the centre line counts as running through it,
+/// metres: from the centre line to a street's edge or a built-up area.
+pub const URBAN_REACH: f64 = 60.0;
+/// The shortest stretch between two urban stretches the profile comes back down
+/// (or up) to grade for, metres; shorter, the two are one.
+pub const URBAN_GAP: f64 = 200.0;
+/// How far before the town, and after it, the profile is at its full height or
+/// depth, metres, beyond the climb or descent at the design grade.
+const URBAN_LEVEL: f64 = 20.0;
+
 /// A motorway corridor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorridorSpec {
@@ -279,6 +403,13 @@ pub struct CorridorSpec {
     /// Centre-line stretches dropped into a cut-and-cover tunnel, and how far under.
     pub sunken: Vec<(f64, f64)>,
     pub sunken_depth: f64,
+    /// Whether the stretches through the town are found by the corridor itself,
+    /// and lifted onto a viaduct or dropped into a cut-and-cover tunnel: the
+    /// stretches near the town's streets and built-up areas, with the room to
+    /// climb or descend at the design grade either side. They are found only by
+    /// [`CorridorSpec::plan_in`], which is given the town, and added to the
+    /// stretches `elevated` and `sunken` give by hand. See [`Town`].
+    pub urban: Option<Urban>,
     pub interchanges: Vec<InterchangeSite>,
     pub ramps: Vec<RampSite>,
     /// The length over which the motorway becomes an ordinary road at its far
@@ -304,6 +435,7 @@ impl CorridorSpec {
             shared_deck: false,
             sunken: Vec::new(),
             sunken_depth: 10.0,
+            urban: None,
             interchanges: Vec::new(),
             ramps: Vec::new(),
             end_transition: None,
@@ -519,6 +651,19 @@ fn along(points: &[Point3], stations: &[f64], s: f64) -> Point3 {
         .clamp(1, stations.len() - 1);
     let t = (s - stations[index - 1]) / (stations[index] - stations[index - 1]).max(1e-9);
     points[index - 1].lerp(points[index], t)
+}
+
+/// `stretches` sorted, and any nearer each other than `gap` made one.
+fn merged(mut stretches: Vec<(f64, f64)>, gap: f64) -> Vec<(f64, f64)> {
+    stretches.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for (from, to) in stretches {
+        match out.last_mut() {
+            Some(last) if from - last.1 < gap || from <= last.1 => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
 }
 
 /// A smooth bump: zero before `from`, `height` from `from + ramp` to `to − ramp`,
@@ -847,13 +992,114 @@ pub(super) struct Access {
 }
 
 impl CorridorSpec {
+    /// The length over which the profile climbs `height` onto an elevated stretch,
+    /// or descends it into a sunken one: a cosine transition whose steepest grade
+    /// is four fifths of the design standard's, and no shorter than 120 m.
+    fn lift(&self, height: f64) -> f64 {
+        (height * std::f64::consts::PI / (2.0 * 0.8 * self.standard.max_grade.max(0.02))).max(120.0)
+    }
+
+    /// The stretches of the centre line through `town`, each from where the
+    /// profile leaves its grade to where it is back on it.
+    ///
+    /// A station runs through the town when the centre line there is within
+    /// [`URBAN_REACH`] of a street's edge or of a built-up area. Each run of such
+    /// stations is widened by the climb (or descent) to the height of
+    /// [`CorridorSpec::urban`]'s structure at the design grade — as
+    /// [`CorridorSpec::elevated`] stretches are, which include their ramps — and
+    /// by [`URBAN_LEVEL`] more, so the profile is at its full height over the
+    /// town; runs nearer each other than [`URBAN_GAP`] are then one. A stretch
+    /// whose climb does not fit before an end of the corridor is noted.
+    pub fn urban_stretches(
+        &self,
+        town: &Town,
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<(f64, f64)>, String> {
+        let Some(urban) = self.urban else {
+            return Ok(Vec::new());
+        };
+        let track = Track::new(&self.centre, self.standard.min_radius, &mut Vec::new())?;
+        let length = track.length();
+        let steps = (length / STEP).ceil().max(1.0) as usize;
+        let mut runs: Vec<(f64, f64)> = Vec::new();
+        for k in 0..=steps {
+            let s = length * k as f64 / steps as f64;
+            let (x, y, _) = track.at(s);
+            if !town.near([x, y], URBAN_REACH) {
+                continue;
+            }
+            match runs.last_mut() {
+                Some(run) if s - run.1 <= STEP * 1.5 => run.1 = s,
+                _ => runs.push((s, s)),
+            }
+        }
+        let height = match urban {
+            Urban::Elevated => self.elevated_height,
+            Urban::Sunken => self.sunken_depth,
+        };
+        let lead = self.lift(height) + URBAN_LEVEL;
+        let mut stretches = Vec::new();
+        for (from, to) in runs {
+            if from < lead || to > length - lead {
+                notes.push(format!(
+                    "{}: the town at {from:.0}–{to:.0} m is too near an end of the corridor \
+                     for it to be {} at its grade there",
+                    self.name,
+                    urban.as_str()
+                ));
+            }
+            stretches.push(((from - lead).max(0.0), (to + lead).min(length)));
+        }
+        Ok(merged(stretches, URBAN_GAP))
+    }
+
+    /// Plans the corridor through `town`: as [`CorridorSpec::plan`], with the
+    /// stretches [`CorridorSpec::urban_stretches`] finds lifted or dropped.
+    ///
+    /// They are added to the stretches of the same kind given by hand, and where
+    /// one overlaps another the two are one; one that overlaps a stretch of the
+    /// other kind given by hand gives way to it, and is noted. Without
+    /// [`CorridorSpec::urban`] this is [`CorridorSpec::plan`].
+    pub fn plan_in(
+        &self,
+        handedness: TrafficHandedness,
+        town: &Town,
+    ) -> Result<CorridorPlan, String> {
+        let Some(urban) = self.urban else {
+            return self.plan(handedness);
+        };
+        self.check()?;
+        let mut notes = Vec::new();
+        let found = self.urban_stretches(town, &mut notes)?;
+        let mut spec = self.clone();
+        spec.urban = None;
+        let (mine, theirs) = match urban {
+            Urban::Elevated => (&mut spec.elevated, &self.sunken),
+            Urban::Sunken => (&mut spec.sunken, &self.elevated),
+        };
+        for (from, to) in found {
+            if theirs.iter().any(|&(a, b)| from < b && a < to) {
+                notes.push(format!(
+                    "{}: the town at {from:.0}–{to:.0} m is not {}: a stretch given by hand \
+                     is the other way",
+                    self.name,
+                    urban.as_str()
+                ));
+                continue;
+            }
+            mine.push((from, to));
+        }
+        *mine = merged(std::mem::take(mine), 0.0);
+        let mut plan = spec.plan(handedness)?;
+        notes.append(&mut plan.notes);
+        plan.notes = notes;
+        Ok(plan)
+    }
+
     /// The height of the centre line at `s`: the profile, lifted over its elevated
     /// stretches and dropped through its sunken ones.
     fn height_at(&self, profile: &VerticalProfile, s: f64) -> f64 {
-        let ramp_for = |height: f64| {
-            (height * std::f64::consts::PI / (2.0 * 0.8 * self.standard.max_grade.max(0.02)))
-                .max(120.0)
-        };
+        let ramp_for = |height: f64| self.lift(height);
         let mut z = profile.height(s);
         for &(from, to) in &self.elevated {
             z += bump(
@@ -972,6 +1218,14 @@ impl CorridorSpec {
             corridor: self.name.clone(),
             ..CorridorPlan::default()
         };
+        if let Some(urban) = self.urban {
+            plan.notes.push(format!(
+                "{}: drawn without the town, so no stretch through it is {}; plan it in the \
+                 town with plan_in",
+                self.name,
+                urban.as_str()
+            ));
+        }
         let track = Track::new(&self.centre, standard.min_radius, &mut plan.notes)?;
         let length = track.length();
 
@@ -2386,6 +2640,41 @@ mod tests {
             .filter(|c| matches!(c, ConnectionPlan::Follows { .. }))
             .count();
         assert_eq!(follows, 6, "three joins on each carriageway");
+    }
+
+    #[test]
+    fn a_town_at_the_corridors_start_is_noted_where_the_climb_to_it_does_not_fit() {
+        let mut spec = CorridorSpec::new(
+            "Shuto",
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(2000.0, 0.0, 0.0)],
+            60.0,
+        )
+        .unwrap();
+        spec.urban = Some(Urban::Elevated);
+        let street = |x: f64| (vec![[x, -300.0], [x, 300.0]], 6.0);
+        let town = Town {
+            streets: vec![street(50.0), street(1300.0)],
+            areas: Vec::new(),
+        };
+        let mut notes = Vec::new();
+        let stretches = spec.urban_stretches(&town, &mut notes).unwrap();
+        // Two stretches, too far apart to be one; the first from the very start.
+        assert_eq!(stretches.len(), 2, "{stretches:?}");
+        assert_eq!(stretches[0].0, 0.0);
+        assert!(stretches[1].0 > 800.0 && stretches[1].1 < 1800.0);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        // A built-up area counts as the town too, from inside it or near it.
+        let town = Town {
+            streets: Vec::new(),
+            areas: vec![vec![
+                [900.0, 30.0],
+                [1100.0, 30.0],
+                [1100.0, 200.0],
+                [900.0, 200.0],
+            ]],
+        };
+        let stretches = spec.urban_stretches(&town, &mut notes).unwrap();
+        assert_eq!(stretches.len(), 1, "{stretches:?}");
     }
 
     /// The viaducts a corridor along y = 0, elevated from 200 m to 1400 m, asks

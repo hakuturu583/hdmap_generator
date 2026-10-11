@@ -908,7 +908,11 @@ and the embankment's toe as breaklines. Anywhere one road crosses over another w
 nothing under it, an overpass is put there. Piers are spaced along every bridge and
 kept off every carriageway below. `elevated=` and `sunken=` stretches lift a
 corridor onto a viaduct or drop it into a cut-and-cover tunnel — through a town, say
-— and `add_ramp()` adds a lone slip road for a street to be joined to.
+— and `add_ramp()` adds a lone slip road for a street to be joined to. With
+`urban="elevated"` (or `"sunken"`) the corridor finds the town itself: wherever its
+line comes within 60 m of a street already on the map, or of a pad with buildings,
+it goes onto a viaduct (or into a tunnel), with room either side to climb to it at
+its grade.
 
 The town keeps to its side: no building faces a motorway or a slip road, none
 stands under a deck or on a corridor's slopes.

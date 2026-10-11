@@ -2130,7 +2130,11 @@ impl PyMap {
     /// `shared_deck` puts both carriageways on one deck wherever both are on a
     /// bridge or a viaduct over the same stretch — the elevated stretches and the
     /// bridges the land asks for — with its piers down the median; otherwise each
-    /// carriageway has a deck of its own.
+    /// carriageway has a deck of its own. `urban`, `"elevated"` or `"sunken"`,
+    /// has the corridor find the stretches through the town itself — those near
+    /// the streets on the map now and the pads with buildings, with the climb or
+    /// descent at its grade either side — and lift or drop them as well as any
+    /// given by hand; streets added after the corridor are not seen.
     /// Nothing goes on the map until its `plan()` is added with `add_plan`.
     #[pyo3(signature = (
         name,
@@ -2145,6 +2149,7 @@ impl PyMap {
         sunken_depth = 10.0,
         end_transition = None,
         shared_deck = false,
+        urban = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_corridor(
@@ -2161,6 +2166,7 @@ impl PyMap {
         sunken_depth: f64,
         end_transition: Option<f64>,
         shared_deck: bool,
+        urban: Option<&str>,
     ) -> PyResult<highway::PyCorridor> {
         let spec = highway::corridor(
             name,
@@ -2175,9 +2181,21 @@ impl PyMap {
             sunken_depth,
             end_transition,
             shared_deck,
+            urban,
         )?;
-        let handedness = self.builder_mut()?.metadata().handedness;
-        Ok(highway::PyCorridor { spec, handedness })
+        let places = self.places.clone();
+        let builder = self.builder_mut()?;
+        let handedness = builder.metadata().handedness;
+        let town = if spec.urban.is_some() {
+            environment::Town::of(builder, &places)
+        } else {
+            environment::Town::default()
+        };
+        Ok(highway::PyCorridor {
+            spec,
+            handedness,
+            town,
+        })
     }
 
     /// Puts a corridor's plan on the map: its roads, junctions, movements,

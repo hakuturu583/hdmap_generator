@@ -58,7 +58,7 @@ use roadgen_core::validation::UnvalidatedMap;
 
 pub use corridor::{
     Control, CorridorPlan, CorridorSpec, DesignStandard, InterchangeKind, InterchangeSite,
-    RampSite, Side, StructureMode,
+    RampSite, Side, StructureMode, Town, Urban,
 };
 pub use heap::HeapSpec;
 pub use hill::HillSpec;
