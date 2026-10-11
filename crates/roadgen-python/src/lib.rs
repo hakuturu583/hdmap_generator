@@ -32,6 +32,7 @@ use roadgen_core::validation::{UnvalidatedMap, ValidatedMap};
 use roadgen_buildings::Rules as BuildingRules;
 use roadgen_carla::environment::{self, HeapSpec, PadSpec, PitSpec, RampSpec};
 
+mod highway;
 mod trace;
 
 fn value_error<E: std::fmt::Display>(error: E) -> PyErr {
@@ -568,6 +569,9 @@ pub struct PyMap {
     /// round the roads' generated edges. `town`, `ground` and `seed` are left
     /// empty here and come from `buildings` and `land`.
     places: environment::Places,
+    /// What generating the places onto the map last came to: where a rule could
+    /// not be kept, or only just.
+    notes: Vec<String>,
 }
 
 /// Where a map comes from: the builder its roads are added to, or a file it was
@@ -635,6 +639,7 @@ impl PyMap {
             buildings: None,
             land: None,
             places: environment::Places::default(),
+            notes: Vec::new(),
         })
     }
 
@@ -653,6 +658,8 @@ impl PyMap {
         cross_sections = None,
         pavement = None,
         site = None,
+        form = None,
+        corridor = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn add_road(
@@ -669,6 +676,8 @@ impl PyMap {
         cross_sections: Option<Vec<(f64, Vec<PyLane>)>>,
         pavement: Option<Vec<(f64, String)>>,
         site: Option<String>,
+        form: Option<&str>,
+        corridor: Option<String>,
     ) -> PyResult<PyRoad> {
         let reference_line = match (start, end, points, alignment) {
             (Some(start), Some(end), None, None) => {
@@ -732,10 +741,16 @@ impl PyMap {
                 .collect::<PyResult<Vec<_>>>()?;
             spec = spec.with_pavement(PavementProfile::new(spans).map_err(PyValueError::new_err)?);
         }
+        if let Some(form) = form {
+            spec = spec.with_form(highway::form_of_way(form)?);
+        }
         let lane_count = spec.all_lanes().count();
         let id = self.builder_mut()?.add_road(spec).map_err(value_error)?;
         if let Some(site) = site {
             self.places.site_roads.push((id.clone(), site));
+        }
+        if let Some(corridor) = corridor {
+            self.places.corridor_roads.push((id.clone(), corridor));
         }
         self.invalidate();
         Ok(PyRoad {
@@ -1955,6 +1970,329 @@ impl PyMap {
         Ok(id.to_string())
     }
 
+    /// Puts a bridge under stretches of road: `spans` is `[(road, from, to), ...]`,
+    /// several side by side sharing one deck. `form` is `bridge`, `viaduct` or
+    /// `overpass`; its abutments and piers are laid out when the map is built,
+    /// off every road below.
+    #[pyo3(signature = (
+        spans,
+        form = "bridge",
+        material = "concrete",
+        deck_depth = None,
+        pier_spacing = 40.0,
+        name = None,
+    ))]
+    fn add_bridge(
+        &mut self,
+        spans: Vec<(String, f64, f64)>,
+        form: &str,
+        material: &str,
+        deck_depth: Option<f64>,
+        pier_spacing: f64,
+        name: Option<String>,
+    ) -> PyResult<()> {
+        let spec = highway::bridge_spec(form, material, deck_depth, pier_spacing, name)?;
+        self.builder_mut()?
+            .add_bridge(highway::spans(spans), spec)
+            .map_err(value_error)?;
+        self.invalidate();
+        Ok(())
+    }
+
+    /// Puts a tunnel round stretches of road: `form` is `bored`, `cut_and_cover`
+    /// or `underpass`. Twin bores are two tunnels.
+    #[pyo3(signature = (
+        spans,
+        form = "bored",
+        clear_height = 5.0,
+        lining = 0.6,
+        lighting = true,
+        name = None,
+    ))]
+    fn add_tunnel(
+        &mut self,
+        spans: Vec<(String, f64, f64)>,
+        form: &str,
+        clear_height: f64,
+        lining: f64,
+        lighting: bool,
+        name: Option<String>,
+    ) -> PyResult<()> {
+        let spec = highway::tunnel_spec(form, clear_height, lining, lighting, name)?;
+        self.builder_mut()?
+            .add_tunnel(highway::spans(spans), spec)
+            .map_err(value_error)?;
+        self.invalidate();
+        Ok(())
+    }
+
+    /// Gathers junctions and roads into one interchange. The movements through its
+    /// junctions, and the structures its roads are on, are added when it is built.
+    #[pyo3(signature = (name, kind, junctions, roads = Vec::new()))]
+    fn add_interchange(
+        &mut self,
+        name: String,
+        kind: String,
+        junctions: Vec<String>,
+        roads: Vec<String>,
+    ) -> PyResult<String> {
+        let id = self
+            .builder_mut()?
+            .add_interchange(
+                name,
+                kind,
+                junctions.iter().map(JunctionId::parse_printed).collect(),
+                roads.iter().map(RoadId::parse_printed).collect(),
+            )
+            .map_err(value_error)?;
+        self.invalidate();
+        Ok(id.to_string())
+    }
+
+    /// Swells the land along `crest` — one point for a round hill — `height`
+    /// metres over the country and `width` from foot to foot.
+    #[pyo3(signature = (crest, width, height, name = "hill"))]
+    fn add_hill(
+        &mut self,
+        crest: Vec<(f64, f64, f64)>,
+        width: f64,
+        height: f64,
+        name: &str,
+    ) -> PyResult<()> {
+        let spec = environment::HillSpec {
+            name: name.to_owned(),
+            crest: crest.into_iter().map(point).collect(),
+            width,
+            height,
+        };
+        spec.check().map_err(PyValueError::new_err)?;
+        self.builder_mut()?;
+        self.places.hills.push(spec);
+        self.invalidate();
+        Ok(())
+    }
+
+    /// Cuts a river into the land down `centre`, at its banks' height: `width`
+    /// from bank top to bank top, `depth` deep, the banks running out `bank_slope`
+    /// metres for each metre they fall. Returns the land cover's identifier.
+    #[pyo3(signature = (centre, width, depth, bank_slope = 2.0, name = "river", site = None))]
+    fn add_river(
+        &mut self,
+        centre: Vec<(f64, f64, f64)>,
+        width: f64,
+        depth: f64,
+        bank_slope: f64,
+        name: &str,
+        site: Option<String>,
+    ) -> PyResult<String> {
+        let spec = environment::RiverSpec {
+            name: name.to_owned(),
+            centre: centre.into_iter().map(point).collect(),
+            width,
+            depth,
+            bank_slope,
+            site,
+        };
+        spec.check().map_err(PyValueError::new_err)?;
+        part_name(&spec.name)?;
+        self.builder_mut()?;
+        let id = land_cover_of(&spec.name);
+        self.places.rivers.push(spec);
+        self.invalidate();
+        Ok(id)
+    }
+
+    /// A motorway corridor along `centre`, designed for `design_speed` km/h:
+    /// `profile` is its vertical alignment as `[(station, height), ...]`, `lanes`
+    /// the driving lanes each way. `elevated` and `sunken` are centre-line
+    /// stretches lifted onto a viaduct or dropped into a cut-and-cover tunnel.
+    /// Nothing goes on the map until its `plan()` is added with `add_plan`.
+    #[pyo3(signature = (
+        name,
+        centre,
+        design_speed = 100.0,
+        profile = None,
+        lanes = 2,
+        structures = "auto",
+        elevated = None,
+        elevated_height = 9.0,
+        sunken = None,
+        sunken_depth = 10.0,
+        end_transition = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_corridor(
+        &mut self,
+        name: String,
+        centre: Vec<(f64, f64, f64)>,
+        design_speed: f64,
+        profile: Option<Vec<(f64, f64)>>,
+        lanes: usize,
+        structures: &str,
+        elevated: Option<Vec<(f64, f64)>>,
+        elevated_height: f64,
+        sunken: Option<Vec<(f64, f64)>>,
+        sunken_depth: f64,
+        end_transition: Option<f64>,
+    ) -> PyResult<highway::PyCorridor> {
+        let spec = highway::corridor(
+            name,
+            centre,
+            design_speed,
+            profile,
+            lanes,
+            structures,
+            elevated,
+            elevated_height,
+            sunken,
+            sunken_depth,
+            end_transition,
+        )?;
+        let handedness = self.builder_mut()?.metadata().handedness;
+        Ok(highway::PyCorridor { spec, handedness })
+    }
+
+    /// Puts a corridor's plan on the map: its roads, junctions, movements,
+    /// signals, structures and interchanges. Returns the roads' identifiers.
+    fn add_plan(&mut self, plan: &highway::PyCorridorPlan) -> PyResult<Vec<String>> {
+        if self
+            .places
+            .corridors
+            .iter()
+            .any(|corridor| corridor.key() == plan.spec.key())
+        {
+            return Err(PyValueError::new_err(format!(
+                "a corridor named {:?} is on the map already",
+                plan.spec.name
+            )));
+        }
+        let mut corridor_roads = Vec::new();
+        let builder = self.builder_mut()?;
+        // Applied to a copy, so a plan that fails half way leaves the map as it was.
+        let mut trial = builder.clone();
+        let ids = plan
+            .plan
+            .apply(&mut trial, &mut corridor_roads)
+            .map_err(PyValueError::new_err)?;
+        *builder = trial;
+        self.places.corridor_roads.extend(corridor_roads);
+        self.places.corridors.push(plan.spec.clone());
+        self.invalidate();
+        Ok(ids.into_iter().map(|id| id.to_string()).collect())
+    }
+
+    /// Where generating the map's places last departed from a rule: a structure
+    /// that could not be laid out, a crossing with too little clearance.
+    fn generation_notes(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        Ok(self.notes.clone())
+    }
+
+    /// Identifiers of every bridge and tunnel.
+    fn structure_ids(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(map.structures.iter().map(|s| s.id.to_string()).collect())
+    }
+
+    /// A bridge or tunnel as a dict: `name`, `kind`, `form`, `carries`, `outline`,
+    /// and a bridge's `supports` or a tunnel's `portals`.
+    fn structure<'py>(
+        &mut self,
+        py: Python<'py>,
+        structure: String,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let entry = map
+            .structures
+            .get(&roadgen_core::id::StructureId::parse_printed(&structure))
+            .ok_or_else(|| PyValueError::new_err(format!("no such structure: {structure}")))?;
+        highway::structure(py, entry)
+    }
+
+    /// Every place one road passes over another, or over water, and by what.
+    fn grade_separations<'py>(&mut self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.ensure_built()?;
+        highway::separations(py, self.built.as_ref().expect("just built"))
+    }
+
+    /// Identifiers of every interchange.
+    fn interchange_ids(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(map.interchanges.iter().map(|i| i.id.to_string()).collect())
+    }
+
+    /// An interchange as `{"name", "kind", "junctions", "roads", "structures"}`.
+    fn interchange<'py>(
+        &mut self,
+        py: Python<'py>,
+        interchange: String,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let entry = map
+            .interchanges
+            .get(&roadgen_core::id::InterchangeId::parse_printed(
+                &interchange,
+            ))
+            .ok_or_else(|| PyValueError::new_err(format!("no such interchange: {interchange}")))?;
+        let out = PyDict::new(py);
+        out.set_item("name", entry.name.clone())?;
+        out.set_item("kind", entry.kind.clone())?;
+        out.set_item(
+            "junctions",
+            entry
+                .junctions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )?;
+        out.set_item(
+            "roads",
+            entry
+                .roads
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )?;
+        out.set_item(
+            "structures",
+            entry
+                .structures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(out)
+    }
+
+    /// What part a road plays in the network: `motorway`, `slip_road`, ...
+    fn road_form(&mut self, road: String) -> PyResult<String> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let entry = map
+            .road(&RoadId::parse_printed(&road))
+            .ok_or_else(|| PyValueError::new_err(format!("no such road: {road}")))?;
+        Ok(entry.form.as_str().to_owned())
+    }
+
+    /// The stretches of a road on a bridge or in a tunnel, as `(from, to, structure)`.
+    fn road_structures(&mut self, road: String) -> PyResult<Vec<(f64, f64, String)>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let entry = map
+            .road(&RoadId::parse_printed(&road))
+            .ok_or_else(|| PyValueError::new_err(format!("no such road: {road}")))?;
+        Ok(entry
+            .structure
+            .spans()
+            .iter()
+            .map(|span| (span.from, span.to, span.structure.to_string()))
+            .collect())
+    }
+
     /// Identifiers of every site: the places made of several features.
     fn site_ids(&mut self) -> PyResult<Vec<String>> {
         self.ensure_built()?;
@@ -2240,6 +2578,11 @@ impl PyMap {
     }
 
     fn build(&self) -> PyResult<UnvalidatedMap> {
+        Ok(self.generate()?.0)
+    }
+
+    /// The map built and generated, and what generating it came to.
+    fn generate(&self) -> PyResult<(UnvalidatedMap, Vec<String>)> {
         let mut map = match &self.source {
             Source::Built(builder) => (**builder).clone().finish().map_err(value_error)?,
             Source::Read { map, .. } => (**map).clone(),
@@ -2253,10 +2596,13 @@ impl PyMap {
             seed: self.land.as_ref().map_or(0, |&(_, seed)| seed),
             ..self.places.clone()
         };
+        let mut notes = Vec::new();
         if places != environment::Places::default() {
-            environment::generate(&mut map, &places).map_err(value_error)?;
+            notes = environment::generate(&mut map, &places)
+                .map_err(value_error)?
+                .notes;
         }
-        Ok(map)
+        Ok((map, notes))
     }
 
     /// Writes `trace` to `path`, beside or inside what the export wrote.
@@ -2274,7 +2620,9 @@ impl PyMap {
 
     fn ensure_built(&mut self) -> PyResult<()> {
         if self.built.is_none() {
-            self.built = Some(self.build()?.validate().map_err(value_error)?);
+            let (map, notes) = self.generate()?;
+            self.notes = notes;
+            self.built = Some(map.validate().map_err(value_error)?);
         }
         Ok(())
     }
@@ -2469,6 +2817,7 @@ fn read_opendrive(
         buildings: None,
         land: None,
         places: environment::Places::default(),
+        notes: Vec::new(),
     })
 }
 
@@ -2567,6 +2916,8 @@ fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyJunction>()?;
     module.add_class::<PyLaneRef>()?;
     module.add_class::<PyPit>()?;
+    module.add_class::<highway::PyCorridor>()?;
+    module.add_class::<highway::PyCorridorPlan>()?;
     module.add_class::<PyAlignment>()?;
     module.add_class::<trace::PyTrace>()?;
     module.add_function(wrap_pyfunction!(read_opendrive, module)?)?;

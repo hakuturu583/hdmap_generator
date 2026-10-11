@@ -105,6 +105,45 @@ class Pit:
         `add_road(points=...)`."""
     def rim(self, spacing: float = 5.0) -> list[Point]: ...
 
+Span = tuple[str, float, float]
+
+class Corridor:
+    """A motorway corridor. It puts nothing on the map; `plan()` draws its roads
+    and `Map.add_plan()` puts them there."""
+    @property
+    def name(self) -> str: ...
+    @property
+    def standard(self) -> dict[str, float]: ...
+    def add_interchange(
+        self,
+        name: str,
+        at: float,
+        crossroad: Sequence[Point],
+        crossroad_lanes: Sequence[Lane],
+        kind: str = "diamond",
+        side: Optional[str] = None,
+        over: bool = True,
+        control: str = "signal",
+        terminal: float = 80.0,
+        reach: float = 320.0,
+    ) -> None: ...
+    def add_ramp(
+        self, name: str, at: float, end: Point, side: str = "right", on: bool = False
+    ) -> None: ...
+    def plan(self) -> CorridorPlan: ...
+
+class CorridorPlan:
+    """A first draft of a corridor's roads, to look at, edit and add."""
+    @property
+    def roads(self) -> list[dict[str, Any]]: ...
+    @property
+    def notes(self) -> list[str]: ...
+    @property
+    def junctions(self) -> list[str]: ...
+    @property
+    def structures(self) -> list[tuple[str, list[Span]]]: ...
+    def set_points(self, name: str, points: Sequence[Point]) -> None: ...
+
 class Map:
     """A road network under construction."""
 
@@ -130,7 +169,16 @@ class Map:
         cross_sections: Optional[Sequence[tuple[float, Sequence[Lane]]]] = None,
         pavement: Optional[Sequence[tuple[float, str]]] = None,
         site: Optional[str] = None,
-    ) -> Road: ...
+        form: Optional[str] = None,
+        corridor: Optional[str] = None,
+    ) -> Road:
+        """`form` is the road's form of way: `motorway`, `slip_road`,
+        `multiple_carriageway`, `single_carriageway`, `parallel_road`,
+        `service_road`, `roundabout`. A motorway or slip road crosses nothing on
+        the level and has no frontage for a building. `corridor` names the
+        corridor the road belongs to: the land is cut and filled to meet it, and
+        its structures are chosen from the land."""
+        ...
     def add_junction(self, name: Optional[str] = None) -> Junction: ...
     def connect(
         self,
@@ -316,6 +364,68 @@ class Map:
         """States the land round the map's roads as a TIN, shaped by every pit,
         heap and pad on the map. A pit, heap or pad turns it on with these defaults,
         and `enabled=False` does not turn it off then: such a map always has land."""
+    def add_bridge(
+        self,
+        spans: Sequence[Span],
+        form: str = "bridge",
+        material: str = "concrete",
+        deck_depth: Optional[float] = None,
+        pier_spacing: float = 40.0,
+        name: Optional[str] = None,
+    ) -> None:
+        """A bridge under `[(road, from, to), ...]`; `form` is `bridge`, `viaduct`
+        or `overpass`."""
+        ...
+    def add_tunnel(
+        self,
+        spans: Sequence[Span],
+        form: str = "bored",
+        clear_height: float = 5.0,
+        lining: float = 0.6,
+        lighting: bool = True,
+        name: Optional[str] = None,
+    ) -> None:
+        """A tunnel round `[(road, from, to), ...]`; `form` is `bored`,
+        `cut_and_cover` or `underpass`."""
+        ...
+    def add_interchange(
+        self, name: str, kind: str, junctions: Sequence[str], roads: Sequence[str] = ...
+    ) -> str: ...
+    def add_hill(
+        self, crest: Sequence[Point], width: float, height: float, name: str = "hill"
+    ) -> None: ...
+    def add_river(
+        self,
+        centre: Sequence[Point],
+        width: float,
+        depth: float,
+        bank_slope: float = 2.0,
+        name: str = "river",
+        site: Optional[str] = None,
+    ) -> str: ...
+    def add_corridor(
+        self,
+        name: str,
+        centre: Sequence[Point],
+        design_speed: float = 100.0,
+        profile: Optional[Sequence[tuple[float, float]]] = None,
+        lanes: int = 2,
+        structures: str = "auto",
+        elevated: Optional[Sequence[tuple[float, float]]] = None,
+        elevated_height: float = 9.0,
+        sunken: Optional[Sequence[tuple[float, float]]] = None,
+        sunken_depth: float = 10.0,
+        end_transition: Optional[float] = None,
+    ) -> Corridor: ...
+    def add_plan(self, plan: CorridorPlan) -> list[str]: ...
+    def generation_notes(self) -> list[str]: ...
+    def structure_ids(self) -> list[str]: ...
+    def structure(self, structure: str) -> dict[str, Any]: ...
+    def grade_separations(self) -> list[dict[str, Any]]: ...
+    def interchange_ids(self) -> list[str]: ...
+    def interchange(self, interchange: str) -> dict[str, Any]: ...
+    def road_form(self, road: str) -> str: ...
+    def road_structures(self, road: str) -> list[tuple[float, float, str]]: ...
     def site_ids(self) -> list[str]: ...
     def site(self, site: str) -> dict[str, Any]: ...
     def tin_surface_ids(self) -> list[str]: ...
