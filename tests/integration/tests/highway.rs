@@ -167,6 +167,30 @@ fn the_far_end_becomes_an_ordinary_road() {
         .collect();
     assert!(forms.contains(&FormOfWay::MultipleCarriageway));
     assert!(forms.contains(&FormOfWay::Motorway));
+    // On the way: an 80 km/h stage of the motorway, joined end to end to the
+    // stretches either side of it with no junction between.
+    let stages: Vec<_> = map
+        .roads
+        .iter()
+        .filter(|road| {
+            road.id.as_str().starts_with("road/e1_")
+                && road
+                    .speed_limit
+                    .map(|limit| (limit.kph() - 80.0).abs() < 1e-6)
+                    == Some(true)
+        })
+        .collect();
+    assert_eq!(stages.len(), 2, "one on each carriageway");
+    for stage in stages {
+        assert_eq!(stage.form, FormOfWay::Motorway);
+        for link in [&stage.link.predecessor, &stage.link.successor] {
+            assert!(
+                matches!(link, Some(roadgen_core::topology::RoadLinkTarget::Road(_))),
+                "{link:?}"
+            );
+        }
+        assert!(stage.junction.is_none());
+    }
 }
 
 #[test]
@@ -294,4 +318,206 @@ fn every_building_stands_on_the_land_on_a_foundation_where_it_falls_away() {
         founded > 0,
         "the crossroad's approach leaves some building a foundation"
     );
+}
+
+#[test]
+fn a_post_on_a_bridge_stands_on_its_parapet_not_in_the_air() {
+    use roadgen_core::structure::{BridgeSpec, RoadSpan};
+    use roadgen_core::topology::LaneEnd;
+    let lane = |direction| LaneSpec::new(PositiveWidth::new(3.5).unwrap(), direction);
+    let lanes = vec![lane(Direction::Backward), lane(Direction::Forward)];
+    let mut builder = MapBuilder::default();
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 9.0),
+                Point3::new(300.0, 0.0, 9.0),
+                lanes,
+            )
+            .unwrap()
+            .with_name("deck"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(road.clone(), 0.0, 300.0)],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    builder
+        .add_traffic_sign(&LaneRef::new(road, 1), LaneEnd::End, "stop", 2.0)
+        .unwrap();
+    let map = builder.finish().unwrap();
+    let map = map.as_map();
+    let bridge = map.structures.iter().next().unwrap();
+    let curb = bridge.kind.bridge().unwrap().curb;
+    let furniture = roadgen_carla::furniture::build(
+        map,
+        "deck",
+        &PackageConfig::new("deck").surfaces,
+        &roadgen_carla::FurnitureConfig::default(),
+    );
+    let [sign] = furniture.signs.as_slice() else {
+        panic!("one sign: {furniture:?}");
+    };
+    // On the parapet over the deck's curb, 3.5 m out: inside the deck, and up
+    // on the parapet rather than level with the road.
+    let out = sign.position.y.abs();
+    assert!(out > 3.5 && out < 3.5 + curb, "{:?}", sign.position);
+    assert!((sign.position.z - (9.0 + roadgen_carla::structures::PARAPET)).abs() < 1e-6);
+}
+
+#[test]
+fn a_river_falls_along_its_length_and_its_water_with_it() {
+    use roadgen_carla::environment::{self, Places, RiverSpec};
+    let mut builder = MapBuilder::default();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-200.0, -300.0, 6.0),
+                Point3::new(-200.0, 300.0, 6.0),
+                roadgen_integration_tests::highway::street_lanes(),
+            )
+            .unwrap()
+            .with_name("bank"),
+        )
+        .unwrap();
+    // Down from 12 m at its source to 0 at its mouth, with a rise on the way
+    // that the bed does not follow.
+    let places = Places {
+        rivers: vec![RiverSpec {
+            name: "Tama".into(),
+            centre: vec![
+                Point3::new(200.0, -400.0, 12.0),
+                Point3::new(200.0, -100.0, 6.0),
+                Point3::new(200.0, 100.0, 8.0),
+                Point3::new(200.0, 400.0, 0.0),
+            ],
+            width: 40.0,
+            depth: 4.0,
+            bank_slope: 2.0,
+            site: None,
+        }],
+        ..Places::default()
+    };
+    let mut map = builder.finish().unwrap();
+    environment::generate(&mut map, &places).expect("generates");
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
+    let tin = map.tin_surfaces.iter().next().unwrap().tin.locator();
+    let beds: Vec<f64> = [-350.0, -200.0, 0.0, 150.0, 350.0]
+        .iter()
+        .map(|&y| tin.height_at(200.0, y).unwrap())
+        .collect();
+    assert!(beds.windows(2).all(|w| w[1] <= w[0] + 1e-6), "{beds:?}");
+    assert!(beds[0] - beds[4] > 8.0, "{beds:?}");
+    let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("tama"));
+    let water = meshes
+        .iter()
+        .find(|mesh| mesh.materials == [materials::WATER])
+        .expect("water");
+    // Level across the river, down along it, and over the bed everywhere.
+    let mut along: Vec<&Point3> = water.positions.iter().collect();
+    along.sort_by(|a, b| a.y.total_cmp(&b.y));
+    // Short of its two ends, where the channel stops and the land does not.
+    for p in along.iter().filter(|p| p.y.abs() < 380.0) {
+        let bed = tin.height_at(200.0, p.y).unwrap();
+        assert!(p.z > bed && p.z < bed + 4.0, "{p:?} over a bed at {bed:.2}");
+    }
+    assert!(along.first().unwrap().z - along.last().unwrap().z > 8.0);
+
+    // The same hollow as a lake: standing water, one level all over.
+    let mut lake = (*map).clone();
+    let ids: Vec<_> = lake
+        .land_covers
+        .iter()
+        .map(|cover| cover.id.clone())
+        .collect();
+    for id in ids {
+        if let Some(cover) = lake.land_covers.get_mut(&id) {
+            if cover.kind == "water" {
+                cover.kind = "lake".into();
+            }
+        }
+    }
+    let lake = UnvalidatedMap::from_map(lake)
+        .validate()
+        .unwrap_or_else(|error| panic!("{error}"));
+    let meshes = roadgen_carla::to_meshes(&lake, &PackageConfig::new("tama"));
+    let water = meshes
+        .iter()
+        .find(|mesh| mesh.materials == [materials::WATER])
+        .expect("water");
+    let level = water.positions[0].z;
+    assert!(water.positions.iter().all(|p| (p.z - level).abs() < 1e-9));
+}
+
+#[test]
+fn one_bridge_over_both_carriageways_is_one_deck_across_the_median() {
+    use roadgen_core::structure::{BridgeSpec, RoadSpan};
+    let one_way = || {
+        vec![LaneSpec::new(
+            PositiveWidth::new(3.5).unwrap(),
+            Direction::Forward,
+        )]
+    };
+    let mut builder = MapBuilder::default();
+    // Drawn opposite ways, each lane outside its line: a 12 m median between.
+    let east = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -6.0, 9.0),
+                Point3::new(300.0, -6.0, 9.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("east"),
+        )
+        .unwrap();
+    let west = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(300.0, 6.0, 9.0),
+                Point3::new(0.0, 6.0, 9.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("west"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(east, 0.0, 300.0),
+                RoadSpan::new(west, 0.0, 300.0),
+            ],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder
+        .finish()
+        .unwrap()
+        .validate()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("deck"));
+    let deck: Vec<Point3> = meshes
+        .iter()
+        .filter(|mesh| mesh.role == Role::Terrain && mesh.materials == [materials::ROAD_CONCRETE])
+        .flat_map(|mesh| mesh.positions.iter().copied())
+        .collect();
+    assert!(!deck.is_empty());
+    let parapet = 9.0 + roadgen_carla::structures::PARAPET;
+    // Parapets along the two outer edges only, none down the median.
+    assert!(deck
+        .iter()
+        .any(|p| (p.z - parapet).abs() < 1e-6 && p.y.abs() > 9.0));
+    assert!(
+        !deck
+            .iter()
+            .any(|p| (p.z - parapet).abs() < 1e-6 && p.y.abs() < 6.0 - 1e-6),
+        "a parapet down the median"
+    );
+    // The slab is there across the middle of the median, at the road's height.
+    assert!(deck
+        .iter()
+        .any(|p| p.y.abs() < 1e-6 && (p.z - 9.0).abs() < 1e-6));
 }

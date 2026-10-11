@@ -222,10 +222,10 @@ impl PitSpec {
                 closed: true,
             });
         }
-        forms.levels.push(Level {
-            ring: plan_of(&self.ring(0.0, bottom, spacing)),
-            z: bottom,
-        });
+        forms.levels.push(Level::flat(
+            plan_of(&self.ring(0.0, bottom, spacing)),
+            bottom,
+        ));
         forms.holes.push(plan_of(&rim));
         forms.anchors.extend(rim);
         forms

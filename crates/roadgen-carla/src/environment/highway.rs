@@ -299,6 +299,8 @@ pub(crate) struct Earthworks {
     pub holes: Vec<Vec<PlanPoint>>,
     /// `(kind, outline)`, at the land's height.
     pub covers: Vec<(String, Vec<Point3>)>,
+    /// The road each of `covers` is the slope of.
+    pub owners: Vec<RoadId>,
 }
 
 pub(crate) fn earthworks(map: &Map, roads: &[RoadId], natural: &Natural) -> Earthworks {
@@ -306,6 +308,7 @@ pub(crate) fn earthworks(map: &Map, roads: &[RoadId], natural: &Natural) -> Eart
         lines: Vec::new(),
         holes: Vec::new(),
         covers: Vec::new(),
+        owners: Vec::new(),
     };
     // Every road's outline, to stop a slope where it runs into another road.
     let mut edges = Segments::new(20.0);
@@ -332,6 +335,7 @@ pub(crate) fn earthworks(map: &Map, roads: &[RoadId], natural: &Natural) -> Eart
                 );
             }
         }
+        out.owners.resize(out.covers.len(), id.clone());
     }
     out
 }

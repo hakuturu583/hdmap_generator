@@ -110,11 +110,51 @@ pub struct Line {
     pub closed: bool,
 }
 
-/// A region filled with points at one height: a pit's floor, a heap's top.
+/// A region filled with points at one height: a pit's floor, a heap's top — or
+/// at the height of a line through it, a river's bed falling along its length.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Level {
     pub ring: Vec<PlanPoint>,
     pub z: f64,
+    /// When not empty, the height at a point is this line's where it passes
+    /// nearest, and `z` is not used.
+    pub along: Vec<Point3>,
+}
+
+impl Level {
+    pub fn flat(ring: Vec<PlanPoint>, z: f64) -> Level {
+        Level {
+            ring,
+            z,
+            along: Vec::new(),
+        }
+    }
+
+    fn height(&self, p: PlanPoint) -> f64 {
+        height_along(&self.along, p).unwrap_or(self.z)
+    }
+}
+
+/// The height of `line` where it passes nearest `p`, read off the segment there;
+/// `None` for no line.
+pub fn height_along(line: &[Point3], p: PlanPoint) -> Option<f64> {
+    let first = line.first()?;
+    let mut best = (f64::INFINITY, first.z);
+    for pair in line.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let length = dx * dx + dy * dy;
+        let t = if length < 1e-18 {
+            0.0
+        } else {
+            (((p[0] - a.x) * dx + (p[1] - a.y) * dy) / length).clamp(0.0, 1.0)
+        };
+        let distance = (p[0] - a.x - t * dx).hypot(p[1] - a.y - t * dy);
+        if distance < best.0 {
+            best = (distance, a.z + t * (b.z - a.z));
+        }
+    }
+    Some(best.1)
 }
 
 /// What a place shapes its land with, beyond its roads. A town shapes it with
@@ -383,11 +423,30 @@ struct Roads {
     rails: Segments,
     outlines: Vec<([f64; 4], Vec<PlanPoint>)>,
     edges: Vec<Constraint>,
+    /// The longest an edge's segment is left: a straight road's edge is two
+    /// points, and the land beside it a fan of triangles its length unless the
+    /// edge has points as close as the country's own.
+    spacing: f64,
+}
+
+/// `points` with every segment longer than `spacing` split evenly along it.
+fn split(points: &[Point3], spacing: f64) -> Vec<Point3> {
+    let mut out = Vec::with_capacity(points.len());
+    for pair in points.windows(2) {
+        out.push(pair[0]);
+        let pieces = (pair[0].horizontal_distance_to(pair[1]) / spacing).ceil() as usize;
+        for k in 1..pieces {
+            out.push(pair[0].lerp(pair[1], k as f64 / pieces as f64));
+        }
+    }
+    out.extend(points.last());
+    out
 }
 
 impl Roads {
-    fn of(map: &Map) -> Roads {
+    fn of(map: &Map, spacing: f64) -> Roads {
         let mut roads = Roads {
+            spacing,
             rails: Segments::new(20.0),
             outlines: Vec::new(),
             edges: Vec::new(),
@@ -426,6 +485,7 @@ impl Roads {
         }
         let name = road.id.local_name();
         for (side, points) in [("left", left), ("right", right)] {
+            let points = split(&points, self.spacing);
             self.rails.insert_polyline(&plan_of(&points));
             self.edges.push(Constraint {
                 kind: "road_edge".into(),
@@ -574,7 +634,7 @@ pub fn generate(
     }
     let ground = &land.ground;
     let source = map.as_map();
-    let roads = Roads::of(source);
+    let roads = Roads::of(source, land.ground.cell);
 
     let Landforms {
         lines,
@@ -712,7 +772,7 @@ pub fn generate(
                     && !roads.near(p, step * 0.5)
                     && off_lines(p, step * 0.45)
                 {
-                    free.push(Point3::new(x, y, level.z));
+                    free.push(Point3::new(x, y, level.height(p)));
                 }
                 x += step;
             }

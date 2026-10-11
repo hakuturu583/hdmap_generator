@@ -616,12 +616,36 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     }
     if let Some(works) = earthworks {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        let site = places
-            .corridors
-            .first()
-            .map(|corridor| site_of(&corridor.name))
-            .transpose()?;
-        for (kind, ring) in works.covers {
+        // Each slope is its road's corridor's: a corridor road's own, or — for a
+        // crossroad the corridor fitted to the land — the corridor whose slip
+        // roads meet it at a junction.
+        let corridor_of = |road: &RoadId| -> Option<&String> {
+            if let Some((_, name)) = corridor_roads.iter().find(|(id, _)| id == road) {
+                return Some(name);
+            }
+            let entry = target.road(road)?;
+            [&entry.link.predecessor, &entry.link.successor]
+                .into_iter()
+                .find_map(|link| match link {
+                    Some(roadgen_core::topology::RoadLinkTarget::Junction(junction)) => {
+                        corridor_roads.iter().find_map(|(id, name)| {
+                            (target.road(id)?.junction.as_ref() == Some(junction)).then_some(name)
+                        })
+                    }
+                    _ => None,
+                })
+        };
+        let owners: Vec<Option<SiteId>> = works
+            .owners
+            .iter()
+            .map(|road| {
+                corridor_of(road)
+                    .or_else(|| places.corridors.first().map(|corridor| &corridor.name))
+                    .map(|name| site_of(name))
+                    .transpose()
+            })
+            .collect::<Result<_, _>>()?;
+        for ((kind, ring), site) in works.covers.into_iter().zip(owners) {
             // Draped on the land just built, so the outline sits on it.
             let count = counts.entry(kind.clone()).or_default();
             let cover_key = format!("{kind}/{count}");

@@ -294,6 +294,9 @@ struct Cross<'a> {
 /// two roads that meet are tangent-continuous by the time they are built — a corner
 /// between them is rounded into an arc — so a cut perpendicular to one is
 /// perpendicular to the other, and the two surfaces end on the same line.
+/// The farthest apart two rungs of a road are, metres.
+const RUNG_SPACING: f64 = 20.0;
+
 fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
     let mut samples = map.vertex_samples(&road.id).ok()?;
     // A rung wherever the pavement changes, too, so that the surface can change
@@ -316,6 +319,28 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
         }
     }
     samples.sort_by(|a, b| a.station.total_cmp(&b.station));
+    // And a rung every `RUNG_SPACING` along a long straight stretch, which has
+    // vertices only at its ends: the land meets the road rung for rung, and a
+    // street hundreds of metres long met at its two ends alone is a fan of
+    // triangles that long beside it.
+    let mut between = Vec::new();
+    for pair in samples.windows(2) {
+        let gap = pair[1].station - pair[0].station;
+        let extra = (gap / RUNG_SPACING).ceil() as usize;
+        for k in 1..extra {
+            let station = pair[0].station + gap * k as f64 / extra as f64;
+            if let Ok(sample) = road
+                .reference_line
+                .sample_at(station, map.metadata.sampling)
+            {
+                between.push(sample);
+            }
+        }
+    }
+    if !between.is_empty() {
+        samples.extend(between);
+        samples.sort_by(|a, b| a.station.total_cmp(&b.station));
+    }
     let mut rungs = Vec::with_capacity(samples.len());
     for sample in samples {
         let Ok(frame) = sample.frame() else {
@@ -404,11 +429,16 @@ impl<'a> Layout<'a> {
     /// still has the post on it. On the verge, `setback` out from the carriageway's
     /// edge, when there is not. `None` when the cross-section carries no vehicles
     /// at all, since there is then no road for a post to stand beside.
+    ///
+    /// `ledge` is where a post stands on a road with no pavement whose edge has
+    /// no verge either — a deck's parapet, a tunnel's walkway: how far out from
+    /// the road's outer edge, and how high.
     pub(crate) fn post_position(
         &self,
         station: f64,
         side: LateralSide,
         setback: f64,
+        ledge: Option<(f64, f64)>,
     ) -> Option<(f64, f64)> {
         let cuts = self.cuts(station);
         let (left_edge, right_edge) = self.carriageway(station)?;
@@ -441,7 +471,16 @@ impl<'a> Layout<'a> {
                     self.rise_of(lane),
                 ))
             }
-            None => Some((edge + outward * setback, 0.0)),
+            None => match ledge {
+                Some((out, rise)) => {
+                    let outer = match side {
+                        LateralSide::Left => cuts[0],
+                        LateralSide::Right => cuts[cuts.len() - 1],
+                    };
+                    Some((outer + outward * out, rise))
+                }
+                None => Some((edge + outward * setback, 0.0)),
+            },
         }
     }
 

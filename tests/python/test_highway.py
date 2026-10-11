@@ -149,3 +149,26 @@ def test_a_corridor_motorway_with_a_river_a_ridge_and_a_diamond():
     for structure in m.structure_ids():
         for support in m.structure(structure).get("supports", []):
             assert support["base"] is not None
+
+
+@pytest.mark.parametrize("kind,side,loops", [("parclo", None, 2), ("trumpet", "right", 1)])
+def test_a_parclo_and_a_trumpet_turn_on_by_loops(kind, side, loops):
+    m = roadgen.Map(name="loops")
+    e5 = m.add_corridor("E5", [(-1500.0, 0.0, 0.0), (1500.0, 0.0, 0.0)], design_speed=100.0)
+    e5.add_interchange("Minami IC", at=1500.0, crossroad=[(0.0, -500.0, 0.0), (0.0, 500.0, 0.0)],
+                       crossroad_lanes=street_lanes(), kind=kind, side=side, terminal=100.0)
+    plan = e5.plan()
+    assert plan.notes == []
+    m.add_plan(plan)
+    m.validate()
+    names = [road["name"] for road in plan.roads]
+    assert sum(name.endswith("_loop") for name in names) == loops
+    [interchange] = m.interchange_ids()
+    assert m.interchange(interchange)["kind"] == kind
+
+
+def test_a_trumpet_says_which_side_it_stops_on():
+    corridor = roadgen.Map().add_corridor("E5", [(0.0, 0.0, 0.0), (3000.0, 0.0, 0.0)])
+    with pytest.raises(ValueError, match="side="):
+        corridor.add_interchange("T", at=1500.0, crossroad=[(1500.0, -500.0, 0.0), (1500.0, 500.0, 0.0)],
+                                 crossroad_lanes=street_lanes(), kind="trumpet")

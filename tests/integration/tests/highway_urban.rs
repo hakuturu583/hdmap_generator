@@ -108,6 +108,33 @@ fn an_elevated_motorway_passes_over_the_streets_on_a_viaduct() {
 }
 
 #[test]
+fn the_land_beside_a_long_straight_street_is_no_fan_of_long_triangles() {
+    let (map, _) = generate(corridor(true), |_| {});
+    let longest = |corners: [Point3; 3]| {
+        (0..3)
+            .map(|k| corners[k].horizontal_distance_to(corners[(k + 1) % 3]))
+            .fold(0.0, f64::max)
+    };
+    // The streets are 600 m of straight road, with vertices only at their ends.
+    let land = map.tin_surfaces.iter().next().expect("land");
+    let nodes = land.tin.nodes();
+    for triangle in land.tin.triangles() {
+        let corners = triangle.map(|i| nodes[i as usize]);
+        assert!(longest(corners) < 40.0, "a land triangle {corners:?}");
+    }
+    let meshes = roadgen_carla::to_meshes(&map, &roadgen_carla::PackageConfig::new("shuto"));
+    for mesh in meshes
+        .iter()
+        .filter(|mesh| mesh.role == roadgen_carla::Role::Terrain)
+    {
+        for triangle in &mesh.triangles {
+            let corners = triangle.map(|i| mesh.positions[i as usize]);
+            assert!(longest(corners) < 60.0, "a terrain triangle {corners:?}");
+        }
+    }
+}
+
+#[test]
 fn a_sunken_motorway_passes_under_the_streets_in_a_cut_and_cover_tunnel() {
     let (map, notes) = generate(corridor(false), |_| {});
     assert!(notes.is_empty(), "{notes:#?}");

@@ -101,10 +101,7 @@ impl HeapSpec {
         let crest = self.ring(self.top_radius(), top, spacing);
         let mut forms = Landforms::default();
         forms.holes.push(plan_of(&toe));
-        forms.levels.push(Level {
-            ring: plan_of(&crest),
-            z: top,
-        });
+        forms.levels.push(Level::flat(plan_of(&crest), top));
         forms.anchors.extend(toe.iter().copied());
         forms.lines.push(Line {
             key: format!("{key}/toe"),

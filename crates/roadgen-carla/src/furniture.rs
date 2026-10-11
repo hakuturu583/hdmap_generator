@@ -430,7 +430,12 @@ fn stand(
         let station = wanted.clamp(0.0, length);
         let section = site.road.section_at(station)?;
         let layout = Layout::of(map, site.road, section, surfaces)?;
-        let (lateral, rise) = layout.post_position(station, site.kerb, config.kerb_setback)?;
+        let (lateral, rise) = layout.post_position(
+            station,
+            site.kerb,
+            config.kerb_setback,
+            ledge(map, site.road, station),
+        )?;
         let (frame, heading) = frame_and_facing(map, site, station)?;
         let foot = frame.to_global([0.0, lateral, rise]);
         let clear = posts
@@ -448,6 +453,18 @@ fn stand(
         wanted += back * config.clearance * 1.5;
     }
     found
+}
+
+/// Where a post stands on a structure, beside a road with no pavement: on top
+/// of a bridge's parapet, or on a tunnel's walkway — not out on a verge that is
+/// not there. How far out from the road's outer edge, and how high.
+fn ledge(map: &Map, road: &Road, station: f64) -> Option<(f64, f64)> {
+    let structure = map.structures.get(road.structure.at(station)?)?;
+    match (structure.kind.bridge(), structure.kind.tunnel()) {
+        (Some(bridge), _) => Some((bridge.curb / 2.0, crate::structures::PARAPET)),
+        (_, Some(tunnel)) => Some((tunnel.walkway / 2.0, 0.0)),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

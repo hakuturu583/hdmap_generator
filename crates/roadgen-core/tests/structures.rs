@@ -323,3 +323,71 @@ fn an_interchange_points_its_junctions_back_at_it() {
     // The movements through its junction are its roads too.
     assert!(interchange.roads.len() > 1);
 }
+
+#[test]
+fn a_deck_over_two_carriageways_running_opposite_ways_sits_on_its_supports() {
+    // Two one-way carriageways side by side, climbing east, drawn opposite ways.
+    let one_way = || {
+        vec![LaneSpec::new(
+            PositiveWidth::new(3.5).unwrap(),
+            Direction::Forward,
+        )]
+    };
+    let mut builder = MapBuilder::default();
+    let east = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -6.0, 0.0),
+                Point3::new(300.0, -6.0, 15.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("east"),
+        )
+        .unwrap();
+    let west = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(300.0, 6.0, 15.0),
+                Point3::new(0.0, 6.0, 0.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("west"),
+        )
+        .unwrap();
+    let spec = BridgeSpec::default();
+    let depth = spec.deck_depth;
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(east, 50.0, 250.0),
+                RoadSpan::new(west, 50.0, 250.0),
+            ],
+            spec,
+        )
+        .unwrap();
+    let map = builder.finish().unwrap();
+    let map = map.as_map();
+    let bridge = map.structures.iter().next().unwrap();
+    let abutments: Vec<_> = bridge
+        .kind
+        .bridge()
+        .unwrap()
+        .supports
+        .iter()
+        .filter(|s| s.kind == SupportKind::Abutment)
+        .collect();
+    assert_eq!(abutments.len(), 2);
+    for abutment in abutments {
+        // The deck is 0.05 up per metre east; its underside over the abutment is
+        // there, not at the far end of the other carriageway.
+        let x = abutment.footprint.centroid().x;
+        let top = abutment.footprint.highest();
+        let deck = 0.05 * x;
+        assert!(
+            (top - (deck - depth)).abs() < 0.6,
+            "an abutment at x {x:.0} topped at {top:.2}, under a deck at {deck:.2}"
+        );
+    }
+}

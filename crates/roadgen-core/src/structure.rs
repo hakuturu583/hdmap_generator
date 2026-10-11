@@ -905,24 +905,31 @@ fn place_with(
                     (row.3 - bridge.curb, row.2 + bridge.curb)
                 }
             };
+            // The other roads where they pass nearest the first: two carriageways
+            // on one deck run opposite ways, so the same proportion along each is
+            // opposite ends of the deck.
+            let others = spans[1..]
+                .iter()
+                .map(|span| Strip::of(map, span))
+                .collect::<Result<Vec<_>, _>>()?;
             let underside = |station: f64| -> f64 {
-                spans
-                    .iter()
-                    .filter_map(|span| {
-                        let road = map.road(&span.road)?;
-                        let s = if span.road == spans[0].road {
-                            station
-                        } else {
-                            // The other roads at the same proportion along.
-                            span.from
-                                + (station - spans[0].from) / spans[0].length().max(1e-9)
-                                    * span.length()
-                        };
-                        road.frame_at(s.clamp(span.from, span.to), map.metadata.sampling)
-                            .ok()
-                            .map(|frame| frame.origin.z)
+                let Some(here) = map
+                    .road(&spans[0].road)
+                    .and_then(|road| {
+                        road.frame_at(
+                            station.clamp(spans[0].from, spans[0].to),
+                            map.metadata.sampling,
+                        )
+                        .ok()
                     })
-                    .fold(f64::INFINITY, f64::min)
+                    .map(|frame| frame.origin)
+                else {
+                    return f64::INFINITY;
+                };
+                others
+                    .iter()
+                    .map(|other| other.rows[other.locate(here).0].1.origin.z)
+                    .fold(here.z, f64::min)
                     - bridge.deck_depth
             };
             let mut supports = Vec::new();
