@@ -296,9 +296,12 @@ impl<'a> Stated<'a> {
             // Each land cover's outline too, draped on the land, so that where the
             // surface changes from grass to rock it changes along the outline
             // rather than along whichever triangles straddle it.
+            // Not a cutting's or an embankment's: it is grass like the land round
+            // it, and its edges are the road's and its slope's foot already.
             let outlines: Vec<Vec<Point3>> = map
                 .land_covers
                 .iter()
+                .filter(|cover| !matches!(cover.kind.as_str(), "cutting" | "embankment"))
                 .map(|cover| stated.drape(cover.area.points()))
                 .collect();
             stated.breaklines.extend(outlines);

@@ -525,8 +525,9 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     }
 
     // What each part's land is, and which site it belongs to.
-    let mut sites: BTreeMap<String, (String, Vec<LandCoverId>, Vec<RoadId>, &'static str)> =
-        BTreeMap::new();
+    // By key: the site's name, its land covers, its roads and its kind.
+    type Gathered = (String, Vec<LandCoverId>, Vec<RoadId>, &'static str);
+    let mut sites: BTreeMap<String, Gathered> = BTreeMap::new();
     let site_of = |name: &str| -> Result<SiteId, Error> {
         let key = slug(name);
         if key.is_empty() {

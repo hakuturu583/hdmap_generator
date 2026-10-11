@@ -64,8 +64,11 @@ fn rows(map: &Map, span: &RoadSpan) -> Vec<Row> {
 /// road it carries there. A road passing under a bridge is inside its outline too,
 /// but a deck's depth and a clearance below it.
 pub struct Carried {
-    outlines: Vec<(Vec<[f64; 2]>, Vec<Point3>, [f64; 4])>,
+    outlines: Vec<Outline>,
 }
+
+/// One structure's outline: in plan, with its heights, and its bounds.
+type Outline = (Vec<[f64; 2]>, Vec<Point3>, [f64; 4]);
 
 impl Carried {
     pub fn of(map: &Map) -> Carried {
