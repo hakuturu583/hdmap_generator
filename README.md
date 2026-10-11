@@ -63,10 +63,10 @@ m.export_gpudrive("scene.json")
        │             │             │
        └─────────────┼─────────────┘
                      ▼
-              Canonical Road IR ◀──── roadgen-buildings ◀── CGA shape grammar
-                     │      ▲                                 `symbios-shape`
-                     │      └──────── roadgen-mine ◀── MineSpec: benches, ramp,
-                     │                                 heaps, a TIN (`spade`)
+              Canonical Road IR ◀──── roadgen_carla::environment
+                     │                 ├─ Urban ◀── roadgen-buildings ◀── CGA shape grammar
+                     │                 └─ Mine  ◀── MineSpec: benches, ramp, heaps,
+                     │                              the land as a TIN (`spade`)
                  validate()
                      ▼
                 ValidatedMap
@@ -88,15 +88,18 @@ Every exporter reads a `ValidatedMap` and writes nothing back into it: what a fo
 cannot hold comes back to the caller through that exporter's `check()`, never as a
 field in the IR.
 
-`roadgen-buildings` is the one arrow pointing *into* the IR, and it is a generator
-rather than an exporter — it reads roads and writes [buildings](#buildings), the
+The arrow pointing *into* the IR is the environment a CARLA map is generated for,
+and it is a generator rather than an exporter: one value, `Environment`, whose
+branches are the kinds of place. `Urban` puts a town along the caller's streets with
+`roadgen-buildings`, and that crate is a generator — it reads roads and writes [buildings](#buildings), the
 same way the builder reads a `RoadSpec` and writes lanes. It runs after generation
 and before validation, because a lot is measured against geometry that does not exist
 until the first and buildings are part of what the second checks.
 
-`roadgen-mine` is the other generator. It fills the part of the IR a road network
-leaves empty — the shape of the land, what the land is, and the place they add up
-to — and lays out the roads that place needs: see [Mines](#mines).
+`Mine` fills the part of the IR a road network leaves empty — the shape of the
+land, what the land is, and the place they add up to — and lays out the roads that
+place needs: see [Mines](#mines). Whichever branch runs, it writes only the IR, so
+what it generates reaches every format and not only CARLA's.
 
 The two arrows at the bottom go the other way. `roadgen-viewer` reads the **written
 files** — never the IR — so a picture it draws is a picture of what a consumer would
@@ -1574,13 +1577,16 @@ measured where it actually is:
             └─ raised by the kerb height ──────────────┘            └─ Terrain
 ```
 
-A lane whose type is `sidewalk` is raised by the kerb height, which puts a vertical face
-between it and the surface beside it — that face is the **curb**, and the strip of road
+A lane stands where the IR lifts it — its [`height`](#a-lane-off-the-road-surface),
+station by station — and a `sidewalk` the IR left flat is raised by the kerb height
+instead. Either way a lane above its neighbour puts a vertical face between them — that face is the **curb**, and the strip of road
 at the foot of it is the **gutter**, split off the outermost part of the carriageway the
 way a real one is. Neither is a lane in the IR and neither should be: they are what a
 *surface* has and a road network does not. Painted lines are geometry rather than
 texture — a broken line is a strip per dash, cut by arc length so that a three-metre
-dash is three metres however the sampler laid its vertices.
+dash is three metres however the sampler laid its vertices. The surface is what the
+road's pavement says it is — asphalt, concrete, cobbles, gravel, dirt, sand, rock —
+changing material where the pavement changes.
 
 Beyond the outermost band is the **land**: one mesh, from every road's edge out to
 150 m past the network (`ground_extent`), for a lidar to reach and a vehicle that

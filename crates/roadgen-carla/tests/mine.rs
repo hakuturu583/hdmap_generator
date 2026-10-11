@@ -1,6 +1,6 @@
+use roadgen_carla::environment::mine::{generate, lay_out, MineSpec};
 use roadgen_core::prelude::*;
 use roadgen_core::semantics::{MapObjectKind, Pavement, UnpavedSurface};
-use roadgen_mine::{generate, lay_out, MineSpec};
 
 fn mine(spec: &MineSpec) -> ValidatedMap {
     let mut builder = MapBuilder::default();
@@ -117,7 +117,7 @@ fn a_turned_anticlockwise_pit_validates_too() {
         name: "East Pit".into(),
         centre: Point3::new(500.0, -200.0, 120.0),
         heading: 0.6,
-        ramp: roadgen_mine::RampSpec {
+        ramp: roadgen_carla::environment::mine::RampSpec {
             clockwise: false,
             start: 45.0,
             grade: 0.1,
@@ -132,7 +132,7 @@ fn a_turned_anticlockwise_pit_validates_too() {
 fn a_spec_no_pit_could_be_is_refused() {
     let mut builder = MapBuilder::default();
     let spec = MineSpec {
-        pit: roadgen_mine::PitSpec {
+        pit: roadgen_carla::environment::mine::PitSpec {
             benches: 0,
             ..Default::default()
         },

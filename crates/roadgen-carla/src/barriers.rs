@@ -1,12 +1,13 @@
-//! The barriers a map stands beside its roads, as solids: a safety berm is a ridge
-//! of broken rock along a haul road's edge.
+//! The barriers a map stands beside its roads, as solids.
 //!
 //! A barrier's band is the ground it occupies; its height is how far its top stands
-//! above that. What is built here is the ridge: its two sides rising from the band's
-//! edges at the angle loose rock rests at, and a flat top where the band is wide
-//! enough to leave one — otherwise a sharp crest down the middle.
+//! above that. A berm — a ridge of broken rock along a haul road's edge — has its two
+//! sides rising from the band's edges at the angle loose rock rests at, and a flat
+//! top where the band is wide enough to leave one, otherwise a sharp crest down the
+//! middle. A wall or a rail is built: it stands upright over the whole band, in
+//! concrete or in steel.
 //!
-//! A berm is earth, and CARLA has no class for a berm, so it is terrain.
+//! CARLA's import has no class for any of these, so they are terrain.
 
 use roadgen_core::geometry::{Point3, Polyline3};
 use roadgen_core::map::Map;
@@ -27,8 +28,14 @@ pub fn berms(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh> {
     let sampling = map.metadata.sampling;
     let mut meshes = Vec::new();
     for object in map.objects.iter() {
-        let MapObjectKind::Barrier { height, .. } = &object.kind else {
+        let MapObjectKind::Barrier { kind, height } = &object.kind else {
             continue;
+        };
+        // Earth slopes at its angle of repose; anything built stands upright.
+        let (slope, material) = match kind.as_str() {
+            "berm" | "bund" | "windrow" | "embankment" => (Some(REPOSE), materials::GRAVEL),
+            "wall" | "jersey" | "concrete" => (None, materials::CURB),
+            _ => (None, materials::STEEL),
         };
         let ObjectGeometry::Band { left, right } = &object.geometry else {
             continue;
@@ -42,7 +49,7 @@ pub fn berms(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh> {
             .max(1)
             + 1;
         let (left, right) = (resample(&left, count), resample(&right, count));
-        let run = height / REPOSE.to_radians().tan();
+        let run = slope.map_or(0.0, |angle| height / angle.to_radians().tan());
         let (mut top_left, mut top_right) = (Vec::with_capacity(count), Vec::with_capacity(count));
         for (l, r) in left.iter().zip(&right) {
             let width = l.horizontal_distance_to(*r);
@@ -60,7 +67,7 @@ pub fn berms(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh> {
         let mut mesh = Mesh::new(
             mesh_name(map_name, Role::Terrain, ordinals.take(Role::Terrain)),
             Role::Terrain,
-            materials::GRAVEL,
+            material,
         );
         // Each strip anticlockwise seen from outside: from above, left to right.
         mesh.strip(&left, &top_left, 0);

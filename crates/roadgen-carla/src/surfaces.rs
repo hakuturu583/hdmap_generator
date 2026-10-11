@@ -48,7 +48,7 @@ use std::collections::HashMap;
 
 use roadgen_core::geometry::{Frame3, Point3, Vector3};
 use roadgen_core::map::{Map, Road};
-use roadgen_core::semantics::{LaneType, MarkingColor, Pavement, RoadMarking};
+use roadgen_core::semantics::{LaneType, MarkingColor, RoadMarking};
 use roadgen_core::topology::LateralSide;
 
 use crate::facades;
@@ -251,7 +251,27 @@ struct Cross<'a> {
 /// between them is rounded into an arc — so a cut perpendicular to one is
 /// perpendicular to the other, and the two surfaces end on the same line.
 fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
-    let samples = map.vertex_samples(&road.id).ok()?;
+    let mut samples = map.vertex_samples(&road.id).ok()?;
+    // A rung wherever the pavement changes, too, so that the surface can change
+    // material there rather than at the next vertex, which on a straight road is
+    // its far end.
+    let (first, last) = (samples.first()?.station, samples.last()?.station);
+    for &(station, _) in road.pavement.spans() {
+        if station > first + 1e-6
+            && station < last - 1e-6
+            && !samples
+                .iter()
+                .any(|sample| (sample.station - station).abs() < 1e-6)
+        {
+            if let Ok(sample) = road
+                .reference_line
+                .sample_at(station, map.metadata.sampling)
+            {
+                samples.push(sample);
+            }
+        }
+    }
+    samples.sort_by(|a, b| a.station.total_cmp(&b.station));
     let mut rungs = Vec::with_capacity(samples.len());
     for sample in samples {
         let Ok(frame) = sample.frame() else {
@@ -265,6 +285,9 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
     (rungs.len() >= 2).then_some(rungs)
 }
 
+/// How far a rail stands off the road plane, by station.
+type Lift<'a> = Box<dyn Fn(f64) -> f64 + 'a>;
+
 /// What one cross-section of one road is made of, left to right.
 pub(crate) struct Layout<'a> {
     range: (f64, f64),
@@ -273,9 +296,8 @@ pub(crate) struct Layout<'a> {
     /// The lanes, from the leftmost to the rightmost.
     lanes: Vec<&'a roadgen_core::map::Lane>,
     config: SurfaceConfig,
-    /// Whether the road is unpaved here, which surfaces it in gravel rather than
-    /// asphalt.
-    unpaved: bool,
+    /// What the road is surfaced with along its length.
+    pavement: &'a roadgen_core::semantics::PavementProfile,
 }
 
 impl<'a> Layout<'a> {
@@ -311,7 +333,7 @@ impl<'a> Layout<'a> {
             lane_offset: &road.lane_offset,
             lanes: left,
             config: *config,
-            unpaved: matches!(road.pavement.at(range.0), Some(Pavement::Unpaved(_))),
+            pavement: &road.pavement,
         })
     }
 
@@ -430,10 +452,36 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// How far a lane's surface stands off the road plane, as one number: the
+    /// lift the IR gives it halfway along the section, or for a pavement the IR
+    /// left flat, the configured kerb. What decides whether there is a kerb, and
+    /// which side the land is on; the surfaces themselves follow [`Self::edge_rise`].
     fn rise_of(&self, lane: &roadgen_core::map::Lane) -> f64 {
+        if !lane.height.is_flat() {
+            let (inner, outer) = lane.height.evaluate((self.range.0 + self.range.1) / 2.0);
+            return (inner + outer) / 2.0;
+        }
         match lane.lane_type {
             LaneType::Sidewalk => self.config.kerb_height,
             _ => 0.0,
+        }
+    }
+
+    /// How far lane `index`'s surface stands off the road plane at cut `cut` — one
+    /// of its own two edges — at `station`: the IR's lift there, inner or outer
+    /// whichever that edge is, or for a lane the IR left flat, [`Self::rise_of`].
+    fn edge_rise(&self, index: usize, cut: usize, station: f64) -> f64 {
+        let lane = self.lanes[index];
+        if lane.height.is_flat() {
+            return self.rise_of(lane);
+        }
+        let (inner, outer) = lane.height.evaluate(station);
+        // The cuts run left to right: a left lane's inner edge is its right one,
+        // a right lane's its left one.
+        let is_left_edge = cut == index;
+        match (lane.side, is_left_edge) {
+            (LateralSide::Left, true) | (LateralSide::Right, false) => outer,
+            _ => inner,
         }
     }
 
@@ -449,12 +497,8 @@ impl<'a> Layout<'a> {
             let Some((role, material)) = Self::role_of(lane) else {
                 continue;
             };
-            let material = if self.unpaved && material == materials::ASPHALT {
-                materials::GRAVEL
-            } else {
-                material
-            };
-            let rise = self.rise_of(lane);
+            let left_rise = move |station: f64| self.edge_rise(index, index, station);
+            let right_rise = move |station: f64| self.edge_rise(index, index + 1, station);
 
             // A driving surface beside a kerb gives up its outermost strip to the
             // gutter. Which side that is depends on which neighbour is raised, and a
@@ -475,8 +519,8 @@ impl<'a> Layout<'a> {
                     rungs,
                     |cuts| cuts[index],
                     move |cuts| cuts[index] - inner_gutter,
-                    rise,
-                    rise,
+                    left_rise,
+                    left_rise,
                     Role::Gutter,
                     materials::ASPHALT,
                     map_name,
@@ -489,8 +533,8 @@ impl<'a> Layout<'a> {
                     rungs,
                     move |cuts| cuts[index + 1] + outer_gutter,
                     |cuts| cuts[index + 1],
-                    rise,
-                    rise,
+                    right_rise,
+                    right_rise,
                     Role::Gutter,
                     materials::ASPHALT,
                     map_name,
@@ -498,42 +542,50 @@ impl<'a> Layout<'a> {
                     out,
                 );
             }
-            self.band(
-                rungs,
-                move |cuts| cuts[index] - inner_gutter,
-                move |cuts| cuts[index + 1] + outer_gutter,
-                rise,
-                rise,
-                role,
-                material,
-                map_name,
-                ordinals,
-                out,
-            );
+            // A road's surface is what its pavement says, stretch by stretch: a
+            // change of pavement starts a band of its own at the rung nearest it.
+            for (stretch, surface) in self.stretches(rungs, material) {
+                self.band(
+                    stretch,
+                    move |cuts| cuts[index] - inner_gutter,
+                    move |cuts| cuts[index + 1] + outer_gutter,
+                    left_rise,
+                    right_rise,
+                    role,
+                    surface,
+                    map_name,
+                    ordinals,
+                    out,
+                );
+            }
 
             // The kerb: a vertical face at the cut this lane shares with a neighbour
             // that sits lower. Written by the raised lane so that it is written once.
             for side in [Neighbour::Left, Neighbour::Right] {
-                let Some(drop) = self.kerb_against(index, side) else {
+                if self.kerb_against(index, side).is_none() {
                     continue;
+                }
+                let (cut, neighbour) = match side {
+                    Neighbour::Left => (index, index - 1),
+                    Neighbour::Right => (index + 1, index + 1),
                 };
-                let cut = match side {
-                    Neighbour::Left => index,
-                    Neighbour::Right => index + 1,
-                };
+                // From this lane's edge down to its neighbour's, both as the IR
+                // lifts them at each station.
+                let high = move |station: f64| self.edge_rise(index, cut, station);
+                let low = move |station: f64| self.edge_rise(neighbour, cut, station);
                 // Anticlockwise seen from the road: the low rail on the outside of
                 // the face, so the kerb is visible from the carriageway rather than
                 // from inside the pavement.
-                let (low, high) = match side {
-                    Neighbour::Left => (rise - drop, rise),
-                    Neighbour::Right => (rise, rise - drop),
+                let (first, second): (Lift, Lift) = match side {
+                    Neighbour::Left => (Box::new(low), Box::new(high)),
+                    Neighbour::Right => (Box::new(high), Box::new(low)),
                 };
                 self.band(
                     rungs,
                     move |cuts| cuts[cut],
                     move |cuts| cuts[cut],
-                    low,
-                    high,
+                    first,
+                    second,
                     Role::Curb,
                     materials::CURB,
                     map_name,
@@ -542,6 +594,33 @@ impl<'a> Layout<'a> {
                 );
             }
         }
+    }
+
+    /// The rungs split where the road's pavement changes, each stretch with the
+    /// material it is surfaced in. A lane whose material is not the road's — a
+    /// pavement, a kerb — keeps `material` and is one stretch.
+    fn stretches<'r>(
+        &self,
+        rungs: &'r [Cross<'r>],
+        material: usize,
+    ) -> Vec<(&'r [Cross<'r>], usize)> {
+        if material != materials::ASPHALT {
+            return vec![(rungs, material)];
+        }
+        let surface = |cross: &Cross| materials::road(self.pavement.at(cross.rung.station));
+        let mut stretches = Vec::new();
+        let mut start = 0;
+        for index in 1..rungs.len() {
+            if surface(&rungs[index]) != surface(&rungs[start]) {
+                // The rung where the change is shared, so the two bands meet.
+                stretches.push((&rungs[start..=index], surface(&rungs[start])));
+                start = index;
+            }
+        }
+        if rungs.len() - start >= 2 {
+            stretches.push((&rungs[start..], surface(&rungs[start])));
+        }
+        stretches
     }
 
     /// How wide a gutter this lane gives up on one side: the configured width, if the
@@ -598,8 +677,8 @@ impl<'a> Layout<'a> {
         rungs: &[Cross],
         left: impl Fn(&[f64]) -> f64,
         right: impl Fn(&[f64]) -> f64,
-        left_rise: f64,
-        right_rise: f64,
+        left_rise: impl Fn(f64) -> f64,
+        right_rise: impl Fn(f64) -> f64,
         role: Role,
         material: usize,
         map_name: &str,
@@ -609,8 +688,9 @@ impl<'a> Layout<'a> {
         let mut left_rail = Vec::with_capacity(rungs.len());
         let mut right_rail = Vec::with_capacity(rungs.len());
         for cross in rungs {
-            left_rail.push(cross.rung.at(left(&cross.cuts), left_rise));
-            right_rail.push(cross.rung.at(right(&cross.cuts), right_rise));
+            let station = cross.rung.station;
+            left_rail.push(cross.rung.at(left(&cross.cuts), left_rise(station)));
+            right_rail.push(cross.rung.at(right(&cross.cuts), right_rise(station)));
         }
         let mut mesh = Mesh::new(
             mesh_name(map_name, role, ordinals.take(role)),
@@ -661,7 +741,16 @@ impl<'a> Layout<'a> {
             });
             for (index, side) in lines.iter().enumerate() {
                 let shift = side * config.marking_width;
-                let rail = self.rail(rungs, cut, config.marking_rise, shift);
+                // On the surface the line is painted on: the higher of the two lanes
+                // either side of it, as the IR lifts them, at each station.
+                let lift = |station: f64| {
+                    let left = cut
+                        .checked_sub(1)
+                        .map(|index| self.edge_rise(index, cut, station));
+                    let right = (cut < self.lanes.len()).then(|| self.edge_rise(cut, cut, station));
+                    config.marking_rise + left.into_iter().chain(right).fold(0.0_f64, f64::max)
+                };
+                let rail = self.rail(rungs, cut, lift, shift);
                 // In `broken solid` the left-hand line is the broken one, which is
                 // the order OpenDRIVE and the IR both read a double line in.
                 let broken = match boundary.marking {
@@ -708,6 +797,11 @@ impl<'a> Layout<'a> {
             (first, self.rise_of(self.lanes[first])),
             (last + 1, self.rise_of(self.lanes[last])),
         ];
+        // Each edge's lift station by station, as the lane's surface has it.
+        let edge_rise = |side: usize, station: f64| match side {
+            0 => self.edge_rise(first, first, station),
+            _ => self.edge_rise(last, last + 1, station),
+        };
         // Which side the land is on, when only one is: the side whose edge, halfway
         // along, is farther from the junction.
         let land = match facing {
@@ -729,11 +823,15 @@ impl<'a> Layout<'a> {
             let (cut, rise) = edges[side];
             // Outwards: to the left on the left side, the right on the right.
             let sign = if side == 0 { 1.0 } else { -1.0 };
-            let rail_rise = if land[side] { rise } else { 0.0 };
             let mut rail = Vec::with_capacity(rungs.len());
             let mut toe = Vec::with_capacity(if land[side] { rungs.len() } else { 0 });
             for cross in rungs {
                 let edge = cross.cuts[cut];
+                let rail_rise = if land[side] {
+                    edge_rise(side, cross.rung.station)
+                } else {
+                    0.0
+                };
                 rail.push(cross.rung.at(edge, rail_rise));
                 if land[side] {
                     toe.push(cross.rung.at(edge + sign * width, 0.0));
@@ -742,13 +840,19 @@ impl<'a> Layout<'a> {
             if !land[side] && rise > 0.0 {
                 // The kerb face, anticlockwise seen from the junction: the low
                 // rail on the outside of the face.
-                let (low, high) = if side == 0 { (0.0, rise) } else { (rise, 0.0) };
+                let lift = move |station: f64| edge_rise(side, station);
+                let ground = |_: f64| 0.0;
+                let (first, second): (Lift, Lift) = if side == 0 {
+                    (Box::new(ground), Box::new(lift))
+                } else {
+                    (Box::new(lift), Box::new(ground))
+                };
                 self.band(
                     rungs,
                     move |cuts| cuts[cut],
                     move |cuts| cuts[cut],
-                    low,
-                    high,
+                    first,
+                    second,
                     Role::Curb,
                     materials::CURB,
                     map_name,
@@ -766,12 +870,20 @@ impl<'a> Layout<'a> {
     /// The direction comes along so that a dash can be cut anywhere between two
     /// stations: a painted line has to be given a width perpendicular to itself, and
     /// halfway through a rung there is no frame to ask.
-    fn rail(&self, rungs: &[Cross], cut: usize, rise: f64, shift: f64) -> Vec<(Point3, Vector3)> {
+    fn rail(
+        &self,
+        rungs: &[Cross],
+        cut: usize,
+        rise: impl Fn(f64) -> f64,
+        shift: f64,
+    ) -> Vec<(Point3, Vector3)> {
         rungs
             .iter()
             .map(|cross| {
                 (
-                    cross.rung.at(cross.cuts[cut] + shift, rise),
+                    cross
+                        .rung
+                        .at(cross.cuts[cut] + shift, rise(cross.rung.station)),
                     cross.rung.frame.left.get(),
                 )
             })

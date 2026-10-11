@@ -5,16 +5,18 @@
 //! OpenDRIVE writes the gravel and the berm, OpenStreetMap writes the quarry, and
 //! the formats with no word for any of it still write the roads.
 
+use roadgen_carla::environment::{self, Environment, MineSpec};
 use roadgen_carla::{materials, PackageConfig, Role};
 use roadgen_core::prelude::*;
 use roadgen_core::semantics::{MapObjectKind, Pavement, UnpavedSurface};
-use roadgen_mine::MineSpec;
 
 fn mine() -> ValidatedMap {
     let mut builder = MapBuilder::default();
-    let plan = roadgen_mine::lay_out(&mut builder, &MineSpec::default()).expect("lays out");
+    // The mine is one branch of the environment a CARLA map is generated for.
+    let plan =
+        environment::lay_out(&mut builder, &Environment::Mine(Box::default())).expect("lays out");
     let mut map = builder.finish().expect("builds");
-    roadgen_mine::generate(&mut map, &plan).expect("generates");
+    environment::generate(&mut map, &plan).expect("generates");
     map.validate().expect("validates")
 }
 
@@ -68,7 +70,7 @@ fn carla_builds_its_ground_from_the_terrain_the_map_states() {
         "{warnings:#?}"
     );
     assert!(
-        warnings.iter().any(|w| w.contains("unpaved")),
+        warnings.iter().any(|w| w.contains("other than asphalt")),
         "{warnings:#?}"
     );
 
@@ -125,4 +127,151 @@ fn the_formats_with_no_land_still_write_the_roads() {
         .objects
         .iter()
         .any(|object| matches!(object.kind, MapObjectKind::Barrier { .. })));
+}
+
+/// A mine with a road of the caller's own beside it: two driving lanes and a
+/// pavement each side, the pavements lifted 0.3 m by the IR — twice the kerb the
+/// CARLA export would put under a pavement the IR left flat.
+fn mine_with_a_street() -> ValidatedMap {
+    use roadgen_core::geometry::LaneHeight;
+    use roadgen_core::semantics::{LaneType, PavedSurface, PavementProfile};
+    use roadgen_core::topology::Direction;
+    use roadgen_core::units::PositiveWidth;
+
+    let mut builder = MapBuilder::default();
+    let width = |metres| PositiveWidth::new(metres).unwrap();
+    let pavement = |direction| {
+        LaneSpec::new(width(2.5), direction)
+            .with_type(LaneType::Sidewalk)
+            .with_height(LaneHeight::constant(0.3, 0.3).unwrap())
+    };
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-200.0, 260.0, 0.0),
+                Point3::new(200.0, 260.0, 0.0),
+                vec![
+                    LaneSpec::new(width(3.5), Direction::Forward),
+                    pavement(Direction::Forward),
+                    LaneSpec::new(width(3.5), Direction::Backward),
+                    pavement(Direction::Backward),
+                ],
+            )
+            .unwrap()
+            .with_name("street")
+            // Concrete for the first half, cobbles for the rest.
+            .with_pavement(
+                PavementProfile::new([
+                    (0.0, Pavement::Paved(PavedSurface::Concrete)),
+                    (200.0, Pavement::Paved(PavedSurface::Cobblestone)),
+                ])
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    let plan = environment::lay_out(&mut builder, &Environment::Mine(Box::default())).unwrap();
+    let mut map = builder.finish().unwrap();
+    environment::generate(&mut map, &plan).unwrap();
+    map.validate().expect("validates")
+}
+
+#[test]
+fn a_road_the_caller_adds_to_a_mine_is_on_the_land_with_its_pavements() {
+    let map = mine_with_a_street();
+    let surface = map.tin_surfaces.iter().next().unwrap();
+    let locator = surface.tin.locator();
+    // The street's edges are breaklines of the land, at the pavements' own height.
+    let street = RoadId::new("street");
+    let edges: Vec<_> = map
+        .tin_breaklines
+        .iter()
+        .filter(|line| line.id.as_str().contains("/road/street/"))
+        .collect();
+    assert_eq!(edges.len(), 2);
+    for edge in edges {
+        for point in edge.line.points() {
+            assert!((point.z - 0.3).abs() < 1e-6, "{}", point.z);
+        }
+    }
+    for lane in map.lanes_of_section(&street, 0) {
+        for point in lane
+            .centerline
+            .to_polyline(map.metadata.sampling)
+            .unwrap()
+            .points()
+        {
+            let ground = locator.height_at(point.x, point.y).expect("on the land");
+            assert!(
+                (ground - point.z).abs() < 0.31,
+                "{} at {:.2}",
+                lane.id,
+                ground
+            );
+        }
+    }
+
+    // And CARLA draws all of it: pavements, kerbs, the land.
+    let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("Quarry"));
+    for role in [Role::Sidewalk, Role::Curb, Role::Terrain, Role::Road] {
+        assert!(meshes.iter().any(|mesh| mesh.role == role), "{role:?}");
+    }
+}
+
+#[test]
+fn carla_draws_what_the_ir_says_rather_than_its_defaults() {
+    let map = mine_with_a_street();
+    let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("Quarry"));
+
+    // The pavements stand where the IR lifted them, not at the configured kerb.
+    let top = meshes
+        .iter()
+        .filter(|mesh| mesh.role == Role::Sidewalk)
+        .flat_map(|mesh| mesh.positions.iter())
+        .filter(|p| p.y > 250.0)
+        .map(|p| p.z)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!((top - 0.3).abs() < 1e-6, "{top}");
+
+    // The street is concrete, then cobbles; the haul roads gravel.
+    let materials: std::collections::HashSet<usize> = meshes
+        .iter()
+        .filter(|mesh| mesh.role == Role::Road)
+        .flat_map(|mesh| mesh.materials.iter().copied())
+        .collect();
+    for material in [
+        materials::ROAD_CONCRETE,
+        materials::COBBLESTONE,
+        materials::GRAVEL,
+    ] {
+        assert!(materials.contains(&material), "{material}");
+    }
+    assert!(!materials.contains(&materials::ASPHALT));
+}
+
+#[test]
+fn a_barrier_is_built_the_way_its_kind_is() {
+    let mut map = mine().into_map();
+    let berm = map
+        .objects
+        .iter()
+        .find(|object| matches!(object.kind, MapObjectKind::Barrier { .. }))
+        .unwrap()
+        .id
+        .clone();
+    let draw = |map: &roadgen_core::map::Map| {
+        let map = roadgen_core::validation::UnvalidatedMap::from_map(map.clone())
+            .validate()
+            .unwrap();
+        roadgen_carla::to_meshes(&map, &PackageConfig::new("Quarry"))
+            .into_iter()
+            .filter(|mesh| mesh.role == Role::Terrain && mesh.materials.len() == 1)
+            .map(|mesh| mesh.materials[0])
+            .collect::<Vec<_>>()
+    };
+    assert!(draw(&map).contains(&materials::GRAVEL));
+    map.objects.get_mut(&berm).unwrap().kind = MapObjectKind::Barrier {
+        kind: "wall".into(),
+        height: 1.0,
+    };
+    assert!(draw(&map).contains(&materials::CURB));
 }

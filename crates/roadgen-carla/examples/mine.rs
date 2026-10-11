@@ -2,11 +2,11 @@
 //! covers as JSON, for looking at.
 //!
 //! ```sh
-//! cargo run -p roadgen-mine --example mine > mine.json
+//! cargo run -p roadgen-carla --example mine > mine.json
 //! ```
 
+use roadgen_carla::environment::mine::{generate, lay_out, MineSpec};
 use roadgen_core::prelude::*;
-use roadgen_mine::{generate, lay_out, MineSpec};
 
 fn points(points: &[Point3]) -> String {
     let inner: Vec<String> = points

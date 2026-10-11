@@ -44,6 +44,14 @@
 //! carriageway, the paint on it, the pavements beside it, the kerb faces between them,
 //! the gutters at the foot of those, and the grass beyond. See [`surfaces`].
 //!
+//! # What kind of place
+//!
+//! A town or a mine is one value, [`Environment`], and each is a branch of
+//! [`environment`]: it lays out the roads the place needs and generates, into the
+//! IR, what stands on and under them — a town's buildings, a mine's benches, heaps
+//! and land. The package is then written from the IR the same way for every kind
+//! of place, so this crate's export stays a lowering that pushes nothing back.
+//!
 //! # What stands beside it
 //!
 //! Traffic lights and signs, built to the cross-section — a pole on the pavement, an
@@ -66,6 +74,7 @@
 
 pub mod barriers;
 pub mod crosswalks;
+pub mod environment;
 pub mod error;
 pub mod facades;
 pub mod fbx;
@@ -90,6 +99,7 @@ use roadgen_core::semantics::MapObjectKind;
 use roadgen_core::trace::{Relation, Trace};
 use roadgen_core::ValidatedMap;
 
+pub use environment::{Environment, MineSpec};
 pub use error::ExportError;
 pub use furniture::{FurnitureConfig, SignKind};
 pub use materials::Material;
@@ -823,21 +833,22 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
         );
     }
 
-    let unpaved = map
+    let resurfaced = map
         .roads
         .iter()
         .filter(|road| {
             road.pavement
                 .spans()
                 .iter()
-                .any(|(_, pavement)| !pavement.is_paved())
+                .any(|&(_, pavement)| materials::road(Some(pavement)) != materials::ASPHALT)
         })
         .count();
-    if unpaved > 0 && config.use_carla_materials {
+    if resurfaced > 0 && config.use_carla_materials {
         warnings.push(format!(
-            "{unpaved} roads are unpaved and surfaced in gravel here, but CARLA's own \
-             materials are on and will repaint every road surface as its asphalt; \
-             turn them off to keep the gravel"
+            "{resurfaced} roads are surfaced in something other than asphalt — gravel, \
+             concrete, dirt — and drawn so here, but CARLA's own materials are on and \
+             will repaint every road surface as its asphalt; turn them off to keep \
+             what the map says"
         ));
     }
     let berms = map

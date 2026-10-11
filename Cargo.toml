@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/roadgen-core",
     "crates/roadgen-buildings",
-    "crates/roadgen-mine",
     "crates/roadgen-carla",
     "crates/roadgen-opendrive",
     "crates/roadgen-lanelet2",
@@ -28,7 +27,6 @@ homepage = "https://github.com/hakuturu583/hdmap_generator"
 [workspace.dependencies]
 roadgen-core = { path = "crates/roadgen-core" }
 roadgen-buildings = { path = "crates/roadgen-buildings" }
-roadgen-mine = { path = "crates/roadgen-mine" }
 roadgen-carla = { path = "crates/roadgen-carla" }
 roadgen-opendrive = { path = "crates/roadgen-opendrive" }
 roadgen-lanelet2 = { path = "crates/roadgen-lanelet2" }

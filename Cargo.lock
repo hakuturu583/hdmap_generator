@@ -1375,7 +1375,6 @@ dependencies = [
  "roadgen-core",
  "roadgen-gpudrive",
  "roadgen-lanelet2",
- "roadgen-mine",
  "roadgen-opendrive",
  "roadgen-osm",
  "roadgen-sumo",
@@ -1396,14 +1395,6 @@ dependencies = [
  "ll2-routing",
  "ll2-traffic-rules",
  "roadgen-core",
-]
-
-[[package]]
-name = "roadgen-mine"
-version = "0.18.0"
-dependencies = [
- "roadgen-core",
- "spade",
 ]
 
 [[package]]
@@ -1439,7 +1430,6 @@ dependencies = [
  "roadgen-core",
  "roadgen-gpudrive",
  "roadgen-lanelet2",
- "roadgen-mine",
  "roadgen-opendrive",
  "roadgen-osm",
  "roadgen-sumo",

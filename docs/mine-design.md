@@ -13,7 +13,8 @@
 | 土手: `MapObjectKind::Barrier { kind, height }` | `crates/roadgen-core/src/semantics.rs` |
 | 検証（TIN の折り返し、折れ線が TIN の辺に乗っているか、参照の双方向性） | `crates/roadgen-core/src/validation.rs` |
 | IR ダンプ（新しい地物は空なら出力しない＝既存の地図の fingerprint は不変） | `crates/roadgen-trace/src/ir.rs` |
-| 生成器 | `crates/roadgen-mine` |
+| 環境の切り替え: `Environment::{Urban, Mine}` / `lay_out` / `generate` | `crates/roadgen-carla/src/environment/mod.rs` |
+| 鉱山の生成 | `crates/roadgen-carla/src/environment/mine/` |
 | CARLA: 地形を TIN から構築、砂利・岩の材質、土手のメッシュ | `crates/roadgen-carla/src/{ground,terrain,barriers}.rs` |
 | OpenDRIVE: `<lane><material>`（書き出しと読み戻し）、`<object type="barrier">` + `<repeat>` | `crates/roadgen-opendrive` |
 | OpenStreetMap: `surface=*`、`landuse=quarry` / `man_made=spoil_heap` の面、`barrier` の way | `crates/roadgen-osm` |
@@ -27,9 +28,9 @@ CARLA の出力は「道路網から、その見た目を作る」設計で、�
 露天掘り鉱山では地形そのものが環境の本体である（ベンチ、ランプ、ズリ山、貯鉱山）。そこで、
 
 - IR が **地形を「述べられるもの」として持てる** ようにし、
-- それを埋める **生成器** を、建物と同じく別クレートとして足した。
+- それを埋める **生成処理** を、CARLA アセット生成の **環境の分岐** として `roadgen-carla` の中に足した（`Environment::Urban` が市街地＝建物、`Environment::Mine` が鉱山）。環境ごとにクレートを分けない。
 
-出力処理は IR を読むだけの薄い層のままにしてある。
+生成処理は IR だけを書き、パッケージは環境によらず同じ出力処理で書く。生成結果は IR に入るので、CARLA 以外の形式にも届く。
 
 ## 2. IR の設計 — GDF 5.1 の考え方に寄せる
 
@@ -67,16 +68,16 @@ IR は GDF 5.1 から「考え方だけ」を借りている（README の Design
 
 GDF でどのテーマに属するか（Road Furniture か Structures か）は本文で確認できていない。既存の道路付属物モデル（種類・幾何・関係する車線）に収まるので、ここに置いた。
 
-## 3. 生成 — `roadgen-mine`
+## 3. 生成 — `roadgen_carla::environment::mine`
 
 ```
-MineSpec + seed
+Environment::Mine(MineSpec + seed)
    │
-lay_out(&mut MapBuilder)      ランプ・運搬路・交差点（道路は builder に追加）
+environment::lay_out(&mut MapBuilder)      ランプ・運搬路・交差点（道路は builder に追加）
    │
 MapBuilder::finish()
    │
-generate(&mut UnvalidatedMap) 地形 TIN と折れ線・土地被覆・土手・Site
+environment::generate(&mut UnvalidatedMap) 地形 TIN と折れ線・土地被覆・土手・Site
    │
 validate()
 ```
@@ -103,7 +104,25 @@ validate()
 | Lanelet2 | 出力しない | 出力しない | 出力しない | `type=road_border` の linestring |
 | SUMO / ClipGT / GPUDrive | 出力しない | 出力しない | 出力しない | 出力しない |
 
-## 5. 既知の制約・今後
+## 5. IR にあるものはすべてアセットに出す
+
+環境（市街地・鉱山）によらず、CARLA アセットは IR から作る。鉱山マップに利用者が足した道路（歩道・縁石付きなど）も、他の道路と同じに描かれる。
+
+| IR | CARLA アセット |
+| --- | --- |
+| 車線（全種別）・幅・横断勾配 | 路面・歩道・縁石・側溝のメッシュ |
+| 車線の高さ `LaneHeight` | 測点ごとにその高さで描く（以前は歩道を設定の縁石高さで一律に上げていた。IR が平らな歩道だけ、従来どおり設定値を使う） |
+| 区画線 | 塗装メッシュ（持ち上がった車線の上に載る） |
+| 舗装 `Road.pavement` | 舗装の種類ごとの材質（アスファルト・コンクリート・石畳・砂利・土・砂・岩）。道路の途中で変わる所には断面を挿入し、そこで材質を切り替える |
+| 信号・標識 / 停止線・横断歩道 | 小物（props）/ 塗装 |
+| 土手 `Barrier` | 種類ごとの形：berm 等は安息角の斜面（砂利）、wall はコンクリートの直立壁、それ以外は鋼の直立体 |
+| 建物 | 地図の FBX 内・props・出力しない（設定） |
+| 地形 TIN と折れ線 | 地面（折れ線を辺として保持） |
+| 土地被覆 | 地面の材質（外形を制約線に入れて境界を揃える） |
+
+鉱山の地形 TIN は、鉱山自身の道路だけでなく **マップ上のすべての道路** の縁を折れ線として取り込む。ベンチの線や周辺の格子点は、どの道路からも離して置く。だから後から足した道路も地形と頂点単位で一致する。
+
+## 6. 既知の制約・今後
 
 - 1 鉱山 1 ピット、ランプは螺旋 1 本。スイッチバック、複数ピット、坑内掘りは対象外。
 - ベンチ線をランプ付近で切り取った端で、細い三角形の切れ込みが出ることがある。

@@ -353,7 +353,48 @@ pub const MATERIALS: &[Material] = &[
             scale: 12.0,
         }),
     },
+    // The other surfaces a road can be made of. Colours only: what they look like
+    // is said, and a photograph can be put on them in the editor.
+    Material {
+        name: "M_Road_Concrete",
+        color: [0.60, 0.60, 0.58],
+        roughness: 0.8,
+        texture: None,
+    },
+    Material {
+        name: "M_Road_Cobblestone",
+        color: [0.42, 0.40, 0.38],
+        roughness: 0.85,
+        texture: None,
+    },
+    Material {
+        name: "M_Road_Dirt",
+        color: [0.42, 0.33, 0.24],
+        roughness: 0.95,
+        texture: None,
+    },
+    Material {
+        name: "M_Road_Sand",
+        color: [0.76, 0.68, 0.50],
+        roughness: 0.95,
+        texture: None,
+    },
 ];
+
+/// The material a road surfaced with `pavement` is drawn in; asphalt when nobody
+/// said.
+pub fn road(pavement: Option<roadgen_core::semantics::Pavement>) -> usize {
+    use roadgen_core::semantics::{PavedSurface, Pavement, UnpavedSurface};
+    match pavement {
+        None | Some(Pavement::Paved(PavedSurface::Asphalt)) => ASPHALT,
+        Some(Pavement::Paved(PavedSurface::Concrete)) => ROAD_CONCRETE,
+        Some(Pavement::Paved(PavedSurface::Cobblestone)) => COBBLESTONE,
+        Some(Pavement::Unpaved(UnpavedSurface::Gravel)) => GRAVEL,
+        Some(Pavement::Unpaved(UnpavedSurface::Dirt)) => DIRT,
+        Some(Pavement::Unpaved(UnpavedSurface::Sand)) => SAND,
+        Some(Pavement::Unpaved(UnpavedSurface::Rock)) => ROCK,
+    }
+}
 
 pub const ASPHALT: usize = 0;
 pub const MARKING_WHITE: usize = 1;
@@ -377,6 +418,10 @@ pub const PLATE_WHITE: usize = 18;
 pub const PLATE_BLUE: usize = 19;
 pub const GRAVEL: usize = 20;
 pub const ROCK: usize = 21;
+pub const ROAD_CONCRETE: usize = 22;
+pub const COBBLESTONE: usize = 23;
+pub const DIRT: usize = 24;
+pub const SAND: usize = 25;
 
 /// One texture file the package expects, and where it comes from.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

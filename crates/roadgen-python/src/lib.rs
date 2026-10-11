@@ -30,6 +30,7 @@ use roadgen_core::units::{GeoOrigin, PositiveWidth, SpeedLimit};
 use roadgen_core::validation::{UnvalidatedMap, ValidatedMap};
 
 use roadgen_buildings::Rules as BuildingRules;
+use roadgen_carla::environment::{self, mine, Environment};
 
 mod trace;
 
@@ -464,9 +465,11 @@ pub struct PyMap {
     /// Held rather than applied, because a lot is cut out of generated geometry and
     /// there is none until the map is built.
     buildings: Option<BuildingRules>,
-    /// The mines laid out on the builder, whose land is generated once the roads
-    /// are: the land is built round the roads' generated edges.
-    mines: Vec<roadgen_mine::Plan>,
+    /// The places laid out on the builder — a mine, say — whose land is generated
+    /// once the roads are, because it is built round the roads' generated edges.
+    /// A town's buildings are the same kind of thing, held in `buildings` so that
+    /// they can be switched off again.
+    environments: Vec<roadgen_carla::environment::Plan>,
 }
 
 /// Where a map comes from: the builder its roads are added to, or a file it was
@@ -532,7 +535,7 @@ impl PyMap {
             built: None,
             fingerprint: None,
             buildings: None,
-            mines: Vec::new(),
+            environments: Vec::new(),
         })
     }
 
@@ -1724,23 +1727,22 @@ impl PyMap {
         relief: f64,
         seed: u64,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let defaults = roadgen_mine::MineSpec::default();
-        let heap =
-            |given: Option<(f64, f64, f64, f64)>, default: roadgen_mine::HeapSpec| match given {
-                Some((bearing, distance, radius, height)) => roadgen_mine::HeapSpec {
-                    bearing,
-                    distance,
-                    radius,
-                    height,
-                    ..default
-                },
-                None => default,
-            };
-        let spec = roadgen_mine::MineSpec {
+        let defaults = mine::MineSpec::default();
+        let heap = |given: Option<(f64, f64, f64, f64)>, default: mine::HeapSpec| match given {
+            Some((bearing, distance, radius, height)) => mine::HeapSpec {
+                bearing,
+                distance,
+                radius,
+                height,
+                ..default
+            },
+            None => default,
+        };
+        let spec = mine::MineSpec {
             name: name.to_owned(),
             centre: point(centre),
             heading: heading.to_radians(),
-            pit: roadgen_mine::PitSpec {
+            pit: mine::PitSpec {
                 floor_length: floor.0,
                 floor_width: floor.1,
                 benches,
@@ -1748,12 +1750,12 @@ impl PyMap {
                 bench_width,
                 face_angle,
             },
-            ramp: roadgen_mine::RampSpec {
+            ramp: mine::RampSpec {
                 grade: ramp_grade,
                 start: ramp_start,
                 clockwise,
             },
-            haul_road: roadgen_mine::HaulRoadSpec {
+            haul_road: mine::HaulRoadSpec {
                 lane_width,
                 shoulder_width,
                 berm_height,
@@ -1763,7 +1765,7 @@ impl PyMap {
             },
             waste_dump: heap(waste_dump, defaults.waste_dump.clone()),
             stockpile: heap(stockpile, defaults.stockpile.clone()),
-            ground: roadgen_mine::GroundSpec {
+            ground: mine::GroundSpec {
                 margin: ground_margin,
                 cell: ground_cell,
                 relief,
@@ -1771,20 +1773,24 @@ impl PyMap {
             },
             seed,
         };
-        let plan = roadgen_mine::lay_out(self.builder_mut()?, &spec).map_err(value_error)?;
+        let plan = environment::lay_out(self.builder_mut()?, &Environment::Mine(Box::new(spec)))
+            .map_err(value_error)?;
+        let environment::Plan::Mine(mine) = &plan else {
+            unreachable!("a mine lays out as a mine");
+        };
         self.invalidate();
         let result = PyDict::new(py);
-        result.set_item("site", plan.site.to_string())?;
-        result.set_item("ramp", plan.ramp.to_string())?;
+        result.set_item("site", mine.site.to_string())?;
+        result.set_item("ramp", mine.ramp.to_string())?;
         result.set_item(
             "haul_roads",
-            plan.haul_roads
+            mine.haul_roads
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
         )?;
-        result.set_item("junction", plan.hub.to_string())?;
-        self.mines.push(plan);
+        result.set_item("junction", mine.hub.to_string())?;
+        self.environments.push(plan);
         Ok(result)
     }
 
@@ -2080,11 +2086,12 @@ impl PyMap {
         // After the roads and before validation, which is the only moment buildings
         // can be generated: a lot is measured against generated geometry, and
         // validation has something to say about what comes out.
-        for plan in &self.mines {
-            roadgen_mine::generate(&mut map, plan).map_err(value_error)?;
+        for plan in &self.environments {
+            environment::generate(&mut map, plan).map_err(value_error)?;
         }
         if let Some(rules) = &self.buildings {
-            roadgen_buildings::generate(&mut map, rules).map_err(value_error)?;
+            environment::generate(&mut map, &environment::Plan::Urban(rules.clone()))
+                .map_err(value_error)?;
         }
         Ok(map)
     }
@@ -2297,7 +2304,7 @@ fn read_opendrive(
         built: None,
         fingerprint: None,
         buildings: None,
-        mines: Vec::new(),
+        environments: Vec::new(),
     })
 }
 

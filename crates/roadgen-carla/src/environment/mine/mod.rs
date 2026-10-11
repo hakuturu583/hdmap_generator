@@ -1,9 +1,10 @@
-//! `roadgen-mine` — an open-pit mine, generated.
+//! An open-pit mine: the [`Mine`](super::Environment::Mine) branch of a CARLA map's
+//! environment.
 //!
-//! Like `roadgen-buildings` this is a *generator*: it reads a description and fills
-//! the IR, and no file format is mentioned anywhere in it. What it fills is the part
-//! of the IR a road network alone leaves empty — the shape of the land, what the land
-//! is, and the place they add up to — and the roads that the place needs.
+//! What it fills is the part of the IR a road network alone leaves empty — the shape
+//! of the land, what the land is, and the place they add up to — and the roads that
+//! the place needs. It writes no file: the package is written from the IR like any
+//! other map's, and so is every other format.
 //!
 //! ```text
 //!   MineSpec + seed
@@ -68,8 +69,8 @@ use roadgen_core::topology::{Direction, LateralSide, RoadEnd};
 use roadgen_core::units::{PositiveWidth, SpeedLimit};
 use roadgen_core::validation::UnvalidatedMap;
 
-use crate::geometry::{polyline_distance, ring_contains, smoothstep, Ellipse, Frame, SegmentIndex};
-use crate::tin::Constraint;
+use self::geometry::{polyline_distance, ring_contains, smoothstep, Ellipse, Frame, SegmentIndex};
+use self::tin::Constraint;
 
 /// The pit: its floor, and the benches stepped up from it to the rim.
 #[derive(Debug, Clone, PartialEq)]
@@ -298,6 +299,13 @@ pub struct Plan {
     pub haul_roads: Vec<RoadId>,
     pub hub: JunctionId,
     layout: Layout,
+}
+
+impl Plan {
+    /// The roads the mine laid out: the ramp, then the haul roads.
+    pub fn roads(&self) -> impl Iterator<Item = &RoadId> {
+        std::iter::once(&self.ramp).chain(&self.haul_roads)
+    }
 }
 
 /// What generating the land came to.
@@ -754,48 +762,73 @@ pub fn generate(map: &mut UnvalidatedMap, plan: &Plan) -> Result<Report, Error> 
     }
 
     let spacing = spec.ground.spacing;
-    let half = spec.haul_road.half_width();
-    let roads: Vec<RoadId> = std::iter::once(plan.ramp.clone())
-        .chain(plan.haul_roads.iter().cloned())
-        .collect();
-
-    // The roads as the land sees them: their edges, and their centre lines for
-    // keeping the land's own lines clear of them.
-    let mut corridors: Vec<Vec<[f64; 2]>> = Vec::new();
+    // Every road on the map, not only the mine's own: the land has to meet whatever
+    // the map holds — a road the caller laid beside the mine, with a pavement on it,
+    // is as much a road the ground runs up to. Each through road's edges become
+    // breaklines of the land; a junction's movements overlap one another and add no
+    // edge of their own, but nothing of the land is put inside them either.
+    let mut rails = SegmentIndex::new(20.0);
+    let mut outlines: Vec<([f64; 4], Vec<[f64; 2]>)> = Vec::new();
     let mut constraints: Vec<Constraint> = Vec::new();
     {
         let source = map.as_map();
-        for road in &roads {
-            let entry = source.road(road).ok_or_else(|| {
-                Error::Spec(format!(
+        for road in plan.roads() {
+            if source.road(road).is_none() {
+                return Err(Error::Spec(format!(
                     "{road} is not on the map: lay the mine out on its builder"
-                ))
-            })?;
-            corridors.push(plan_of(
-                entry
-                    .reference_line
-                    .to_polyline(source.metadata.sampling)?
-                    .points(),
-            ));
-            let (left, right) = road_edges(source, road)?;
+                )));
+            }
+        }
+        for road in source.roads.iter() {
+            let (left, right) = road_edges(source, &road.id)?;
+            if left.len() < 2 || right.len() < 2 {
+                continue;
+            }
+            let ring: Vec<[f64; 2]> = plan_of(&left)
+                .into_iter()
+                .chain(plan_of(&right).into_iter().rev())
+                .collect();
+            let bounds = ring.iter().fold(
+                [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ],
+                |b, p| {
+                    [
+                        b[0].min(p[0]),
+                        b[1].min(p[1]),
+                        b[2].max(p[0]),
+                        b[3].max(p[1]),
+                    ]
+                },
+            );
+            outlines.push((bounds, ring));
+            if road.is_connector() {
+                continue;
+            }
             for (side, points) in [("left", left), ("right", right)] {
+                rails.insert_polyline(&plan_of(&points));
                 constraints.push(Constraint {
                     kind: "road_edge".into(),
-                    key: format!("road/{}/{side}", road.local_name()),
+                    key: format!("road/{}/{side}", road.id.local_name()),
                     points,
                     closed: false,
                 });
             }
         }
     }
-    let mut roads_index = SegmentIndex::new(half + 20.0);
-    for corridor in &corridors {
-        roads_index.insert_polyline(corridor);
-    }
-    let clear = half + ROAD_CLEARANCE;
+    // Within `reach` of a road's edge, or on a road.
     let near_road = |p: [f64; 2], reach: f64| {
-        roads_index.distance_within(p, reach).is_some()
-            || (p[0] - layout.hub[0]).hypot(p[1] - layout.hub[1]) < HUB_RADIUS + reach
+        rails.distance_within(p, reach).is_some()
+            || outlines.iter().any(|(b, ring)| {
+                p[0] >= b[0]
+                    && p[0] <= b[2]
+                    && p[1] >= b[1]
+                    && p[1] <= b[3]
+                    && ring_contains(ring, p)
+            })
     };
 
     // Each ring of the pit, cut where the ramp passes through it.
@@ -828,7 +861,10 @@ pub fn generate(map: &mut UnvalidatedMap, plan: &Plan) -> Result<Report, Error> 
         ));
     }
     for (key, kind, ring) in rings {
-        let kept: Vec<bool> = ring.iter().map(|p| !near_road([p.x, p.y], clear)).collect();
+        let kept: Vec<bool> = ring
+            .iter()
+            .map(|p| !near_road([p.x, p.y], ROAD_CLEARANCE))
+            .collect();
         if kept.iter().all(|&ok| ok) {
             constraints.push(Constraint {
                 kind: kind.into(),
@@ -889,8 +925,8 @@ pub fn generate(map: &mut UnvalidatedMap, plan: &Plan) -> Result<Report, Error> 
     let mut closed_pad = pad_ring.clone();
     closed_pad.push(pad_ring[0]);
     features.insert_polyline(&closed_pad);
-    for corridor in &corridors {
-        features.insert_polyline(corridor);
+    for constraint in constraints.iter().filter(|c| c.kind == "road_edge") {
+        features.insert_polyline(&plan_of(&constraint.points));
     }
     let heap_rings: Vec<Vec<[f64; 2]>> = layout
         .heaps
@@ -902,7 +938,7 @@ pub fn generate(map: &mut UnvalidatedMap, plan: &Plan) -> Result<Report, Error> 
         closed.push(ring[0]);
         features.insert_polyline(&closed);
     }
-    let (quiet, rolling) = (half + 20.0, half + 140.0);
+    let (quiet, rolling) = (20.0, 140.0);
     let ground = |x: f64, y: f64| -> f64 {
         let distance = features.distance_within([x, y], rolling).unwrap_or(rolling);
         let inside_pad = ring_contains(&pad_ring, [x, y]);
@@ -946,7 +982,7 @@ pub fn generate(map: &mut UnvalidatedMap, plan: &Plan) -> Result<Report, Error> 
             let p = [x0 + cell * i as f64, y0 + cell * j as f64];
             if ring_contains(&rim_ring, p)
                 || heap_rings.iter().any(|ring| ring_contains(ring, p))
-                || near_road(p, half + cell * 0.5)
+                || near_road(p, cell * 0.5)
                 || !off_lines(p, cell * 0.45)
             {
                 continue;
@@ -981,7 +1017,7 @@ pub fn generate(map: &mut UnvalidatedMap, plan: &Plan) -> Result<Report, Error> 
                 let p = [x, y];
                 if ring_contains(&ring, p)
                     && polyline_distance(p, &ring) > step * 0.45
-                    && !near_road(p, half + step * 0.5)
+                    && !near_road(p, step * 0.5)
                     && off_lines(p, step * 0.45)
                 {
                     free.push(Point3::new(x, y, z));
@@ -1110,7 +1146,7 @@ pub fn generate(map: &mut UnvalidatedMap, plan: &Plan) -> Result<Report, Error> 
         report.berms += 1;
     }
 
-    let mut site_roads = roads.clone();
+    let mut site_roads: Vec<RoadId> = plan.roads().cloned().collect();
     if let Some(junction) = target.junction(&plan.hub) {
         site_roads.extend(junction.connecting_roads.iter().cloned());
     }
