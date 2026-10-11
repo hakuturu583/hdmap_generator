@@ -379,6 +379,51 @@ fn carla_draws_the_decks_piers_and_tunnels() {
 }
 
 #[test]
+fn the_land_beside_the_motorway_is_no_strip_of_slivers() {
+    // A sliver: a triangle whose height over its longest side is under a tenth of
+    // that side. Where the road's edge and the slope's toe beside it had two
+    // vertices a hand's breadth apart, every triangle on the pair was one.
+    let sliver = |corners: [Point3; 3]| {
+        let longest = (0..3)
+            .map(|k| corners[k].horizontal_distance_to(corners[(k + 1) % 3]))
+            .fold(0.0, f64::max);
+        let [a, b, c] = corners;
+        let area = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() / 2.0;
+        2.0 * area / longest < 0.1 * longest
+    };
+    let map = highway();
+    let land = map.tin_surfaces.iter().next().expect("land");
+    let nodes = land.tin.nodes();
+    let slivers = land
+        .tin
+        .triangles()
+        .iter()
+        .filter(|triangle| sliver(triangle.map(|i| nodes[i as usize])))
+        .count();
+    let triangles = land.tin.triangles().len();
+    assert!(
+        slivers * 1000 < triangles,
+        "{slivers} of the land's {triangles} triangles are slivers"
+    );
+    // And CARLA's ground, which is the land re-triangulated round the roads.
+    let meshes = roadgen_carla::to_meshes(map, &PackageConfig::new("Expressway"));
+    let ground = meshes
+        .iter()
+        .find(|mesh| mesh.role == Role::Terrain && mesh.materials.contains(&materials::GRASS))
+        .expect("land");
+    let slivers = ground
+        .triangles
+        .iter()
+        .filter(|triangle| sliver(triangle.map(|i| ground.positions[i as usize])))
+        .count();
+    let triangles = ground.triangles.len();
+    assert!(
+        slivers * 1000 < triangles,
+        "{slivers} of the ground's {triangles} triangles are slivers"
+    );
+}
+
+#[test]
 fn every_building_stands_on_the_land_on_a_foundation_where_it_falls_away() {
     let map = highway();
     let tin = map.tin_surfaces.iter().next().expect("land").tin.locator();

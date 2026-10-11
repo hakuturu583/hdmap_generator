@@ -117,6 +117,19 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
     // out from every road's edge, so it needs every edge before it can start.
     let mut land = crate::terrain::Land::default();
     let spacing = ground_spacing(map, config);
+    // A land the map states meets its roads already — their edges are breaklines
+    // of it — so a road has no verge to slope down to it, and no toe: a line of
+    // points a verge out, at the land's heights, would only stand among the land's
+    // own nodes, a hand's breadth from its toes and crests, every triangle between
+    // them a sliver.
+    let layout_config = SurfaceConfig {
+        verge_width: if map.tin_surfaces.is_empty() {
+            config.verge_width
+        } else {
+            0.0
+        },
+        ..*config
+    };
     let all_rungs: Vec<Option<Vec<Rung>>> = map
         .roads
         .iter()
@@ -132,7 +145,7 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             .as_ref()
             .and_then(|junction| centres.get(junction).copied());
         for section in 0..road.sections.len() {
-            let Some(layout) = Layout::of(map, road, section, config) else {
+            let Some(layout) = Layout::of(map, road, section, &layout_config) else {
                 continue;
             };
             // Every rung of the section, with its cuts worked out once: every band,
@@ -391,6 +404,53 @@ fn rungs(map: &Map, road: &Road, spacing: Option<f64>) -> Option<Vec<Rung>> {
         samples.extend(between);
         samples.sort_by(|a, b| a.station.total_cmp(&b.station));
     }
+    // Two rungs nearer each other than the land keeps two vertices of one line are
+    // one: the curve's own sample a hand's breadth from one a width's taper asked
+    // for is a strip of road too short to change across, and every land triangle
+    // on its edge a sliver. Not where something does change, though — a section,
+    // a structure's end, the pavement, a lane's width or height — and not within that of either end of the
+    // road, where its outline meets the next road's: moved there, the two cross
+    // so nearly along each other that the land's triangulation cannot split them.
+    let fixed: Vec<f64> = road
+        .sections
+        .iter()
+        .map(|section| section.station)
+        .chain(
+            road.structure
+                .spans()
+                .iter()
+                .flat_map(|span| [span.from, span.to]),
+        )
+        .chain(road.pavement.spans().iter().map(|&(station, _)| station))
+        .chain(map.lanes_of(&road.id).into_iter().flat_map(|lane| {
+            lane.width
+                .knots()
+                .iter()
+                .map(|knot| knot.0)
+                .chain(lane.height.knots().iter().map(|knot| knot.0))
+                .collect::<Vec<_>>()
+        }))
+        .collect();
+    let is_fixed = |station: f64| fixed.iter().any(|&at| (at - station).abs() < 1e-6);
+    let closest = crate::environment::tin::CLOSEST;
+    let mut kept: Vec<roadgen_core::geometry::Sample> = Vec::with_capacity(samples.len());
+    for sample in samples {
+        let station = sample.station;
+        match kept.last_mut() {
+            Some(previous)
+                if station - previous.station < closest
+                    && station > first + closest
+                    && station < last - closest
+                    && !(is_fixed(previous.station) && is_fixed(station)) =>
+            {
+                if is_fixed(station) {
+                    *previous = sample;
+                }
+            }
+            _ => kept.push(sample),
+        }
+    }
+    let samples = kept;
     let mut rungs = Vec::with_capacity(samples.len());
     for sample in samples {
         let Ok(frame) = sample.frame() else {
@@ -903,7 +963,8 @@ impl<'a> Layout<'a> {
     ///
     /// Each side's flank is the outermost surfaced band's edge — a `none` lane
     /// carries no surface, so the land starts where the surface does — with the
-    /// verge's toe `verge_width` out from it on a side that has land. `facing` is
+    /// verge's toe `verge_width` out from it on a side that has land, and no toe
+    /// for a verge of no width. `facing` is
     /// where the junction this road runs through is, if it runs through one. A road
     /// in a junction has land on one side of it at most, the side that faces away
     /// from the junction; the other side has the junction's other roads, and a
@@ -966,7 +1027,7 @@ impl<'a> Layout<'a> {
                     0.0
                 };
                 rail.push(cross.rung.at(edge, rail_rise));
-                if land[side] {
+                if land[side] && width > 0.0 {
                     toe.push(cross.rung.at(edge + sign * width, 0.0));
                 }
             }
@@ -1318,6 +1379,43 @@ mod tests {
         stations.sort_by(f64::total_cmp);
         stations.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
         stations
+    }
+
+    #[test]
+    fn a_taper_shorter_than_the_land_keeps_two_vertices_apart_still_ends_where_it_says() {
+        // Rungs a hand's breadth apart are one, but not the two ends of a lane's
+        // width changing: the road would widen to the next rung instead.
+        use roadgen_core::prelude::*;
+        let taper = WidthProfile::tapered(
+            100.0,
+            0.6,
+            PositiveWidth::new(3.5).unwrap(),
+            PositiveWidth::new(4.0).unwrap(),
+            Taper::Linear,
+        )
+        .unwrap();
+        let mut builder = MapBuilder::default();
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 10.0),
+                    Point3::new(300.0, 0.0, 10.0),
+                    vec![
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward)
+                            .with_width_profile(taper),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let at = stations(&build(&map, "m", &SurfaceConfig::default()));
+        for knot in [100.0, 100.6] {
+            assert!(
+                at.iter().any(|x| (x - knot).abs() < 1e-6),
+                "no rung at {knot}: {at:?}"
+            );
+        }
     }
 
     #[test]
