@@ -383,11 +383,30 @@ struct Roads {
     rails: Segments,
     outlines: Vec<([f64; 4], Vec<PlanPoint>)>,
     edges: Vec<Constraint>,
+    /// The longest an edge's segment is left: a straight road's edge is two
+    /// points, and the land beside it a fan of triangles its length unless the
+    /// edge has points as close as the country's own.
+    spacing: f64,
+}
+
+/// `points` with every segment longer than `spacing` split evenly along it.
+fn split(points: &[Point3], spacing: f64) -> Vec<Point3> {
+    let mut out = Vec::with_capacity(points.len());
+    for pair in points.windows(2) {
+        out.push(pair[0]);
+        let pieces = (pair[0].horizontal_distance_to(pair[1]) / spacing).ceil() as usize;
+        for k in 1..pieces {
+            out.push(pair[0].lerp(pair[1], k as f64 / pieces as f64));
+        }
+    }
+    out.extend(points.last());
+    out
 }
 
 impl Roads {
-    fn of(map: &Map) -> Roads {
+    fn of(map: &Map, spacing: f64) -> Roads {
         let mut roads = Roads {
+            spacing,
             rails: Segments::new(20.0),
             outlines: Vec::new(),
             edges: Vec::new(),
@@ -426,6 +445,7 @@ impl Roads {
         }
         let name = road.id.local_name();
         for (side, points) in [("left", left), ("right", right)] {
+            let points = split(&points, self.spacing);
             self.rails.insert_polyline(&plan_of(&points));
             self.edges.push(Constraint {
                 kind: "road_edge".into(),
@@ -574,7 +594,7 @@ pub fn generate(
     }
     let ground = &land.ground;
     let source = map.as_map();
-    let roads = Roads::of(source);
+    let roads = Roads::of(source, land.ground.cell);
 
     let Landforms {
         lines,
