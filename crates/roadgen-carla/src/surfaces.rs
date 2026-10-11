@@ -116,7 +116,12 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
     // The roads first, then the land round them: the land is one surface built
     // out from every road's edge, so it needs every edge before it can start.
     let mut land = crate::terrain::Land::default();
-    let all_rungs: Vec<Option<Vec<Rung>>> = map.roads.iter().map(|road| rungs(map, road)).collect();
+    let spacing = ground_spacing(map, config);
+    let all_rungs: Vec<Option<Vec<Rung>>> = map
+        .roads
+        .iter()
+        .map(|road| rungs(map, road, spacing))
+        .collect();
     let centres = junction_centres(map, &all_rungs);
     for (road, rungs) in map.roads.iter().zip(&all_rungs) {
         let Some(rungs) = rungs else {
@@ -288,16 +293,48 @@ struct Cross<'a> {
     cuts: Vec<f64>,
 }
 
+/// How far apart the ground's own points are beside the roads, metres: the
+/// spacing the land wants a road's edge met at. `None` when there is no ground past
+/// the verges to meet it.
+///
+/// A generated ground is a grid of `ground_cell`. A stated one is whatever the map
+/// says, and what it says beside a road is its road-edge breaklines, which the
+/// generator splits to its own grid's spacing.
+fn ground_spacing(map: &Map, config: &SurfaceConfig) -> Option<f64> {
+    if !map.tin_surfaces.is_empty() {
+        let stated = map
+            .tin_breaklines
+            .iter()
+            .filter(|line| line.kind == "road_edge")
+            .flat_map(|line| line.line.points().windows(2))
+            .map(|pair| pair[0].horizontal_distance_to(pair[1]))
+            .fold(0.0, f64::max);
+        let spacing = if stated > 1e-6 {
+            stated
+        } else {
+            config.ground_cell
+        };
+        return (spacing > 0.0).then_some(spacing);
+    }
+    (config.ground_extent > 0.0 && config.ground_cell > 0.0).then_some(config.ground_cell)
+}
+
+/// How many of the ground's cells apart two rungs are along a straight stretch. The
+/// land's triangles beside the road then reach a cell out to the ground's points
+/// and two along, which is no sliver; a rung every cell is half as many rungs
+/// again on every road, for land triangles that are shorter but no fewer of them
+/// thin.
+const CELLS_PER_RUNG: f64 = 2.0;
+
 /// Every station a road is sampled at, with its banked frame.
 ///
 /// The frame's own lateral is the right one at every station, the ends included:
 /// two roads that meet are tangent-continuous by the time they are built — a corner
 /// between them is rounded into an arc — so a cut perpendicular to one is
 /// perpendicular to the other, and the two surfaces end on the same line.
-/// The farthest apart two rungs of a road are, metres.
-const RUNG_SPACING: f64 = 20.0;
-
-fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
+///
+/// `spacing` is the ground's, from [`ground_spacing`].
+fn rungs(map: &Map, road: &Road, spacing: Option<f64>) -> Option<Vec<Rung>> {
     let mut samples = map.vertex_samples(&road.id).ok()?;
     // A rung wherever the pavement changes, too, so that the surface can change
     // material there rather than at the next vertex, which on a straight road is
@@ -319,16 +356,29 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
         }
     }
     samples.sort_by(|a, b| a.station.total_cmp(&b.station));
-    // And a rung every `RUNG_SPACING` along a long straight stretch, which has
-    // vertices only at its ends: the land meets the road rung for rung, and a
-    // street hundreds of metres long met at its two ends alone is a fan of
-    // triangles that long beside it.
+    // And a rung every `CELLS_PER_RUNG` of the ground's cells along a long
+    // straight stretch, which has vertices only at its ends: the land meets the
+    // road rung for rung, and a street hundreds of metres long met at its two
+    // ends alone is a fan of triangles that long beside it, out to the ground's
+    // points. Only where the land does meet it, though — every rung is a dozen
+    // triangles across the road, and a deck, a tunnel, a movement through a
+    // junction on a viaduct and a map with no ground past its verges have no
+    // ground beside them to fan out to.
+    let spacing = spacing.filter(|_| !roadgen_core::structure::connector_carried(map, road));
     let mut between = Vec::new();
     for pair in samples.windows(2) {
-        let gap = pair[1].station - pair[0].station;
-        let extra = (gap / RUNG_SPACING).ceil() as usize;
+        let Some(spacing) = spacing else {
+            break;
+        };
+        // A structure's ends are vertices already, so a stretch is on one
+        // throughout or not at all.
+        let (from, to) = (pair[0].station, pair[1].station);
+        if road.structure.carries_strictly(0.5 * (from + to)) {
+            continue;
+        }
+        let extra = ((to - from) / (CELLS_PER_RUNG * spacing)).ceil() as usize;
         for k in 1..extra {
-            let station = pair[0].station + gap * k as f64 / extra as f64;
+            let station = from + (to - from) * k as f64 / extra as f64;
             if let Ok(sample) = road
                 .reference_line
                 .sample_at(station, map.metadata.sampling)
@@ -1227,6 +1277,80 @@ mod tests {
             builder.connect_via(&junction, from, to).unwrap();
         }
         builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// A straight road 300 m long, on a bridge from 100 m to 200 m if `bridged`.
+    fn straight(bridged: bool) -> roadgen_core::validation::ValidatedMap {
+        use roadgen_core::prelude::*;
+        use roadgen_core::structure::BridgeSpec;
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 10.0),
+                    Point3::new(300.0, 0.0, 10.0),
+                    vec![LaneSpec::new(
+                        PositiveWidth::new(3.5).unwrap(),
+                        Direction::Forward,
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        if bridged {
+            builder
+                .add_bridge(
+                    vec![roadgen_core::structure::RoadSpan::new(road, 100.0, 200.0)],
+                    BridgeSpec::default(),
+                )
+                .unwrap();
+        }
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    /// Where along the road its surface has vertices.
+    fn stations(meshes: &[Mesh]) -> Vec<f64> {
+        let mut stations: Vec<f64> = meshes
+            .iter()
+            .filter(|mesh| mesh.role == Role::Road)
+            .flat_map(|mesh| mesh.positions.iter().map(|point| point.x))
+            .collect();
+        stations.sort_by(f64::total_cmp);
+        stations.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        stations
+    }
+
+    #[test]
+    fn a_road_gets_rungs_only_where_the_ground_meets_its_edge() {
+        // A rung is a dozen triangles across the road, there for the land beside
+        // it to meet. On the ground it comes every two of the ground's cells.
+        let config = SurfaceConfig::default();
+        let gaps = |stations: &[f64]| {
+            stations
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .fold(0.0, f64::max)
+        };
+        let at_grade = stations(&build(&straight(false), "m", &config));
+        assert!(
+            gaps(&at_grade) <= 2.0 * config.ground_cell + 1e-6,
+            "{at_grade:?}"
+        );
+        // On a bridge there is no land beside it: the deck's only rungs are its ends.
+        let bridged = stations(&build(&straight(true), "m", &config));
+        let on_deck: Vec<f64> = bridged
+            .iter()
+            .copied()
+            .filter(|x| *x > 100.0 + 1e-6 && *x < 200.0 - 1e-6)
+            .collect();
+        assert!(on_deck.is_empty(), "rungs on the deck at {on_deck:?}");
+        assert!(bridged.iter().any(|x| *x > 1e-6 && *x < 100.0 - 1e-6));
+        // And with no ground past the verges there is nothing to fan out to.
+        let bare = SurfaceConfig {
+            ground_extent: 0.0,
+            ..SurfaceConfig::default()
+        };
+        assert_eq!(stations(&build(&straight(false), "m", &bare)), [0.0, 300.0]);
     }
 
     #[test]
