@@ -68,22 +68,7 @@ impl Zones {
                 .collect();
             let mut edges = Segments::new(20.0);
             edges.insert_ring(&ring);
-            let bounds = ring.iter().fold(
-                [
-                    f64::INFINITY,
-                    f64::INFINITY,
-                    f64::NEG_INFINITY,
-                    f64::NEG_INFINITY,
-                ],
-                |b, p| {
-                    [
-                        b[0].min(p[0]),
-                        b[1].min(p[1]),
-                        b[2].max(p[0]),
-                        b[3].max(p[1]),
-                    ]
-                },
-            );
+            let bounds = roadgen_core::geometry::plan::bounds(&ring);
             let mut rows = Vec::new();
             for span in &structure.carries {
                 let Some(road) = map.road(&span.road) else {
@@ -116,10 +101,6 @@ impl Zones {
             zones,
             reach: cell * 1.5,
         }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.zones.is_empty()
     }
 
     /// Every outline, for the land's extent.

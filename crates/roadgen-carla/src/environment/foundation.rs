@@ -33,12 +33,11 @@ pub fn lay(map: &mut Map, surface: &TinSurfaceId) -> Result<usize, super::land::
             .collect();
         let floor = parts
             .iter()
-            .flat_map(|part| part.solid.footprint.points())
-            .map(|p| p.z)
+            .map(|part| part.solid.footprint.lowest())
             .fold(f64::INFINITY, f64::min);
         for part in parts {
             let ring = part.solid.footprint.points();
-            let base = ring.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+            let base = part.solid.footprint.lowest();
             // Only what stands on the ground: a tower on a podium stands on the
             // podium.
             if base > floor + 0.05 {
@@ -54,7 +53,7 @@ pub fn lay(map: &mut Map, surface: &TinSurfaceId) -> Result<usize, super::land::
             if !low.is_finite() || base - low < SMALLEST {
                 continue;
             }
-            let top = ring.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+            let top = part.solid.footprint.highest();
             let footprint = Footprint::new(ring.iter().map(|p| Point3::new(p.x, p.y, low)))?;
             let key = part
                 .id

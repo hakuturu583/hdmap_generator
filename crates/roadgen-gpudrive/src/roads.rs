@@ -309,34 +309,19 @@ fn outline_along(
     let Some(road) = map.road(&span.road) else {
         return Ok(None);
     };
-    let config = map.metadata.sampling;
     let length = road.horizontal_length()?;
     let from = (span.from - CUT_REACH).max(0.0);
     let to = (span.to + CUT_REACH).min(length);
     if to <= from {
         return Ok(None);
     }
-    let steps = ((to - from) / 2.0).ceil().max(1.0) as usize;
-    let (mut left, mut right) = (Vec::new(), Vec::new());
-    for step in 0..=steps {
-        let station = from + (to - from) * step as f64 / steps as f64;
-        let Some((high, low)) = structure::road_extent(map, &span.road, station) else {
-            continue;
-        };
-        let frame = road.frame_at(station, config)?;
-        let (a, b) = (
-            frame.offset(high + CUT_MARGIN),
-            frame.offset(low - CUT_MARGIN),
-        );
-        left.push([a.x, a.y]);
-        right.push([b.x, b.y]);
-    }
-    if left.len() < 2 {
-        return Ok(None);
-    }
-    right.reverse();
-    left.extend(right);
-    Ok(Some(left))
+    Ok(structure::outline(
+        map,
+        &[RoadSpan::new(span.road.clone(), from, to)],
+        CUT_MARGIN,
+    )
+    .ok()
+    .map(|ring| ring.iter().map(|p| [p.x, p.y]).collect()))
 }
 
 /// A polyline with every stretch of it that lies inside one of `zones` taken out:

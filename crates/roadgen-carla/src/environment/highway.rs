@@ -34,9 +34,7 @@ const SHORTEST: f64 = 30.0;
 const GAP: f64 = 50.0;
 /// How far apart a road is read, metres.
 const STEP: f64 = 5.0;
-/// Clear height under a bridge over a road, and an overpass's deck, metres.
-const CLEARANCE: f64 = 4.5;
-const OVERPASS_DECK: f64 = 1.8;
+use roadgen_core::structure::{CLEARANCE, OVERPASS_DECK};
 /// A fill's and a cut's slope: metres out for every metre down or up.
 const FILL: f64 = 1.8;
 const CUT: f64 = 1.2;
@@ -89,24 +87,23 @@ pub(crate) fn choose_structures(
         if road.is_connector() {
             continue;
         }
-        let Ok(length) = road.horizontal_length() else {
+        // The road at each of its own vertices, sampled once: classified, and
+        // whether it is over water.
+        let Ok(samples) = road.reference_line.samples(map.metadata.sampling) else {
             continue;
         };
-        let count = (length / STEP).ceil().max(1.0) as usize;
-        let mut rows: Vec<(f64, f64, Class)> = Vec::with_capacity(count + 1);
-        for index in 0..=count {
-            let station = length * index as f64 / count as f64;
-            let Ok(sample) = road
-                .reference_line
-                .sample_at(station, map.metadata.sampling)
-            else {
-                continue;
-            };
-            let p = sample.point;
+        let mut rows: Vec<(f64, f64, Class)> = Vec::with_capacity(samples.len());
+        let mut wet: Vec<f64> = Vec::new();
+        for sample in samples {
+            let (station, p) = (sample.station, sample.point);
             let d = p.z - natural.height(p.x, p.y);
+            let over_water = water.iter().any(|ring| ring_contains(ring, [p.x, p.y]));
+            if over_water {
+                wet.push(station);
+            }
             let class = if road.structure.at(station).is_some() {
                 Class::Fixed
-            } else if water.iter().any(|ring| ring_contains(ring, [p.x, p.y])) || d > BRIDGE {
+            } else if over_water || d > BRIDGE {
                 Class::Bridge
             } else if d < -(deep + COVER) {
                 Class::Tunnel
@@ -115,25 +112,7 @@ pub(crate) fn choose_structures(
             };
             rows.push((station, d, class));
         }
-        let wet: Vec<(f64, bool)> = rows
-            .iter()
-            .map(|row| {
-                let dry = road
-                    .reference_line
-                    .sample_at(row.0, map.metadata.sampling)
-                    .map(|sample| {
-                        !water
-                            .iter()
-                            .any(|ring| ring_contains(ring, [sample.point.x, sample.point.y]))
-                    })
-                    .unwrap_or(true);
-                (row.0, !dry)
-            })
-            .collect();
-        let over_water = |from: f64, to: f64| {
-            wet.iter()
-                .any(|(station, wet)| *wet && *station >= from && *station <= to)
-        };
+        let over_water = |from: f64, to: f64| wet.iter().any(|s| *s >= from && *s <= to);
         for (kind, extend) in [(Class::Bridge, ABUTMENT), (Class::Tunnel, deep + PORTAL)] {
             let runs = runs_of(&rows, kind, extend);
             for (from, to) in runs {
@@ -215,32 +194,14 @@ fn runs_of(rows: &[(f64, f64, Class)], kind: Class, extend: f64) -> Vec<(f64, f6
 pub(crate) fn separate(map: &mut Map) -> Vec<String> {
     let mut notes = Vec::new();
     for crossing in structure::crossings(map) {
-        let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
-        let (upper, lower) = (upper.clone(), lower.clone());
-        let carried = map
-            .road(&upper)
-            .and_then(|road| road.structure.at(us))
-            .and_then(|id| map.structures.get(id))
-            .is_some_and(|s| s.kind.bridge().is_some())
-            || map
-                .road(&lower)
-                .and_then(|road| road.structure.at(ls))
-                .and_then(|id| map.structures.get(id))
-                .is_some_and(|s| s.kind.tunnel().is_some());
-        if carried {
+        if crossing.carried_by(map).is_some() {
             continue;
         }
+        let strict = crossing.strict(map);
+        let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
+        let (upper, lower) = (upper.clone(), lower.clone());
         let gap = uz - lz;
         if gap < OVERPASS_DECK + 0.5 {
-            let strict = [&upper, &lower].iter().any(|id| {
-                map.road(id).is_some_and(|road| {
-                    road.form.is_controlled_access()
-                        || road
-                            .structure
-                            .at(if *id == &upper { us } else { ls })
-                            .is_some()
-                })
-            });
             if strict {
                 notes.push(format!(
                     "{upper} at {us:.0} m and {lower} at {ls:.0} m cross {gap:.1} m apart: too \
@@ -256,9 +217,7 @@ pub(crate) fn separate(map: &mut Map) -> Vec<String> {
                 gap - OVERPASS_DECK
             ));
         }
-        // Over the lower road, and as far again past it as the land needs to come
-        // down from the abutments to it at a fill's slope.
-        let reach = 2.0 + (gap - OVERPASS_DECK).max(0.0) * FILL;
+        let reach = abutment_reach(gap - OVERPASS_DECK);
         let mut span = structure::span_across(map, &upper, us, &lower, ls);
         span.from = (span.from - reach).max(0.0);
         let length = map
@@ -266,18 +225,18 @@ pub(crate) fn separate(map: &mut Map) -> Vec<String> {
             .and_then(|road| road.horizontal_length().ok())
             .unwrap_or(span.to);
         span.to = (span.to + reach).min(length);
-        let spec = StructureSpec::Bridge(BridgeSpec {
-            form: BridgeForm::Overpass,
-            deck_depth: OVERPASS_DECK,
-            ..BridgeSpec::default()
-        });
+        let spec = StructureSpec::Bridge(BridgeSpec::for_form(BridgeForm::Overpass));
         if let Err(error) = structure::place(map, &[span], &spec) {
             notes.push(format!("{upper} over {lower}: no overpass: {error}"));
         }
     }
-    structure::derive_separations(map);
-    structure::refresh_interchanges(map);
     notes
+}
+
+/// How far past what it crosses a bridge reaches, for the land to come down from
+/// its abutments to the road below at a fill's slope: `height` over it.
+pub(crate) fn abutment_reach(height: f64) -> f64 {
+    2.0 + height.max(0.0) * FILL
 }
 
 /// How far a road may stand off the natural land and still have a frontage,
@@ -342,7 +301,7 @@ pub(crate) struct Earthworks {
     pub covers: Vec<(String, Vec<Point3>)>,
 }
 
-pub(crate) fn earthworks(map: &Map, roads: &[(RoadId, String)], natural: &Natural) -> Earthworks {
+pub(crate) fn earthworks(map: &Map, roads: &[RoadId], natural: &Natural) -> Earthworks {
     let mut out = Earthworks {
         lines: Vec::new(),
         holes: Vec::new(),
@@ -351,27 +310,17 @@ pub(crate) fn earthworks(map: &Map, roads: &[(RoadId, String)], natural: &Natura
     // Every road's outline, to stop a slope where it runs into another road.
     let mut edges = Segments::new(20.0);
     for road in map.roads.iter() {
-        let runs = if road.structure.is_empty() {
-            vec![super::land::road_edges(map, &road.id)]
-        } else {
-            at_grade_edges(map, road)
-        };
-        for (left, right) in runs {
+        for (left, right) in at_grade_edges(map, road) {
             edges.insert_polyline(&plan_of(&left));
             edges.insert_polyline(&plan_of(&right));
         }
     }
-    for (id, _) in roads {
+    for id in roads {
         let Some(road) = map.road(id) else { continue };
         if road.is_connector() {
             continue;
         }
-        let runs = if road.structure.is_empty() {
-            vec![super::land::road_edges(map, &road.id)]
-        } else {
-            at_grade_edges(map, road)
-        };
-        for (run, (left, right)) in runs.into_iter().enumerate() {
+        for (run, (left, right)) in at_grade_edges(map, road).into_iter().enumerate() {
             for (side, points, sign) in [("left", left, 1.0), ("right", right, -1.0)] {
                 slopes(
                     &format!("{}/{run}/{side}", id.local_name()),

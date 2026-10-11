@@ -48,10 +48,7 @@ struct Pending {
 
 impl Pending {
     fn name(&self) -> Option<&str> {
-        match &self.spec {
-            StructureSpec::Bridge(spec) => spec.name.as_deref(),
-            StructureSpec::Tunnel(spec) => spec.name.as_deref(),
-        }
+        self.spec.name()
     }
 
     fn is_bridge(&self) -> bool {
@@ -91,18 +88,19 @@ pub fn read(reader: &mut Reader<'_>) -> Result<(), ImportError> {
         let span = |s: f64, length: f64| RoadSpan::new(id.clone(), s, s + length);
         for bridge in &objects.bridge {
             let form = form_of(&bridge.additional_data);
+            let form = form
+                .and_then(BridgeForm::parse)
+                .unwrap_or(BridgeForm::Bridge);
             let spec = BridgeSpec {
                 name: name_of(&bridge.name),
-                form: form
-                    .and_then(BridgeForm::parse)
-                    .unwrap_or(BridgeForm::Bridge),
                 material: match bridge.r#type {
                     BridgeType::Concrete => StructureMaterial::Concrete,
                     BridgeType::Steel => StructureMaterial::Steel,
                     BridgeType::Brick => StructureMaterial::Masonry,
                     BridgeType::Wood => StructureMaterial::Timber,
                 },
-                ..BridgeSpec::default()
+                // An overpass's deck is a shallower one than a bridge's.
+                ..BridgeSpec::for_form(form)
             };
             if spec.name.is_none() {
                 unnamed_bridges += 1;

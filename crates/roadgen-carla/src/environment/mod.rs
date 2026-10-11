@@ -144,18 +144,7 @@ impl From<land::Error> for Error {
     }
 }
 
-/// The name made safe to put in an identifier: lower case, words joined by `_`.
-pub fn slug(name: &str) -> String {
-    let mut out = String::new();
-    for character in name.trim().chars() {
-        if character.is_ascii_alphanumeric() {
-            out.push(character.to_ascii_lowercase());
-        } else if !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    out.trim_matches('_').to_owned()
-}
+pub use roadgen_core::structure::slug;
 
 /// What the land is named: `tin/land`.
 pub const LAND: &str = "land";
@@ -406,18 +395,10 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
             &water,
         ));
         report.notes.extend(highway::separate(target));
-        let fitted: Vec<(RoadId, String)> = corridor_roads
-            .iter()
-            .cloned()
-            .chain(
-                places
-                    .fitted_roads
-                    .iter()
-                    .map(|road| (road.clone(), String::new())),
-            )
-            .collect();
-        if !fitted.is_empty() {
-            earthworks = Some(highway::earthworks(target, &fitted, &natural));
+        // Every road the land is fitted to; the movements among them are skipped,
+        // as the land does not take its slopes from a junction.
+        if !forms.floating.is_empty() {
+            earthworks = Some(highway::earthworks(target, &forms.floating, &natural));
         }
         embanked = highway::off_the_land(target, &places.fitted_roads, &natural);
     }
@@ -541,12 +522,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
                             .iter()
                             .map(|support| {
                                 let centre = support.footprint.centroid();
-                                let top = support
-                                    .footprint
-                                    .points()
-                                    .iter()
-                                    .map(|p| p.z)
-                                    .fold(f64::INFINITY, f64::min);
+                                let top = support.footprint.lowest();
                                 locator.height_at(centre.x, centre.y).map(|z| z.min(top))
                             })
                             .collect(),
@@ -640,16 +616,16 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
     }
     if let Some(works) = earthworks {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let site = places
+            .corridors
+            .first()
+            .map(|corridor| site_of(&corridor.name))
+            .transpose()?;
         for (kind, ring) in works.covers {
             // Draped on the land just built, so the outline sits on it.
             let count = counts.entry(kind.clone()).or_default();
             let cover_key = format!("{kind}/{count}");
             *count += 1;
-            let site = places
-                .corridors
-                .first()
-                .map(|corridor| site_of(&corridor.name))
-                .transpose()?;
             let id = match land::cover(
                 target,
                 LAND,
@@ -665,7 +641,7 @@ pub fn generate(map: &mut UnvalidatedMap, places: &Places) -> Result<Report, Err
                 Err(error) => return Err(error.into()),
             };
             report.land_covers += 1;
-            if let Some(site) = site {
+            if let Some(site) = &site {
                 if let Some(entry) = sites.get_mut(site.local_name()) {
                     entry.1.push(id);
                 }

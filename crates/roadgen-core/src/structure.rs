@@ -201,6 +201,9 @@ pub struct Bridge {
     pub material: StructureMaterial,
     /// From the road surface to the underside of the deck, metres.
     pub deck_depth: f64,
+    /// How far the deck reaches past the road's outer edge: the kerb its parapet
+    /// stands on, metres.
+    pub curb: f64,
     pub supports: Vec<Support>,
 }
 
@@ -225,6 +228,8 @@ pub struct Tunnel {
     /// to clear its ceiling by this much.
     pub lining: f64,
     pub lighting: bool,
+    /// The inspection walkway each side of the road, inside the bore, metres.
+    pub walkway: f64,
     pub portals: [Portal; 2],
 }
 
@@ -318,6 +323,21 @@ impl StructureProfile {
             .map(|span| &span.structure)
     }
 
+    /// Whether `station` is strictly inside a span: on a structure and not at
+    /// either end of it, where the road meets the ground.
+    pub fn carries_strictly(&self, station: f64) -> bool {
+        self.spans
+            .iter()
+            .any(|span| station > span.from + 1e-6 && station < span.to - 1e-6)
+    }
+
+    /// Whether a span begins at `station`.
+    pub fn begins_at(&self, station: f64) -> bool {
+        self.spans
+            .iter()
+            .any(|span| (station - span.from).abs() <= 1e-6)
+    }
+
     /// Adds a span, keeping them in station order. Fails, handing the span back,
     /// when it overlaps one already there.
     pub fn insert(&mut self, span: StructureSpan) -> Result<(), StructureSpan> {
@@ -388,6 +408,26 @@ pub struct BridgeSpec {
     pub site: Option<SiteId>,
 }
 
+/// The clear height a road needs under anything that crosses over it, metres.
+pub const CLEARANCE: f64 = 4.5;
+/// An overpass's deck: a short span, so a shallower one than a viaduct's, metres.
+pub const OVERPASS_DECK: f64 = 1.8;
+
+impl BridgeSpec {
+    /// The defaults for a bridge of `form`: an overpass's deck is shallower.
+    pub fn for_form(form: BridgeForm) -> Self {
+        BridgeSpec {
+            form,
+            deck_depth: if form == BridgeForm::Overpass {
+                OVERPASS_DECK
+            } else {
+                BridgeSpec::default().deck_depth
+            },
+            ..BridgeSpec::default()
+        }
+    }
+}
+
 impl Default for BridgeSpec {
     fn default() -> Self {
         BridgeSpec {
@@ -436,7 +476,7 @@ pub enum StructureSpec {
 }
 
 impl StructureSpec {
-    fn name(&self) -> Option<&str> {
+    pub fn name(&self) -> Option<&str> {
         match self {
             StructureSpec::Bridge(spec) => spec.name.as_deref(),
             StructureSpec::Tunnel(spec) => spec.name.as_deref(),
@@ -517,22 +557,28 @@ impl From<GeometryError> for StructureError {
 /// its banked lateral axis: the left edge's offset (positive) and the right edge's
 /// (negative), from the lanes of the section there.
 pub fn road_extent(map: &Map, road: &RoadId, station: f64) -> Option<(f64, f64)> {
-    let entry = map.road(road)?;
-    let section = entry.section_at(station)?;
-    let origin = entry.lane_offset.evaluate(station);
-    let (mut left, mut right) = (origin, origin);
-    for lane in map.lanes_of_section(road, section) {
-        match lane.side {
-            LateralSide::Left => left += lane.width_at(station),
-            LateralSide::Right => right -= lane.width_at(station),
-        }
-    }
-    Some((left, right))
+    extent(map, road, station, |_| true)
 }
 
 /// The same as [`road_extent`], counting only the lanes traffic drives on and their
 /// shoulders — where a pier must not stand.
 pub fn carriageway_extent(map: &Map, road: &RoadId, station: f64) -> Option<(f64, f64)> {
+    extent(map, road, station, |lane| {
+        matches!(
+            lane.lane_type,
+            LaneType::Driving | LaneType::Shoulder | LaneType::Biking | LaneType::Parking
+        )
+    })
+}
+
+/// How far out each side the outermost lane `keep` takes reaches, the lanes inside
+/// it counted whatever they are.
+fn extent(
+    map: &Map,
+    road: &RoadId,
+    station: f64,
+    keep: impl Fn(&crate::map::Lane) -> bool,
+) -> Option<(f64, f64)> {
     let entry = map.road(road)?;
     let section = entry.section_at(station)?;
     let origin = entry.lane_offset.evaluate(station);
@@ -542,20 +588,16 @@ pub fn carriageway_extent(map: &Map, road: &RoadId, station: f64) -> Option<(f64
     let (mut outer_left, mut outer_right) = (origin, origin);
     for lane in lanes {
         let width = lane.width_at(station);
-        let traffic = matches!(
-            lane.lane_type,
-            LaneType::Driving | LaneType::Shoulder | LaneType::Biking | LaneType::Parking
-        );
         match lane.side {
             LateralSide::Left => {
                 left += width;
-                if traffic {
+                if keep(lane) {
                     outer_left = left;
                 }
             }
             LateralSide::Right => {
                 right -= width;
-                if traffic {
+                if keep(lane) {
                     outer_right = right;
                 }
             }
@@ -798,6 +840,8 @@ fn place_with(
                 if !snapping {
                     return station;
                 }
+                // A straight road has a vertex only at each end, so the nearest
+                // may be far: then the end stays where it was asked for.
                 stations
                     .iter()
                     .copied()
@@ -975,6 +1019,7 @@ fn place_with(
                 form: bridge.form,
                 material: bridge.material,
                 deck_depth: bridge.deck_depth,
+                curb: bridge.curb,
                 supports,
             })
         }
@@ -990,6 +1035,7 @@ fn place_with(
                 clear_height: tunnel.clear_height,
                 lining: tunnel.lining,
                 lighting: tunnel.lighting,
+                walkway: tunnel.walkway,
                 portals: [
                     portal(&primary.rows[0]),
                     portal(&primary.rows[primary.rows.len() - 1]),
@@ -1055,6 +1101,50 @@ impl Crossing {
             (b, a)
         }
     }
+
+    /// The structure that already carries one road over the other here: a bridge
+    /// the upper is on, or a tunnel the lower is in.
+    pub fn carried_by(&self, map: &Map) -> Option<StructureId> {
+        let ((upper, us, _), (lower, ls, _)) = self.ordered();
+        let on = |road: &RoadId, station: f64, bridge: bool| {
+            map.road(road)
+                .and_then(|r| r.structure.at(station))
+                .filter(|id| {
+                    map.structures.get(id).is_some_and(|s| {
+                        if bridge {
+                            s.kind.bridge().is_some()
+                        } else {
+                            s.kind.tunnel().is_some()
+                        }
+                    })
+                })
+                .cloned()
+        };
+        on(upper, us, true).or_else(|| on(lower, ls, false))
+    }
+
+    /// Whether the crossing has to be separated: either road is a motorway or a
+    /// slip road, or is on a structure here.
+    pub fn strict(&self, map: &Map) -> bool {
+        [(&self.a, self.a_station), (&self.b, self.b_station)]
+            .iter()
+            .any(|(road, station)| {
+                map.road(road).is_some_and(|r| {
+                    r.form.is_controlled_access() || r.structure.at(*station).is_some()
+                })
+            })
+    }
+}
+
+/// Whether anything on the map can make a crossing matter: a structure, or a road
+/// that crosses nothing on the level. A map with neither — every town written
+/// before this module — has no crossings worth looking for.
+pub fn separates(map: &Map) -> bool {
+    !map.structures.is_empty()
+        || map
+            .roads
+            .iter()
+            .any(|road| road.form.is_controlled_access())
 }
 
 /// A road's reference line in plan, with each vertex's station and height.
@@ -1169,27 +1259,13 @@ pub fn span_across(
 /// Replaces whatever separations the map held.
 pub fn derive_separations(map: &mut Map) {
     let mut found: Vec<(RoadSpan, Underneath, StructureId)> = Vec::new();
+    if map.structures.is_empty() {
+        map.grade_separations.clear();
+        return;
+    }
     for crossing in crossings(map) {
-        let ((upper, us, _), (lower, ls, _)) = crossing.ordered();
-        let upper_on = map
-            .road(upper)
-            .and_then(|r| r.structure.at(us))
-            .filter(|id| {
-                map.structures
-                    .get(id)
-                    .is_some_and(|s| s.kind.bridge().is_some())
-            })
-            .cloned();
-        let lower_in = map
-            .road(lower)
-            .and_then(|r| r.structure.at(ls))
-            .filter(|id| {
-                map.structures
-                    .get(id)
-                    .is_some_and(|s| s.kind.tunnel().is_some())
-            })
-            .cloned();
-        if let Some(via) = upper_on.or(lower_in) {
+        if let Some(via) = crossing.carried_by(map) {
+            let ((upper, us, _), (lower, ls, _)) = crossing.ordered();
             found.push((
                 span_across(map, upper, us, lower, ls),
                 Underneath::Road(span_across(map, lower, ls, upper, us)),
@@ -1627,18 +1703,14 @@ fn check_against_land(
 /// A crossing between two ordinary roads at grade is left alone. A map may draw
 /// streets that cross without a junction, and always could.
 fn check_crossings(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    if !separates(map) {
+        return;
+    }
     for crossing in crossings(map) {
-        let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
-        let (Some(upper_road), Some(lower_road)) = (map.road(upper), map.road(lower)) else {
-            continue;
-        };
-        let strict = upper_road.form.is_controlled_access()
-            || lower_road.form.is_controlled_access()
-            || upper_road.structure.at(us).is_some()
-            || lower_road.structure.at(ls).is_some();
-        if !strict {
+        if !crossing.strict(map) {
             continue;
         }
+        let ((upper, us, uz), (lower, ls, lz)) = crossing.ordered();
         let needed = depth_at(map, upper, us).max(depth_at(map, lower, ls));
         let recorded = map.grade_separations.iter().any(|separation| {
             separation.over.road == *upper
@@ -1646,11 +1718,12 @@ fn check_crossings(map: &Map, issues: &mut Vec<ValidationIssue>) {
                 && matches!(&separation.under, Underneath::Road(span)
                     if span.road == *lower && span.contains(ls))
         });
-        if uz - lz < needed.max(0.5) || !recorded {
+        let too_close = uz - lz < needed.max(0.5);
+        if too_close || !recorded {
             issues.push(ValidationIssue::UnseparatedCrossing {
                 over: upper.clone(),
                 under: lower.clone(),
-                detail: if uz - lz < needed.max(0.5) {
+                detail: if too_close {
                     format!(
                         "{upper} at {us:.1} m is only {:.2} m above {lower} at {ls:.1} m",
                         uz - lz

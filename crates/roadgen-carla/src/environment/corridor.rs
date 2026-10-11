@@ -28,7 +28,9 @@ use roadgen_core::map::TrafficHandedness;
 use roadgen_core::semantics::{
     BoundaryMarking, FormOfWay, LaneType, MarkingColor, RoadMarking, RoadType,
 };
-use roadgen_core::structure::{BridgeForm, BridgeSpec, RoadSpan, TunnelForm, TunnelSpec};
+use roadgen_core::structure::{
+    BridgeForm, BridgeSpec, RoadSpan, TunnelForm, TunnelSpec, CLEARANCE, OVERPASS_DECK,
+};
 use roadgen_core::topology::{Direction, LaneEnd};
 use roadgen_core::units::{PositiveWidth, SpeedLimit};
 
@@ -447,6 +449,15 @@ impl Track {
     }
 }
 
+/// The point `s` metres along a polyline whose vertices are at `stations`.
+fn along(points: &[Point3], stations: &[f64], s: f64) -> Point3 {
+    let index = stations
+        .partition_point(|x| *x < s)
+        .clamp(1, stations.len() - 1);
+    let t = (s - stations[index - 1]) / (stations[index] - stations[index - 1]).max(1e-9);
+    points[index - 1].lerp(points[index], t)
+}
+
 /// A smooth bump: zero before `from`, `height` from `from + ramp` to `to − ramp`,
 /// zero after `to`, with cosine transitions.
 fn bump(s: f64, from: f64, to: f64, ramp: f64, height: f64) -> f64 {
@@ -686,6 +697,18 @@ struct Carriageway {
     noses: Vec<Nose>,
 }
 
+impl Carriageway {
+    /// The way traffic heads at centre-line station `s`.
+    fn heading(&self, track: &Track, s: f64) -> f64 {
+        let (_, _, h) = track.at(s);
+        if self.along {
+            h
+        } else {
+            h + std::f64::consts::PI
+        }
+    }
+}
+
 impl CorridorSpec {
     /// The height of the centre line at `s`: the profile, lifted over its elevated
     /// stretches and dropped through its sunken ones.
@@ -769,6 +792,8 @@ impl CorridorSpec {
         let z = |s: f64| self.height_at(&profile, s);
 
         let cw_width = carriageway_width(standard, self.lanes);
+        // What a slip road is designed to.
+        let ramp_standard = DesignStandard::for_speed(40.0)?;
         let forward_right = handedness == TrafficHandedness::RightHand;
         let mut carriageways: Vec<Carriageway> = [Side::Left, Side::Right]
             .into_iter()
@@ -812,83 +837,51 @@ impl CorridorSpec {
             }
             // The crossroad: where it crosses the centre line, and its profile up
             // over the motorway or down under it.
-            let cross: Vec<[f64; 2]> = site.crossroad.iter().map(|p| [p.x, p.y]).collect();
             let mut stations = vec![0.0];
-            for pair in cross.windows(2) {
-                stations.push(
-                    stations.last().unwrap()
-                        + (pair[1][0] - pair[0][0]).hypot(pair[1][1] - pair[0][1]),
-                );
+            for pair in site.crossroad.windows(2) {
+                stations.push(stations.last().unwrap() + pair[0].horizontal_distance_to(pair[1]));
             }
             let cross_length = *stations.last().unwrap();
-            let lateral: Vec<f64> = cross.iter().map(|p| track.locate(*p).1).collect();
-            let crossing = (1..cross.len())
-                .find(|&i| lateral[i - 1].signum() != lateral[i].signum())
-                .ok_or_else(|| {
-                    format!("{}: the crossroad does not cross the corridor", site.name)
-                })?;
-            let at_lateral = |target: f64| -> Option<f64> {
-                // The crossroad station where its offset from the centre line is
-                // `target`, interpolated, densely.
-                let count = (cross_length / 1.0).ceil() as usize;
-                let point_at = |s: f64| {
-                    let index = stations
-                        .partition_point(|x| *x < s)
-                        .clamp(1, stations.len() - 1);
-                    let t = (s - stations[index - 1])
-                        / (stations[index] - stations[index - 1]).max(1e-9);
-                    [
-                        cross[index - 1][0] + (cross[index][0] - cross[index - 1][0]) * t,
-                        cross[index - 1][1] + (cross[index][1] - cross[index - 1][1]) * t,
-                    ]
-                };
-                let mut previous: Option<(f64, f64)> = None;
-                for step in 0..=count {
+            // The crossroad as drawn at station `s`: where, and the ground's height.
+            let drawn = |s: f64| along(&site.crossroad, &stations, s);
+            let point_at = |s: f64| {
+                let p = drawn(s);
+                [p.x, p.y]
+            };
+            let ground_at = |s: f64| drawn(s).z;
+            // Its offset from the centre line every metre, once, to find where it is
+            // any given distance to one side.
+            let count = cross_length.ceil().max(1.0) as usize;
+            let offsets: Vec<(f64, f64)> = (0..=count)
+                .map(|step| {
                     let s = cross_length * step as f64 / count as f64;
-                    let l = track.locate(point_at(s)).1 - target;
-                    if let Some((ps, pl)) = previous {
-                        if pl.signum() != l.signum() {
-                            return Some(ps + (s - ps) * pl / (pl - l));
-                        }
-                    }
-                    previous = Some((s, l));
-                }
-                None
+                    (s, track.locate(point_at(s)).1)
+                })
+                .collect();
+            let at_lateral = |target: f64| -> Option<f64> {
+                offsets.windows(2).find_map(|pair| {
+                    let ((ps, pl), (s, l)) = (pair[0], pair[1]);
+                    let (pl, l) = (pl - target, l - target);
+                    (pl.signum() != l.signum()).then(|| ps + (s - ps) * pl / (pl - l))
+                })
             };
-            let c_station = at_lateral(0.0).unwrap_or(stations[crossing]);
-            let point_at = |s: f64| -> [f64; 2] {
-                let index = stations
-                    .partition_point(|x| *x < s)
-                    .clamp(1, stations.len() - 1);
-                let t =
-                    (s - stations[index - 1]) / (stations[index] - stations[index - 1]).max(1e-9);
-                [
-                    cross[index - 1][0] + (cross[index][0] - cross[index - 1][0]) * t,
-                    cross[index - 1][1] + (cross[index][1] - cross[index - 1][1]) * t,
-                ]
-            };
-            let ground_at = |s: f64| -> f64 {
-                let index = stations
-                    .partition_point(|x| *x < s)
-                    .clamp(1, stations.len() - 1);
-                let t =
-                    (s - stations[index - 1]) / (stations[index] - stations[index - 1]).max(1e-9);
-                site.crossroad[index - 1].z
-                    + (site.crossroad[index].z - site.crossroad[index - 1].z) * t
-            };
+            let c_station = at_lateral(0.0).ok_or_else(|| {
+                format!("{}: the crossroad does not cross the corridor", site.name)
+            })?;
             let (centre_station, _) = track.locate(point_at(c_station));
             let motorway_z = z(centre_station);
             let half_corridor = standard.median / 2.0 + cw_width + 3.0;
             // Over the motorway: an overpass's deck and the clearance under it;
             // under it: the clearance under the motorway's own overpass.
             let target = if site.over {
-                motorway_z + 4.5 + 1.8
+                motorway_z + CLEARANCE + OVERPASS_DECK
             } else {
-                motorway_z - 1.8 - 0.5 - 4.5
+                motorway_z - OVERPASS_DECK - 0.5 - CLEARANCE
             };
             // The overpass reaches out far enough for the land to come down from
             // its abutments to the motorway at a fill's slope.
-            let half_corridor = half_corridor + (target - motorway_z).abs() * 1.8;
+            let half_corridor =
+                half_corridor + super::highway::abutment_reach((target - motorway_z).abs());
             let flat = half_corridor + 5.0;
             // Level over the motorway, down at an approach grade each side, and on
             // the ground it was drawn on beyond that: an overpass's approach is an
@@ -1017,14 +1010,7 @@ impl CorridorSpec {
                     .position(|c| c.side == *side)
                     .expect("both sides");
                 let carriageway = &carriageways[c];
-                let heading_travel = {
-                    let (_, _, h) = track.at(site.at);
-                    if carriageway.along {
-                        h
-                    } else {
-                        h + std::f64::consts::PI
-                    }
-                };
+                let heading_travel = carriageway.heading(&track, site.at);
                 let back = |d: f64| {
                     [
                         terminal.x - heading_travel.cos() * d,
@@ -1040,7 +1026,6 @@ impl CorridorSpec {
                 // Lanes lie on the outward side of a ramp's reference line, so the
                 // line is shifted back by half the ramp's width to centre the ramp on
                 // the terminal.
-                let ramp_standard = DesignStandard::for_speed(40.0)?;
                 let ramp_width = carriageway_width(&ramp_standard, 1);
                 let normal = heading_travel + std::f64::consts::FRAC_PI_2;
                 let shift = |p: [f64; 2]| {
@@ -1157,12 +1142,7 @@ impl CorridorSpec {
                 .iter()
                 .position(|c| c.side == ramp.side)
                 .expect("both sides");
-            let (_, _, h) = track.at(ramp.at);
-            let heading = if carriageways[c].along {
-                h
-            } else {
-                h + std::f64::consts::PI
-            };
+            let heading = carriageways[c].heading(&track, ramp.at);
             accesses.push(Access {
                 ramp: name,
                 carriageway: c,
@@ -1238,14 +1218,7 @@ impl CorridorSpec {
             let p = track.offset(s, c.offset + travel_left * extra);
             Point3::new(p[0], p[1], z(s))
         };
-        let heading_on = |c: &Carriageway, t: f64| {
-            let (_, _, h) = track.at(centre_of(c, t));
-            if c.along {
-                h
-            } else {
-                h + std::f64::consts::PI
-            }
-        };
+        let heading_on = |c: &Carriageway, t: f64| c.heading(&track, centre_of(c, t));
         for (c, pieces) in carriageways.iter().zip(&piece_names) {
             for (name, piece) in pieces {
                 let count = ((piece.to - piece.from) / STEP).ceil().max(1.0) as usize;
@@ -1339,7 +1312,6 @@ impl CorridorSpec {
         }
 
         // The slip roads, and the junction where each leaves or joins.
-        let ramp_standard = DesignStandard::for_speed(40.0)?;
         for access in &accesses {
             let c = &carriageways[access.carriageway];
             let pieces = &piece_names[access.carriageway];
@@ -1353,25 +1325,15 @@ impl CorridorSpec {
                 .iter()
                 .find(|r| &r.name == before)
                 .expect("planned");
-            let offset_last = lanes_before.lanes.len()
-                + lanes_before
-                    .cross_sections
-                    .iter()
-                    .take(lanes_before.cross_sections.len().saturating_sub(1))
-                    .map(|(_, l)| l.len())
-                    .sum::<usize>();
-            let offset_last = if lanes_before.cross_sections.is_empty() {
-                0
-            } else {
-                offset_last
+            // Where the lanes of the piece's last cross-section begin in its list.
+            let offset_last = match lanes_before.cross_sections.split_last() {
+                None => 0,
+                Some((_, earlier)) => {
+                    lanes_before.lanes.len() + earlier.iter().map(|(_, l)| l.len()).sum::<usize>()
+                }
             };
-            let width_after_start = carriageway_width(standard, self.lanes)
-                + if access.on { standard.lane_width } else { 0.0 };
-            let edge = (if access.on {
-                carriageway_width(standard, self.lanes)
-            } else {
-                width_after_start
-            }) + 0.5;
+            // A slip road runs beside the plain carriageway, half a metre clear of it.
+            let edge = cw_width + 0.5;
             let junction = format!("{}_{}", key, access.ramp);
             plan.junctions.push(junction.clone());
             let (start_t, end_t) = (access.nose - GAP / 2.0, access.nose + GAP / 2.0);
@@ -1467,7 +1429,6 @@ impl CorridorSpec {
                         let (a, b) = (travel(c, from), travel(c, to));
                         (a.min(b), a.max(b))
                     };
-                    let mut spans = Vec::new();
                     for (name, piece) in pieces {
                         let (a, b) = (t0.max(piece.from), t1.min(piece.to));
                         if b - a < 10.0 {
@@ -1480,15 +1441,12 @@ impl CorridorSpec {
                             .expect("planned");
                         // Travel stations to stations along the road's own points.
                         let scale = length_of(&road.points) / (piece.to - piece.from).max(1e-9);
-                        spans.push((
-                            name.clone(),
-                            (a - piece.from) * scale,
-                            (b - piece.from) * scale,
-                        ));
-                    }
-                    for span in spans {
                         plan.structures.push(StructurePlan {
-                            spans: vec![span],
+                            spans: vec![(
+                                name.clone(),
+                                (a - piece.from) * scale,
+                                (b - piece.from) * scale,
+                            )],
                             bridge: bridge.then_some(BridgeForm::Viaduct),
                             tunnel: (!bridge).then_some(TunnelForm::CutAndCover),
                         });
@@ -1633,18 +1591,7 @@ impl CorridorPlan {
                 .collect();
             if let Some(form) = structure.bridge {
                 builder
-                    .add_bridge(
-                        spans,
-                        BridgeSpec {
-                            form,
-                            deck_depth: if form == BridgeForm::Overpass {
-                                1.8
-                            } else {
-                                2.5
-                            },
-                            ..BridgeSpec::default()
-                        },
-                    )
+                    .add_bridge(spans, BridgeSpec::for_form(form))
                     .map_err(|e| e.to_string())?;
             } else if let Some(form) = structure.tunnel {
                 builder

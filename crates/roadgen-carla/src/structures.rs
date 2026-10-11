@@ -79,30 +79,11 @@ impl Carried {
                 .map(|structure| {
                     let points = structure.outline.points().to_vec();
                     let ring: Vec<[f64; 2]> = points.iter().map(|p| [p.x, p.y]).collect();
-                    let bounds = ring.iter().fold(
-                        [
-                            f64::INFINITY,
-                            f64::INFINITY,
-                            f64::NEG_INFINITY,
-                            f64::NEG_INFINITY,
-                        ],
-                        |b, p| {
-                            [
-                                b[0].min(p[0]),
-                                b[1].min(p[1]),
-                                b[2].max(p[0]),
-                                b[3].max(p[1]),
-                            ]
-                        },
-                    );
+                    let bounds = roadgen_core::geometry::plan::bounds(&ring);
                     (ring, points, bounds)
                 })
                 .collect(),
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.outlines.is_empty()
     }
 
     pub fn contains(&self, point: &Point3) -> bool {
@@ -151,7 +132,7 @@ pub fn meshes(
                 }
                 for support in &bridge.supports {
                     let ring = support.footprint.points();
-                    let top = ring.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+                    let top = support.footprint.lowest();
                     let centre = support.footprint.centroid();
                     let base = support.base.unwrap_or_else(|| {
                         ground.map_or(top - FALLBACK_DEPTH, |ground| {
@@ -178,7 +159,7 @@ fn deck(mesh: &mut Mesh, rows: &[Row], bridge: &Bridge) {
     if rows.len() < 2 {
         return;
     }
-    let curb = 0.6;
+    let curb = bridge.curb;
     let depth = bridge.deck_depth;
     let line = |lateral: &dyn Fn(&Row) -> f64, rise: f64| -> Vec<Point3> {
         rows.iter().map(|row| row.at(lateral(row), rise)).collect()
@@ -218,7 +199,7 @@ fn bore(mesh: &mut Mesh, rows: &[Row], tunnel: &Tunnel) {
     if rows.len() < 2 {
         return;
     }
-    let walkway = 0.75;
+    let walkway = tunnel.walkway;
     let height = tunnel.clear_height;
     let line = |lateral: &dyn Fn(&Row) -> f64, rise: f64| -> Vec<Point3> {
         rows.iter().map(|row| row.at(lateral(row), rise)).collect()

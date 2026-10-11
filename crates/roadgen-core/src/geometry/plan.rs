@@ -79,6 +79,32 @@ pub fn polyline_distance(p: PlanPoint, line: &[PlanPoint]) -> f64 {
     }
 }
 
+/// The plan bounds of some points: `[min x, min y, max x, max y]`, or infinities
+/// inside out for none.
+pub fn bounds(points: &[PlanPoint]) -> [f64; 4] {
+    points.iter().fold(
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |b, p| {
+            [
+                b[0].min(p[0]),
+                b[1].min(p[1]),
+                b[2].max(p[0]),
+                b[3].max(p[1]),
+            ]
+        },
+    )
+}
+
+/// Whether `p` is inside bounds from [`bounds`], `margin` metres widened.
+pub fn within_bounds(b: &[f64; 4], p: PlanPoint, margin: f64) -> bool {
+    p[0] >= b[0] - margin && p[0] <= b[2] + margin && p[1] >= b[1] - margin && p[1] <= b[3] + margin
+}
+
 /// Many segments, filed on a [`Grid`], for asking how near the nearest of them is
 /// without measuring against all of them.
 #[derive(Debug, Clone)]

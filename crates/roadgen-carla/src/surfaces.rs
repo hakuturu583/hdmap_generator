@@ -195,35 +195,20 @@ fn at_grade<'c, 'r>(map: &Map, road: &Road, within: &'c [Cross<'r>]) -> Vec<&'c 
     if road.structure.is_empty() {
         return vec![within];
     }
-    let carried = |station: f64| {
-        road.structure
-            .spans()
-            .iter()
-            .any(|span| station > span.from + 1e-6 && station < span.to - 1e-6)
-    };
     let mut runs = Vec::new();
     let mut start: Option<usize> = None;
     for (index, cross) in within.iter().enumerate() {
         let station = cross.rung.station;
-        if carried(station) {
-            if let Some(from) = start.take() {
-                runs.push(&within[from..index]);
-            }
-        } else if start.is_none() {
-            start = Some(index);
+        let carried = road.structure.carries_strictly(station);
+        if !carried {
+            start.get_or_insert(index);
         }
-        // A rung on a boundary ends the run before a span and starts the one
-        // after it.
-        let boundary = road
-            .structure
-            .spans()
-            .iter()
-            .any(|span| (station - span.from).abs() <= 1e-6);
-        if boundary {
-            if let Some(from) = start {
-                runs.push(&within[from..=index]);
+        // A rung on a span's start ends the run before it; one inside a span ends
+        // whatever run there was.
+        if carried || road.structure.begins_at(station) {
+            if let Some(from) = start.take() {
+                runs.push(&within[from..index + usize::from(!carried)]);
             }
-            start = None;
         }
     }
     if let Some(from) = start {
@@ -312,22 +297,9 @@ fn rungs(map: &Map, road: &Road) -> Option<Vec<Rung>> {
     let mut samples = map.vertex_samples(&road.id).ok()?;
     // A rung wherever the pavement changes, too, so that the surface can change
     // material there rather than at the next vertex, which on a straight road is
-    // its far end; and wherever a bridge or a tunnel begins or ends, so the land
-    // stops meeting the road exactly there.
+    // its far end. A bridge's or a tunnel's ends are vertices of the road already.
     let (first, last) = (samples.first()?.station, samples.last()?.station);
-    let boundaries = road
-        .pavement
-        .spans()
-        .iter()
-        .map(|&(station, _)| station)
-        .chain(
-            road.structure
-                .spans()
-                .iter()
-                .flat_map(|span| [span.from, span.to]),
-        )
-        .collect::<Vec<f64>>();
-    for &station in &boundaries {
+    for &(station, _) in road.pavement.spans() {
         if station > first + 1e-6
             && station < last - 1e-6
             && !samples

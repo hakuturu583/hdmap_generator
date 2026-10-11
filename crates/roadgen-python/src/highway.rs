@@ -51,18 +51,14 @@ pub(crate) fn bridge_spec(
 ) -> PyResult<BridgeSpec> {
     let form = BridgeForm::parse(form)
         .ok_or_else(|| PyValueError::new_err(format!("unknown bridge form {form:?}")))?;
+    let defaults = BridgeSpec::for_form(form);
     Ok(BridgeSpec {
         name,
-        form,
         material: StructureMaterial::parse(material)
             .ok_or_else(|| PyValueError::new_err(format!("unknown material {material:?}")))?,
-        deck_depth: deck_depth.unwrap_or(if form == BridgeForm::Overpass {
-            1.8
-        } else {
-            2.5
-        }),
+        deck_depth: deck_depth.unwrap_or(defaults.deck_depth),
         pier_spacing,
-        ..BridgeSpec::default()
+        ..defaults
     })
 }
 

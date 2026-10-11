@@ -89,7 +89,7 @@ impl Field {
         let carried = crate::structures::Carried::of(map);
         let samples: Vec<Point3> = with_reference_lines(map, samples)
             .into_iter()
-            .filter(|point| carried.is_empty() || !carried.contains(point))
+            .filter(|point| !carried.contains(point))
             .collect();
         if samples.is_empty() {
             return None;
@@ -262,15 +262,8 @@ impl<'a> Stated<'a> {
             .land_covers
             .iter()
             .map(|cover| {
-                let material = match cover.kind.as_str() {
-                    "pit" | "quarry" | "waste_dump" | "spoil_heap" | "stockpile" => {
-                        crate::materials::ROCK
-                    }
-                    "pad" | "yard" => crate::materials::GRAVEL,
-                    _ => crate::materials::GRASS,
-                };
                 let ring = cover.area.points().iter().map(|p| [p.x, p.y]).collect();
-                (ring, material)
+                (ring, cover_material(&cover.kind))
             })
             .collect();
         Some(Stated {
@@ -296,12 +289,12 @@ impl<'a> Stated<'a> {
             // Each land cover's outline too, draped on the land, so that where the
             // surface changes from grass to rock it changes along the outline
             // rather than along whichever triangles straddle it.
-            // Not a cutting's or an embankment's: it is grass like the land round
-            // it, and its edges are the road's and its slope's foot already.
+            // Not one surfaced like the land round it — a cutting, an embankment:
+            // there is no change of surface along its outline to keep.
             let outlines: Vec<Vec<Point3>> = map
                 .land_covers
                 .iter()
-                .filter(|cover| !matches!(cover.kind.as_str(), "cutting" | "embankment"))
+                .filter(|cover| cover_material(&cover.kind) != crate::materials::GRASS)
                 .map(|cover| stated.drape(cover.area.points()))
                 .collect();
             stated.breaklines.extend(outlines);
@@ -342,6 +335,16 @@ impl<'a> Stated<'a> {
             .rev()
             .find(|(ring, _)| roadgen_core::geometry::plan::ring_contains(ring, [x, y]))
             .map_or(crate::materials::GRASS, |&(_, material)| material)
+    }
+}
+
+/// What land of a cover's kind is surfaced with: grass unless it is dug, heaped or
+/// levelled.
+pub fn cover_material(kind: &str) -> usize {
+    match kind {
+        "pit" | "quarry" | "waste_dump" | "spoil_heap" | "stockpile" => crate::materials::ROCK,
+        "pad" | "yard" => crate::materials::GRAVEL,
+        _ => crate::materials::GRASS,
     }
 }
 

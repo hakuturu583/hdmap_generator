@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use roadgen_carla::{materials, PackageConfig, Role};
 use roadgen_core::geometry::plan::ring_contains;
 use roadgen_core::prelude::*;
-use roadgen_core::structure::{BridgeForm, StructureKind, TunnelForm, Underneath};
+use roadgen_core::structure::{BridgeForm, TunnelForm, Underneath};
 use roadgen_core::FormOfWay;
 use roadgen_integration_tests::highway::build;
 
@@ -244,7 +244,6 @@ fn carla_draws_the_decks_piers_and_tunnels() {
         .map(|p| p.z)
         .fold(f64::MIN, f64::max);
     assert!(top > 40.0, "the ridge reaches {top:.1} m");
-    let _ = StructureKind::Bridge;
 }
 
 #[test]

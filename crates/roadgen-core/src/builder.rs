@@ -1316,25 +1316,7 @@ impl Generator {
                 half_arc,
                 reference_line.horizontal_length()?,
             );
-            let draft = self.builder.draft_mut(&road.0)?;
-            draft.spec.reference_line = reference_line;
-            draft.spec.map_stations(&moved);
-            for (spans, _) in &mut self.builder.structures {
-                for span in spans.iter_mut().filter(|span| span.road == road.0) {
-                    span.from = moved(span.from);
-                    span.to = moved(span.to);
-                }
-            }
-            for (_, object) in &mut self.builder.objects {
-                if let ObjectSpec::AcrossRoad {
-                    road: at, station, ..
-                } = object
-                {
-                    if at == &road.0 {
-                        *station = moved(*station);
-                    }
-                }
-            }
+            self.reshape(&road.0, reference_line, &moved)?;
         }
         Ok(())
     }
@@ -1351,6 +1333,37 @@ impl Generator {
     /// lines and arcs that every format draws the same way. A vertex the road has no
     /// room to round shrinks its arc to fit, down to a corner as tight as the road is
     /// wide, and past that the build fails and says which vertex.
+    /// Gives a road a new reference line, and moves everything that was put on it
+    /// by station — its cross-sections, the bridges and tunnels on it, the
+    /// crosswalks across it — to where `moved` says those stations went.
+    fn reshape(
+        &mut self,
+        road: &RoadId,
+        reference_line: Curve3,
+        moved: &impl Fn(f64) -> f64,
+    ) -> Result<(), BuildError> {
+        let draft = self.builder.draft_mut(road)?;
+        draft.spec.reference_line = reference_line;
+        draft.spec.map_stations(moved);
+        for (spans, _) in &mut self.builder.structures {
+            for span in spans.iter_mut().filter(|span| &span.road == road) {
+                span.from = moved(span.from);
+                span.to = moved(span.to);
+            }
+        }
+        for (_, object) in &mut self.builder.objects {
+            if let ObjectSpec::AcrossRoad {
+                road: at, station, ..
+            } = object
+            {
+                if at == road {
+                    *station = moved(*station);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn round_vertices(&mut self) -> Result<(), BuildError> {
         let roads: Vec<RoadId> = self
             .builder
@@ -1370,26 +1383,7 @@ impl Generator {
             let Some((reference_line, moved)) = self.round_polyline(&road, &points)? else {
                 continue;
             };
-            let draft = self.builder.draft_mut(&road)?;
-            draft.spec.reference_line = reference_line;
-            draft.spec.map_stations(&moved);
-            // A bridge or tunnel the caller put on the road moves with it too.
-            for (spans, _) in &mut self.builder.structures {
-                for span in spans.iter_mut().filter(|span| span.road == road) {
-                    span.from = moved(span.from);
-                    span.to = moved(span.to);
-                }
-            }
-            for (_, object) in &mut self.builder.objects {
-                if let ObjectSpec::AcrossRoad {
-                    road: at, station, ..
-                } = object
-                {
-                    if at == &road {
-                        *station = moved(*station);
-                    }
-                }
-            }
+            self.reshape(&road, reference_line, &moved)?;
         }
         Ok(())
     }
