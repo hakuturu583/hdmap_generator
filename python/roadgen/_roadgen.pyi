@@ -81,6 +81,30 @@ class Alignment:
     @property
     def curvature(self) -> float: ...
 
+class Pit:
+    """An open pit on the map, for drawing the roads into it."""
+
+    @property
+    def name(self) -> str: ...
+    @property
+    def land_cover(self) -> str: ...
+    @property
+    def rim_height(self) -> float: ...
+    @property
+    def floor_height(self) -> float: ...
+    def ramp(
+        self,
+        start: float = -90.0,
+        grade: float = 0.1,
+        clockwise: bool = True,
+        width: float = 21.0,
+        approach: float = 80.0,
+    ) -> list[Point]:
+        """The points of the usual ramp: an approach from clear of the rim, then a
+        spiral down the wall at `grade` to the floor. Pass them to
+        `add_road(points=...)`."""
+    def rim(self, spacing: float = 5.0) -> list[Point]: ...
+
 class Map:
     """A road network under construction."""
 
@@ -105,6 +129,7 @@ class Map:
         superelevation: Optional[Sequence[tuple[float, float]]] = None,
         cross_sections: Optional[Sequence[tuple[float, Sequence[Lane]]]] = None,
         pavement: Optional[Sequence[tuple[float, str]]] = None,
+        site: Optional[str] = None,
     ) -> Road: ...
     def add_junction(self, name: Optional[str] = None) -> Junction: ...
     def connect(
@@ -239,9 +264,9 @@ class Map:
         rules: Optional[str] = None,
         seed: int = 0,
     ) -> None: ...
-    def generate_mine(
+    def add_pit(
         self,
-        name: str = "mine",
+        name: str = "pit",
         centre: Point = (0.0, 0.0, 0.0),
         heading: float = 0.0,
         floor: tuple[float, float] = (220.0, 140.0),
@@ -249,28 +274,36 @@ class Map:
         bench_height: float = 12.0,
         bench_width: float = 10.0,
         face_angle: float = 70.0,
-        ramp_grade: float = 0.1,
-        ramp_start: float = -90.0,
-        clockwise: bool = True,
-        lane_width: float = 7.5,
-        shoulder_width: float = 3.0,
-        berm_height: float = 1.5,
-        speed_limit_kph: float = 40.0,
-        surface: str = "gravel",
-        waste_dump: Optional[tuple[float, float, float, float]] = None,
-        stockpile: Optional[tuple[float, float, float, float]] = None,
-        ground_margin: float = 150.0,
-        ground_cell: float = 10.0,
-        relief: float = 6.0,
-        yard_buildings: bool = True,
+        site: Optional[str] = None,
+    ) -> Pit:
+        """Puts an open pit on the map: a floor and benches stepped up from it to
+        the rim at `centre`'s height. Lays out no road: draw the roads into it with
+        `add_road`; `Pit.ramp()` gives the points of the usual spiral ramp."""
+    def add_heap(
+        self,
+        kind: str,
+        centre: Point,
+        radius: float,
+        height: float,
+        repose: float = 37.0,
+        name: Optional[str] = None,
+        site: Optional[str] = None,
+    ) -> str:
+        """Puts a heap of `kind` (`waste_dump`, `stockpile`) on the map; returns
+        its land cover's id. `name` defaults to `kind`, so two heaps of one kind
+        need names of their own."""
+    def add_pad(
+        self,
+        outline: Sequence[Point],
+        buildings: Optional[str] = None,
         seed: int = 0,
-    ) -> dict[str, Any]:
-        """Lays out an open-pit mine: benches, a ramp down the wall, haul roads to
-        a waste dump and a stockpile, and the land round them as one TIN.
-
-        A heap is `(bearing_degrees, distance, radius, height)` from the junction at
-        the top of the ramp. Returns `{"site", "ramp", "haul_roads", "junction"}`.
-        """
+        name: str = "pad",
+        site: Optional[str] = None,
+    ) -> str:
+        """Puts a levelled yard on the map, with `buildings` (a preset or a grammar)
+        on lots along the roads beside it; returns its land cover's id."""
+    def add_barrier(self, lane: LaneRef, kind: str = "berm", height: float = 1.5) -> str:
+        """Stands a barrier along the whole of `lane`; returns the object's id."""
     def generate_land(
         self,
         enabled: bool = True,
@@ -280,8 +313,9 @@ class Map:
         wavelength: float = 180.0,
         seed: int = 0,
     ) -> None:
-        """States the land round the map's roads as a TIN — the same land a mine's
-        is built as, shaped by nothing but the roads."""
+        """States the land round the map's roads as a TIN, shaped by every pit,
+        heap and pad on the map. A pit, heap or pad turns it on with these defaults,
+        and `enabled=False` does not turn it off then: such a map always has land."""
     def site_ids(self) -> list[str]: ...
     def site(self, site: str) -> dict[str, Any]: ...
     def tin_surface_ids(self) -> list[str]: ...

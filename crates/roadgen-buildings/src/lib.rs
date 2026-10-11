@@ -136,6 +136,9 @@ pub struct Placement {
     pub roads: Option<Vec<roadgen_core::id::RoadId>>,
     /// Only lots wholly inside one of these outlines, in plan; anywhere when empty.
     pub within: Vec<Vec<plane::Point2>>,
+    /// No lot with a corner inside one of these outlines, in plan: a pit, a heap, a
+    /// yard that is another place's.
+    pub outside: Vec<Vec<plane::Point2>>,
     /// Keep the buildings already on the map, and keep clear of them, rather than
     /// replacing them.
     pub keep: bool,
@@ -148,12 +151,24 @@ impl Placement {
                 return false;
             }
         }
+        let corners = lot.ground_plan();
+        let inside = |ring: &Vec<plane::Point2>, corner: &plane::Point2| {
+            roadgen_core::geometry::plan::ring_contains(ring, *corner)
+        };
+        // Any ground shared — a corner of the lot in the outline, the outline
+        // across the lot, or a small outline wholly on it.
+        if self
+            .outside
+            .iter()
+            .any(|ring| roadgen_core::geometry::plan::rings_overlap(ring, &corners))
+        {
+            return false;
+        }
         self.within.is_empty()
-            || self.within.iter().any(|ring| {
-                lot.ground_plan()
-                    .iter()
-                    .all(|&corner| roadgen_core::geometry::plan::ring_contains(ring, corner))
-            })
+            || self
+                .within
+                .iter()
+                .any(|ring| corners.iter().all(|corner| inside(ring, corner)))
     }
 }
 

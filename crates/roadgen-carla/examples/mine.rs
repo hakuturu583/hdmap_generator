@@ -1,11 +1,11 @@
-//! Generates the default mine and prints its terrain, breaklines, roads and land
-//! covers as JSON, for looking at.
+//! Puts a pit, the ramp into it and a waste dump on a map, and prints the terrain,
+//! breaklines, roads and land covers as JSON, for looking at.
 //!
 //! ```sh
 //! cargo run -p roadgen-carla --example mine > mine.json
 //! ```
 
-use roadgen_carla::environment::mine::{generate, lay_out, MineSpec};
+use roadgen_carla::environment::{generate, HeapSpec, PitSpec, Places, RampSpec};
 use roadgen_core::prelude::*;
 
 fn points(points: &[Point3]) -> String {
@@ -21,15 +21,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let spec = MineSpec {
+    let pit = PitSpec {
         name: "North Pit".into(),
-        seed,
-        ..MineSpec::default()
+        ..PitSpec::default()
     };
     let mut builder = MapBuilder::default();
-    let plan = lay_out(&mut builder, &spec)?;
+    let lanes = vec![
+        LaneSpec::new(PositiveWidth::new(10.5)?, Direction::Forward),
+        LaneSpec::new(PositiveWidth::new(10.5)?, Direction::Backward),
+    ];
+    let ramp = builder.add_road(
+        RoadSpec::new(Curve3::polyline(pit.ramp(&RampSpec::default())?)?, lanes).with_name("ramp"),
+    )?;
+    builder.add_barrier(&LaneRef::new(ramp.clone(), 0), "berm", 1.5)?;
+    let places = Places {
+        heaps: vec![HeapSpec {
+            name: "dump".into(),
+            centre: Point3::new(300.0, -250.0, 0.0),
+            radius: 90.0,
+            height: 25.0,
+            site: Some(pit.name.clone()),
+            ..HeapSpec::default()
+        }],
+        site_roads: vec![(ramp, pit.name.clone())],
+        pits: vec![pit],
+        seed,
+        ..Places::default()
+    };
     let mut map = builder.finish()?;
-    let report = generate(&mut map, &plan)?;
+    let report = generate(&mut map, &places)?;
     eprintln!("{report:?}");
     let map = map.validate()?;
     let sampling = map.metadata.sampling;

@@ -275,6 +275,8 @@ enum ObjectSpec {
         setback: f64,
         lanes: Vec<LaneRef>,
     },
+    /// A band over the whole of one lane, end to end: a berm on a shoulder.
+    AlongLane { kind: MapObjectKind, lane: LaneRef },
     /// A band across a whole road at a station along it.
     AcrossRoad {
         kind: MapObjectKind,
@@ -849,6 +851,28 @@ impl MapBuilder {
                 station,
                 width,
                 lanes,
+            },
+        )
+    }
+
+    /// Stands a barrier along the whole of `lane`: a berm of broken rock on a haul
+    /// road's shoulder, a wall, a guard rail. `kind` says which, in the caller's
+    /// words; `height` is how far its top stands above the lane, metres.
+    pub fn add_barrier(
+        &mut self,
+        lane: &LaneRef,
+        kind: impl Into<String>,
+        height: f64,
+    ) -> Result<ObjectId, BuildError> {
+        self.lane_spec(lane)?;
+        self.push_object(
+            format!("barrier/{}/{}", lane.road.local_name(), lane.index),
+            ObjectSpec::AlongLane {
+                kind: MapObjectKind::Barrier {
+                    kind: kind.into(),
+                    height,
+                },
+                lane: lane.clone(),
             },
         )
     }
@@ -2122,6 +2146,18 @@ impl Generator {
                         kind,
                         geometry: ObjectGeometry::Line(Curve3::polyline([left, right])?),
                         lanes: self.lane_ids(&lanes)?,
+                    }
+                }
+                ObjectSpec::AlongLane { kind, lane } => {
+                    let entry = self.lane(&lane)?.clone();
+                    MapObject {
+                        id: id.clone(),
+                        kind,
+                        geometry: ObjectGeometry::Band {
+                            left: entry.left_boundary.clone(),
+                            right: entry.right_boundary.clone(),
+                        },
+                        lanes: vec![entry.id.clone()],
                     }
                 }
                 ObjectSpec::AcrossRoad {

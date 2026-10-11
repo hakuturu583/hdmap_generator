@@ -63,10 +63,10 @@ m.export_gpudrive("scene.json")
        │             │             │
        └─────────────┼─────────────┘
                      ▼
-              Canonical Road IR ◀──── roadgen_carla::environment
-                     │                 ├─ Urban ◀── roadgen-buildings ◀── CGA shape grammar
-                     │                 └─ Mine  ◀── MineSpec: benches, ramp, heaps,
-                     │                              the land as a TIN (`spade`)
+              Canonical Road IR ◀──── roadgen_carla::environment::Places
+                     │                 ├─ buildings ◀── roadgen-buildings ◀── CGA shape grammar
+                     │                 ├─ pits, heaps, pads: parts the land is shaped into
+                     │                 └─ one land as a TIN round all of it (`spade`)
                  validate()
                      ▼
                 ValidatedMap
@@ -766,21 +766,44 @@ those outlines, which is why a town shows up in the OpenDRIVE picture and in no 
 
 ## Mines
 
-Not every map is a town. `generate_mine()` lays out an open-pit mine: a pit stepped
-down in benches, a ramp spiralling down its wall at a haul road's grade, haul roads
-from the top of the ramp to a waste dump and a stockpile, and — once the roads are
-built — the land round all of it as one triangulated surface.
+Not every map is a town. A mine is put together from parts, the same way a town is
+put together from roads: a pit, the roads into it — any shape, drawn with
+`add_road` like every other road — the heaps they lead to, a yard for the
+workshops, a berm along the ramp. Once the roads are built, the land round all of it
+is generated as one triangulated surface.
 
 ```python
 m = roadgen.Map(name="quarry")
-mine = m.generate_mine(name="North Pit", benches=6, bench_height=12.0, seed=1)
+pit = m.add_pit(name="North Pit", centre=(0.0, 0.0, 0.0), benches=6, bench_height=12.0)
+
+haul = [
+    roadgen.Lane(width=7.5, direction="forward"),
+    roadgen.Lane(width=3.0, direction="forward", type_="shoulder"),
+    roadgen.Lane(width=7.5, direction="backward"),
+    roadgen.Lane(width=3.0, direction="backward", type_="shoulder"),
+]
+# The ramp is a road like any other. pit.ramp() gives the points of the usual
+# spiral down the wall; pass points of your own for any other shape.
+ramp = m.add_road(points=pit.ramp(grade=0.1, clockwise=True), lanes=haul,
+                  pavement=[(0.0, "gravel")], site="North Pit")
+m.add_barrier(ramp.lane(1), kind="berm", height=1.5)     # on the pit-side shoulder
+m.add_road(start=(100.0, -260.0, 0.0), end=(300.0, -260.0, 0.0), lanes=haul,
+           pavement=[(0.0, "gravel")], site="North Pit")
+m.add_heap("waste_dump", centre=(440.0, -260.0, 0.0), radius=110.0, height=30.0,
+           site="North Pit")
+m.add_pad([(140.0, -320.0, 0.0), (260.0, -320.0, 0.0), (260.0, -272.5, 0.0),
+           (140.0, -272.5, 0.0)], buildings="industrial", site="North Pit")
+
 m.export_carla("Import/", name="Quarry", use_carla_materials=False)
 
-site = m.site(mine["site"])             # {"kind": "open_pit_mine", "land_covers": [...], ...}
+site = m.site("site/north_pit")          # {"kind": "open_pit_mine", "land_covers": [...], ...}
 nodes, triangles = m.tin_mesh(site["surfaces"][0])
 m.terrain_height(0.0, 0.0)               # the pit's floor: -72.0
-m.road_pavement(mine["ramp"])            # [(0.0, "gravel")]
 ```
+
+A second pit is a second `add_pit`, with its own roads and its own `site`: every
+part shapes the same land, which is stated once for the whole map, and two parts
+that overlap are refused.
 
 What it adds to the IR is the land, said once and in the IR's own terms — the
 GDF ideas the rest of it is built on, applied to the Terrain Elevation and Land
@@ -795,12 +818,12 @@ Cover themes:
 | `Road.pavement` | paved or unpaved, then what with — so an unpaved asphalt road is a value the type cannot hold |
 | `MapObjectKind::Barrier` | the safety berm along the ramp's pit side |
 
-A mine and a town are two branches of one generator, and they share everything but
-their shapes. The land is one TIN builder for both — every road's edges as
-breaklines, the country rolling away from them — given a pit and its heaps for a
-mine and nothing for a town (`m.generate_land()` states a town's land the same way).
-The buildings are one shape grammar on lots along roads for both: a town's streets,
-or the yard beside a mine's haul road (`industrial`, unless `yard_buildings=False`).
+A mine and a town are not two generators: they are parts on one map. The land is
+one TIN builder — every road's edges as breaklines, the country rolling away from
+them — shaped by whatever pits and heaps are on the map, or by nothing
+(`m.generate_land()` states a town's land the same way, and tunes a mine's). The
+buildings are one shape grammar on lots along roads: a town's streets
+(`generate_buildings()`, kept off the pits, heaps, pads and site roads), or a pad's.
 
 The roads go into the TIN as breaklines, so the land under a road is the road's own
 plane, vertex for vertex. CARLA builds its ground from the TIN rather than from the

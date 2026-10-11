@@ -13,17 +13,17 @@
 | 土手: `MapObjectKind::Barrier { kind, height }` | `crates/roadgen-core/src/semantics.rs` |
 | 検証（TIN の折り返し、折れ線が TIN の辺に乗っているか、参照の双方向性） | `crates/roadgen-core/src/validation.rs` |
 | IR ダンプ（新しい地物は空なら出力しない＝既存の地図の fingerprint は不変） | `crates/roadgen-trace/src/ir.rs` |
-| 環境の切り替え: `Environment::{Urban, Mine}` / `lay_out` / `generate` | `crates/roadgen-carla/src/environment/mod.rs` |
+| 部品の生成: `Places { pits, heaps, pads, site_roads, town, ground, seed }` / `generate` | `crates/roadgen-carla/src/environment/mod.rs` |
 | 共通: 地形（TIN の組み立て、全道路の縁を折れ線に、起伏、基準高さ）、土地被覆の登録 | `crates/roadgen-carla/src/environment/{land,tin,noise}.rs` |
 | 共通: 建物（CGA 文法、道路沿いの区画、`Placement` で道路・範囲を絞る） | `crates/roadgen-buildings`（`generate_with`） |
 | 共通: 平面幾何（内外判定・距離・線分インデックス） | `crates/roadgen-core/src/geometry/plan.rs` |
-| 鉱山固有: ピット・ランプ・盛土・ヤードの形、土手、Site | `crates/roadgen-carla/src/environment/mine/` |
-| Python: `Map.generate_land()`（街の地形）、`generate_mine(yard_buildings=...)` | `crates/roadgen-python` |
+| 部品: ピット（`PitSpec`、ランプの点列を返す `PitSpec::ramp`）、盛土（`HeapSpec`）、ヤード（`PadSpec`） | `crates/roadgen-carla/src/environment/{pit,heap,pad}.rs` |
+| 土手: `MapBuilder::add_barrier(lane, kind, height)` | `crates/roadgen-core/src/builder.rs` |
 | CARLA: 地形を TIN から構築、砂利・岩の材質、土手のメッシュ | `crates/roadgen-carla/src/{ground,terrain,barriers}.rs` |
 | OpenDRIVE: `<lane><material>`（書き出しと読み戻し）、`<object type="barrier">` + `<repeat>` | `crates/roadgen-opendrive` |
 | OpenStreetMap: `surface=*`、`landuse=quarry` / `man_made=spoil_heap` の面、`barrier` の way | `crates/roadgen-osm` |
 | Lanelet2: 土手を `road_border` の linestring として出力 | `crates/roadgen-lanelet2` |
-| Python: `Map.generate_mine()`、`site` / `tin_mesh` / `tin_breaklines` / `terrain_height` / `land_cover` / `road_pavement`、`add_road(pavement=...)` | `crates/roadgen-python` |
+| Python: `add_pit()`（`Pit.ramp()` / `Pit.rim()`）、`add_heap()`、`add_pad()`、`add_barrier()`、`add_road(site=..., pavement=...)`、`generate_land()`、`site` / `tin_mesh` / `tin_breaklines` / `terrain_height` / `land_cover` / `road_pavement` | `crates/roadgen-python` |
 
 ## 1. 何が足りなかったか
 
@@ -32,7 +32,9 @@ CARLA の出力は「道路網から、その見た目を作る」設計で、�
 露天掘り鉱山では地形そのものが環境の本体である（ベンチ、ランプ、ズリ山、貯鉱山）。そこで、
 
 - IR が **地形を「述べられるもの」として持てる** ようにし、
-- それを埋める **生成処理** を、CARLA アセット生成の **環境の分岐** として `roadgen-carla` の中に足した（`Environment::Urban` が市街地＝建物、`Environment::Mine` が鉱山）。環境ごとにクレートを分けない。
+- それを埋める **生成処理** を `roadgen-carla` の中に足した。環境ごとにクレートを分けず、「鉱山」「市街地」という生成関数も持たない。ピット・盛土・ヤード・土手・道路という **部品** を利用者が地図に置き、建物と地形は置かれた部品すべてから 1 回で生成する。
+
+当初は `generate_mine()` 1 関数で鉱山一式（ピット・ランプ・運搬路・盛土・ヤード）を生成していたが、道路の形を利用者が決められないため廃止し、部品に分けた。
 
 生成処理は IR だけを書き、パッケージは環境によらず同じ出力処理で書く。生成結果は IR に入るので、CARLA 以外の形式にも届く。
 
@@ -50,9 +52,9 @@ IR は GDF 5.1 から「考え方だけ」を借りている（README の Design
 
 ### 2.1 Terrain Elevation テーマ → `terrain.rs`
 
-- `TinSurface` は地物（ID: `tin/<site>`）。
+- `TinSurface` は地物（ID: `tin/land`）。地図に 1 つで、どの Site にも属さず（`site: None`）、各 Site がそれを `surfaces` に挙げる。
 - 頂点と三角形（`Tin`）は **その幾何であって地物ではない**。三角形に入力由来の安定した ID は付けられず、付けると再生成した地図どうしの比較が無意味になるため。
-- `TinBreakline` は地物（ID: `breakline/<site>/bench/3/crest` など）。ベンチの肩・法尻、ズリ山の肩・法尻、道路の縁（`road_edge`）。
+- `TinBreakline` は地物（ID: `breakline/land/north_pit/bench/3/crest` など）。ベンチの肩・法尻、ズリ山の肩・法尻、道路の縁（`road_edge`）。
 - **不変条件**: 折れ線の各頂点は TIN の節点であり、各線分は TIN の辺である。`validate()` が検査する。
 - 道路は地形に含めない。地形は道路の下の地面で、生成器は道路の縁を折れ線として TIN に入れるので、両者は頂点単位で一致する。
 
@@ -72,51 +74,54 @@ IR は GDF 5.1 から「考え方だけ」を借りている（README の Design
 
 GDF でどのテーマに属するか（Road Furniture か Structures か）は本文で確認できていない。既存の道路付属物モデル（種類・幾何・関係する車線）に収まるので、ここに置いた。
 
-## 3. 生成 — `roadgen_carla::environment::mine`
+## 3. 生成 — `roadgen_carla::environment`
 
 ```
-Environment::Mine(MineSpec + seed)
-   │
-environment::lay_out(&mut MapBuilder)      ランプ・運搬路・交差点（道路は builder に追加）
+MapBuilder: add_road / add_junction / add_barrier   道路（ランプも運搬路も街路も、形は利用者が決める）
    │
 MapBuilder::finish()
    │
-environment::generate(&mut UnvalidatedMap) 地形 TIN と折れ線・土地被覆・土手・Site
+environment::generate(&mut UnvalidatedMap, &Places) 建物 → 地形 TIN と折れ線 → 土地被覆 → Site
    │
 validate()
 ```
 
 2 段階なのは、地形を **生成済みの道路の縁** に合わせて作るため。
 
-1. **ピット**: 床は楕円。各ベンチの法尻・肩は床の外形を法線方向にオフセットした平行曲線（凸なので折れない）。法面は `face_angle`、段差は `bench_height`、ベンチ幅は `bench_width`。
-2. **ランプ**: リム上の `ramp.start` から一定勾配 `ramp.grade` で壁を螺旋状に下る。高さ z における壁の平均位置に **ランプの外側の縁** を合わせるので、外側は切土、内側は盛土になる。リムからの入りは 40 m かけてなめらかに曲げる。入口はリムから外へ離した 2 次ベジェで、その先に交差点。
-3. **運搬路**: 交差点からズリ山・貯鉱山の法尻手前まで。3 本の腕を交差点で相互に接続（接続道路は builder が生成）。車線は 走行 2 + 路肩 2、白線なし、`Unpaved(Gravel)`。
-4. **ズリ山・貯鉱山**: 安息角（既定 37°）の円錐台。法尻と肩を折れ線にする。
-5. **地形**: spade の制約付き三角形分割。自由点 = 周辺の格子（`ground.cell`）、ピットの床、盛土の天端。制約線 = ベンチ・盛土の肩と法尻、道路の縁。ランプが通る所のベンチ線は道路の縁から 3 m 以内を切り取る。辺にならなかった線分は折れ線から外す（§2.1 の不変条件を生成側で保証）。周辺は seed 付きのフラクタル雑音で緩やかに起伏させ、施設の周り（20 m 以内）は平らに保つ。
-6. **土手**: ランプのピット側の路肩に `Barrier { kind: "berm", height: berm_height }`。
-7. **Site** で全体を束ねる。
+### 3.1 部品
 
-同じ `MineSpec`（seed を含む）からは常に同じ鉱山ができる。ID は名前と地物の種類から決まる。
+1. **ピット** `PitSpec`: 床は楕円。各ベンチの法尻・肩は床の外形を法線方向にオフセットした平行曲線（凸なので折れない）。法面は `face_angle`、段差は `bench_height`、ベンチ幅は `bench_width`。ピットは地形の形であって道路を作らない。
+2. **ランプ** `PitSpec::ramp(&RampSpec)`: ただの点列を返す補助。リム上の `start` から一定勾配 `grade` で壁を螺旋状に下る。高さ z における壁の平均位置に **ランプの外側の縁**（幅 `width` の半分だけ内側が中心線）を合わせるので、外側は切土、内側は盛土になる。リムからの入りは 40 m かけてなめらかに曲げ、`approach` > 0 ならリムの外から 2 次ベジェで入る。4 周で床に届かない勾配は拒否。床の外形の曲率半径が道路の半幅より小さい所（細長いピットの長軸の端）では、内側の縁が折り返さないよう、ランプを壁側へ寄せる。利用者はこの点列を `add_road` に渡す。スイッチバックや直線の切り通しなど、別の形の点列を渡してもよい。
+3. **盛土** `HeapSpec`: 安息角（既定 37°）の円錐台。`kind`（`waste_dump` / `stockpile` など）が土地被覆の種類になる。法尻と肩を折れ線にする。
+4. **ヤード** `PadSpec`: 外形の高さ（平均）で均した平地。外形を折れ線（`edge`）にし、内側は周辺の格子を入れずその高さの点で埋める。`buildings` があれば、ヤードの中に収まる区画にだけ建物を建てる（区画は道路沿いなので運搬路に面する）。
+5. **土手** `MapBuilder::add_barrier(lane, kind, height)`: 車線 1 本の全長に `Barrier` を置く。
+6. **Site**: 部品と道路（`add_road(site=...)`）の `site` 名でまとめる。ピットを含む Site は `open_pit_mine`、それ以外は `works`。交差点の流入道路がすべて同じ Site のものなら、その交差点の接続道路もその Site に入れる。
+
+### 3.2 地形
+
+spade の制約付き三角形分割で、地図に 1 つ。自由点 = 周辺の格子（`ground.cell`）、ピットの床、盛土の天端。制約線 = 全道路の縁、ベンチ・盛土の肩と法尻。部品の線は道路の縁から 3 m 以内を切り取る。辺にならなかった線分は折れ線から外す（§2.1 の不変条件を生成側で保証）。
+
+周辺の基準高さは **道路とリム・法尻の高さ**（`Base::Roads` + `Landforms::anchors`）から決める。ピットや盛土の内側を通る道路（ランプ）は基準高さに使わない。そこから seed 付きのフラクタル雑音で緩やかに起伏させ、部品・道路・建物の周り（20 m 以内）とヤードは平らに保つ。
+
+部品が重なっていれば拒否する（頂点の包含と辺の交差の両方を見る）。街の建物も同じ判定で部品にかかる区画を除く。道路だけの Site（部品なし）も作る（`surfaces` は空）。ピット・盛土・ヤードが 1 つでもあれば地形を生成し（`ground` 未指定なら既定値）、部品がなく `ground` も未指定なら地形は書かない（CARLA 出力が道路から地面を作る）。
+
+同じ `Places`（seed を含む）からは常に同じ地図ができる。ID は名前と地物の種類から決まる。
 
 ## 3.5 市街地と鉱山で共有しているもの
 
-環境ごとに違うのは「形」だけで、組み立て方は共有する。
+「市街地」「鉱山」という分岐はもうない。どちらも同じ `Places` の部品の組み合わせで、1 つの地図に両方を置いてもよい。
 
 ```
-                    共通の段                          市街地                     鉱山
-道路の配置          MapBuilder                         利用者が描く               ランプ・運搬路・交差点
-建物                roadgen_buildings::generate_with   Site に属さない全道路沿い  運搬路沿い・ヤード内のみ
-                    （区画割り＋CGA 文法）             （town などのプリセット）  （industrial プリセット）
-地形                environment::land::generate        Base::Roads、形なし        Base::Level(リム)、
-                    （全道路の縁＝折れ線、格子、起伏、                            ベンチ・盛土の線、床・天端
-                     TIN、IR へ登録）
-土地被覆            land::cover                        —                          pit / waste_dump / stockpile / pad
-CARLA 出力          surfaces / terrain / barriers      IR から（環境によらず同じ）
+                    共通の段                          街の部品                     鉱山の部品
+道路                MapBuilder（利用者が描く）         街路                         ランプ・運搬路（site= 付き）
+建物                roadgen_buildings::generate_with   Site に属さない全道路沿い    ヤード内のみ（industrial など）
+                    （区画割り＋CGA 文法）             部品の上には建てない
+地形                environment::land::generate        —                            ベンチ・盛土の線、床・天端
+                    （全道路の縁＝折れ線、格子、起伏、
+                     TIN、IR へ登録）——地図に 1 回
+土地被覆            land::cover                        —                            pit / waste_dump / stockpile / pad
+CARLA 出力          surfaces / terrain / barriers      IR から（部品によらず同じ）
 ```
-
-- 地形は「基準高さ（一定 or 道路から決まる高さ）」と「形（折れ線・平坦面・穴・平地）」を渡すだけで、市街地も鉱山も同じ関数で作る。道路から決まる高さには、CARLA 出力が地面を作るときと同じ `ground::Field` を使う。
-- 建物は、鉱山のヤードにも市街地と同じ区画割り・同じ文法で建てる。区画は道路沿いなので、ヤードの建物も運搬路に面する。
-- 市街地は、鉱山など他の Site に属する道路には建物を並べない。
 
 ## 4. 各出力処理
 
@@ -148,8 +153,8 @@ CARLA 出力          surfaces / terrain / barriers      IR から（環境に�
 
 ## 6. 既知の制約・今後
 
-- 1 鉱山 1 ピット、ランプは螺旋 1 本。スイッチバック、複数ピット、坑内掘りは対象外。
+- ピットの床は楕円のみ。坑内掘りは対象外。ランプの補助は螺旋だけ（他の形は点列を自分で渡す）。
 - ベンチ線をランプ付近で切り取った端で、細い三角形の切れ込みが出ることがある。
-- CARLA の地面は TIN の範囲（施設の外接矩形＋`ground_margin`）で終わる。
+- CARLA の地面は TIN の範囲（部品と道路の外接矩形＋`ground.margin`）で終わる。
 - 新しい CARLA 材質の Poly Haven スラッグ（`rocky_trail`、`aerial_rocks_02`）は既定値で、実在は未確認（開発環境から API に接続できなかったため）。取得スクリプトが存在しないスラッグを報告するので、その場合はマニフェストを差し替えればよい。
 - `use_carla_materials=True`（既定）だと CARLA が路面をアスファルトに塗り替える。`check()` が警告する。

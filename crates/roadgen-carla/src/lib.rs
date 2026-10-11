@@ -46,11 +46,12 @@
 //!
 //! # What kind of place
 //!
-//! A town or a mine is one value, [`Environment`], and each is a branch of
-//! [`environment`]: it lays out the roads the place needs and generates, into the
-//! IR, what stands on and under them — a town's buildings, a mine's benches, heaps
-//! and land. The package is then written from the IR the same way for every kind
-//! of place, so this crate's export stays a lowering that pushes nothing back.
+//! A town or a mine is not a branch of this crate but parts on one map: the
+//! caller draws the roads — streets, a ramp, haul roads — and puts pits, heaps and
+//! pads in [`Places`], and [`environment::generate`] fills the IR with what stands
+//! on and under them: buildings along the streets and on the pads, and one land
+//! shaped by every part. The package is then written from the IR the same way for
+//! every map, so this crate's export stays a lowering that pushes nothing back.
 //!
 //! # What stands beside it
 //!
@@ -99,7 +100,7 @@ use roadgen_core::semantics::MapObjectKind;
 use roadgen_core::trace::{Relation, Trace};
 use roadgen_core::ValidatedMap;
 
-pub use environment::{Environment, MineSpec};
+pub use environment::{HeapSpec, PadSpec, PitSpec, Places, RampSpec};
 pub use error::ExportError;
 pub use furniture::{FurnitureConfig, SignKind};
 pub use materials::Material;
