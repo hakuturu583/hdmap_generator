@@ -1087,6 +1087,14 @@ impl CorridorSpec {
                 ground,
                 curve,
             )?;
+            // Grades either way: the branch's ground may stand above the flyovers'
+            // levels, and a flyover down to it as steep as one up is as bad.
+            let (on_climb, on_descent, off_climb, off_descent) = (
+                on_climb.abs(),
+                on_descent.abs(),
+                off_climb.abs(),
+                off_descent.abs(),
+            );
             if on_descent > FLYOVER_GRADE || off_climb > FLYOVER_GRADE {
                 let least = if on_descent.max(off_climb).is_finite() {
                     site.reach * on_descent.max(off_climb) / FLYOVER_GRADE

@@ -314,6 +314,31 @@ fn a_directional_ts_flyovers_need_room_to_climb_from_the_far_carriageway() {
 }
 
 #[test]
+fn a_directional_ts_flyovers_come_down_to_a_branch_on_high_ground_no_steeper_than_up() {
+    // The branch drawn on ground well above both flyovers' levels, and long
+    // enough to come down from it at the flyovers' grade.
+    let mut spec = corridor(InterchangeKind::Directional { side: Side::Left }, 80.0);
+    for p in &mut spec.interchanges[0].crossroad {
+        p.y *= 3.0;
+        p.z = 40.0;
+    }
+    let plan = spec.plan(TrafficHandedness::RightHand).unwrap();
+    for road in plan
+        .roads
+        .iter()
+        .filter(|road| road.name.ends_with("_on") || road.name.ends_with("_off"))
+    {
+        for pair in road.points.windows(2) {
+            let run = pair[0].horizontal_distance_to(pair[1]);
+            if run > 1e-6 {
+                let grade = (pair[1].z - pair[0].z).abs() / run;
+                assert!(grade < 0.065, "{} at {:.1} %", road.name, grade * 100.0);
+            }
+        }
+    }
+}
+
+#[test]
 fn a_cloverleaf_says_how_much_reach_its_collector_distributor_roads_need() {
     let mut spec = corridor(InterchangeKind::Cloverleaf, 80.0);
     spec.interchanges[0].reach = 200.0;
