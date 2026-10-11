@@ -391,6 +391,11 @@ impl MapBuilder {
         &mut self.metadata
     }
 
+    /// The roads added so far, in the order they were added.
+    pub fn roads(&self) -> impl Iterator<Item = (&RoadId, &RoadSpec)> {
+        self.roads.iter().map(|draft| (&draft.id, &draft.spec))
+    }
+
     /// Adds a road. Its identifier comes from `spec.name`, or from the road's
     /// position if it has none, so two identical scripts name the same roads.
     pub fn add_road(&mut self, spec: RoadSpec) -> Result<RoadId, BuildError> {

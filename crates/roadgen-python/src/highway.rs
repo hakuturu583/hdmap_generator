@@ -7,7 +7,7 @@ use pyo3::types::PyDict;
 
 use roadgen_carla::environment::{
     Control, CorridorPlan, CorridorSpec, InterchangeKind, InterchangeSite, RampSite, Side,
-    StructureMode,
+    StructureMode, Town, Urban,
 };
 use roadgen_core::map::{Map, TrafficHandedness};
 use roadgen_core::semantics::FormOfWay;
@@ -91,6 +91,9 @@ type Span = (String, f64, f64);
 pub struct PyCorridor {
     pub(crate) spec: CorridorSpec,
     pub(crate) handedness: TrafficHandedness,
+    /// The town on the map when the corridor was added to it, for an urban
+    /// corridor to find its way through.
+    pub(crate) town: Town,
 }
 
 #[pymethods]
@@ -239,7 +242,7 @@ impl PyCorridor {
     fn plan(&self) -> PyResult<PyCorridorPlan> {
         let plan = self
             .spec
-            .plan(self.handedness)
+            .plan_in(self.handedness, &self.town)
             .map_err(PyValueError::new_err)?;
         Ok(PyCorridorPlan {
             plan,
@@ -342,6 +345,7 @@ pub(crate) fn corridor(
     sunken_depth: f64,
     end_transition: Option<f64>,
     shared_deck: bool,
+    urban: Option<&str>,
 ) -> PyResult<CorridorSpec> {
     let mut spec = CorridorSpec::new(name, centre.into_iter().map(point).collect(), design_speed)
         .map_err(PyValueError::new_err)?;
@@ -362,6 +366,12 @@ pub(crate) fn corridor(
     spec.sunken = sunken.unwrap_or_default();
     spec.sunken_depth = sunken_depth;
     spec.end_transition = end_transition;
+    spec.urban = match urban {
+        None => None,
+        Some(text) => Some(Urban::parse(text).ok_or_else(|| {
+            PyValueError::new_err(format!("urban is elevated or sunken, not {text:?}"))
+        })?),
+    };
     spec.check().map_err(PyValueError::new_err)?;
     Ok(spec)
 }
