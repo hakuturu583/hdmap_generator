@@ -37,7 +37,7 @@ use roadgen_core::structure::{
 use roadgen_core::topology::{Direction, LaneEnd};
 use roadgen_core::units::{PositiveWidth, SpeedLimit};
 
-use super::interchange::{self, Directional, FreeFlow};
+use super::interchange::{self, Directional, FreeFlow, Stack};
 
 /// The geometry a road is designed to, by design speed.
 #[derive(Debug, Clone, PartialEq)]
@@ -207,6 +207,19 @@ pub enum InterchangeKind {
     /// one. The two flyovers cross each other beside the motorway, one stacked
     /// over the other: three levels.
     Directional { side: Side },
+    /// A junction of two motorways that cross — a four-level stack. The
+    /// crossroad is the other motorway's line, drawn right across the corridor;
+    /// the plan builds it as two carriageways of the corridor's standard and
+    /// lanes, its own `crossroad_lanes` unused, lifted on a viaduct over the
+    /// corridor. Every one of the eight turns has a slip road of its own, off
+    /// one motorway with a deceleration lane and on to the other with an
+    /// acceleration lane: the four turns that cross nothing a quarter turn in
+    /// their quadrant, outside everything else; the four that cross both
+    /// motorways a flyover round the middle, the two on to the corridor a level
+    /// over the other motorway and the two off it a level higher still. The
+    /// corridor is the bottom level, the other motorway the second, and the
+    /// flyovers the third and the fourth.
+    Stack,
 }
 
 impl InterchangeKind {
@@ -218,6 +231,7 @@ impl InterchangeKind {
             InterchangeKind::Trumpet { .. } => "trumpet",
             InterchangeKind::Cloverleaf => "cloverleaf",
             InterchangeKind::Directional { .. } => "directional",
+            InterchangeKind::Stack => "stack",
         }
     }
 }
@@ -980,6 +994,20 @@ pub(super) enum Shape {
     /// No road of its own: the slip road is the first (off) or last (on) piece
     /// of a collector–distributor road.
     Collector,
+    /// No road of its own here: the slip road is another plan's, which leaves
+    /// or joins this one's carriageway — a stack's, between two motorways.
+    Elsewhere,
+}
+
+/// A slip road another plan draws, leaving or joining one of this corridor's
+/// carriageways: its name, the carriageway's side, and the nose, as a travel
+/// station along that carriageway.
+#[derive(Debug, Clone)]
+pub(super) struct Join {
+    pub ramp: String,
+    pub side: Side,
+    pub on: bool,
+    pub nose: f64,
 }
 
 /// Where a slip road leaves or joins a carriageway, and the slip road.
@@ -1000,7 +1028,7 @@ impl CorridorSpec {
     /// The length over which the profile climbs `height` onto an elevated stretch,
     /// or descends it into a sunken one: a cosine transition whose steepest grade
     /// is four fifths of the design standard's, and no shorter than 120 m.
-    fn lift(&self, height: f64) -> f64 {
+    pub(super) fn lift(&self, height: f64) -> f64 {
         (height * std::f64::consts::PI / (2.0 * 0.8 * self.standard.max_grade.max(0.02))).max(120.0)
     }
 
@@ -1103,7 +1131,7 @@ impl CorridorSpec {
 
     /// The height of the centre line at `s`: the profile, lifted over its elevated
     /// stretches and dropped through its sunken ones.
-    fn height_at(&self, profile: &VerticalProfile, s: f64) -> f64 {
+    pub(super) fn height_at(&self, profile: &VerticalProfile, s: f64) -> f64 {
         let ramp_for = |height: f64| self.lift(height);
         let mut z = profile.height(s);
         for &(from, to) in &self.elevated {
@@ -1121,8 +1149,6 @@ impl CorridorSpec {
         z
     }
 
-    /// Works out the roads, junctions, movements and structures the corridor asks
-    /// for. See the module documentation.
     /// Splits the piece at the corridor's far end into the stages of its
     /// transition to an ordinary road: the limit stepped down 20 km/h at a
     /// time to 60, each stage an equal share of `transition`, and the last no
@@ -1215,27 +1241,22 @@ impl CorridorSpec {
         }
     }
 
+    /// Works out the roads, junctions, movements and structures the corridor asks
+    /// for. See the module documentation.
     pub fn plan(&self, handedness: TrafficHandedness) -> Result<CorridorPlan, String> {
-        self.check()?;
-        let key = self.key();
-        let standard = &self.standard;
-        let mut plan = CorridorPlan {
-            corridor: self.name.clone(),
-            ..CorridorPlan::default()
-        };
-        if let Some(urban) = self.urban {
-            plan.notes.push(format!(
-                "{}: drawn without the town, so no stretch through it is {}; plan it in the \
-                 town with plan_in",
-                self.name,
-                urban.as_str()
-            ));
-        }
-        let track = Track::new(&self.centre, standard.min_radius, &mut plan.notes)?;
-        let length = track.length();
+        self.plan_joined(handedness, &[])
+    }
 
-        // The vertical alignment: the profile given, or the centre points' heights
-        // at their stations.
+    /// The centre line, rounded and sampled, and its vertical alignment: the
+    /// profile given, or the centre points' heights at their stations. A bend
+    /// tighter than the design speed allows, and a grade steeper, is noted.
+    pub(super) fn alignment(
+        &self,
+        notes: &mut Vec<String>,
+    ) -> Result<(Track, VerticalProfile), String> {
+        let standard = &self.standard;
+        let track = Track::new(&self.centre, standard.min_radius, notes)?;
+        let length = track.length();
         let pvis: Vec<(f64, f64)> = if self.profile.is_empty() {
             self.centre
                 .iter()
@@ -1271,12 +1292,39 @@ impl CorridorSpec {
             .collect();
         let profile = VerticalProfile::with_radii(pvis, radii).map_err(|e| e.to_string())?;
         if profile.steepest() > standard.max_grade + 1e-9 {
-            plan.notes.push(format!(
+            notes.push(format!(
                 "the profile climbs {:.1} %, steeper than the {:.1} % the design speed allows",
                 profile.steepest() * 100.0,
                 standard.max_grade * 100.0
             ));
         }
+        Ok((track, profile))
+    }
+
+    /// Plans the corridor as [`CorridorSpec::plan`] does, with `joins` — slip
+    /// roads another plan draws — leaving and joining its carriageways too.
+    pub(super) fn plan_joined(
+        &self,
+        handedness: TrafficHandedness,
+        joins: &[Join],
+    ) -> Result<CorridorPlan, String> {
+        self.check()?;
+        let key = self.key();
+        let standard = &self.standard;
+        let mut plan = CorridorPlan {
+            corridor: self.name.clone(),
+            ..CorridorPlan::default()
+        };
+        if let Some(urban) = self.urban {
+            plan.notes.push(format!(
+                "{}: drawn without the town, so no stretch through it is {}; plan it in the \
+                 town with plan_in",
+                self.name,
+                urban.as_str()
+            ));
+        }
+        let (track, profile) = self.alignment(&mut plan.notes)?;
+        let length = track.length();
         let z = |s: f64| self.height_at(&profile, s);
 
         let cw_width = carriageway_width(standard, self.lanes);
@@ -1377,6 +1425,27 @@ impl CorridorSpec {
                         point_at: &point_at,
                         ground_at: &ground_at,
                         at_lateral: &at_lateral,
+                        cw_width,
+                        outward,
+                        handedness,
+                        ramp_standard: &ramp_standard,
+                    },
+                    &mut plan,
+                    &carriageways,
+                    &mut accesses,
+                )?;
+                continue;
+            }
+            // A stack's crossroad is a motorway that crosses on through, planned
+            // as a corridor of its own.
+            if site.kind == InterchangeKind::Stack {
+                self.stack(
+                    Stack {
+                        site,
+                        ic: &ic,
+                        centre_station,
+                        track: &track,
+                        z: &z,
                         cw_width,
                         outward,
                         handedness,
@@ -1949,6 +2018,22 @@ impl CorridorSpec {
                 shape: Shape::Link,
             });
         }
+        for join in joins {
+            let c = carriageways
+                .iter()
+                .position(|c| c.side == join.side && !c.collector)
+                .expect("both sides");
+            accesses.push(Access {
+                ramp: join.ramp.clone(),
+                carriageway: c,
+                on: join.on,
+                nose: join.nose,
+                end: [0.0, 0.0],
+                end_z: 0.0,
+                end_heading: 0.0,
+                shape: Shape::Elsewhere,
+            });
+        }
         for access in &accesses {
             carriageways[access.carriageway].noses.push(Nose {
                 at: access.nose,
@@ -2180,7 +2265,7 @@ impl CorridorSpec {
                 points
             };
             let points = match (&access.shape, access.on) {
-                (Shape::Collector, _) => None,
+                (Shape::Collector | Shape::Elsewhere, _) => None,
                 (Shape::Whole(points), _) => Some(points.clone()),
                 (shape, true) => {
                     let end = point_on(c, start_t, outward * edge);

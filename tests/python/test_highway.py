@@ -262,6 +262,30 @@ def test_a_directional_t_ends_another_motorway_on_flyovers():
                            crossroad_lanes=street_lanes(), kind="directional")
 
 
+def test_a_stack_crosses_another_motorway_on_four_levels():
+    m = roadgen.Map(name="stack")
+    e5 = m.add_corridor("E5", [(-1500.0, 0.0, 0.0), (1500.0, 0.0, 0.0)], design_speed=100.0)
+    e5.add_interchange("Minami JCT", at=1500.0, crossroad=[(0.0, -1300.0, 0.0), (0.0, 1300.0, 0.0)],
+                       crossroad_lanes=street_lanes(), kind="stack", reach=450.0)
+    plan = e5.plan()
+    assert plan.notes == []
+    forms = {road["name"]: road["form"] for road in plan.roads}
+    assert forms["minami_jct_branch_left_0"] == "motorway"
+    # A quarter turn and a flyover off and on each carriageway.
+    assert sum(form == "slip_road" for form in forms.values()) == 8
+    # The other motorway's viaduct over this one, and each flyover's.
+    assert [form for form, _ in plan.structures].count("viaduct") >= 5
+    m.add_plan(plan)
+    m.validate()
+    [interchange] = m.interchange_ids()
+    assert m.interchange(interchange)["kind"] == "stack"
+    too_near = roadgen.Map().add_corridor("E5", [(-1500.0, 0.0, 0.0), (1500.0, 0.0, 0.0)])
+    too_near.add_interchange("J", at=1500.0, crossroad=[(0.0, -1300.0, 0.0), (0.0, 1300.0, 0.0)],
+                             crossroad_lanes=street_lanes(), kind="stack")
+    with pytest.raises(ValueError, match="reach of"):
+        too_near.plan()
+
+
 def test_a_trumpet_says_which_side_it_stops_on():
     corridor = roadgen.Map().add_corridor("E5", [(0.0, 0.0, 0.0), (3000.0, 0.0, 0.0)])
     with pytest.raises(ValueError, match="side="):

@@ -1,5 +1,5 @@
-//! The free-flow interchanges a corridor plans — the cloverleaf, the trumpet and
-//! the directional T — laid out quadrant by quadrant.
+//! The free-flow interchanges a corridor plans — the cloverleaf, the trumpet, the
+//! directional T and the four-level stack — laid out quadrant by quadrant.
 //!
 //! Each side of the corridor is drawn in a frame of its own: `a` metres along the
 //! traffic of that side's carriageway from where the crossroad crosses the centre
@@ -26,12 +26,12 @@ use roadgen_core::builder::LaneSpec;
 use roadgen_core::geometry::{Point3, VerticalProfile};
 use roadgen_core::map::TrafficHandedness;
 use roadgen_core::semantics::{FormOfWay, LaneType, RoadType};
-use roadgen_core::structure::{BridgeForm, CLEARANCE, OVERPASS_DECK};
+use roadgen_core::structure::{BridgeForm, BridgeSpec, CLEARANCE, OVERPASS_DECK};
 use roadgen_core::topology::{Direction, RoadEnd};
 
 use super::corridor::{
     carriageway_width, length_of, link, one_way, Access, Carriageway, ConnectionPlan, CorridorPlan,
-    CorridorSpec, DesignStandard, InterchangePlan, InterchangeSite, RoadPlan, Shape, Side,
+    CorridorSpec, DesignStandard, InterchangePlan, InterchangeSite, Join, RoadPlan, Shape, Side,
     StructurePlan, Track, GAP, LOOP_CLEARANCE, LOOP_RADIUS, STEP,
 };
 
@@ -74,6 +74,12 @@ impl Frame {
             self.origin[0] + self.u[0] * a + self.w[0] * b,
             self.origin[1] + self.u[1] * a + self.w[1] * b,
         ]
+    }
+
+    /// A point in the plane as a point of the frame.
+    pub fn local(&self, p: [f64; 2]) -> [f64; 2] {
+        let (x, y) = (p[0] - self.origin[0], p[1] - self.origin[1]);
+        [x * self.u[0] + y * self.u[1], x * self.w[0] + y * self.w[1]]
     }
 
     /// A heading in the frame as a heading in the plane.
@@ -1267,6 +1273,570 @@ impl CorridorSpec {
                 off_name,
                 on_name,
             ],
+        });
+        Ok(())
+    }
+}
+
+/// What [`CorridorSpec::stack`] builds from: the site, where its crossroad — the
+/// other motorway's line — crosses the centre line, and the corridor.
+pub(super) struct Stack<'a> {
+    pub site: &'a InterchangeSite,
+    pub ic: &'a str,
+    pub centre_station: f64,
+    pub track: &'a Track,
+    /// The corridor's height at a centre-line station.
+    pub z: &'a dyn Fn(f64) -> f64,
+    pub cw_width: f64,
+    pub outward: f64,
+    pub handedness: TrafficHandedness,
+    pub ramp_standard: &'a DesignStandard,
+}
+
+/// How far a slip road of a stack takes to move out from the carriageway it
+/// leaves to the line it runs on beside it, and back in to the one it joins,
+/// metres: an easy S.
+const EASE: f64 = 100.0;
+/// The room kept between two of a stack's slip roads side by side, and between
+/// the two flyovers of a level where they pass through the middle, metres.
+const APART: f64 = 3.0;
+/// How far out from the middle a stack's flyover may cross anything, metres:
+/// past it, nothing is looked for to keep it level over.
+const MIDDLE: f64 = 300.0;
+
+/// A carriageway as a stack reads it: the line it runs beside and its height
+/// there, which way along the line its traffic goes, and how far to the left of
+/// the line its reference line is.
+struct Way<'a> {
+    track: &'a Track,
+    z: &'a dyn Fn(f64) -> f64,
+    along: bool,
+    offset: f64,
+}
+
+impl Way<'_> {
+    /// A centre-line station as a travel station, or back.
+    fn travel(&self, s: f64) -> f64 {
+        if self.along {
+            s
+        } else {
+            self.track.length() - s
+        }
+    }
+
+    /// Where a slip road leaves or joins it at travel station `t`: half a metre
+    /// clear of its edge, a carriageway `width` wide whose lanes lie `outward`
+    /// of its reference line, at its height; and the way its traffic heads.
+    fn beside(&self, t: f64, width: f64, outward: f64) -> (Point3, f64) {
+        let s = self.travel(t);
+        let travel_left = if self.along { 1.0 } else { -1.0 };
+        let p = self
+            .track
+            .offset(s, self.offset + travel_left * outward * (width + 0.5));
+        (Point3::new(p[0], p[1], (self.z)(s)), self.heading(s))
+    }
+
+    /// The way its traffic heads at centre-line station `s`.
+    fn heading(&self, s: f64) -> f64 {
+        let (_, _, h) = self.track.at(s);
+        if self.along {
+            h
+        } else {
+            h + PI
+        }
+    }
+}
+
+/// One of a stack's slip roads: its line, heights and all, from the nose it
+/// leaves at to the nose it joins at, and the two noses — on the corridor's
+/// carriageway, and on the other motorway's — as travel stations.
+struct StackRamp {
+    name: String,
+    points: Vec<Point3>,
+    flyover: bool,
+    /// Whether it joins the corridor, from the other motorway, or leaves it.
+    on: bool,
+    carriageway: usize,
+    nose: f64,
+    other: Side,
+    other_nose: f64,
+}
+
+impl CorridorSpec {
+    /// Builds a four-level stack: the other motorway on through, a corridor of
+    /// its own lifted a level over this one where it crosses, and the eight slip
+    /// roads between the two. See [`InterchangeKind::Stack`].
+    ///
+    /// Each side is laid out in its frame, as a free-flow interchange's is, the
+    /// other motorway running along `a = 0`. The flyovers turn round the middle
+    /// on arcs whose centres stand on the diagonals, `c` out each way: the two
+    /// of a level — on to each carriageway, or off each — pass either side of
+    /// the middle, `d` from it, and cross the other level's two; each runs on
+    /// beside both motorways `p` out from its line. The quarter turns are as
+    /// much farther out as keeps them clear of the flyovers, and leave and join
+    /// each motorway farther from the middle than the flyovers do, by a speed-
+    /// change lane and an easy S: the outer turn leaves first and joins last,
+    /// and nothing crosses it.
+    ///
+    /// [`InterchangeKind::Stack`]: super::corridor::InterchangeKind::Stack
+    pub(super) fn stack(
+        &self,
+        cx: Stack<'_>,
+        plan: &mut CorridorPlan,
+        carriageways: &[Carriageway],
+        accesses: &mut Vec<Access>,
+    ) -> Result<(), String> {
+        let Stack { site, ic, .. } = cx;
+        let standard = &self.standard;
+        let ramp = cx.ramp_standard;
+        let median = standard.median / 2.0;
+        let edge = median + cx.cw_width;
+        // A level over another: the clearance under a viaduct's deck, and half a
+        // metre to spare.
+        let level = CLEARANCE + BridgeSpec::for_form(BridgeForm::Viaduct).deck_depth + 0.5;
+        let (ox, oy, oh) = cx.track.at(cx.centre_station);
+
+        // The other motorway: a corridor of this one's standard along the
+        // crossroad, lifted where it crosses to a level over this one.
+        let mut other = CorridorSpec::new(
+            format!("{ic}_branch"),
+            site.crossroad.clone(),
+            standard.design_speed,
+        )?;
+        other.standard = standard.clone();
+        other.lanes = self.lanes;
+        other.structures = self.structures;
+        other.shared_deck = self.shared_deck;
+        let (other_track, other_profile) = other.alignment(&mut Vec::new())?;
+        let other_length = other_track.length();
+        let (across, lateral) = other_track.locate([ox, oy]);
+        if lateral.abs() > 1.0 {
+            return Err(format!(
+                "{}: the crossroad does not cross the corridor",
+                site.name
+            ));
+        }
+        // Lifted to a level over the corridor where the two cross: over the
+        // corridor's highest under the deck, from the crossroad's lowest there,
+        // both on their grades.
+        let deck = edge + 5.0;
+        let highest = |z: &dyn Fn(f64) -> f64, from: f64, to: f64| {
+            let steps = ((to - from) / 5.0).ceil().max(1.0) as usize;
+            (0..=steps)
+                .map(|k| z(from + (to - from) * k as f64 / steps as f64))
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        let under = highest(cx.z, cx.centre_station - deck, cx.centre_station + deck);
+        let low = -highest(
+            &|s: f64| -other_profile.height(s),
+            across - deck,
+            across + deck,
+        );
+        let lift = under + level - low;
+        if lift < 0.0 {
+            return Err(format!(
+                "{}: the crossroad of a stack stands {:.1} m over the corridor where they                  cross, higher than the level the stack lifts it to; give it a profile                  nearer the corridor's",
+                site.name,
+                low - under
+            ));
+        }
+        // Always on a bridge where it crosses, however little it is lifted: the
+        // bridge is what says which of the two is carried over the other.
+        let lift = lift.max(0.5);
+        let half = edge + 10.0 + other.lift(lift);
+        other.elevated = vec![(across - half, across + half)];
+        other.elevated_height = lift;
+        let other_z = |s: f64| other.height_at(&other_profile, s);
+        let forward_right = cx.handedness == TrafficHandedness::RightHand;
+        let other_way = |side: Side| Way {
+            track: &other_track,
+            z: &other_z,
+            along: (side == Side::Right) == forward_right,
+            offset: side.sign() * median,
+        };
+        let way = |c: usize| Way {
+            track: cx.track,
+            z: cx.z,
+            along: carriageways[c].along,
+            offset: carriageways[c].offset,
+        };
+        let index_of = |side: Side| {
+            carriageways
+                .iter()
+                .position(|c| c.side == side && !c.collector)
+                .expect("both sides")
+        };
+        let opposite = |side: Side| match side {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        };
+
+        // The layout's dimensions, in a side's frame. A flyover's reference line
+        // is on the inside of its turn, its lane outside, towards the middle.
+        let ramp_width = carriageway_width(ramp, 1);
+        let lane_middle = ramp.inner_shoulder + ramp.lane_width / 2.0;
+        let d = ramp_width + APART;
+        let radius = ((edge + 0.5 + SWING + d / SQRT_2) / (1.0 - 1.0 / SQRT_2))
+            .max(ramp.min_radius - lane_middle);
+        let c = (radius + d) / SQRT_2;
+        let p = radius - c;
+        let q = p + ramp_width + APART;
+        let ro = ramp.min_radius + lane_middle;
+        // The quarter turns leave and join a speed-change lane and an S farther
+        // out than the flyovers.
+        let spacing =
+            GAP + standard.acceleration.max(standard.deceleration) + standard.taper + EASE + 10.0;
+
+        // The layout for the flyovers' noses `reach` from the middle along each
+        // motorway: nothing if they are too near to fit, or to climb at an easy
+        // grade.
+        let layout = |reach: f64| -> Result<Option<Vec<StackRamp>>, String> {
+            let reach_q = reach + spacing;
+            let mut ramps = Vec::new();
+            for side in [Side::Left, Side::Right] {
+                let far = opposite(side);
+                let (n, f) = (index_of(side), index_of(far));
+                let frame = Frame::new(
+                    [ox, oy],
+                    carriageways[n].heading(cx.track, cx.centre_station),
+                    [-oh.sin() * side.sign(), oh.cos() * side.sign()],
+                );
+                // The other motorway's carriageway heading in towards the
+                // corridor on this side, and the one heading out.
+                let heads_in = |s: Side| {
+                    let heading = other_way(s).heading(across);
+                    heading.cos() * frame.w[0] + heading.sin() * frame.w[1] < 0.0
+                };
+                let (inbound, outbound) = if heads_in(Side::Left) {
+                    (Side::Left, Side::Right)
+                } else {
+                    (Side::Right, Side::Left)
+                };
+                let (b_in, b_out) = (other_way(inbound), other_way(outbound));
+                let (t_in, t_out) = (b_in.travel(across), b_out.travel(across));
+                let (a_near, a_far) = (way(n), way(f));
+                let (t_near, t_far) = (
+                    a_near.travel(cx.centre_station),
+                    a_far.travel(cx.centre_station),
+                );
+                let width = cx.cw_width;
+                // An off slip road starts at the end of its junction, an on one
+                // ends at its start.
+                let leave = |w: &Way, t: f64| w.beside(t + GAP / 2.0, width, cx.outward);
+                let join = |w: &Way, t: f64| w.beside(t - GAP / 2.0, width, cx.outward);
+                let local = |end: &(Point3, f64)| frame.local([end.0.x, end.0.y]);
+                // The line from `start` along `path` to `end`, eased in and out.
+                let whole = |start: (Point3, f64), from: f64, path: &Path, end: (Point3, f64)| {
+                    let placed: Vec<[f64; 2]> =
+                        path.points.iter().map(|x| frame.place(*x)).collect();
+                    let mut out = link(
+                        [start.0.x, start.0.y],
+                        start.1,
+                        0.0,
+                        placed[0],
+                        frame.heading(from),
+                        0.0,
+                    );
+                    out.extend(placed[1..].iter().map(|x| Point3::new(x[0], x[1], 0.0)));
+                    out.extend(
+                        link(
+                            placed[placed.len() - 1],
+                            frame.heading(path.heading),
+                            0.0,
+                            [end.0.x, end.0.y],
+                            end.1,
+                            0.0,
+                        )
+                        .into_iter()
+                        .skip(1),
+                    );
+                    // As high as the carriageways at the noses; the heights
+                    // between are worked out below.
+                    let last = out.len() - 1;
+                    out[0].z = start.0.z;
+                    out[last].z = end.0.z;
+                    out
+                };
+
+                // The flyover from the other motorway on to the far carriageway:
+                // down beside it, round the middle, and on beside the far
+                // carriageway.
+                let start = leave(&b_in, t_in - reach);
+                let end = join(&a_far, t_far + reach);
+                let (lead_b, lead_a) = (local(&start)[1] - EASE, local(&end)[0] + EASE);
+                if lead_b < c || lead_a > -c {
+                    return Ok(None);
+                }
+                let path = Path::from(p, lead_b, 1.5 * PI)
+                    .line(lead_b - c)
+                    .arc(radius, -FRAC_PI_2)
+                    .line(-c - lead_a);
+                ramps.push(StackRamp {
+                    name: format!("{ic}_{}_flyover_on", far.as_str()),
+                    points: whole(start, 1.5 * PI, &path, end),
+                    flyover: true,
+                    on: true,
+                    carriageway: f,
+                    nose: t_far + reach,
+                    other: inbound,
+                    other_nose: t_in - reach,
+                });
+                // And the one off the far carriageway: in from beside it, round
+                // the middle, and on out beside the other motorway.
+                let start = leave(&a_far, t_far - reach);
+                let end = join(&b_out, t_out + reach);
+                let (lead_a, lead_b) = (local(&start)[0] - EASE, local(&end)[1] - EASE);
+                if lead_a < c || lead_b < c {
+                    return Ok(None);
+                }
+                let path = Path::from(lead_a, -p, PI)
+                    .line(lead_a - c)
+                    .arc(radius, -FRAC_PI_2)
+                    .line(lead_b - c);
+                ramps.push(StackRamp {
+                    name: format!("{ic}_{}_flyover_off", far.as_str()),
+                    points: whole(start, PI, &path, end),
+                    flyover: true,
+                    on: false,
+                    carriageway: f,
+                    nose: t_far - reach,
+                    other: outbound,
+                    other_nose: t_out + reach,
+                });
+                // The quarter turns: off the near carriageway out beside the
+                // other motorway, and in from it on to the near carriageway.
+                let start = leave(&a_near, t_near - reach_q);
+                let end = join(&b_out, t_out + reach_q);
+                let (lead_a, lead_b) = (local(&start)[0] + EASE, local(&end)[1] - EASE);
+                if lead_a > -q - ro || lead_b < q + ro {
+                    return Ok(None);
+                }
+                let path = Path::from(lead_a, q, 0.0)
+                    .line(-q - ro - lead_a)
+                    .arc(ro, FRAC_PI_2)
+                    .line(lead_b - q - ro);
+                ramps.push(StackRamp {
+                    name: format!("{ic}_{}_off", side.as_str()),
+                    points: whole(start, 0.0, &path, end),
+                    flyover: false,
+                    on: false,
+                    carriageway: n,
+                    nose: t_near - reach_q,
+                    other: outbound,
+                    other_nose: t_out + reach_q,
+                });
+                let start = leave(&b_in, t_in - reach_q);
+                let end = join(&a_near, t_near + reach_q);
+                let (lead_b, lead_a) = (local(&start)[1] - EASE, local(&end)[0] - EASE);
+                if lead_b < q + ro || lead_a < q + ro {
+                    return Ok(None);
+                }
+                let path = Path::from(q, lead_b, 1.5 * PI)
+                    .line(lead_b - q - ro)
+                    .arc(ro, FRAC_PI_2)
+                    .line(lead_a - q - ro);
+                ramps.push(StackRamp {
+                    name: format!("{ic}_{}_on", side.as_str()),
+                    points: whole(start, 1.5 * PI, &path, end),
+                    flyover: false,
+                    on: true,
+                    carriageway: n,
+                    nose: t_near + reach_q,
+                    other: inbound,
+                    other_nose: t_in - reach_q,
+                });
+            }
+
+            // The heights. A flyover is level over both motorways and where it
+            // crosses another flyover — on to the corridor the third level, off
+            // it the fourth — and climbs and descends each side; a quarter turn
+            // is at one grade all the way.
+            let lines: Vec<Vec<Point3>> = ramps.iter().map(|r| r.points.clone()).collect();
+            // The second level, the one the flyovers stand over: the other
+            // motorway's, at its highest where a flyover crosses it, and a level
+            // over the corridor's highest where one crosses that. On a grade a
+            // motorway stands higher where a flyover crosses it than where the
+            // two motorways cross, by more than a level has to spare.
+            let mut second = under + level;
+            for ramp_line in ramps.iter().filter(|ramp| ramp.flyover) {
+                for point in &ramp_line.points {
+                    if (point.x - ox).hypot(point.y - oy) > MIDDLE {
+                        continue;
+                    }
+                    let (s, off) = cx.track.locate([point.x, point.y]);
+                    if off.abs() < edge + 3.0 {
+                        second = second.max((cx.z)(s) + level);
+                    }
+                    let (s, off) = other_track.locate([point.x, point.y]);
+                    if off.abs() < edge + 3.0 {
+                        second = second.max(other_z(s));
+                    }
+                }
+            }
+            for (index, ramp_line) in ramps.iter_mut().enumerate() {
+                let stations = stations_of(&ramp_line.points);
+                let (from, to) = (
+                    ramp_line.points[0].z,
+                    ramp_line.points[ramp_line.points.len() - 1].z,
+                );
+                if !ramp_line.flyover {
+                    let total = stations[stations.len() - 1];
+                    if ((to - from) / total).abs() > ramp.max_grade {
+                        return Ok(None);
+                    }
+                    for (point, s) in ramp_line.points.iter_mut().zip(&stations) {
+                        point.z = from + (to - from) * s / total;
+                    }
+                    continue;
+                }
+                let mut range: Option<(f64, f64)> = None;
+                let mut widen = |s: f64| {
+                    range = Some(range.map_or((s, s), |(lo, hi)| (lo.min(s), hi.max(s))));
+                };
+                for (point, s) in ramp_line.points.iter().zip(&stations) {
+                    if (point.x - ox).hypot(point.y - oy) > MIDDLE {
+                        continue;
+                    }
+                    let near_line =
+                        |track: &Track| track.locate([point.x, point.y]).1.abs() < edge + 3.0;
+                    if near_line(cx.track) || near_line(&other_track) {
+                        widen(*s);
+                    }
+                }
+                for (other_index, other_line) in lines.iter().enumerate() {
+                    if other_index == index {
+                        continue;
+                    }
+                    if let Some((s, _)) = crossing(&lines[index], other_line) {
+                        widen(s);
+                    }
+                }
+                let Some((lo, hi)) = range else {
+                    return Err(format!(
+                        "{}: a flyover of the stack crosses neither motorway",
+                        site.name
+                    ));
+                };
+                let top = second + level * if ramp_line.on { 1.0 } else { 2.0 };
+                let (heights, climb, descent) = flyover(
+                    &stations,
+                    from,
+                    top,
+                    (lo - LEVEL_MARGIN, hi + LEVEL_MARGIN),
+                    to,
+                    ramp.crest_radius,
+                )?;
+                if climb.abs().max(descent.abs()) > FLYOVER_GRADE || heights.is_empty() {
+                    return Ok(None);
+                }
+                for (point, z) in ramp_line.points.iter_mut().zip(heights) {
+                    point.z = z;
+                }
+            }
+            // The other motorway reaches far enough for the quarter turns, and
+            // is lifted and back down again within it.
+            let needed = (reach_q + GAP / 2.0 + 30.0).max(half);
+            if across < needed || other_length - across < needed {
+                return Err(format!(
+                    "{}: the crossroad of a stack needs to reach {needed:.0} m each side of the \
+                     corridor",
+                    site.name
+                ));
+            }
+            Ok(Some(ramps))
+        };
+        let mut reach = site.reach;
+        let ramps = loop {
+            if reach > 5000.0 {
+                return Err(format!(
+                    "{}: the flyovers of the stack cannot be laid out at an easy grade",
+                    site.name
+                ));
+            }
+            match layout(reach)? {
+                Some(ramps) if reach == site.reach => break ramps,
+                Some(_) => {
+                    return Err(format!(
+                        "{}: the flyovers of a stack need room to climb; give it a reach of \
+                         {reach:.0} m or more",
+                        site.name
+                    ))
+                }
+                None => reach += 10.0,
+            }
+        };
+
+        // The flyovers, on a viaduct where they stand high; and every slip road
+        // as an access to the corridor's carriageway and a join to the other
+        // motorway's.
+        let mut joins = Vec::new();
+        let mut roads = Vec::new();
+        for ramp_line in ramps {
+            let StackRamp {
+                name,
+                points,
+                flyover,
+                on,
+                carriageway,
+                nose,
+                other: other_side,
+                other_nose,
+            } = ramp_line;
+            if flyover {
+                let stations = stations_of(&points);
+                let total = stations[stations.len() - 1];
+                let (first, last) = (points[0].z, points[points.len() - 1].z);
+                let high: Vec<f64> = stations
+                    .iter()
+                    .zip(&points)
+                    .filter(|(s, p)| p.z - (first + (last - first) * **s / total) >= VIADUCT_HEIGHT)
+                    .map(|(s, _)| *s)
+                    .collect();
+                if let (Some(from), Some(to)) = (high.first(), high.last()) {
+                    plan.structures.push(StructurePlan {
+                        spans: vec![(name.clone(), *from, *to)],
+                        bridge: Some(BridgeForm::Viaduct),
+                        tunnel: None,
+                    });
+                }
+            }
+            joins.push(Join {
+                ramp: name.clone(),
+                side: other_side,
+                on: !on,
+                nose: other_nose,
+            });
+            accesses.push(Access {
+                ramp: name.clone(),
+                carriageway,
+                on,
+                nose,
+                end: [0.0, 0.0],
+                end_z: 0.0,
+                end_heading: 0.0,
+                shape: Shape::Whole(points),
+            });
+            roads.push(name);
+        }
+
+        // The other motorway, its carriageways split where the slip roads leave
+        // and join, each with its speed-change lane.
+        let other_plan = other.plan_joined(cx.handedness, &joins)?;
+        let mut ic_roads: Vec<String> = other_plan.roads.iter().map(|r| r.name.clone()).collect();
+        ic_roads.extend(roads);
+        plan.roads.extend(other_plan.roads);
+        plan.junctions.extend(other_plan.junctions.iter().cloned());
+        plan.connections.extend(other_plan.connections);
+        plan.controls.extend(other_plan.controls);
+        plan.structures.extend(other_plan.structures);
+        plan.fitted.extend(other_plan.fitted);
+        plan.anchors.extend(other_plan.anchors);
+        plan.notes.extend(other_plan.notes);
+        plan.interchanges.push(InterchangePlan {
+            name: site.name.clone(),
+            kind: site.kind.as_str().into(),
+            junctions: other_plan.junctions,
+            roads: ic_roads,
         });
         Ok(())
     }
