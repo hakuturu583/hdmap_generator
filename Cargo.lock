@@ -1403,6 +1403,7 @@ version = "0.32.2"
 dependencies = [
  "ll2-projection",
  "opendrive",
+ "quick-xml",
  "roadgen-buildings",
  "roadgen-core",
  "tempfile",

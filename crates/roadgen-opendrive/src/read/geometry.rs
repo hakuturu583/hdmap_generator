@@ -23,7 +23,7 @@ use uom::si::length::meter;
 
 use roadgen_core::geometry::{
     Arc3, Bezier3, Clothoid3, Curve3, Line3, Point3, Poly3Piece, Poly3Profile, Polyline3,
-    SamplingConfig,
+    SamplingConfig, Vector3,
 };
 
 use super::Approximations;
@@ -32,25 +32,28 @@ use crate::error::ImportError;
 /// How far apart the end of one plan-view piece and the start of the next may be
 /// and still be joined by moving the second onto the first, metres. Beyond this the
 /// document describes two roads, not one with a rounding error in it.
-const SNAP_TOLERANCE: f64 = 0.1;
+pub const SNAP_TOLERANCE: f64 = 0.1;
 
 /// Heights closer than this are the same height.
 const HEIGHT_TOLERANCE: f64 = 1e-6;
 
-/// The road's reference line as one [`Curve3`].
+/// The road's reference line as one [`Curve3`], moved by `shift` from where the
+/// document puts it — which is nowhere, unless the road is moved onto a neighbour it
+/// misses by a hair (see [`super::links::closing_shifts`]).
 pub fn reference_line(
     road: &OdRoad,
+    shift: Vector3,
     config: SamplingConfig,
     approximations: &mut Approximations,
 ) -> Result<Curve3, ImportError> {
-    let elevation = Elevation::of(road)?;
+    let elevation = Elevation::of(road, shift.z)?;
     let mut pieces: Vec<Curve3> = Vec::new();
     let mut previous_end: Option<Point3> = None;
 
     for entry in road.plan_view.geometry.iter() {
         let declared = Point3::new(
-            entry.x.get::<meter>(),
-            entry.y.get::<meter>(),
+            entry.x.get::<meter>() + shift.x,
+            entry.y.get::<meter>() + shift.y,
             elevation.at(entry.s.get::<meter>()),
         );
         // The file's own start, unless the previous piece ended a hair away from
@@ -98,10 +101,13 @@ pub fn reference_line(
 /// may have one per metre.
 struct Elevation {
     profile: Poly3Profile,
+    /// Added to every height: how far the road is lifted from where the document
+    /// puts it.
+    lift: f64,
 }
 
 impl Elevation {
-    fn of(road: &OdRoad) -> Result<Elevation, ImportError> {
+    fn of(road: &OdRoad, lift: f64) -> Result<Elevation, ImportError> {
         let rows = road
             .elevation_profile
             .iter()
@@ -109,6 +115,7 @@ impl Elevation {
             .map(|row| (row.s, row.a, row.b, row.c, row.d));
         Ok(Elevation {
             profile: super::profile(rows)?,
+            lift,
         })
     }
 
@@ -126,7 +133,7 @@ impl Elevation {
     }
 
     fn at(&self, station: f64) -> f64 {
-        self.pieces()[self.governing(station)].evaluate(station)
+        self.pieces()[self.governing(station)].evaluate(station) + self.lift
     }
 
     /// The knots strictly inside `(from, to)`, ascending.

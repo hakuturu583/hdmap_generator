@@ -44,9 +44,11 @@
 //! the controller it was drawn for.
 
 mod furniture;
+mod gaps;
 mod geometry;
 mod lanes;
 mod links;
+mod repair;
 mod structures;
 
 use std::cell::OnceCell;
@@ -60,7 +62,7 @@ use opendrive::road::rule::Rule;
 use opendrive::road::Road as OdRoad;
 use uom::si::length::meter;
 
-use roadgen_core::geometry::{Poly3Piece, Poly3Profile, SamplingConfig};
+use roadgen_core::geometry::{Poly3Piece, Poly3Profile, SamplingConfig, Vector3};
 use roadgen_core::id::{JunctionId, LaneId, RoadId};
 use roadgen_core::layout::{self, RoadGeometry, SectionLayout};
 use roadgen_core::map::{CrossSection, Map, MapMetadata, Projection, Road, TrafficHandedness};
@@ -106,9 +108,15 @@ pub fn from_xml(xml: &str) -> Result<Imported, ImportError> {
 
 /// Reads an OpenDRIVE document from a string, with the caller's options.
 pub fn from_xml_with(xml: &str, options: &ReadOptions) -> Result<Imported, ImportError> {
+    let mut repairs = Approximations::default();
+    let xml = repair::repair(xml, &mut repairs)?;
     let document =
-        OpenDrive::from_xml_str(xml).map_err(|error| ImportError::Parse(format!("{error:?}")))?;
-    from_document(&document, options)
+        OpenDrive::from_xml_str(&xml).map_err(|error| ImportError::Parse(format!("{error:?}")))?;
+    let mut imported = from_document(&document, options)?;
+    let mut approximations = repairs.finish();
+    approximations.append(&mut imported.approximations);
+    imported.approximations = approximations;
+    Ok(imported)
 }
 
 /// Reads an OpenDRIVE file.
@@ -249,10 +257,21 @@ impl<'a> Reader<'a> {
                 Relation::Exact,
             );
         }
+        let shifts = gaps::closing_shifts(
+            self.document,
+            &self.names,
+            self.sampling(),
+            &mut self.approximations,
+        )?;
         for road in &self.document.road {
-            self.read_road(road)?;
+            let shift = shifts
+                .get(&RoadId::new(&road.id))
+                .copied()
+                .unwrap_or(Vector3::ZERO);
+            self.read_road(road, shift)?;
         }
         links::connect(&mut self)?;
+        gaps::close_lane_gaps(&mut self.map, &mut self.approximations);
         furniture::read(&mut self)?;
         structures::read(&mut self)?;
         Ok(Imported {
@@ -270,14 +289,15 @@ impl<'a> Reader<'a> {
         self.map.metadata.handedness
     }
 
-    /// One `<road>`: its reference line, its profiles, its sections and the lanes
-    /// laid out against them.
-    fn read_road(&mut self, road: &OdRoad) -> Result<(), ImportError> {
+    /// One `<road>`: its reference line, moved by `shift`, its profiles, its sections
+    /// and the lanes laid out against them.
+    fn read_road(&mut self, road: &OdRoad, shift: Vector3) -> Result<(), ImportError> {
         let id = RoadId::new(&road.id);
         let config = self.sampling();
         let length = road.length.get::<meter>();
 
-        let reference_line = geometry::reference_line(road, config, &mut self.approximations)?;
+        let reference_line =
+            geometry::reference_line(road, shift, config, &mut self.approximations)?;
         let lane_offset = profile(
             road.lanes
                 .lane_offset
@@ -358,7 +378,7 @@ impl<'a> Reader<'a> {
             let layout = SectionLayout::new(
                 &section.specs,
                 (section.station, end),
-                lane_offset.clone(),
+                section.lane_offset.clone(),
                 self.handedness(),
             );
             let built = layout::section_lanes(
