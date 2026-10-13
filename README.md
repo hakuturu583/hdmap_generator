@@ -2398,6 +2398,17 @@ Python, one line per thing the map now says less exactly than the file did:
 - a lane type the IR does not have — `stop`, `median`, `bus`, the ramps — lands on
   the nearest it does, and a road type likewise;
 - a building's roof is flat, because an outline has one height per corner;
+- what an older writer leaves out is filled in before the document is parsed —
+  CARLA 0.10's maps (RoadRunner, OpenDRIVE 1.4) give a `<roadMark>` no `color`
+  (read as `standard`), an outline `<cornerLocal>` no `height` (read as 0), an
+  `<object>` the `type` `-1` (read as `none`), and a `<userData>` elements but no
+  `code` (passed over, as ancillary data is, and not reported);
+- a road that ends up to 10 cm from the road it is linked to is moved, whole, onto
+  it, when its other end is linked to no road; and a lane that ends up to 10 cm
+  from the lane it continues has its end moved onto that lane's — the lane of a
+  junction's connecting road where there is one. CARLA stores a road's start in
+  single precision, so its roads miss each other by a millimetre or so, and
+  Lanelet2 joins lanelets only where they share points;
 - a signal or object that names no lanes is read as governing every lane of its
   section that runs the way it faces;
 - a traffic light that names the lanes *inside* a junction — CARLA's Town maps
@@ -2429,7 +2440,8 @@ a `ref_line`. The SUMO export stops lanes at a line by the same rule
 What is an error rather than a note is a document that is not a road network: a
 reference line with a gap in it wider than 10 cm (a narrower one is closed and
 reported), a link to a road that is not there, a lane link to a lane the neighbour
-does not have. A `<geoReference>` the reader does not recognise places the map at
+does not have. Roads or lanes linked across more than 10 cm are read as the
+document has them, and validation says they do not meet. A `<geoReference>` the reader does not recognise places the map at
 latitude 0, longitude 0 and says so; `origin=` overrides it.
 
 Roads and junctions are named after the file's ids, so the file's road 12 is

@@ -114,8 +114,8 @@ pub fn read<'a>(reader: &mut Reader<'a>) -> Result<(), ImportError> {
                 Some(ObjectType::Barrier)
                     if object.subtype.as_deref() == Some(structure::PARAPET_KIND) => {}
                 _ => reader.approximations.count(format!(
-                    "the IR has no object of type {:?}, so {{n}} of them are not read",
-                    object.r#type
+                    "the IR has no object of type `{}`, so {{n}} of them are not read",
+                    object.r#type.as_ref().map_or("none", ObjectType::as_str)
                 )),
             }
         }

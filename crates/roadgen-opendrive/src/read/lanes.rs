@@ -52,6 +52,8 @@ pub struct Section {
     pub station: f64,
     pub specs: Vec<LaneSpec>,
     pub opendrive_ids: Vec<i64>,
+    /// The lane offset as this section sees it — see [`section_offset`].
+    pub lane_offset: Poly3Profile,
 }
 
 /// The road's sections, each with its lanes as specs.
@@ -75,11 +77,12 @@ pub fn sections(
                 road.id, section.s
             )));
         }
+        let lane_offset = section_offset(lane_offset, end);
         let mut reader = SectionReader {
             road: road_id,
             section,
             range: (section.s, end),
-            lane_offset,
+            lane_offset: &lane_offset,
             handedness,
             config,
             approximations,
@@ -98,10 +101,39 @@ pub fn sections(
             station: section.s,
             specs,
             opendrive_ids,
+            lane_offset,
         });
     }
     Ok(built)
 }
+
+/// The lane offset as the section ending at `end` sees it.
+///
+/// A `<laneOffset>` may jump where a section ends: CARLA's junction roads open with
+/// a short section of `none` lanes and an offset that cancels their width, and the
+/// offset drops back to zero where the next section begins. The station a section
+/// ends at is the next section's first, and the profile, asked about it, answers
+/// with the piece that starts there — the next section's offset, not this one's, so
+/// this section's last cross-section would stand metres from where it should. A
+/// piece that starts where the section ends is the next section's to use, and is
+/// left out here.
+fn section_offset(lane_offset: &Poly3Profile, end: f64) -> Poly3Profile {
+    let pieces = lane_offset.pieces();
+    let within = pieces
+        .iter()
+        .take_while(|piece| piece.station < end - SECTION_JOIN)
+        .count();
+    if within == 0 || within == pieces.len() {
+        return lane_offset.clone();
+    }
+    Poly3Profile::new(pieces[..within].iter().copied())
+        .expect("the pieces of a profile are already finite")
+}
+
+/// How close to a section's end a `<laneOffset>` may start and still be taken to
+/// start where the next section does, metres. Writers round the two stations
+/// separately; a micrometre is far below any length a document means.
+const SECTION_JOIN: f64 = 1e-6;
 
 /// Reads the lanes of one side of one section.
 struct SectionReader<'a> {
