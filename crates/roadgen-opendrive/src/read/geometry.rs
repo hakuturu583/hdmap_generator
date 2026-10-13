@@ -39,7 +39,7 @@ const HEIGHT_TOLERANCE: f64 = 1e-6;
 
 /// The road's reference line as one [`Curve3`], moved by `shift` from where the
 /// document puts it — which is nowhere, unless the road is moved onto a neighbour it
-/// misses by a hair (see [`super::links::closing_shifts`]).
+/// misses by a hair (see [`super::gaps::closing_shifts`]).
 pub fn reference_line(
     road: &OdRoad,
     shift: Vector3,

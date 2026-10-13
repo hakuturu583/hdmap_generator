@@ -249,8 +249,8 @@ fn a_millimetre_between_linked_roads_and_lanes_is_closed_and_said() {
 
 #[test]
 fn more_than_a_hairline_is_not_closed() {
-    // Ten centimetres to the side is not rounding: the reader leaves it, and
-    // validation says the lanes do not meet.
+    // Twenty centimetres to the side, past the 10 cm the reader closes, is not
+    // rounding: the reader leaves it, and validation says the lanes do not meet.
     let apart = CARLA.replace(
         r#"<geometry s="0.0" x="100.0" y="0.001" hdg="0.0" length="20.0"><line/></geometry>"#,
         r#"<geometry s="0.0" x="100.0" y="0.2" hdg="0.0" length="20.0"><line/></geometry>"#,
