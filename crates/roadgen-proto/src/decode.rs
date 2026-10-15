@@ -50,7 +50,7 @@ use crate::ReadError;
 type Result<T> = std::result::Result<T, ReadError>;
 
 pub(crate) fn map(message: &v1::Map) -> Result<Map> {
-    let mut map = Map::new(metadata(required(&message.metadata)?).within("metadata")?);
+    let mut map = Map::new(field(&message.metadata, "metadata", metadata)?);
     // Every arena but the rules, which have no identifiers: in the schema's
     // order, each refusing an identifier it has already seen.
     macro_rules! fill {
@@ -296,13 +296,10 @@ fn curve(message: &v1::Curve) -> Result<Curve3> {
             // Checked as `Curve3::composite` checks, but kept as written rather than
             // built through it: that would unwrap a composite of one piece, and the
             // map said composite.
-            for (index, pair) in pieces.windows(2).enumerate() {
-                let gap = pair[0].end_point().distance_to(pair[1].start_point());
-                if gap > Curve3::JOIN_TOLERANCE {
-                    return Err(invalid(GeometryError::DisjointSegments { gap }))
-                        .within(Indexed("pieces", index + 1))
-                        .within("composite");
-                }
+            if let Some((index, gap)) = Curve3::first_gap(&pieces) {
+                return Err(invalid(GeometryError::DisjointSegments { gap }))
+                    .within(Indexed("pieces", index))
+                    .within("composite");
             }
             Ok(Curve3::Composite(pieces))
         }
@@ -498,6 +495,13 @@ fn road(message: &v1::Road) -> Result<Road> {
     .within("pavement")?;
     let mut structure = StructureProfile::at_grade();
     for (index, span) in message.structure.iter().enumerate() {
+        if !(span.from.is_finite() && span.to.is_finite() && span.from < span.to) {
+            return Err(invalid(format!(
+                "runs from {} to {}, which is no stretch of road",
+                span.from, span.to
+            )))
+            .within(Indexed("structure", index));
+        }
         structure
             .insert(StructureSpan {
                 from: span.from,

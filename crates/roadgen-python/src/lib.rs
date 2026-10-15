@@ -2912,12 +2912,18 @@ fn read_proto(path: PathBuf) -> PyResult<PyMap> {
     Ok(PyMap::from_read(map, Vec::new(), trace))
 }
 
-/// The Protocol Buffers schema of the IR, as `{import path: source}`: write the
-/// files out under one directory and hand them to `protoc` to read an IR document
-/// from any language.
+/// The Protocol Buffers schema of the IR, as `{import path: source}` in
+/// dependency order, each file after the ones it imports: write the files out
+/// under one directory and hand them to `protoc` to read an IR document from any
+/// language.
 #[pyfunction]
-fn proto_schema() -> std::collections::BTreeMap<&'static str, &'static str> {
-    roadgen_proto::SCHEMA.iter().copied().collect()
+fn proto_schema(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    // A dict rather than a sorted map, so that the order survives.
+    let schema = PyDict::new(py);
+    for (path, source) in roadgen_proto::SCHEMA {
+        schema.set_item(path, source)?;
+    }
+    Ok(schema)
 }
 
 #[pyfunction]

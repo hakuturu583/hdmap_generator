@@ -74,7 +74,9 @@ def test_a_file_that_is_not_a_document_is_refused(tmp_path):
 
 def test_the_schema_is_shipped_with_the_package():
     schema = roadgen.proto_schema()
-    assert "roadgen_ir/v1/map.proto" in schema
+    # In dependency order: geometry first, the map that imports everything last.
+    assert list(schema)[0] == "roadgen_ir/v1/geometry.proto"
+    assert list(schema)[-1] == "roadgen_ir/v1/map.proto"
     assert all("package roadgen_ir.v1;" in text for text in schema.values())
 
 

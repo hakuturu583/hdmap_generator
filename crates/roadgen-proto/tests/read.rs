@@ -7,6 +7,7 @@
 
 use prost::Message;
 use roadgen_core::prelude::*;
+use roadgen_core::SamplingConfig;
 use roadgen_proto::{v1, ReadError};
 
 fn two_way_road() -> ValidatedMap {
@@ -253,4 +254,42 @@ fn the_schema_ships_compiled_and_as_source() {
         .message_type
         .iter()
         .any(|message| message.name() == "Map"));
+}
+
+#[test]
+fn a_map_without_metadata_is_refused_by_name() {
+    let mut message = written();
+    message.metadata = None;
+    assert_eq!(refused_at(&message), "metadata");
+}
+
+#[test]
+fn a_structure_span_that_runs_backwards_is_refused() {
+    let mut message = written();
+    message.roads[0].structure.push(v1::StructureSpan {
+        from: 50.0,
+        to: 10.0,
+        structure: "structure/bridge".into(),
+    });
+    assert_eq!(refused_at(&message), "roads[0].structure[0]");
+}
+
+#[test]
+fn however_long_a_curve_its_samples_are_bounded() {
+    // An arc a hundred million kilometres round, read from a document, costs what
+    // any curve can cost, rather than all the memory there is.
+    let message = with_reference_line(v1::curve::Kind::Arc(v1::Arc {
+        start: Some(at(0.0, 0.0)),
+        heading: 0.0,
+        curvature: 0.0,
+        horizontal_length: 1e14,
+        end_z: 0.0,
+    }));
+    let map = roadgen_proto::from_message(&message).unwrap();
+    let road = map.as_map().roads.iter().next().unwrap();
+    let samples = road
+        .reference_line
+        .samples(map.as_map().metadata.sampling)
+        .unwrap();
+    assert_eq!(samples.len(), SamplingConfig::MAX_SEGMENTS + 1);
 }
