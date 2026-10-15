@@ -389,6 +389,22 @@ impl Bezier3 {
         })
     }
 
+    /// The curve through these control points, realised as exactly `segments`
+    /// straight pieces.
+    ///
+    /// For a reader putting back a curve that was written out: the resolution is
+    /// part of the curve, and [`Bezier3::new`] would derive it again from whatever
+    /// sampling the reader happens to have.
+    pub fn with_segments(control: [Point3; 4], segments: usize) -> Result<Self, GeometryError> {
+        if !control.iter().all(|point| point.is_finite()) {
+            return Err(GeometryError::NonFiniteCoordinate);
+        }
+        if segments == 0 {
+            return Err(GeometryError::TooFewPoints { got: 1 });
+        }
+        Ok(Bezier3 { control, segments })
+    }
+
     /// How many straight segments the curve is realised as.
     pub fn segments(&self) -> usize {
         self.segments

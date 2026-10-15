@@ -16,6 +16,7 @@ roadgen-lanelet2.workspace = true
 roadgen-clipgt.workspace = true
 roadgen-gpudrive.workspace = true
 roadgen-osm.workspace = true
+roadgen-proto.workspace = true
 roadgen-sumo.workspace = true
 roadgen-trace.workspace = true
 roadgen-viewer.workspace = true

@@ -9,6 +9,7 @@ members = [
     "crates/roadgen-clipgt",
     "crates/roadgen-gpudrive",
     "crates/roadgen-osm",
+    "crates/roadgen-proto",
     "crates/roadgen-sumo",
     "crates/roadgen-trace",
     "crates/roadgen-viewer",
@@ -33,6 +34,7 @@ roadgen-lanelet2 = { path = "crates/roadgen-lanelet2" }
 roadgen-clipgt = { path = "crates/roadgen-clipgt" }
 roadgen-gpudrive = { path = "crates/roadgen-gpudrive" }
 roadgen-osm = { path = "crates/roadgen-osm" }
+roadgen-proto = { path = "crates/roadgen-proto" }
 roadgen-sumo = { path = "crates/roadgen-sumo" }
 roadgen-trace = { path = "crates/roadgen-trace" }
 roadgen-viewer = { path = "crates/roadgen-viewer" }
@@ -91,6 +93,15 @@ sha2 = "0.10"
 # architecture in `roadgen-buildings` is a grammar a caller can edit rather than a
 # hard-coded box generator; this project supplies the lots and keeps the footprints.
 symbios-shape = "0.4"
+
+# Protocol Buffers, for the IR as a document other programs can read. prost is
+# Apache-2.0 and protox MIT/Apache-2.0, so an Apache-2.0 project may redistribute
+# both. protox is a protobuf compiler written in Rust: the build reads the `.proto`
+# files itself, so nobody building roadgen has to install `protoc`.
+prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
+protox = "0.10"
 
 pyo3 = "0.29"
 

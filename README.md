@@ -10,7 +10,9 @@ This is a generator, not a converter. You describe roads, lanes, junctions and t
 movements between them, and the library builds the geometry and writes the files.
 The one file it reads is its own kind: an **OpenDRIVE** document can be
 [read back](#reading-opendrive-back) into the same model, whether roadgen wrote it or
-someone else did, and written out again in every other format.
+someone else did, and written out again in every other format. And the model itself
+can be written and read as **Protocol Buffers**, losing nothing, to a
+[schema](#the-ir-as-protocol-buffers) any other program can compile and read.
 
 **[Try it in a browser](https://hakuturu583.github.io/hdmap_generator/)** — the demo
 page runs this package, compiled for WebAssembly. Write a script, press Run, and flip
@@ -78,11 +80,13 @@ m.export_gpudrive("scene.json")
                      ├──▶ SUMO           .nod/.edg/.con.xml  `quick-xml` + netconvert
                      ├──▶ CARLA          .fbx + .xodr        `roadgen-opendrive`
                      ├──▶ ClipGT         .parquet layers     `arrow`/`parquet`
-                     └──▶ GPUDrive       scene .json         `serde_json`
+                     ├──▶ GPUDrive       scene .json         `serde_json`
+                     └──▶ the IR itself  .roadgen.pb         `prost`
 
               the written files ──▶ roadgen-viewer ──▶ SVG
 
                 map.xodr ──▶ roadgen-opendrive::read ──▶ Canonical Road IR
+          map.roadgen.pb ──▶ roadgen-proto::read     ──▶ Canonical Road IR
 ```
 
 Every exporter reads a `ValidatedMap` and writes nothing back into it: what a format
@@ -109,7 +113,10 @@ receive. It is what the [demo page](#the-demo-page) shows. And
 the format the IR was shaped against, so a document comes back as roads, lanes,
 movements, furniture and rules rather than as a picture — see
 [Reading OpenDRIVE back](#reading-opendrive-back). No other format is read, and
-[`docs/import-feasibility.md`](docs/import-feasibility.md) says why.
+[`docs/import-feasibility.md`](docs/import-feasibility.md) says why. The IR's own
+document is not a format in that sense: `roadgen-proto` writes the IR field for field
+and reads it back as the map it was, so it lowers nothing and approximates nothing —
+see [The IR as Protocol Buffers](#the-ir-as-protocol-buffers).
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
 
@@ -201,6 +208,7 @@ roadgen-lanelet2 = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-clipgt = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-osm = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-buildings = { git = "https://github.com/hakuturu583/hdmap_generator" }
+roadgen-proto = { git = "https://github.com/hakuturu583/hdmap_generator" }
 ```
 
 ```rust
@@ -2353,6 +2361,79 @@ Each exporter adds the constraints its own format imposes, through
 from Python). Those constraints stay on the exporter's side of the boundary and are
 never pushed back into the IR.
 
+## The IR as Protocol Buffers
+
+```python
+m.export_proto("map.roadgen.pb")
+m = roadgen.read_proto("map.roadgen.pb")    # the same map, to export later
+```
+
+```rust
+roadgen_proto::write(&map, "map.roadgen.pb")?;
+let map = roadgen_proto::read("map.roadgen.pb")?.validate()?;
+```
+
+Every exporter lowers the IR onto something narrower, and the IR dump
+(`export_ir`) leaves the geometry out. This writes **all** of it — roads, lanes and
+their curves, junctions, connections, objects, rules, buildings, bridges and
+tunnels, grade separations, interchanges, terrain, land cover and sites — field for
+field and in the IR's own order, and reads it back as a map equal to the one written.
+So the document is something to keep, to hand to another process, or to export from
+later: the round-trip tests check that a map read back writes the same OpenDRIVE and
+Lanelet2, byte for byte, as the one that was written. (The one thing that does not
+survive is the sign of a zero — proto3 writes no field that holds zero — so a `-0.0`
+comes back as `0.0`.)
+
+The reader is not only for documents roadgen wrote. Every value goes back through
+the IR's own constructors, so one that the IR cannot hold — a width of zero, a
+polyline of one point, an origin off the globe, an enum left unset — is refused,
+naming the field (`lanes[3].width.knots[0].width`). Whether the result is a
+consistent road network is `validate()`'s question, as it is for any map.
+
+### Reading it somewhere else
+
+The schema is in [`crates/roadgen-proto/proto/roadgen_ir/v1/`](crates/roadgen-proto/proto/roadgen_ir/v1/),
+and it is written for whoever reads a document *without* roadgen: every field says
+what it means, in what unit and against what reference. A reader in any language
+compiles it with `protoc` and needs to know three things, all of which `map.proto`
+says at the top:
+
+- **References are identifiers.** Every element has an `id` such as `road/north`
+  or `lane/north/0`, and every reference is one. Build a dictionary per kind.
+- **Every curve can carry its vertices.** A reference line is a line, an arc, a
+  clothoid, a Bézier, a polyline or a chain of them, and a reader is welcome to
+  evaluate them — but each curve also carries `samples`: itself evaluated at the
+  map's sampling length, the polyline every polyline export of the map gets. A
+  reader that wants polylines reads those and never integrates a clothoid.
+  `curve_samples=False` leaves them out, for a document about half the size.
+- **Lanes are stored along the reference line.** `left_boundary` is the edge to the
+  left of the road's reference line whichever way traffic runs; a backward lane's
+  curves reversed, with left and right swapped, are its travel order.
+
+[`examples/proto_importer.py`](examples/proto_importer.py) is a whole importer of
+the road network in about a hundred lines of Python that never imports roadgen —
+lanes in travel order, their boundaries, speed limits, successors and predecessors
+— and the Python tests run it on what `export_proto` wrote:
+
+```bash
+pip install protobuf grpcio-tools
+python -m grpc_tools.protoc -I crates/roadgen-proto/proto --python_out=generated \
+    crates/roadgen-proto/proto/roadgen_ir/v1/*.proto
+PYTHONPATH=generated python examples/proto_importer.py map.roadgen.pb
+```
+
+Without the repository, `roadgen.proto_schema()` is the same files as
+`{path: source}`, and in Rust `roadgen_proto::SCHEMA` is too, with
+`roadgen_proto::FILE_DESCRIPTOR_SET` the schema compiled, for a reader that works
+from descriptors at run time. The package is `roadgen_ir.v1` rather than
+`roadgen.ir.v1` so that the Python protoc generates (`roadgen_ir/v1/map_pb2.py`)
+imports beside the `roadgen` package instead of inside it. Within `v1` fields are
+only ever added; a change a reader would trip over gets `v2`.
+
+The Rust crate compiles the schema at build time with
+[protox](https://github.com/andrewhickman/protox), a protobuf compiler in Rust, so
+building roadgen needs no `protoc`.
+
 ## Reading OpenDRIVE back
 
 ```python
@@ -2616,10 +2697,13 @@ roadgen/
 │   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON
 │   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
 │   ├── roadgen-sumo/        lowering onto SUMO's plain-XML network
+│   ├── roadgen-proto/       the IR as Protocol Buffers: the schema (`proto/`),
+│   │                        and a lossless writer and reader
 │   ├── roadgen-trace/       the IR dump, trace files, and lookups across them
 │   ├── roadgen-viewer/      reading the exports back, and drawing them as SVG
 │   └── roadgen-python/      PyO3 bindings
-├── examples/                ClipGT and GPUDrive scenario files
+├── examples/                ClipGT and GPUDrive scenario files, and an IR importer
+│                            that knows only the Protocol Buffers schema
 ├── web/                     the demo page: roadgen in a browser, through Pyodide
 ├── python/roadgen/          the Python package
 ├── tests/
@@ -2648,6 +2732,10 @@ it, so what they check is not the exporter's opinion of what it wrote. Install i
 with `apt install sumo` (and `pip install sumolib` for the Python side); without it
 those tests **skip**, saying so. Setting `ROADGEN_REQUIRE_SUMO=1` turns the skip into
 a failure, which is what CI does.
+
+The Python test that reads an IR document knowing only its schema compiles the
+schema with `protoc`, from `pip install protobuf grpcio-tools`; without them it
+skips.
 
 ## Releasing
 

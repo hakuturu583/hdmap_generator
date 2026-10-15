@@ -1294,6 +1294,22 @@ impl PyMap {
         Ok(())
     }
 
+    /// Writes the map as the IR itself, in Protocol Buffers: every road, lane,
+    /// junction, object, rule, building, structure and the land, nothing lost and
+    /// nothing lowered onto another format's terms. `roadgen.read_proto` reads it
+    /// back as the same map.
+    ///
+    /// Any other program can read it too: `roadgen.proto_schema()` is the schema,
+    /// to compile with `protoc`. Unless `curve_samples` is false, every curve also
+    /// carries its own vertices, so a reader needs no clothoid or Bezier of its own.
+    #[pyo3(signature = (path, curve_samples = true))]
+    fn export_proto(&mut self, path: PathBuf, curve_samples: bool) -> PyResult<()> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        roadgen_proto::write_with(map, &path, &roadgen_proto::WriteOptions { curve_samples })
+            .map_err(runtime_error)
+    }
+
     /// Writes the map as OpenDRIVE.
     ///
     /// Also writes `<path>.trace.json`, the road, section and lane number each lane
@@ -2867,6 +2883,38 @@ fn read_opendrive(
     })
 }
 
+/// Reads the IR document at `path` — the one `Map.export_proto` wrote, or one
+/// any other program wrote to the same schema — as the map it describes. What
+/// comes back exports like any other map and cannot be added to.
+#[pyfunction]
+#[pyo3(name = "read_proto")]
+fn read_proto(path: PathBuf) -> PyResult<PyMap> {
+    let map = roadgen_proto::read(&path).map_err(value_error)?;
+    let mut trace = roadgen_core::trace::Trace::imported("roadgen_proto");
+    trace.files.push(path);
+    Ok(PyMap {
+        source: Source::Read {
+            map: Box::new(map),
+            notes: Vec::new(),
+            trace: Box::new(trace),
+        },
+        built: None,
+        fingerprint: None,
+        buildings: None,
+        land: None,
+        places: environment::Places::default(),
+        notes: Vec::new(),
+    })
+}
+
+/// The Protocol Buffers schema of the IR, as `{import path: source}`: write the
+/// files out under one directory and hand them to `protoc` to read an IR document
+/// from any language.
+#[pyfunction]
+fn proto_schema() -> std::collections::BTreeMap<&'static str, &'static str> {
+    roadgen_proto::SCHEMA.iter().copied().collect()
+}
+
 #[pyfunction]
 #[pyo3(name = "render_opendrive")]
 fn render_opendrive(path: PathBuf) -> PyResult<String> {
@@ -2967,6 +3015,8 @@ fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAlignment>()?;
     module.add_class::<trace::PyTrace>()?;
     module.add_function(wrap_pyfunction!(read_opendrive, module)?)?;
+    module.add_function(wrap_pyfunction!(read_proto, module)?)?;
+    module.add_function(wrap_pyfunction!(proto_schema, module)?)?;
     module.add_function(wrap_pyfunction!(render_opendrive, module)?)?;
     module.add_function(wrap_pyfunction!(render_sumo, module)?)?;
     module.add_function(wrap_pyfunction!(render_clipgt, module)?)?;

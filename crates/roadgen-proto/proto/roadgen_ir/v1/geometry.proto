@@ -1,0 +1,180 @@
+// Geometry of the roadgen Canonical Road IR.
+//
+// Every coordinate is metres in the map's own frame: x east, y north, z up, about
+// the origin in `MapMetadata.origin`. There is no 2D type: every point carries its
+// height.
+//
+// Curves are parameterised by *horizontal station*: the arc length of the curve's
+// shadow on the horizontal plane, measured from its start. It is the same `s` that
+// OpenDRIVE uses, and every station in this schema — a cross-section's, a profile
+// piece's, a lane's — is one of these.
+
+syntax = "proto3";
+
+package roadgen_ir.v1;
+
+// A position, metres.
+message Point3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+// A direction. Unit length wherever this schema says "unit".
+message Vector3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+// A straight segment from `start` to `end`. The two never share a horizontal
+// position.
+message Line {
+  Point3 start = 1;
+  Point3 end = 2;
+}
+
+// A constant-curvature arc in plan, with a constant grade.
+//
+// At station s in [0, horizontal_length]:
+//   heading(s) = heading + curvature * s
+//   x(s), y(s) = the plan position reached from `start` along that heading
+//   z(s)       = start.z + (end_z - start.z) * s / horizontal_length
+message Arc {
+  Point3 start = 1;
+  // Radians anticlockwise from +x.
+  double heading = 2;
+  // 1/metres, positive turning left.
+  double curvature = 3;
+  double horizontal_length = 4;
+  double end_z = 5;
+}
+
+// A clothoid (Euler spiral): curvature changes linearly from `curvature_start` to
+// `curvature_end` along the piece. The grade is constant, as for `Arc`. This is
+// OpenDRIVE's `<spiral>`. Its plan position is a Fresnel integral; `Curve.samples`
+// saves an importer from integrating it.
+message Clothoid {
+  Point3 start = 1;
+  // Radians anticlockwise from +x.
+  double heading = 2;
+  double curvature_start = 3;
+  double curvature_end = 4;
+  double horizontal_length = 5;
+  double end_z = 6;
+}
+
+// A cubic Bezier in three dimensions: what a junction connector is made of.
+message Bezier {
+  // Exactly four control points, in order.
+  repeated Point3 control = 1;
+  // How many straight segments the curve is realised as, at equal steps of its
+  // parameter t. Part of the curve: its vertices, and so every lane cut to it, sit
+  // at these steps.
+  uint32 segments = 2;
+}
+
+// An open polyline with at least two distinct vertices.
+message Polyline {
+  repeated Point3 points = 1;
+}
+
+// Several curves end to end, each starting where the one before finished. The
+// stations of a piece continue from where the previous piece's ended.
+message Composite {
+  repeated Curve pieces = 1;
+}
+
+// One evaluated station of a curve.
+message CurveSample {
+  // Horizontal station from the curve's start, metres.
+  double station = 1;
+  Point3 point = 2;
+  // Unit tangent, in the direction of increasing station.
+  Vector3 tangent = 3;
+}
+
+// A 3D curve. Every road reference line, lane boundary and lane centreline is one.
+message Curve {
+  oneof kind {
+    Line line = 1;
+    Arc arc = 2;
+    Clothoid clothoid = 3;
+    Bezier bezier = 4;
+    Polyline polyline = 5;
+    Composite composite = 6;
+  }
+
+  // Informative, derived: the curve evaluated at the map's sampling resolution
+  // (`MapMetadata.sampling`), both ends included, in increasing station. This is
+  // the polyline every polyline format roadgen writes receives, so an importer
+  // that wants vertices can read these and ignore `kind` altogether.
+  //
+  // Written on the outermost curve only — never on the pieces of a `Composite` —
+  // and only when the writer was asked to. roadgen ignores it when it reads a
+  // document.
+  repeated CurveSample samples = 15;
+}
+
+// One piece of a cubic profile: a + b*ds + c*ds^2 + d*ds^3, where ds is measured
+// from `station`.
+message Poly3Piece {
+  double station = 1;
+  double a = 2;
+  double b = 3;
+  double c = 4;
+  double d = 5;
+}
+
+// A value defined piecewise along a reference line, OpenDRIVE-style: each piece
+// governs from its station to the next piece's, and the first also governs
+// everything before it (holding its value at its own station). Ascending by
+// station. Empty means zero everywhere.
+message Poly3Profile {
+  repeated Poly3Piece pieces = 1;
+}
+
+// How a lane width gets from one knot to the next.
+enum Taper {
+  TAPER_UNSPECIFIED = 0;
+  // Straight from one width to the other.
+  TAPER_LINEAR = 1;
+  // Ease in and out: w0 + (w1 - w0) * (3t^2 - 2t^3), t from 0 to 1 between knots.
+  TAPER_SMOOTH = 2;
+}
+
+message WidthKnot {
+  double station = 1;
+  // Metres, always greater than zero.
+  double width = 2;
+}
+
+// A lane width as a function of station along its road: through each knot in
+// turn, held flat before the first and after the last. At least one knot,
+// ascending by station. One knot is a constant width.
+message WidthProfile {
+  repeated WidthKnot knots = 1;
+  Taper taper = 2;
+}
+
+message LaneHeightKnot {
+  double station = 1;
+  // Lift of the lane edge nearer the road's reference line, metres.
+  double inner = 2;
+  // Lift of the edge further out, metres.
+  double outer = 3;
+}
+
+// How far a lane's two edges stand off the road surface (OpenDRIVE `<height>`):
+// straight between knots, held before the first and after the last. Empty for a
+// lane flat on the road surface, which almost every lane is. The lane boundaries
+// already include it.
+message LaneHeight {
+  repeated LaneHeightKnot knots = 1;
+}
+
+// A closed outline: at least three vertices, anticlockwise seen from above,
+// without the closing repeat. Each vertex keeps its own height.
+message Footprint {
+  repeated Point3 points = 1;
+}
