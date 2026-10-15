@@ -4,17 +4,24 @@
 //!
 //! "The same" is checked twice over: the maps compare equal field for field, and
 //! the one read back exports to the same OpenDRIVE and Lanelet2 documents byte for
-//! byte, which is what a caller who keeps the document to export later relies on —
-//! save for the sign of a zero, which proto3 does not keep (see `unsigned_zeros`).
+//! byte, which is what a caller who keeps the document to export later relies on.
+
+use std::sync::LazyLock;
 
 use roadgen_core::map::TrafficHandedness;
 use roadgen_core::validation::ValidatedMap;
 use roadgen_integration_tests::{highway, mine, scenarios};
 use roadgen_proto::{v1, WriteOptions};
 
+/// The motorway, built once: it is the largest map in the suite, and two tests
+/// read it.
+static HIGHWAY: LazyLock<ValidatedMap> = LazyLock::new(highway::highway);
+
 /// Writes `map` with and without curve samples, reads both back, and checks that
 /// each is the map that was written.
 fn round_trip(name: &str, map: &ValidatedMap) {
+    let opendrive = roadgen_opendrive::to_xml(map).unwrap();
+    let lanelet2 = roadgen_lanelet2::to_osm_xml(map).unwrap();
     for curve_samples in [true, false] {
         let options = WriteOptions { curve_samples };
         let bytes = roadgen_proto::to_bytes_with(map, &options)
@@ -28,27 +35,14 @@ fn round_trip(name: &str, map: &ValidatedMap) {
             "{name}: the map read back differs from the one written"
         );
         assert!(
-            unsigned_zeros(&roadgen_opendrive::to_xml(&back).unwrap())
-                == unsigned_zeros(&roadgen_opendrive::to_xml(map).unwrap()),
+            roadgen_opendrive::to_xml(&back).unwrap() == opendrive,
             "{name}: the OpenDRIVE export changed"
         );
         assert!(
-            unsigned_zeros(&roadgen_lanelet2::to_osm_xml(&back).unwrap())
-                == unsigned_zeros(&roadgen_lanelet2::to_osm_xml(map).unwrap()),
+            roadgen_lanelet2::to_osm_xml(&back).unwrap() == lanelet2,
             "{name}: the Lanelet2 export changed"
         );
     }
-}
-
-/// A document with every negative zero written as a zero.
-///
-/// A proto3 field holding zero is not written at all, and reads back as `0.0`, so
-/// a `-0.0` in the map comes back as `0.0`: equal to it, the same number to every
-/// consumer, and a different string once printed.
-fn unsigned_zeros(document: &str) -> String {
-    document
-        .replace("\"-0.00000000000000000e0\"", "\"0.00000000000000000e0\"")
-        .replace("\"-0\"", "\"0\"")
 }
 
 #[test]
@@ -89,7 +83,7 @@ fn every_scenario_comes_back_as_it_was_written() {
 
 #[test]
 fn the_motorway_comes_back_with_its_structures_interchanges_and_town() {
-    let map = highway::highway();
+    let map = &*HIGHWAY;
     // What makes this map the one to check: every kind of feature beside the
     // roads is in it.
     assert!(map.structures.iter().any(|s| s.kind.bridge().is_some()));
@@ -98,7 +92,7 @@ fn the_motorway_comes_back_with_its_structures_interchanges_and_town() {
     assert!(!map.interchanges.is_empty());
     assert!(!map.buildings.is_empty());
     assert!(!map.land_covers.is_empty());
-    round_trip("highway", &map);
+    round_trip("highway", map);
 }
 
 #[test]
@@ -138,8 +132,8 @@ fn curves(message: &v1::Map) -> Vec<(String, &v1::Curve)> {
 
 #[test]
 fn every_curve_carries_the_vertices_an_importer_needs() {
-    let map = highway::highway();
-    let message = roadgen_proto::to_message(&map).unwrap();
+    let map = &*HIGHWAY;
+    let message = roadgen_proto::to_message(map).unwrap();
     let config = map.metadata.sampling;
 
     let mut kinds = std::collections::HashSet::new();

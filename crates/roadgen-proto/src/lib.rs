@@ -7,9 +7,9 @@
 //! itself rather than a picture of it: something to keep, to hand to another
 //! process, or to export from later.
 //!
-//! The one thing that does not survive is the sign of a zero: proto3 writes no
-//! field that holds zero, so a `-0.0` comes back as `0.0` — equal to it, and the
-//! same number to every consumer.
+//! The one thing that would not survive is the sign of a zero — proto3 writes no
+//! field that holds zero, so a `-0.0` would come back as `0.0` — and the IR does
+//! not make one.
 //!
 //! # The schema is the contract
 //!
@@ -62,36 +62,14 @@ pub mod v1 {
 }
 
 /// The schema's files, by their import path, in dependency order.
-pub const SCHEMA: &[(&str, &str)] = &[
-    (
-        "roadgen_ir/v1/geometry.proto",
-        include_str!("../proto/roadgen_ir/v1/geometry.proto"),
-    ),
-    (
-        "roadgen_ir/v1/topology.proto",
-        include_str!("../proto/roadgen_ir/v1/topology.proto"),
-    ),
-    (
-        "roadgen_ir/v1/semantics.proto",
-        include_str!("../proto/roadgen_ir/v1/semantics.proto"),
-    ),
-    (
-        "roadgen_ir/v1/structure.proto",
-        include_str!("../proto/roadgen_ir/v1/structure.proto"),
-    ),
-    (
-        "roadgen_ir/v1/environment.proto",
-        include_str!("../proto/roadgen_ir/v1/environment.proto"),
-    ),
-    (
-        "roadgen_ir/v1/map.proto",
-        include_str!("../proto/roadgen_ir/v1/map.proto"),
-    ),
-];
+pub const SCHEMA: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/schema.rs"));
 
 /// The schema compiled to a `google.protobuf.FileDescriptorSet`, encoded.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/roadgen_ir_v1_descriptor.bin"));
+
+/// The format a reader's trace names, as the other formats' crates name theirs.
+pub const TRACE_FORMAT: &str = "roadgen_proto";
 
 /// The fully qualified name of a document's top-level message.
 pub const MAP_MESSAGE: &str = "roadgen_ir.v1.Map";

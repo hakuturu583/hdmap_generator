@@ -24,7 +24,7 @@ use roadgen_core::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLinkTarget,
 };
 
-use crate::error::{unwritable, Within};
+use crate::error::{unwritable, Indexed, Within};
 use crate::v1;
 use crate::{WriteError, WriteOptions};
 
@@ -71,7 +71,7 @@ fn each<'a, T: 'a, U>(
 ) -> Result<Vec<U>> {
     items
         .enumerate()
-        .map(|(index, item)| encode(item).within(format!("{field}[{index}]")))
+        .map(|(index, item)| encode(item).within(Indexed(field, index)))
         .collect()
 }
 
@@ -188,7 +188,8 @@ fn curve_kind(curve: &Curve3) -> Result<v1::curve::Kind> {
                         kind: Some(curve_kind(piece)?),
                         samples: Vec::new(),
                     })
-                    .within(format!("composite.pieces[{index}]"))
+                    .within(Indexed("pieces", index))
+                    .within("composite")
                 })
                 .collect::<Result<_>>()?,
         }),

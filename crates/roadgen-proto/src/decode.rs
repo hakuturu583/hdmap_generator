@@ -8,10 +8,11 @@
 use std::fmt::Display;
 use std::hash::Hash;
 
-use roadgen_core::arena::Arena;
+use roadgen_core::arena::{Arena, DuplicateId};
 use roadgen_core::buildings::{
     Building, BuildingPart, Footprint, Frontage, Roof, RoofShape, Solid,
 };
+use roadgen_core::error::GeometryError;
 use roadgen_core::geometry::{
     Arc3, Bezier3, Clothoid3, Curve3, LaneHeight, Point3, Poly3Piece, Poly3Profile, Polyline3,
     SamplingConfig, Taper, WidthProfile,
@@ -42,7 +43,7 @@ use roadgen_core::topology::{
 };
 use roadgen_core::units::{GeoOrigin, PositiveWidth, SpeedLimit};
 
-use crate::error::{invalid, Within};
+use crate::error::{invalid, Indexed, Within};
 use crate::v1;
 use crate::ReadError;
 
@@ -50,98 +51,39 @@ type Result<T> = std::result::Result<T, ReadError>;
 
 pub(crate) fn map(message: &v1::Map) -> Result<Map> {
     let mut map = Map::new(metadata(required(&message.metadata)?).within("metadata")?);
-    fill(&mut map.roads, &message.roads, "roads", road, |road| {
-        road.id.clone()
-    })?;
-    fill(&mut map.lanes, &message.lanes, "lanes", lane, |lane| {
-        lane.id.clone()
-    })?;
-    fill(
-        &mut map.junctions,
-        &message.junctions,
-        "junctions",
-        junction,
-        |junction| junction.id.clone(),
-    )?;
-    fill(
-        &mut map.connections,
-        &message.connections,
-        "connections",
-        connection,
-        |connection| connection.id.clone(),
-    )?;
-    fill(
-        &mut map.objects,
-        &message.objects,
-        "objects",
-        object,
-        |object| object.id.clone(),
-    )?;
+    // Every arena but the rules, which have no identifiers: in the schema's
+    // order, each refusing an identifier it has already seen.
+    macro_rules! fill {
+        ($($field:ident => $decode:ident),* $(,)?) => {$(
+            fill(&mut map.$field, &message.$field, stringify!($field), $decode, |value| {
+                value.id.clone()
+            })?;
+        )*};
+    }
+    fill! {
+        roads => road,
+        lanes => lane,
+        junctions => junction,
+        connections => connection,
+        objects => object,
+    }
     map.rules = message
         .rules
         .iter()
         .enumerate()
-        .map(|(index, message)| rule(message).within(format!("rules[{index}]")))
+        .map(|(index, message)| rule(message).within(Indexed("rules", index)))
         .collect::<Result<_>>()?;
-    fill(
-        &mut map.buildings,
-        &message.buildings,
-        "buildings",
-        building,
-        |building| building.id.clone(),
-    )?;
-    fill(
-        &mut map.building_parts,
-        &message.building_parts,
-        "building_parts",
-        building_part,
-        |part| part.id.clone(),
-    )?;
-    fill(&mut map.sites, &message.sites, "sites", site, |site| {
-        site.id.clone()
-    })?;
-    fill(
-        &mut map.tin_surfaces,
-        &message.tin_surfaces,
-        "tin_surfaces",
-        tin_surface,
-        |surface| surface.id.clone(),
-    )?;
-    fill(
-        &mut map.tin_breaklines,
-        &message.tin_breaklines,
-        "tin_breaklines",
-        tin_breakline,
-        |breakline| breakline.id.clone(),
-    )?;
-    fill(
-        &mut map.land_covers,
-        &message.land_covers,
-        "land_covers",
-        land_cover,
-        |cover| cover.id.clone(),
-    )?;
-    fill(
-        &mut map.structures,
-        &message.structures,
-        "structures",
-        structure,
-        |structure| structure.id.clone(),
-    )?;
-    fill(
-        &mut map.grade_separations,
-        &message.grade_separations,
-        "grade_separations",
-        grade_separation,
-        |separation| separation.id.clone(),
-    )?;
-    fill(
-        &mut map.interchanges,
-        &message.interchanges,
-        "interchanges",
-        interchange,
-        |interchange| interchange.id.clone(),
-    )?;
+    fill! {
+        buildings => building,
+        building_parts => building_part,
+        sites => site,
+        tin_surfaces => tin_surface,
+        tin_breaklines => tin_breakline,
+        land_covers => land_cover,
+        structures => structure,
+        grade_separations => grade_separation,
+        interchanges => interchange,
+    }
     Ok(map)
 }
 
@@ -155,12 +97,14 @@ fn fill<K: Eq + Hash + Clone + Display, V, M>(
     key: impl Fn(&V) -> K,
 ) -> Result<()> {
     for (index, message) in messages.iter().enumerate() {
-        let value = decode(message).within(format!("{field}[{index}]"))?;
-        let id = key(&value);
+        let value = decode(message).within(Indexed(field, index))?;
         arena
-            .insert(id.clone(), value)
-            .map_err(|_| invalid(format!("{id} is the identifier of an earlier element")))
-            .within(format!("{field}[{index}].id"))?;
+            .insert(key(&value), value)
+            .map_err(|DuplicateId(id)| {
+                invalid(format!("{id} is the identifier of an earlier element"))
+            })
+            .within("id")
+            .within(Indexed(field, index))?;
     }
     Ok(())
 }
@@ -173,6 +117,20 @@ fn required<T>(value: &Option<T>) -> Result<&T> {
 /// A sub-message, decoded, naming the field it is in when either fails.
 fn field<T, U>(value: &Option<T>, name: &str, decode: impl FnOnce(&T) -> Result<U>) -> Result<U> {
     required(value).and_then(decode).within(name)
+}
+
+/// A sub-message whose absence the schema gives a meaning: the empty message,
+/// which is what a writer that never touched the field means by it.
+fn or_empty<T: Default, U>(
+    value: &Option<T>,
+    name: &str,
+    decode: impl FnOnce(&T) -> Result<U>,
+) -> Result<U> {
+    match value {
+        Some(value) => decode(value),
+        None => decode(&T::default()),
+    }
+    .within(name)
 }
 
 /// An enum field's value. Unknown numbers are refused rather than guessed at.
@@ -204,11 +162,15 @@ macro_rules! raw {
 raw!(
     BuildingId,
     BuildingPartId,
+    ConnectionId,
+    GradeSeparationId,
+    InterchangeId,
     JunctionId,
     LandCoverId,
     LaneId,
     ObjectId,
     RoadId,
+    SiteId,
     StructureId,
     TinBreaklineId,
     TinSurfaceId
@@ -251,8 +213,18 @@ fn point(message: &v1::Point3) -> Point3 {
     Point3::new(message.x, message.y, message.z)
 }
 
+/// A point standing on its own, which no constructor checks for it.
+fn finite_point(message: &v1::Point3) -> Result<Point3> {
+    let at = point(message);
+    if at.is_finite() {
+        Ok(at)
+    } else {
+        Err(invalid("is not finite"))
+    }
+}
+
 fn point_at(message: &Option<v1::Point3>, name: &str) -> Result<Point3> {
-    field(message, name, |at| Ok(point(at)))
+    field(message, name, finite_point)
 }
 
 fn points(messages: &[v1::Point3]) -> Vec<Point3> {
@@ -263,13 +235,9 @@ fn points(messages: &[v1::Point3]) -> Vec<Point3> {
 /// are not read: the curve is what it says it is.
 fn curve(message: &v1::Curve) -> Result<Curve3> {
     use v1::curve::Kind;
-    let geometry = |error: roadgen_core::error::GeometryError| invalid(error);
+    let geometry = |error: GeometryError| invalid(error);
     match required(&message.kind).within("kind")? {
-        Kind::Line(line) => {
-            Curve3::line(point_at(&line.start, "start")?, point_at(&line.end, "end")?)
-                .map_err(geometry)
-                .within("line")
-        }
+        Kind::Line(message) => line(message).within("line"),
         Kind::Arc(arc) => Ok(Curve3::Arc(
             Arc3::new(
                 point_at(&arc.start, "start").within("arc")?,
@@ -315,18 +283,38 @@ fn curve(message: &v1::Curve) -> Result<Curve3> {
             if composite.pieces.is_empty() {
                 return Err(invalid("has no pieces")).within("composite.pieces");
             }
-            // As the pieces were, rather than through `Curve3::composite`: that
-            // would unwrap a composite of one piece, and the map said composite.
-            Ok(Curve3::Composite(
-                composite
-                    .pieces
-                    .iter()
-                    .enumerate()
-                    .map(|(index, piece)| curve(piece).within(format!("composite.pieces[{index}]")))
-                    .collect::<Result<_>>()?,
-            ))
+            let pieces = composite
+                .pieces
+                .iter()
+                .enumerate()
+                .map(|(index, piece)| {
+                    curve(piece)
+                        .within(Indexed("pieces", index))
+                        .within("composite")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Checked as `Curve3::composite` checks, but kept as written rather than
+            // built through it: that would unwrap a composite of one piece, and the
+            // map said composite.
+            for (index, pair) in pieces.windows(2).enumerate() {
+                let gap = pair[0].end_point().distance_to(pair[1].start_point());
+                if gap > Curve3::JOIN_TOLERANCE {
+                    return Err(invalid(GeometryError::DisjointSegments { gap }))
+                        .within(Indexed("pieces", index + 1))
+                        .within("composite");
+                }
+            }
+            Ok(Curve3::Composite(pieces))
         }
     }
+}
+
+fn line(message: &v1::Line) -> Result<Curve3> {
+    Curve3::line(
+        point_at(&message.start, "start")?,
+        point_at(&message.end, "end")?,
+    )
+    .map_err(invalid)
 }
 
 fn curve_at(message: &Option<v1::Curve>, name: &str) -> Result<Curve3> {
@@ -358,7 +346,8 @@ fn width(message: &v1::WidthProfile) -> Result<WidthProfile> {
             PositiveWidth::new(knot.width)
                 .map(|width| (knot.station, width))
                 .map_err(invalid)
-                .within(format!("knots[{index}].width"))
+                .within("width")
+                .within(Indexed("knots", index))
         })
         .collect::<Result<Vec<_>>>()?;
     WidthProfile::new(knots, taper)
@@ -483,7 +472,10 @@ fn surface(raw: i32) -> Result<Pavement> {
 }
 
 fn road(message: &v1::Road) -> Result<Road> {
-    let link = field(&message.link, "link", |link| {
+    if message.sections.is_empty() {
+        return Err(invalid("has none; a road has at least one cross-section")).within("sections");
+    }
+    let link = or_empty(&message.link, "link", |link| {
         Ok(RoadLink {
             predecessor: optional_link(&link.predecessor, "predecessor")?,
             successor: optional_link(&link.successor, "successor")?,
@@ -497,7 +489,7 @@ fn road(message: &v1::Road) -> Result<Road> {
             .map(|(index, span)| {
                 Ok((
                     span.station,
-                    surface(span.surface).within(format!("pavement[{index}]"))?,
+                    surface(span.surface).within(Indexed("pavement", index))?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?,
@@ -513,13 +505,13 @@ fn road(message: &v1::Road) -> Result<Road> {
                 structure: StructureId::from_raw(&span.structure),
             })
             .map_err(|_| invalid("overlaps a span before it"))
-            .within(format!("structure[{index}]"))?;
+            .within(Indexed("structure", index))?;
     }
     Ok(Road {
         id: RoadId::from_raw(&message.id),
         name: message.name.clone(),
         reference_line: curve_at(&message.reference_line, "reference_line")?,
-        lane_offset: field(&message.lane_offset, "lane_offset", profile)?,
+        lane_offset: or_empty(&message.lane_offset, "lane_offset", profile)?,
         lanes: ids(&message.lanes),
         sections: message
             .sections
@@ -540,7 +532,7 @@ fn road(message: &v1::Road) -> Result<Road> {
             v1::RoadType::Unspecified => return unspecified("road_type"),
         },
         speed_limit: speed_limit(message.speed_limit_mps, "speed_limit_mps")?,
-        superelevation: field(&message.superelevation, "superelevation", profile)?,
+        superelevation: or_empty(&message.superelevation, "superelevation", profile)?,
         pavement,
         form: match enumerated(message.form, "form")? {
             v1::FormOfWay::Unspecified => FormOfWay::Unspecified,
@@ -595,7 +587,7 @@ fn lane(message: &v1::Lane) -> Result<Lane> {
             v1::LaneType::Unspecified => return unspecified("lane_type"),
         },
         width: field(&message.width, "width", width)?,
-        height: field(&message.height, "height", height)?,
+        height: or_empty(&message.height, "height", height)?,
         speed_limit: speed_limit(message.speed_limit_mps, "speed_limit_mps")?,
         section: message.section as usize,
         station_range: (message.start_station, message.end_station),
@@ -641,7 +633,7 @@ fn light_head(message: &v1::LightHead) -> Result<LightHead> {
                     v1::LightArrow::DownRight => Some(LightArrow::DownRight),
                 },
             })
-            .within(format!("bulbs[{index}]"))
+            .within(Indexed("bulbs", index))
         })
         .collect::<Result<_>>()?;
     Ok(LightHead {
@@ -670,7 +662,7 @@ fn object(message: &v1::MapObject) -> Result<MapObject> {
     };
     let geometry = field(&message.geometry, "geometry", |geometry| {
         Ok(match required(&geometry.kind).within("kind")? {
-            Geometry::Point(at) => ObjectGeometry::Point(point(at)),
+            Geometry::Point(at) => ObjectGeometry::Point(finite_point(at).within("point")?),
             Geometry::Line(line) => ObjectGeometry::Line(curve(line).within("line")?),
             Geometry::Band(band) => ObjectGeometry::Band {
                 left: curve_at(&band.left, "left").within("band")?,
@@ -713,18 +705,17 @@ fn rule(message: &v1::TrafficRule) -> Result<TrafficRule> {
 // ---------------------------------------------------------------------------------
 
 fn roof(message: &v1::Roof) -> Result<Roof> {
-    Ok(Roof {
-        shape: match enumerated(message.shape, "shape")? {
-            v1::RoofShape::Flat => RoofShape::Flat,
-            v1::RoofShape::Skillion => RoofShape::Skillion,
-            v1::RoofShape::Gabled => RoofShape::Gabled,
-            v1::RoofShape::Hipped => RoofShape::Hipped,
-            v1::RoofShape::Pyramidal => RoofShape::Pyramidal,
-            v1::RoofShape::Unspecified => return unspecified("shape"),
-        },
-        height: message.height,
-        direction: message.direction,
-    })
+    let shape = match enumerated(message.shape, "shape")? {
+        v1::RoofShape::Flat => RoofShape::Flat,
+        v1::RoofShape::Skillion => RoofShape::Skillion,
+        v1::RoofShape::Gabled => RoofShape::Gabled,
+        v1::RoofShape::Hipped => RoofShape::Hipped,
+        v1::RoofShape::Pyramidal => RoofShape::Pyramidal,
+        v1::RoofShape::Unspecified => return unspecified("shape"),
+    };
+    // Through `Roof::new`, which zeroes what the shape does not have: a flat
+    // roof's height, a pyramid's direction.
+    Ok(Roof::new(shape, message.height, message.direction))
 }
 
 fn building(message: &v1::Building) -> Result<Building> {
@@ -848,7 +839,7 @@ fn bridge(message: &v1::Bridge) -> Result<Bridge> {
                 footprint: field(&support.footprint, "footprint", footprint)?,
                 base: support.base,
             })
-            .within(format!("supports[{index}]"))
+            .within(Indexed("supports", index))
         })
         .collect::<Result<_>>()?;
     Ok(Bridge {
@@ -883,7 +874,7 @@ fn tunnel(message: &v1::Tunnel) -> Result<Tunnel> {
                 left: point_at(&portal.left, "left")?,
                 right: point_at(&portal.right, "right")?,
             })
-            .within(format!("portals[{index}]"))
+            .within(Indexed("portals", index))
         })
         .collect::<Result<_>>()?;
     let portals: [Portal; 2] = portals

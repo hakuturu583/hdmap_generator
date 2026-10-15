@@ -68,41 +68,57 @@ impl std::error::Error for ReadError {
 
 /// Adds a field to the front of an error's path, as the error travels up out of
 /// the message it was found in.
-pub(crate) trait Within<T> {
-    fn within(self, field: impl fmt::Display) -> T;
+pub(crate) trait Within {
+    fn within(self, field: impl fmt::Display) -> Self;
 }
 
-fn prefixed(field: impl fmt::Display, path: String) -> String {
-    if path.is_empty() {
-        field.to_string()
-    } else if path.starts_with('[') {
-        format!("{field}{path}")
-    } else {
-        format!("{field}.{path}")
+/// An error that may name the field it was found at.
+pub(crate) trait Located {
+    fn path_mut(&mut self) -> Option<&mut String>;
+}
+
+impl Located for ReadError {
+    fn path_mut(&mut self) -> Option<&mut String> {
+        match self {
+            ReadError::Invalid { path, .. } => Some(path),
+            ReadError::Io(_) | ReadError::Decode(_) => None,
+        }
     }
 }
 
-impl<T> Within<Result<T, ReadError>> for Result<T, ReadError> {
-    fn within(self, field: impl fmt::Display) -> Result<T, ReadError> {
-        self.map_err(|error| match error {
-            ReadError::Invalid { path, message } => ReadError::Invalid {
-                path: prefixed(field, path),
-                message,
-            },
-            other => other,
+impl Located for WriteError {
+    fn path_mut(&mut self) -> Option<&mut String> {
+        match self {
+            WriteError::Invalid { path, .. } => Some(path),
+            WriteError::Io(_) => None,
+        }
+    }
+}
+
+impl<T, E: Located> Within for Result<T, E> {
+    fn within(self, field: impl fmt::Display) -> Self {
+        self.map_err(|mut error| {
+            if let Some(path) = error.path_mut() {
+                *path = if path.is_empty() {
+                    field.to_string()
+                } else if path.starts_with('[') {
+                    format!("{field}{path}")
+                } else {
+                    format!("{field}.{path}")
+                };
+            }
+            error
         })
     }
 }
 
-impl<T> Within<Result<T, WriteError>> for Result<T, WriteError> {
-    fn within(self, field: impl fmt::Display) -> Result<T, WriteError> {
-        self.map_err(|error| match error {
-            WriteError::Invalid { path, message } => WriteError::Invalid {
-                path: prefixed(field, path),
-                message,
-            },
-            other => other,
-        })
+/// `name[index]`, as a path segment: formatted only if an error needs it, since
+/// every element read or written is named in case it fails.
+pub(crate) struct Indexed<'a>(pub &'a str, pub usize);
+
+impl fmt::Display for Indexed<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}[{}]", self.0, self.1)
     }
 }
 

@@ -120,8 +120,11 @@ fn bytes_that_are_not_a_document_are_refused() {
 
 #[test]
 fn samples_are_only_ever_read_by_other_readers() {
+    let map = two_way_road();
+    let mut message = roadgen_proto::to_message(&map).unwrap();
+    let full = message.encoded_len();
+
     // A writer whose samples disagree with its curves is believed about the curves.
-    let mut message = written();
     for sample in &mut message.lanes[0].left_boundary.as_mut().unwrap().samples {
         sample.point = Some(v1::Point3 {
             x: 1e6,
@@ -133,22 +136,100 @@ fn samples_are_only_ever_read_by_other_readers() {
         .unwrap()
         .validate()
         .unwrap();
-    assert_eq!(back.as_map(), two_way_road().as_map());
+    assert_eq!(back.as_map(), map.as_map());
 
-    // And a document without them is half the size and the same map.
+    // And a document without them is smaller and the same map.
     let lean = roadgen_proto::to_bytes_with(
-        &two_way_road(),
+        &map,
         &roadgen_proto::WriteOptions {
             curve_samples: false,
         },
     )
     .unwrap();
-    assert!(lean.len() < written().encoded_len());
+    assert!(lean.len() < full);
     let back = roadgen_proto::from_bytes(&lean)
         .unwrap()
         .validate()
         .unwrap();
-    assert_eq!(back.as_map(), two_way_road().as_map());
+    assert_eq!(back.as_map(), map.as_map());
+}
+
+#[test]
+fn what_an_unset_field_means_is_what_the_schema_says() {
+    // A writer that never touched a lane's height, a road's offset, bank or links
+    // means a flat lane on a level road that ends where it ends.
+    let map = two_way_road();
+    let mut message = roadgen_proto::to_message(&map).unwrap();
+    message.roads[0].lane_offset = None;
+    message.roads[0].superelevation = None;
+    message.roads[0].link = None;
+    for lane in &mut message.lanes {
+        lane.height = None;
+    }
+    let back = roadgen_proto::from_message(&message)
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(back.as_map(), map.as_map());
+}
+
+/// The road's reference line, replaced.
+fn with_reference_line(kind: v1::curve::Kind) -> v1::Map {
+    let mut message = written();
+    message.roads[0].reference_line = Some(v1::Curve {
+        kind: Some(kind),
+        samples: Vec::new(),
+    });
+    message
+}
+
+fn at(x: f64, y: f64) -> v1::Point3 {
+    v1::Point3 { x, y, z: 0.0 }
+}
+
+#[test]
+fn a_composite_with_a_gap_in_it_is_refused() {
+    let line = |from: f64, to: f64| v1::Curve {
+        kind: Some(v1::curve::Kind::Line(v1::Line {
+            start: Some(at(from, 0.0)),
+            end: Some(at(to, 0.0)),
+        })),
+        samples: Vec::new(),
+    };
+    let message = with_reference_line(v1::curve::Kind::Composite(v1::Composite {
+        pieces: vec![line(0.0, 50.0), line(80.0, 100.0)],
+    }));
+    assert_eq!(
+        refused_at(&message),
+        "roads[0].reference_line.composite.pieces[1]"
+    );
+}
+
+#[test]
+fn a_bezier_of_more_segments_than_can_be_afforded_is_refused() {
+    // Every sampling allocates a vertex per segment, so four billion of them
+    // would take the reading process down rather than fail.
+    let message = with_reference_line(v1::curve::Kind::Bezier(v1::Bezier {
+        control: vec![at(0.0, 0.0), at(30.0, 0.0), at(70.0, 0.0), at(100.0, 0.0)],
+        segments: u32::MAX,
+    }));
+    assert_eq!(refused_at(&message), "roads[0].reference_line.bezier");
+}
+
+#[test]
+fn a_point_that_is_not_finite_is_refused() {
+    let message = with_reference_line(v1::curve::Kind::Line(v1::Line {
+        start: Some(at(f64::NAN, 0.0)),
+        end: Some(at(100.0, 0.0)),
+    }));
+    assert_eq!(refused_at(&message), "roads[0].reference_line.line.start");
+}
+
+#[test]
+fn a_road_without_a_cross_section_is_refused() {
+    let mut message = written();
+    message.roads[0].sections.clear();
+    assert_eq!(refused_at(&message), "roads[0].sections");
 }
 
 #[test]

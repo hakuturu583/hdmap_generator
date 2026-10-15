@@ -358,11 +358,6 @@ pub struct Bezier3 {
 impl Bezier3 {
     /// The curve through these control points, realised at `config`'s resolution.
     pub fn new(control: [Point3; 4], config: SamplingConfig) -> Result<Self, GeometryError> {
-        for point in control {
-            if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
-                return Err(GeometryError::NonFiniteCoordinate);
-            }
-        }
         let polygon: f64 = control
             .windows(2)
             .map(|pair| pair[0].distance_to(pair[1]))
@@ -383,10 +378,10 @@ impl Bezier3 {
             }
         };
         let per_five_degrees = (turn / (5.0_f64).to_radians()).ceil() as usize;
-        Ok(Bezier3 {
+        Bezier3::checked(
             control,
-            segments: config.segments_for(polygon).max(8).max(per_five_degrees),
-        })
+            config.segments_for(polygon).max(8).max(per_five_degrees),
+        )
     }
 
     /// The curve through these control points, realised as exactly `segments`
@@ -395,12 +390,30 @@ impl Bezier3 {
     /// For a reader putting back a curve that was written out: the resolution is
     /// part of the curve, and [`Bezier3::new`] would derive it again from whatever
     /// sampling the reader happens to have.
+    ///
+    /// Fails for no segments, and for more than [`Bezier3::MAX_SEGMENTS`]: every
+    /// sampling of the curve allocates one vertex per segment, so a count that
+    /// came from outside is a count the program has to be able to afford.
     pub fn with_segments(control: [Point3; 4], segments: usize) -> Result<Self, GeometryError> {
-        if !control.iter().all(|point| point.is_finite()) {
-            return Err(GeometryError::NonFiniteCoordinate);
-        }
         if segments == 0 {
             return Err(GeometryError::TooFewPoints { got: 1 });
+        }
+        if segments > Self::MAX_SEGMENTS {
+            return Err(GeometryError::TooManySegments {
+                got: segments,
+                max: Self::MAX_SEGMENTS,
+            });
+        }
+        Bezier3::checked(control, segments)
+    }
+
+    /// The most segments [`Bezier3::with_segments`] accepts: a vertex every
+    /// centimetre along ten kilometres of curve.
+    pub const MAX_SEGMENTS: usize = 1 << 20;
+
+    fn checked(control: [Point3; 4], segments: usize) -> Result<Self, GeometryError> {
+        if !control.iter().all(|point| point.is_finite()) {
+            return Err(GeometryError::NonFiniteCoordinate);
         }
         Ok(Bezier3 { control, segments })
     }

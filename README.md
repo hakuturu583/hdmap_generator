@@ -2380,14 +2380,17 @@ tunnels, grade separations, interchanges, terrain, land cover and sites — fiel
 field and in the IR's own order, and reads it back as a map equal to the one written.
 So the document is something to keep, to hand to another process, or to export from
 later: the round-trip tests check that a map read back writes the same OpenDRIVE and
-Lanelet2, byte for byte, as the one that was written. (The one thing that does not
-survive is the sign of a zero — proto3 writes no field that holds zero — so a `-0.0`
-comes back as `0.0`.)
+Lanelet2, byte for byte, as the one that was written. (The one thing that would not
+survive is the sign of a zero — proto3 writes no field that holds zero, so a `-0.0`
+would come back as `0.0` — and the IR does not make one.)
 
 The reader is not only for documents roadgen wrote. Every value goes back through
 the IR's own constructors, so one that the IR cannot hold — a width of zero, a
-polyline of one point, an origin off the globe, an enum left unset — is refused,
-naming the field (`lanes[3].width.knots[0].width`). Whether the result is a
+polyline of one point, a composite with a gap in it, a coordinate that is not a
+number, an origin off the globe, an enum left unset where the schema gives unset no
+meaning — is refused, naming the field (`lanes[3].width.knots[0].width`). A message
+left out where the schema says what empty means — a lane's height, a road's links —
+is read as empty, which is what a writer that never touched it meant. Whether the result is a
 consistent road network is `validate()`'s question, as it is for any map.
 
 ### Reading it somewhere else

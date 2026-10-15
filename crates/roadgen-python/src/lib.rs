@@ -587,6 +587,30 @@ enum Source {
     },
 }
 
+impl PyMap {
+    /// A map read from a file rather than built here: it exports, and cannot be
+    /// added to.
+    fn from_read(
+        map: UnvalidatedMap,
+        notes: Vec<String>,
+        trace: roadgen_core::trace::Trace,
+    ) -> Self {
+        PyMap {
+            source: Source::Read {
+                map: Box::new(map),
+                notes,
+                trace: Box::new(trace),
+            },
+            built: None,
+            fingerprint: None,
+            buildings: None,
+            land: None,
+            places: environment::Places::default(),
+            notes: Vec::new(),
+        }
+    }
+}
+
 impl Source {
     fn metadata(&self) -> &MapMetadata {
         match self {
@@ -2868,19 +2892,11 @@ fn read_opendrive(
         },
     };
     let imported = roadgen_opendrive::read_with(&path, &options).map_err(value_error)?;
-    Ok(PyMap {
-        source: Source::Read {
-            map: Box::new(imported.map),
-            notes: imported.approximations,
-            trace: Box::new(imported.trace),
-        },
-        built: None,
-        fingerprint: None,
-        buildings: None,
-        land: None,
-        places: environment::Places::default(),
-        notes: Vec::new(),
-    })
+    Ok(PyMap::from_read(
+        imported.map,
+        imported.approximations,
+        imported.trace,
+    ))
 }
 
 /// Reads the IR document at `path` — the one `Map.export_proto` wrote, or one
@@ -2890,21 +2906,10 @@ fn read_opendrive(
 #[pyo3(name = "read_proto")]
 fn read_proto(path: PathBuf) -> PyResult<PyMap> {
     let map = roadgen_proto::read(&path).map_err(value_error)?;
-    let mut trace = roadgen_core::trace::Trace::imported("roadgen_proto");
+    let mut trace = roadgen_core::trace::Trace::imported(roadgen_proto::TRACE_FORMAT);
     trace.files.push(path);
-    Ok(PyMap {
-        source: Source::Read {
-            map: Box::new(map),
-            notes: Vec::new(),
-            trace: Box::new(trace),
-        },
-        built: None,
-        fingerprint: None,
-        buildings: None,
-        land: None,
-        places: environment::Places::default(),
-        notes: Vec::new(),
-    })
+    // Nothing to note: the document is the IR, and nothing was approximated.
+    Ok(PyMap::from_read(map, Vec::new(), trace))
 }
 
 /// The Protocol Buffers schema of the IR, as `{import path: source}`: write the

@@ -21,7 +21,7 @@ from __future__ import annotations
 import dataclasses
 import sys
 
-from roadgen_ir.v1 import map_pb2, semantics_pb2, topology_pb2
+from roadgen_ir.v1 import geometry_pb2, map_pb2, semantics_pb2, topology_pb2
 
 Point = tuple[float, float, float]
 
@@ -31,7 +31,8 @@ class Lane:
     id: str
     road: str
     type: str
-    # Metres per second, or None where the lane and its road say nothing.
+    # Metres per second: a speed-limit rule's over the lane's over its road's, or
+    # None where none of them says.
     speed_limit: float | None
     # In the order traffic drives them, the left one on the driver's left.
     centreline: list[Point]
@@ -48,7 +49,7 @@ class Network:
     lanes: dict[str, Lane]
 
 
-def vertices(curve: map_pb2.Curve) -> list[Point]:
+def vertices(curve: geometry_pb2.Curve) -> list[Point]:
     """The curve as a polyline: its samples, in reference-line order."""
     if not curve.samples:
         raise ValueError("written without curve samples; evaluate `curve.kind` instead")
@@ -87,6 +88,11 @@ def read(path: str) -> Network:
             left=left,
             right=right,
         )
+
+    for rule in document.rules:
+        if rule.WhichOneof("kind") == "speed_limit":
+            for lane in rule.speed_limit.lanes:
+                lanes[lane].speed_limit = rule.speed_limit.limit_mps
 
     for connection in document.connections:
         lanes[getattr(connection, "from").lane].successors.append(connection.to.lane)
