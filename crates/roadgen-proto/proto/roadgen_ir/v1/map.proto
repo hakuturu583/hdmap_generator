@@ -1,0 +1,194 @@
+// The roadgen Canonical Road IR, as Protocol Buffers.
+//
+// A document is one `Map` message. It holds everything the generator produced:
+// the network (roads, lanes, junctions, connections), its furniture and rules,
+// and whatever stands beside it (buildings, structures, terrain, land cover).
+// Nothing in it is shaped by OpenDRIVE or Lanelet2: there is no `laneSection`,
+// no `way`, no `relation`.
+//
+// Reading one, in any language:
+//
+//   * Elements refer to each other by identifier, a string such as `road/north`
+//     or `lane/north/0` whose first segment names the kind. Build a dictionary
+//     per kind, keyed by `id`, and resolve references through it.
+//   * Every repeated list of elements is in the order the generator made them,
+//     and the order is meaningful: it is the order every roadgen exporter walks,
+//     so a map read twice is written the same way twice.
+//   * Coordinates are metres, x east, y north, z up, about `metadata.origin`.
+//     Stations are horizontal arc lengths along a road's reference line.
+//   * Every curve may carry `samples`: the curve already evaluated to vertices.
+//     An importer that wants polylines reads those and never needs to evaluate an
+//     arc, a clothoid or a Bezier itself.
+//   * Lane geometry is stored in reference-line order: `left_boundary` is the edge
+//     to the left of the reference line whichever way traffic runs. A backward
+//     lane's travel-order geometry is its curves reversed with left and right
+//     swapped.
+//   * Enum values numbered 0 are `UNSPECIFIED` and never written by roadgen,
+//     except where the value's comment gives 0 a meaning of its own.
+//
+// The package is `roadgen_ir`, not `roadgen.ir`, so that code generated from it
+// does not land inside the `roadgen` Python package: protoc makes
+// `roadgen_ir/v1/map_pb2.py` of it, which imports beside roadgen itself.
+//
+// Compatibility: within `roadgen_ir.v1` fields are only ever added. A reader
+// ignores fields it does not know; a change that would break a reader gets a new
+// package, `roadgen_ir.v2`.
+
+syntax = "proto3";
+
+package roadgen_ir.v1;
+
+import "roadgen_ir/v1/environment.proto";
+import "roadgen_ir/v1/geometry.proto";
+import "roadgen_ir/v1/semantics.proto";
+import "roadgen_ir/v1/structure.proto";
+import "roadgen_ir/v1/topology.proto";
+
+// Which side of the road traffic keeps to. It decides which side of the reference
+// line a forward lane lands on, and nothing else.
+enum TrafficHandedness {
+  TRAFFIC_HANDEDNESS_UNSPECIFIED = 0;
+  // Forward lanes sit to the right of the reference line.
+  TRAFFIC_HANDEDNESS_RIGHT_HAND = 1;
+  // Forward lanes sit to the left.
+  TRAFFIC_HANDEDNESS_LEFT_HAND = 2;
+}
+
+// The frame the map's metric coordinates are read against. In every case x and y
+// are metres about the origin; this says which grid a consumer reconstructs.
+enum Projection {
+  PROJECTION_UNSPECIFIED = 0;
+  // East/north/up metres about the origin.
+  PROJECTION_LOCAL_CARTESIAN = 1;
+  // UTM, in the zone the origin falls in, with the origin's easting and northing
+  // subtracted.
+  PROJECTION_UTM = 2;
+  // UTM again, reported to Autoware as metres within the 100 km MGRS square the
+  // origin falls in.
+  PROJECTION_MGRS = 3;
+}
+
+// A geodetic anchor for the map's metric coordinates.
+message GeoOrigin {
+  // Degrees, WGS 84.
+  double latitude = 1;
+  double longitude = 2;
+  // Metres.
+  double altitude = 3;
+}
+
+// How finely curves are turned into vertices.
+message SamplingConfig {
+  // Upper bound on the horizontal length of one generated segment, metres.
+  double max_segment_length = 1;
+}
+
+// Map-wide settings that are not about any one road.
+message MapMetadata {
+  optional string name = 1;
+  GeoOrigin origin = 2;
+  Projection projection = 3;
+  TrafficHandedness handedness = 4;
+  SamplingConfig sampling = 5;
+}
+
+// One cross-section of a road, from `station` until the next one's.
+message CrossSection {
+  // Horizontal station where it takes over, metres.
+  double station = 1;
+  // `Lane.id`s of this section, in the order they were written.
+  repeated string lanes = 2;
+}
+
+// A stretch of road carrying a cross-section along one reference line.
+message Road {
+  // e.g. `road/north`.
+  string id = 1;
+  optional string name = 2;
+  // The 3D curve the cross-section is laid out against. Its z is the road's
+  // elevation.
+  Curve reference_line = 3;
+  // Lateral displacement of the cross-section's origin from the reference line,
+  // metres to the left, against station. Zero for an ordinary road.
+  Poly3Profile lane_offset = 4;
+  // Every `Lane.id` of the road, section by section.
+  repeated string lanes = 5;
+  // Ascending by station; at least one, and the first starts at zero.
+  repeated CrossSection sections = 6;
+  // A `Junction.id`, set when the road is a connector carrying traffic through a
+  // junction.
+  optional string junction = 7;
+  RoadLink link = 8;
+  RoadType road_type = 9;
+  // Metres per second.
+  optional double speed_limit_mps = 10;
+  // Roll of the road surface about its reference line, radians, against station.
+  Poly3Profile superelevation = 11;
+  // Ascending by station; empty when nobody said what it is surfaced with.
+  repeated PavementSpan pavement = 12;
+  FormOfWay form = 13;
+  // Which stretches are on a bridge or in a tunnel, ascending and never
+  // overlapping; at grade elsewhere.
+  repeated StructureSpan structure = 14;
+}
+
+// One lane of one road.
+message Lane {
+  // e.g. `lane/north/0`.
+  string id = 1;
+  // A `Road.id`.
+  string road = 2;
+  // Position in the road's cross-section list, as written.
+  uint32 index = 3;
+  LateralSide side = 4;
+  // Rank outwards from the cross-section origin on this side, counting from 1.
+  uint32 ordinal = 5;
+  Direction direction = 6;
+  LaneType lane_type = 7;
+  WidthProfile width = 8;
+  LaneHeight height = 9;
+  // Metres per second.
+  optional double speed_limit_mps = 10;
+  // Index into the road's `sections`.
+  uint32 section = 11;
+  // The stations the lane spans, which are its section's.
+  double start_station = 12;
+  double end_station = 13;
+  // Which cross-section edge bounds the lane on each side, counted outwards from
+  // the cross-section origin: 0 is the origin, +n the n-th edge to its left, -n
+  // the n-th to its right. Two lanes share a boundary exactly when these agree.
+  int32 left_edge = 14;
+  int32 right_edge = 15;
+  // Lateral offsets of the two boundaries at the lane's start, metres to the left
+  // of the reference line. Informative: the boundaries are the truth.
+  double left_offset = 16;
+  double right_offset = 17;
+  // In reference-line order; see the file comment.
+  Curve left_boundary = 18;
+  Curve right_boundary = 19;
+  Curve centerline = 20;
+  BoundaryMarking left_marking = 21;
+  BoundaryMarking right_marking = 22;
+}
+
+// The map itself.
+message Map {
+  // What wrote the document, e.g. `roadgen 0.32.3`. Informative.
+  string generator = 1;
+  MapMetadata metadata = 2;
+  repeated Road roads = 3;
+  repeated Lane lanes = 4;
+  repeated Junction junctions = 5;
+  repeated LaneConnection connections = 6;
+  repeated MapObject objects = 7;
+  repeated TrafficRule rules = 8;
+  repeated Building buildings = 9;
+  repeated BuildingPart building_parts = 10;
+  repeated Site sites = 11;
+  repeated TinSurface tin_surfaces = 12;
+  repeated TinBreakline tin_breaklines = 13;
+  repeated LandCover land_covers = 14;
+  repeated Structure structures = 15;
+  repeated GradeSeparation grade_separations = 16;
+  repeated Interchange interchanges = 17;
+}

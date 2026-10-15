@@ -23,6 +23,10 @@ pub enum GeometryError {
     InvalidSampling { max_segment_length: f64 },
     /// A closed ring encloses no area, so it is a line rather than a polygon.
     ZeroArea,
+    /// A curve was asked to be realised in no segments at all.
+    NoSegments,
+    /// A curve was asked to be realised in more segments than can be afforded.
+    TooManySegments { got: usize, max: usize },
 }
 
 impl fmt::Display for GeometryError {
@@ -52,6 +56,13 @@ impl fmt::Display for GeometryError {
             ),
             GeometryError::ZeroArea => {
                 f.write_str("the ring encloses no area, so it is a line and not a polygon")
+            }
+            GeometryError::NoSegments => f.write_str("a curve needs at least one segment"),
+            GeometryError::TooManySegments { got, max } => {
+                write!(
+                    f,
+                    "a curve of {got} segments is more than the {max} allowed"
+                )
             }
         }
     }

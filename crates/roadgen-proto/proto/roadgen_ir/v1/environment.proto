@@ -1,0 +1,133 @@
+// What stands beside the road, and the land it stands on: buildings, terrain,
+// land cover and the sites that gather them.
+
+syntax = "proto3";
+
+package roadgen_ir.v1;
+
+import "roadgen_ir/v1/geometry.proto";
+import "roadgen_ir/v1/topology.proto";
+
+// The OSM `roof:shape` values the IR has words for.
+enum RoofShape {
+  ROOF_SHAPE_UNSPECIFIED = 0;
+  ROOF_SHAPE_FLAT = 1;
+  // One slope, falling across the building.
+  ROOF_SHAPE_SKILLION = 2;
+  // Two slopes meeting at a ridge.
+  ROOF_SHAPE_GABLED = 3;
+  // Every side slopes, two to a ridge.
+  ROOF_SHAPE_HIPPED = 4;
+  // Every side slopes to a single point.
+  ROOF_SHAPE_PYRAMIDAL = 5;
+}
+
+message Roof {
+  RoofShape shape = 1;
+  // How far the roof rises above the eaves, metres. Zero for a flat roof.
+  double height = 2;
+  // Which way the ridge runs, or a skillion falls: radians anticlockwise from +x.
+  // Zero for the shapes that need no direction.
+  double direction = 3;
+}
+
+// The volume one part of a building occupies: an outline, walls rising from it,
+// and a roof on top.
+message Solid {
+  // Where the walls meet the base, each vertex at its own height.
+  Footprint footprint = 1;
+  // How far the walls rise above each base vertex, metres.
+  double wall_height = 2;
+  Roof roof = 3;
+}
+
+// Which road a building stands beside.
+message Frontage {
+  // A `Road.id`.
+  string road = 1;
+  LateralSide side = 2;
+  // Where along the reference line it faces, metres from the road's start.
+  double station = 3;
+}
+
+// One building. Its shape is in its parts.
+message Building {
+  // e.g. `building/high_street/left/3`.
+  string id = 1;
+  // `BuildingPart.id`s, never empty.
+  repeated string parts = 2;
+  // What it is — `house`, `apartments`, `retail` — in its generator's words.
+  string kind = 3;
+  // Unset when it was not put there in relation to a road.
+  Frontage frontage = 4;
+}
+
+// One massing element of a building.
+message BuildingPart {
+  // e.g. `part/high_street/left/3/0`.
+  string id = 1;
+  // A `Building.id`.
+  string building = 2;
+  Solid solid = 3;
+  // What this part is, when it is something its building as a whole is not.
+  optional string kind = 4;
+  // Storeys, at least one.
+  uint32 levels = 5;
+}
+
+// A triangulated irregular network.
+message Tin {
+  repeated Point3 nodes = 1;
+  // Three indices into `nodes` per triangle, each triangle anticlockwise seen from
+  // above.
+  repeated uint32 triangles = 2;
+}
+
+// The land over some extent, as one feature.
+message TinSurface {
+  // e.g. `tin/north_pit`.
+  string id = 1;
+  // A `Site.id`.
+  optional string site = 2;
+  // `TinBreakline.id`s, in the order they were laid.
+  repeated string breaklines = 3;
+  Tin tin = 4;
+}
+
+// A line along which the land changes slope abruptly.
+message TinBreakline {
+  // e.g. `breakline/north_pit/bench/3/crest`.
+  string id = 1;
+  // A `TinSurface.id`.
+  string surface = 2;
+  // `crest`, `toe`, `ridge`, `valley`, `road_edge`, in its generator's words.
+  string kind = 3;
+  // Closed when its last vertex is its first.
+  Polyline line = 4;
+}
+
+// One area of land that is one thing: a pit, a spoil heap, a yard, a river.
+message LandCover {
+  // e.g. `landcover/north_pit/pit`.
+  string id = 1;
+  // A `Site.id`.
+  optional string site = 2;
+  // In its generator's words: `pit`, `waste_dump`, `stockpile`, `water`.
+  string kind = 3;
+  // Its outline, at the land's height along it.
+  Footprint area = 4;
+  // A `TinSurface.id`: the surface the area lies on.
+  optional string draped_on = 5;
+}
+
+// A place made of several features: a mine, a works. It owns nothing; it lists.
+message Site {
+  // e.g. `site/north_pit`.
+  string id = 1;
+  optional string name = 2;
+  // In its generator's words: `open_pit_mine`.
+  string kind = 3;
+  repeated string land_covers = 4;
+  repeated string surfaces = 5;
+  repeated string roads = 6;
+}

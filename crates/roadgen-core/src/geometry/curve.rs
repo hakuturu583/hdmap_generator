@@ -28,9 +28,19 @@ impl SamplingConfig {
         Ok(SamplingConfig { max_segment_length })
     }
 
-    /// Number of segments needed to cover `length` without exceeding the bound.
+    /// The most segments one curve is ever realised as, whatever its length and
+    /// the bound: a vertex every centimetre along ten kilometres of curve.
+    ///
+    /// Every sampling allocates a vertex per segment, so a curve far longer than
+    /// any road, or a bound far finer than any map, has to cost a bounded amount
+    /// rather than all the memory there is — which is what a document from
+    /// outside could otherwise ask for.
+    pub const MAX_SEGMENTS: usize = 1 << 20;
+
+    /// Number of segments needed to cover `length` without exceeding the bound,
+    /// up to [`SamplingConfig::MAX_SEGMENTS`].
     fn segments_for(&self, length: f64) -> usize {
-        ((length / self.max_segment_length).ceil() as usize).max(1)
+        ((length / self.max_segment_length).ceil() as usize).clamp(1, Self::MAX_SEGMENTS)
     }
 
     /// Stations from `from` to `to`, both included, evenly spaced and no further
@@ -358,11 +368,6 @@ pub struct Bezier3 {
 impl Bezier3 {
     /// The curve through these control points, realised at `config`'s resolution.
     pub fn new(control: [Point3; 4], config: SamplingConfig) -> Result<Self, GeometryError> {
-        for point in control {
-            if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
-                return Err(GeometryError::NonFiniteCoordinate);
-            }
-        }
         let polygon: f64 = control
             .windows(2)
             .map(|pair| pair[0].distance_to(pair[1]))
@@ -383,10 +388,41 @@ impl Bezier3 {
             }
         };
         let per_five_degrees = (turn / (5.0_f64).to_radians()).ceil() as usize;
-        Ok(Bezier3 {
+        Bezier3::checked(
             control,
-            segments: config.segments_for(polygon).max(8).max(per_five_degrees),
-        })
+            config.segments_for(polygon).max(8).max(per_five_degrees),
+        )
+    }
+
+    /// The curve through these control points, realised as exactly `segments`
+    /// straight pieces.
+    ///
+    /// For a reader putting back a curve that was written out: the resolution is
+    /// part of the curve, and [`Bezier3::new`] would derive it again from whatever
+    /// sampling the reader happens to have.
+    ///
+    /// Fails for no segments, and for more than [`SamplingConfig::MAX_SEGMENTS`],
+    /// which [`Bezier3::new`] never exceeds: every sampling of the curve allocates
+    /// one vertex per segment, so a count that came from outside is a count the
+    /// program has to be able to afford.
+    pub fn with_segments(control: [Point3; 4], segments: usize) -> Result<Self, GeometryError> {
+        if segments == 0 {
+            return Err(GeometryError::NoSegments);
+        }
+        if segments > SamplingConfig::MAX_SEGMENTS {
+            return Err(GeometryError::TooManySegments {
+                got: segments,
+                max: SamplingConfig::MAX_SEGMENTS,
+            });
+        }
+        Bezier3::checked(control, segments)
+    }
+
+    fn checked(control: [Point3; 4], segments: usize) -> Result<Self, GeometryError> {
+        if !control.iter().all(|point| point.is_finite()) {
+            return Err(GeometryError::NonFiniteCoordinate);
+        }
+        Ok(Bezier3 { control, segments })
     }
 
     /// How many straight segments the curve is realised as.
@@ -558,13 +594,19 @@ impl Curve3 {
             1 => return Ok(segments.into_iter().next().expect("length checked")),
             _ => {}
         }
-        for pair in segments.windows(2) {
-            let gap = pair[0].end_point().distance_to(pair[1].start_point());
-            if gap > Self::JOIN_TOLERANCE {
-                return Err(GeometryError::DisjointSegments { gap });
-            }
+        if let Some((_, gap)) = Curve3::first_gap(&segments) {
+            return Err(GeometryError::DisjointSegments { gap });
         }
         Ok(Curve3::Composite(segments))
+    }
+
+    /// The first piece that does not start where the one before it ended, by
+    /// index, and how far off it starts: what makes pieces not a composite.
+    pub fn first_gap(pieces: &[Curve3]) -> Option<(usize, f64)> {
+        pieces.windows(2).enumerate().find_map(|(index, pair)| {
+            let gap = pair[0].end_point().distance_to(pair[1].start_point());
+            (gap > Self::JOIN_TOLERANCE).then_some((index + 1, gap))
+        })
     }
 
     /// How far apart two pieces of a composite may be and still count as joined.

@@ -150,17 +150,23 @@ impl Poly3Profile {
     }
 
     /// The same profile with every value multiplied by `factor`.
+    ///
+    /// A zero stays a zero rather than becoming `-0.0` under a negative factor:
+    /// the two are the same number, but not the same text once a map is printed,
+    /// and a map written out and read back would otherwise print differently.
     pub fn scaled(&self, factor: f64) -> Poly3Profile {
+        // Adding zero turns -0.0 into 0.0 and leaves every other value alone.
+        let scale = |value: f64| value * factor + 0.0;
         Poly3Profile {
             pieces: self
                 .pieces
                 .iter()
                 .map(|piece| Poly3Piece {
                     station: piece.station,
-                    a: piece.a * factor,
-                    b: piece.b * factor,
-                    c: piece.c * factor,
-                    d: piece.d * factor,
+                    a: scale(piece.a),
+                    b: scale(piece.b),
+                    c: scale(piece.c),
+                    d: scale(piece.d),
                 })
                 .collect(),
         }
@@ -184,6 +190,14 @@ impl Default for Poly3Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaling_by_a_negative_factor_keeps_zeros_unsigned() {
+        let flipped = Poly3Profile::constant(1.5).scaled(-1.0);
+        let piece = flipped.pieces()[0];
+        assert_eq!(piece.a, -1.5);
+        assert!(piece.b.is_sign_positive() && piece.c.is_sign_positive());
+    }
 
     #[test]
     fn a_constant_profile_is_that_value_everywhere() {

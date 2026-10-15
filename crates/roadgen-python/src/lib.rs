@@ -587,6 +587,30 @@ enum Source {
     },
 }
 
+impl PyMap {
+    /// A map read from a file rather than built here: it exports, and cannot be
+    /// added to.
+    fn from_read(
+        map: UnvalidatedMap,
+        notes: Vec<String>,
+        trace: roadgen_core::trace::Trace,
+    ) -> Self {
+        PyMap {
+            source: Source::Read {
+                map: Box::new(map),
+                notes,
+                trace: Box::new(trace),
+            },
+            built: None,
+            fingerprint: None,
+            buildings: None,
+            land: None,
+            places: environment::Places::default(),
+            notes: Vec::new(),
+        }
+    }
+}
+
 impl Source {
     fn metadata(&self) -> &MapMetadata {
         match self {
@@ -1292,6 +1316,22 @@ impl PyMap {
             .map_err(runtime_error)?;
         self.fingerprint = Some(fingerprint);
         Ok(())
+    }
+
+    /// Writes the map as the IR itself, in Protocol Buffers: every road, lane,
+    /// junction, object, rule, building, structure and the land, nothing lost and
+    /// nothing lowered onto another format's terms. `roadgen.read_proto` reads it
+    /// back as the same map.
+    ///
+    /// Any other program can read it too: `roadgen.proto_schema()` is the schema,
+    /// to compile with `protoc`. Unless `curve_samples` is false, every curve also
+    /// carries its own vertices, so a reader needs no clothoid or Bezier of its own.
+    #[pyo3(signature = (path, curve_samples = true))]
+    fn export_proto(&mut self, path: PathBuf, curve_samples: bool) -> PyResult<()> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        roadgen_proto::write_with(map, &path, &roadgen_proto::WriteOptions { curve_samples })
+            .map_err(runtime_error)
     }
 
     /// Writes the map as OpenDRIVE.
@@ -2852,19 +2892,38 @@ fn read_opendrive(
         },
     };
     let imported = roadgen_opendrive::read_with(&path, &options).map_err(value_error)?;
-    Ok(PyMap {
-        source: Source::Read {
-            map: Box::new(imported.map),
-            notes: imported.approximations,
-            trace: Box::new(imported.trace),
-        },
-        built: None,
-        fingerprint: None,
-        buildings: None,
-        land: None,
-        places: environment::Places::default(),
-        notes: Vec::new(),
-    })
+    Ok(PyMap::from_read(
+        imported.map,
+        imported.approximations,
+        imported.trace,
+    ))
+}
+
+/// Reads the IR document at `path` — the one `Map.export_proto` wrote, or one
+/// any other program wrote to the same schema — as the map it describes. What
+/// comes back exports like any other map and cannot be added to.
+#[pyfunction]
+#[pyo3(name = "read_proto")]
+fn read_proto(path: PathBuf) -> PyResult<PyMap> {
+    let map = roadgen_proto::read(&path).map_err(value_error)?;
+    let mut trace = roadgen_core::trace::Trace::imported(roadgen_proto::TRACE_FORMAT);
+    trace.files.push(path);
+    // Nothing to note: the document is the IR, and nothing was approximated.
+    Ok(PyMap::from_read(map, Vec::new(), trace))
+}
+
+/// The Protocol Buffers schema of the IR, as `{import path: source}` in
+/// dependency order, each file after the ones it imports: write the files out
+/// under one directory and hand them to `protoc` to read an IR document from any
+/// language.
+#[pyfunction]
+fn proto_schema(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    // A dict rather than a sorted map, so that the order survives.
+    let schema = PyDict::new(py);
+    for (path, source) in roadgen_proto::SCHEMA {
+        schema.set_item(path, source)?;
+    }
+    Ok(schema)
 }
 
 #[pyfunction]
@@ -2967,6 +3026,8 @@ fn _roadgen(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAlignment>()?;
     module.add_class::<trace::PyTrace>()?;
     module.add_function(wrap_pyfunction!(read_opendrive, module)?)?;
+    module.add_function(wrap_pyfunction!(read_proto, module)?)?;
+    module.add_function(wrap_pyfunction!(proto_schema, module)?)?;
     module.add_function(wrap_pyfunction!(render_opendrive, module)?)?;
     module.add_function(wrap_pyfunction!(render_sumo, module)?)?;
     module.add_function(wrap_pyfunction!(render_clipgt, module)?)?;

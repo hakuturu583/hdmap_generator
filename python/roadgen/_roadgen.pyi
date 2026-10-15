@@ -260,6 +260,9 @@ class Map:
     def sumo_warnings(self) -> list[str]: ...
     def sumo_lane_ids(self) -> list[tuple[str, str]]: ...
     def export_ir(self, path: str) -> None: ...
+    def export_proto(self, path: str, curve_samples: bool = True) -> None:
+        """The map as the IR itself, in Protocol Buffers: nothing lost, and readable
+        by `read_proto` or by any program compiled against `proto_schema()`."""
     def export_opendrive(self, path: str, trace: bool = True) -> None: ...
     def export_lanelet2(self, path: str, trace: bool = True) -> None: ...
     def export_osm(self, path: str, trace: bool = True) -> None: ...
@@ -517,6 +520,14 @@ def read_opendrive(
     """The OpenDRIVE file at `path`, read as a map that exports like any other and
     cannot be added to. `Map.read_warnings()` says what the file stated that the map
     could not keep."""
+
+def read_proto(path: str) -> Map:
+    """The IR document at `path`, as written by `Map.export_proto` or by any other
+    program to the same schema, read as a map that exports like any other and
+    cannot be added to."""
+
+def proto_schema() -> dict[str, str]:
+    """The IR's Protocol Buffers schema, `{import path: source}`, for `protoc`."""
 
 def render_opendrive(path: str) -> str:
     """The OpenDRIVE file at `path`, drawn as an SVG document."""

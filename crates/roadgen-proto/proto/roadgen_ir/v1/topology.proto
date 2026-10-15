@@ -1,0 +1,93 @@
+// Connectivity of the roadgen Canonical Road IR, independent of geometry.
+//
+// Elements refer to one another by identifier: a string such as `road/north` or
+// `lane/north/0` whose first segment names its kind. Every identifier a reference
+// names is the `id` of an element of that kind in the same `Map`.
+
+syntax = "proto3";
+
+package roadgen_ir.v1;
+
+// Which way traffic runs along a lane, relative to its road's reference line.
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  // From the reference line's start towards its end.
+  DIRECTION_FORWARD = 1;
+  // Against the reference line.
+  DIRECTION_BACKWARD = 2;
+}
+
+// Which side of the reference line a lane sits on.
+enum LateralSide {
+  LATERAL_SIDE_UNSPECIFIED = 0;
+  LATERAL_SIDE_LEFT = 1;
+  LATERAL_SIDE_RIGHT = 2;
+}
+
+// One of the two ends of a lane or a road, in reference-line order — not "entry"
+// and "exit": which end traffic uses depends on the lane's `Direction`.
+enum End {
+  END_UNSPECIFIED = 0;
+  END_START = 1;
+  END_END = 2;
+}
+
+// A lane, and which of its ends is meant.
+message LaneEndpoint {
+  // A `Lane.id`.
+  string lane = 1;
+  End end = 2;
+}
+
+// A road, and which of its ends is meant.
+message RoadEndpoint {
+  // A `Road.id`.
+  string road = 1;
+  End end = 2;
+}
+
+// What a road continues into at one of its ends.
+message RoadLinkTarget {
+  oneof target {
+    RoadEndpoint road = 1;
+    // A `Junction.id`.
+    string junction = 2;
+  }
+}
+
+// A road's neighbours along its reference line. A target that is not set means
+// the road ends there.
+message RoadLink {
+  // What lies before the reference line's start.
+  RoadLinkTarget predecessor = 1;
+  // What lies after the reference line's end.
+  RoadLinkTarget successor = 2;
+}
+
+// The canonical truth about connectivity: traffic may pass from `from` to `to`.
+// `from.end` is the end traffic leaves the source lane by and `to.end` the end it
+// arrives at the target lane by, so a connection reads the same whichever way the
+// two reference lines point. In a junction, `from` is an approach lane and `to`
+// the connector lane, or the connector lane and the departure lane.
+message LaneConnection {
+  // e.g. `connection/j0/north_0/east_0`.
+  string id = 1;
+  LaneEndpoint from = 2;
+  LaneEndpoint to = 3;
+  // A `Junction.id`, set when the movement happens inside a junction.
+  optional string junction = 4;
+}
+
+// A place where roads meet and movements have to be enumerated. Its movements
+// are drawn as connector roads, one per movement, each with its `junction` set.
+message Junction {
+  // e.g. `junction/j0`.
+  string id = 1;
+  optional string name = 2;
+  // `Road.id`s that approach or leave the junction, in the order they were added.
+  repeated string incoming_roads = 3;
+  // `Road.id`s of the connector roads that carry traffic through it.
+  repeated string connecting_roads = 4;
+  // An `Interchange.id`, when the junction is part of one.
+  optional string interchange = 5;
+}
