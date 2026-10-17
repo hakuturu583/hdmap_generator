@@ -2,13 +2,15 @@
 //!
 //! CARLA stands a junction's light on a post off the road — valid on no lane of
 //! its own road (`fromLane="0" toLane="0"`) — and names the lanes it switches by
-//! `<signalReference>`s on the junction's *connecting* roads, with no stop line
-//! anywhere. The IR's traffic light, and Autoware's, is about the lanes that stop
-//! for it: the approaches, with the stop line where they enter the junction. So the
-//! reader moves the light onto the approaches that feed what the document names,
-//! and draws the stop line at their mouth; these check that it does, and that the
-//! Lanelet2 export then hangs the regulatory element, with a `ref_line`, on the
-//! approach lanelets.
+//! `<signalReference>`s on the junction's *connecting* roads. Its stop lines are
+//! `StopLine` objects of no type on the connecting roads too, drawn by their
+//! outline and naming no lane. The IR's traffic light, and Autoware's, is about
+//! the lanes that stop for it: the approaches, with the stop line where they
+//! enter the junction. So the reader moves the light onto the approaches that
+//! feed what the document names, reads each painted line as stopping the mouth it
+//! is across, and draws a line at a mouth the document paints none at; these
+//! check that it does, and that the Lanelet2 export then hangs the regulatory
+//! element, with a `ref_line`, on the approach lanelets.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -612,6 +614,108 @@ fn a_document_line_across_part_of_a_mouth_is_kept_and_no_lane_goes_bare() {
             orphans: 0,
         }
     );
+}
+
+/// CARLA's painted lines: a `StopLine` object of no type with a zero width,
+/// drawn by its outline, on one of the junction's connecting roads — whichever
+/// it lies on, not the road of the lanes it stops. Each is read where it is
+/// painted, as the line of the mouth it lies across, and the reader draws none.
+#[test]
+fn a_carla_stop_line_stops_the_mouth_it_is_painted_across() {
+    // Across road 1's mouth 1.5 m into the junction, on road 100; and across
+    // road 3's, 2 m in, also on road 100 — which road 3 does not enter.
+    let painted = r#"<objects>
+      <object id="900" name="StopLine" type="-1" s="1.5" t="-3.5" zOffset="0.0" hdg="1.5707963267948966" pitch="0.0" roll="0.0" orientation="+" length="7.0" width="0.0">
+        <outline>
+          <cornerLocal u="-3.5" v="0.0" z="0.0"/>
+          <cornerLocal u="0.0" v="0.0" z="0.0"/>
+          <cornerLocal u="3.5" v="0.0" z="0.0"/>
+        </outline>
+      </object>
+      <object id="901" name="StopLine" type="-1" s="11.75" t="-8.0" zOffset="0.0" hdg="0.0" pitch="0.0" roll="0.0" orientation="+" length="3.5" width="0.0">
+        <outline>
+          <cornerLocal u="-1.75" v="0.0" z="0.0"/>
+          <cornerLocal u="1.75" v="0.0" z="0.0"/>
+        </outline>
+      </object>
+    </objects>
+    <signals>
+      <signalReference s="0.0" t="0.0" id="42" orientation="+"><validity fromLane="-2" toLane="-1"/></signalReference>"#;
+    let document = CARLA_SHAPED.replacen(
+        r#"<signals>
+      <signalReference s="0.0" t="0.0" id="42" orientation="+"><validity fromLane="-2" toLane="-1"/></signalReference>"#,
+        painted,
+        1,
+    );
+    assert_ne!(document, CARLA_SHAPED);
+    let Imported {
+        map,
+        approximations: notes,
+        ..
+    } = from_xml(&document).expect("the document reads");
+    let map = map.validate().unwrap_or_else(|error| panic!("{error}"));
+
+    let rules = light_rules(&map);
+    assert_eq!(rules.len(), 1, "{:#?}", map.rules);
+    assert_eq!(
+        rules[0].1,
+        &vec![ObjectId::new("900"), ObjectId::new("901")],
+        "{notes:#?}"
+    );
+    assert!(map.objects.get(&ObjectId::new("stopline/1/end")).is_none());
+    assert!(map.objects.get(&ObjectId::new("stopline/3/end")).is_none());
+    assert!(
+        !notes
+            .iter()
+            .any(|note| note.contains("no stop line, and are read with one drawn")),
+        "{notes:#?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("2 stop lines that name no lane are read")),
+        "{notes:#?}"
+    );
+
+    let west = vec![lane_of(&map, "1", 1), lane_of(&map, "1", 2)];
+    let south = vec![lane_of(&map, "3", 1)];
+    // Where each is painted: x = 101.5 across both of road 1's lanes (y 0 to -7),
+    // and y = -8 across road 3's (x 110 to 113.5).
+    for (id, expected, ends) in [
+        ("900", &west, [(101.5, -7.0), (101.5, 0.0)]),
+        ("901", &south, [(110.0, -8.0), (113.5, -8.0)]),
+    ] {
+        let line = map.objects.get(&ObjectId::new(id)).unwrap();
+        assert_eq!(line.kind, MapObjectKind::StopLine);
+        assert_eq!(sorted(&line.lanes), sorted(expected), "{id}");
+        let ObjectGeometry::Line(curve) = &line.geometry else {
+            panic!("a stop line is a line");
+        };
+        for (point, (x, y)) in [curve.start_point(), curve.end_point()]
+            .into_iter()
+            .zip(ends)
+        {
+            assert!(
+                (point.x - x).abs() < 1e-6 && (point.y - y).abs() < 1e-6,
+                "{id}: {point:?}, not ({x}, {y})"
+            );
+        }
+    }
+
+    assert_eq!(
+        reach_lanelet2(&map),
+        Reached {
+            rules: 1,
+            elements: 2,
+            lanes: 3,
+            lanes_carrying: 3,
+            with_ref_line: 3,
+            narrowed: 0,
+            orphans: 0,
+        }
+    );
+    assert!(roadgen_lanelet2::check(&map).is_empty());
+    every_other_export(&map, true);
 }
 
 /// An approach whose *start* meets the junction — its lanes on the left, running
