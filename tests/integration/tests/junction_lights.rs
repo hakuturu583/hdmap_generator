@@ -673,7 +673,7 @@ fn a_carla_stop_line_stops_the_mouth_it_is_painted_across() {
     assert!(
         notes
             .iter()
-            .any(|note| note.contains("2 stop lines a junction's connecting road carries are read")),
+            .any(|note| note.contains("2 stop lines that name no lane are read")),
         "{notes:#?}"
     );
 

@@ -42,7 +42,7 @@ use roadgen_core::id::{BuildingId, BuildingPartId, JunctionId, LaneId, ObjectId,
 use roadgen_core::map::Road;
 use roadgen_core::semantics::{LightHead, MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
 use roadgen_core::structure;
-use roadgen_core::topology::{Direction, LateralSide, RoadEnd, RoadEndpoint};
+use roadgen_core::topology::{Direction, LateralSide, RoadEnd, RoadEndpoint, RoadLinkTarget};
 use roadgen_core::trace::{IrRef, Relation};
 
 use super::Reader;
@@ -390,6 +390,13 @@ fn line_or_point(
     })
 }
 
+/// Whether a mouth a painted line is across, as `(the share of the line its
+/// lanes span, the line's mean distance from the road's end, the lanes)`, is a
+/// better match than `held`: it spans more of the line, or as much and is nearer.
+fn better_mouth(found: &(f64, f64, Vec<LaneId>), held: &(f64, f64, Vec<LaneId>)) -> bool {
+    found.0 > held.0 + 1e-9 || (found.0 >= held.0 - 1e-9 && found.1 < held.1)
+}
+
 /// The local name to give a thing from the document: its `name` when the exporter
 /// wrote one of the IR's own identifiers there, else the document's id — made
 /// unique either way, since a document from elsewhere may reuse a number.
@@ -617,8 +624,8 @@ impl Reader<'_> {
     }
 
     /// A stop line: across the road at its station, as wide as `width` says —
-    /// the way the exporter writes one — or, when it has no width and an outline
-    /// of two or more corners, along that outline, which is how CARLA writes the
+    /// the way the exporter writes one — or, when it has no width and an open
+    /// outline of two or more corners, along that outline, which is how CARLA writes the
     /// lines its towns paint (`StopLine`, `width="0"`, the corners across the
     /// lanes it stops).
     ///
@@ -642,7 +649,11 @@ impl Reader<'_> {
                     points.push(point);
                 }
             }
-            if points.len() >= 2 {
+            // A closed outline is a band — a line painted with its width drawn —
+            // and is read across the road like one the exporter writes.
+            let ring = points.len() > 2
+                && points[0].is_close(points[points.len() - 1], STOP_LINE_HAIRLINE);
+            if points.len() >= 2 && !ring {
                 return self.read_outlined_stop_line(road, object, points);
             }
         }
@@ -661,43 +672,64 @@ impl Reader<'_> {
         )
     }
 
-    /// A stop line drawn as `points`, over the lanes it stops: on a connecting
-    /// road, the approach lanes of the mouth it is painted across; elsewhere,
-    /// those of its own road it governs.
+    /// A stop line drawn as `points`, over the lanes it stops: the approach lanes
+    /// of the junction mouth it is painted across — of the junction its road is
+    /// in, or, when it names no lane, of those its road runs into — and
+    /// otherwise those of its own road it governs.
     fn read_outlined_stop_line(
         &mut self,
         road: &Road,
         object: &Object,
         points: Vec<Point3>,
     ) -> Result<Option<ObjectId>, ImportError> {
-        let lanes = match &road.junction {
-            Some(junction) => match self.mouth_painted_across(junction, &points)? {
-                Some(lanes) => {
-                    self.approximations.count(
-                        "{n} stop lines a junction's connecting road carries are read as \
-                         stopping the approach whose mouth they are painted across",
-                    );
-                    lanes
+        // The junctions whose mouth it may be painted across: the one it is
+        // inside, or for a line on an ordinary road with no lane named, those its
+        // road runs into at either end.
+        let junctions: Vec<JunctionId> = match &road.junction {
+            Some(junction) => vec![junction.clone()],
+            None if object.validity.is_empty() => [RoadEnd::Start, RoadEnd::End]
+                .into_iter()
+                .filter_map(|end| match road.link.at(end) {
+                    Some(RoadLinkTarget::Junction(junction)) => Some(junction.clone()),
+                    _ => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut across: Option<(f64, f64, Vec<LaneId>)> = None;
+        for junction in &junctions {
+            if let Some(found) = self.mouth_painted_across(junction, &points)? {
+                if across
+                    .as_ref()
+                    .is_none_or(|held| better_mouth(&found, held))
+                {
+                    across = Some(found);
                 }
-                None => {
+            }
+        }
+        let lanes = match across {
+            Some((_, _, lanes)) => {
+                self.approximations.count(
+                    "{n} stop lines that name no lane are read as stopping the approach whose \
+                     junction mouth they are painted across",
+                );
+                lanes
+            }
+            None => {
+                if road.junction.is_some() {
                     self.approximations.count(
-                        "{n} stop lines a junction's connecting road carries lie across no \
-                         mouth of the junction, and are read over the lanes of their road",
+                        "{n} stop lines on a junction's connecting road lie across no mouth of \
+                         the junction, and are read over the connecting road's own lanes, which \
+                         no light stops",
                     );
-                    self.governed(
-                        road,
-                        object.s.get::<meter>(),
-                        &object.validity,
-                        object.orientation.as_ref(),
-                    )
                 }
-            },
-            None => self.governed(
-                road,
-                object.s.get::<meter>(),
-                &object.validity,
-                object.orientation.as_ref(),
-            ),
+                self.governed(
+                    road,
+                    object.s.get::<meter>(),
+                    &object.validity,
+                    object.orientation.as_ref(),
+                )
+            }
         };
         if lanes.is_empty() {
             self.approximations
@@ -724,12 +756,13 @@ impl Reader<'_> {
     /// where they leave the road; a mouth may hold more lanes than the line is
     /// painted over — a pavement, a turning lane another line stops. Of the
     /// mouths it is across, the one it spans most of its length over, and then
-    /// the nearest.
+    /// the nearest ([`better_mouth`]); the result is that mouth's lanes, with how
+    /// much of the line they span and its mean distance from the road's end.
     fn mouth_painted_across(
         &self,
         junction: &JunctionId,
         points: &[Point3],
-    ) -> Result<Option<Vec<LaneId>>, ImportError> {
+    ) -> Result<Option<(f64, f64, Vec<LaneId>)>, ImportError> {
         let mut approaches: Vec<LaneId> = Vec::new();
         for connector in self
             .map
@@ -754,8 +787,17 @@ impl Reader<'_> {
                 RoadEnd::End => road.frame_at(road.horizontal_length()?, self.sampling())?,
             };
             let local: Vec<[f64; 3]> = points.iter().map(|&point| frame.to_local(point)).collect();
-            let (first, last) = (local[0], local[local.len() - 1]);
-            let runs_across = (last[0] - first[0]).abs() <= 0.5 * (last[1] - first[1]).abs();
+            let extent = |axis: usize| {
+                let (low, high) = local
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), point| {
+                        (low.min(point[axis]), high.max(point[axis]))
+                    });
+                high - low
+            };
+            // Across rather than along: within 45 degrees of square to the road,
+            // which leaves room for a junction met at a skew.
+            let runs_across = extent(0) <= extent(1);
             let near = local
                 .iter()
                 .all(|point| point[0].abs() <= STOP_LINE_MOUTH_REACH);
@@ -791,14 +833,12 @@ impl Reader<'_> {
             let covered = spanned / (to - from).max(f64::EPSILON);
             let distance =
                 local.iter().map(|point| point[0].abs()).sum::<f64>() / local.len() as f64;
-            let better = best.as_ref().is_none_or(|(held, held_distance, _)| {
-                covered > held + 1e-9 || (covered >= held - 1e-9 && distance < *held_distance)
-            });
-            if better {
-                best = Some((covered, distance, crossed));
+            let found = (covered, distance, crossed);
+            if best.as_ref().is_none_or(|held| better_mouth(&found, held)) {
+                best = Some(found);
             }
         }
-        Ok(best.map(|(_, _, lanes)| lanes))
+        Ok(best)
     }
 
     /// The corners of an outline, in space.
