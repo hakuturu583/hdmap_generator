@@ -525,7 +525,7 @@ govern — and both formats get them:
 | IR | OpenDRIVE | Lanelet2 |
 | --- | --- | --- |
 | Traffic light | `<signal dynamic="true">` with `<validity>`, its housing's `height`, a `<userData>` per lamp | `traffic_light` way with its `height`, `light_bulbs` way + `traffic_light` regulatory element |
-| Traffic sign | `<signal>` carrying the caller's catalogue code | `traffic_sign` way, code as its subtype |
+| Traffic sign | `<signal>` carrying the caller's catalogue code | `traffic_sign` way, code as its subtype; a stop sign (`stop`, `206`, `R1-1`, …) is spelt `stop_sign`, as Autoware reads it, and gets a `traffic_sign` regulatory element — the stop line across the lanes that stop as its `ref_line`, on the junction lanelets they feed, as a light's |
 | Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` — a traffic-light rule with several (one per junction mouth) is one regulatory element per line, on the junction lanelets the rule's lanes it names feed, referring to the lights over them |
 | Crosswalk | `<object type="crosswalk">` with its outline as `<cornerLocal>` corners | a lanelet of subtype `crosswalk` |
 | Right of way | `<junction><priority high low>` | `right_of_way` regulatory element |

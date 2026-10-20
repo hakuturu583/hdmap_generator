@@ -452,6 +452,8 @@ struct Exporter<'a> {
     speed_limits: BTreeMap<usize, Vec<Id>>,
     /// The `light_bulbs` way of each traffic light that has lamps.
     bulbs: HashMap<ObjectId, LineString>,
+    /// The `traffic_sign` regulatory element each stop sign became.
+    stop_signs: HashMap<ObjectId, Id>,
 }
 
 impl<'a> Exporter<'a> {
@@ -475,6 +477,7 @@ impl<'a> Exporter<'a> {
             regulatory_elements: BTreeMap::new(),
             speed_limits: BTreeMap::new(),
             bulbs: HashMap::new(),
+            stop_signs: HashMap::new(),
         })
     }
 
@@ -493,6 +496,7 @@ impl<'a> Exporter<'a> {
         self.build_lanelets()?;
         self.build_objects()?;
         self.build_rules()?;
+        self.build_stop_signs()?;
         let trace = self.trace();
         Ok((self.lanelet_map, trace))
     }
@@ -581,6 +585,15 @@ impl<'a> Exporter<'a> {
                     format!("linestring:{}", bulbs.id()),
                     Relation::Exact,
                     LIGHT_BULBS,
+                );
+            }
+            // A stop sign is the rule it states as well as the sign that states it.
+            if let Some(element) = self.stop_signs.get(&object.id) {
+                trace.link_as(
+                    object.id.clone(),
+                    format!("regulatory_element:{element}"),
+                    Relation::Exact,
+                    "traffic_sign",
                 );
             }
         }
@@ -790,7 +803,9 @@ impl<'a> Exporter<'a> {
                 // A Lanelet2 traffic sign says which sign it is in its subtype, and
                 // a regulatory element referring to one without a subtype is
                 // rejected at load time.
-                MapObjectKind::TrafficSign { code } => attributes.push(("subtype", code.clone())),
+                MapObjectKind::TrafficSign { code } => {
+                    attributes.push(("subtype", tags::sign_subtype(code)))
+                }
                 MapObjectKind::TrafficLight { head } => {
                     attributes.push(("subtype", "red_yellow_green".into()));
                     if let Some(height) = head.height {
@@ -1061,21 +1076,15 @@ impl<'a> Exporter<'a> {
     /// connectors it feeds; a lane that is a connector already, or that feeds none
     /// (a light short of no junction), keeps the element itself.
     fn junction_lanes(&self, lanes: &[LaneId]) -> Vec<LaneId> {
-        let connector = |lane: &LaneId| {
-            self.map
-                .lane(lane)
-                .and_then(|lane| self.map.road(&lane.road))
-                .is_some_and(|road| road.is_connector())
-        };
         let mut carriers: Vec<LaneId> = Vec::new();
         for lane in lanes {
-            let through: Vec<LaneId> = if connector(lane) {
+            let through: Vec<LaneId> = if self.is_connector(lane) {
                 Vec::new()
             } else {
                 self.map
                     .successors(lane)
                     .into_iter()
-                    .filter(|next| connector(next))
+                    .filter(|next| self.is_connector(next))
                     .collect()
             };
             let held = if through.is_empty() {
@@ -1090,6 +1099,93 @@ impl<'a> Exporter<'a> {
             }
         }
         carriers
+    }
+
+    /// Is `lane` on a road through a junction?
+    fn is_connector(&self, lane: &LaneId) -> bool {
+        self.map
+            .lane(lane)
+            .and_then(|lane| self.map.road(&lane.road))
+            .is_some_and(|road| road.is_connector())
+    }
+
+    /// Each stop sign as Autoware reads one: a `traffic_sign` element referring to
+    /// the sign, the stop line its lanes stop at as the `ref_line`, hung where a
+    /// junction's light hangs (`junction_lanes`).
+    ///
+    /// The IR has no rule for a sign — what a sign means is its code — so a stop
+    /// sign is its own rule here, and only a stop sign: Autoware stops for a
+    /// `traffic_sign` element at its line only when it refers to a `stop_sign`, and
+    /// reads a limit off the lanelet's tag and a yield off a `right_of_way`.
+    ///
+    /// The line is the one across the lanes that come to the junction: the sign's
+    /// own, or, for a sign that names the lanes through a junction — as CARLA's
+    /// towns refer to theirs from the connecting roads — the lanes that feed them.
+    /// A sign with no line across those still gets its element, without a
+    /// `ref_line`, as Lanelet2 allows.
+    fn build_stop_signs(&mut self) -> Result<(), ExportError> {
+        let signs: Vec<(ObjectId, Vec<LaneId>)> = self
+            .map
+            .objects
+            .iter()
+            .filter(|object| {
+                matches!(&object.kind, MapObjectKind::TrafficSign { code } if tags::is_stop_sign(code))
+            })
+            .map(|object| (object.id.clone(), object.lanes.clone()))
+            .collect();
+        for (sign, lanes) in signs {
+            let carriers = self.junction_lanes(&lanes);
+            if !carriers.iter().any(|lane| self.lanelets.contains_key(lane)) {
+                continue;
+            }
+            let refers: Vec<RuleParameter> = self
+                .object_lines(&sign)?
+                .into_iter()
+                .map(RuleParameter::LineString)
+                .collect();
+            if refers.is_empty() {
+                continue;
+            }
+            let mut approaches: Vec<LaneId> = Vec::new();
+            for lane in &lanes {
+                if self.is_connector(lane) {
+                    approaches.extend(self.map.predecessors(lane));
+                } else {
+                    approaches.push(lane.clone());
+                }
+            }
+            let stop_lines: Vec<ObjectId> = self
+                .map
+                .objects
+                .iter()
+                .filter(|object| {
+                    object.kind == MapObjectKind::StopLine
+                        && object.lanes.iter().any(|lane| approaches.contains(lane))
+                })
+                .map(|object| object.id.clone())
+                .collect();
+            let mut ref_line = Vec::new();
+            for line in &stop_lines {
+                ref_line.extend(
+                    self.object_lines(line)?
+                        .into_iter()
+                        .map(RuleParameter::LineString),
+                );
+            }
+            let mut parameters = RuleParameterMap::new();
+            parameters.insert(roles::REFERS.to_owned(), refers);
+            if !ref_line.is_empty() {
+                parameters.insert(roles::REF_LINE.to_owned(), ref_line);
+            }
+            let element = self.attach(
+                RegElemKind::TrafficSign,
+                "traffic_sign",
+                parameters,
+                &carriers,
+            )?;
+            self.stop_signs.insert(sign, element);
+        }
+        Ok(())
     }
 
     fn attach(
