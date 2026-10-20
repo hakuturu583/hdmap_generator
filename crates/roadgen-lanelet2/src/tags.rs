@@ -89,6 +89,28 @@ pub fn turn_direction(swing: f64) -> &'static str {
     }
 }
 
+/// Is a traffic sign of this catalogue code a stop sign?
+///
+/// `stop` however it is spelt, `R1-1` (MUTCD) or `206` (the Vienna Convention, the
+/// German catalogue OpenDRIVE and CARLA's towns write, with its country prefix or
+/// without); a catalogue subtype after a slash says nothing more about which sign.
+pub fn is_stop_sign(code: &str) -> bool {
+    let code = code.split('/').next().unwrap_or_default();
+    let code = code.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+    code.starts_with("stop") || code == "r1-1" || code == "206" || code == "de206"
+}
+
+/// The `subtype` of a traffic sign's way: `stop_sign` for a stop sign, which is how
+/// `autoware_lanelet2_extension` names the sign a `traffic_sign` element's stop line
+/// is for, and the caller's own catalogue code for any other.
+pub fn sign_subtype(code: &str) -> String {
+    if is_stop_sign(code) {
+        "stop_sign".to_owned()
+    } else {
+        code.to_owned()
+    }
+}
+
 /// The `type` of the linestring a map object becomes.
 pub fn object_type(kind: &MapObjectKind) -> &'static str {
     match kind {
@@ -104,8 +126,19 @@ pub fn object_type(kind: &MapObjectKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::turn_direction;
+    use super::{sign_subtype, turn_direction};
     use std::f64::consts::{FRAC_PI_2, PI};
+
+    #[test]
+    fn a_stop_sign_is_named_as_autoware_names_it_whatever_catalogue_it_came_from() {
+        for code in ["206", "de206", "206/-1", "stop", "Stop_Sign", "R1-1"] {
+            assert_eq!(sign_subtype(code), "stop_sign", "{code}");
+        }
+        // Any other sign keeps the caller's code.
+        for code in ["205", "de274-60", "R1-2", "1000001"] {
+            assert_eq!(sign_subtype(code), code);
+        }
+    }
 
     #[test]
     fn a_swing_reads_as_the_turn_it_makes_whichever_way_round_it_is_measured() {
