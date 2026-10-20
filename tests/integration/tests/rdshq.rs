@@ -320,3 +320,24 @@ fn check_says_what_the_toolkit_will_do_with_the_clip() {
     let dotted = ClipConfig::new("a.b");
     assert!(roadgen_rdshq::write(&map, tempfile::tempdir().unwrap().path(), &dotted).is_err());
 }
+
+#[test]
+fn a_file_the_clip_no_longer_has_does_not_outlive_a_re_export() {
+    let map = scenarios::controlled_crossroads();
+    let root = tempfile::tempdir().unwrap();
+    let config = ClipConfig::new("again");
+    roadgen_rdshq::write(&map, root.path(), &config).unwrap();
+    let pinhole = root.path().join("pinhole_intrinsic").join("again.tar");
+    assert!(pinhole.is_file());
+
+    // A lens with no linear term has no focal length to give a pinhole.
+    let mut sensor = roadgen_rdshq::scene::default_sensors().remove(0);
+    sensor.polynomial = vec![0.0, 0.0, 1000.0];
+    roadgen_rdshq::write(&map, root.path(), &config.with_sensors(vec![sensor])).unwrap();
+    assert!(!pinhole.exists(), "the first export's pinhole is gone");
+    assert!(root
+        .path()
+        .join("ftheta_intrinsic")
+        .join("again.tar")
+        .is_file());
+}

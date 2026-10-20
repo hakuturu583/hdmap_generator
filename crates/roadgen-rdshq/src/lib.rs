@@ -63,6 +63,11 @@ pub const POSE_FRAME_RATE: f64 = 30.0;
 pub const CHUNK_FRAMES: usize = 121;
 
 /// One file of the clip: the folder it goes in, and the sample it holds.
+///
+/// A shard with no entries is a file the clip does not have — a pinhole for a
+/// lens with no focal length. A tar with nothing in it is not a sample, and a
+/// reader that opens one fails; a folder with no file for the clip is how the
+/// toolkit already spells "not available".
 #[derive(Debug, Clone, PartialEq)]
 pub struct Shard {
     pub folder: String,
@@ -93,14 +98,7 @@ pub fn to_shards_traced(
         sample.push(entry, layer.into_document().to_string().into_bytes());
         shards.push(Shard { folder, sample });
     }
-    // A tar with nothing in it is not a sample, and a reader that opens one fails;
-    // a folder with no file for the clip is how the toolkit already spells "not
-    // available".
-    shards.extend(
-        scene::all(map, config, clip)?
-            .into_iter()
-            .filter(|shard| !shard.sample.entries.is_empty()),
-    );
+    shards.extend(scene::all(map, config, clip)?);
     Ok((shards, trace))
 }
 
@@ -128,9 +126,19 @@ pub fn write_traced(
     let mut files: Vec<PathBuf> = Vec::new();
     for shard in shards {
         let folder = root.join(&shard.folder);
+        let path = folder.join(format!("{clip}.tar"));
+        if shard.sample.entries.is_empty() {
+            // An earlier export of the same clip may have had this file; left
+            // behind, it would describe cameras this clip no longer has.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ExportError::Io(format!("{}: {error}", path.display()))),
+            }
+            continue;
+        }
         std::fs::create_dir_all(&folder)
             .map_err(|error| ExportError::Io(format!("{}: {error}", folder.display())))?;
-        let path = folder.join(format!("{clip}.tar"));
         shard.sample.write(&path)?;
         files.push(path);
     }
