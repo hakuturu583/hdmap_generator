@@ -246,6 +246,7 @@ class Map:
     def format_warnings(self) -> list[str]: ...
     def clipgt_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def gpudrive_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
+    def womd_warnings(self) -> list[str]: ...
     def carla_warnings(
         self,
         name: Optional[str] = None,
@@ -294,6 +295,16 @@ class Map:
         route: Optional[Sequence[str]] = None,
         trace: bool = True,
     ) -> None: ...
+    def export_womd(
+        self,
+        path: str,
+        scenario_id: Optional[str] = None,
+        steps: Optional[int] = None,
+        time_step: Optional[float] = None,
+        current_time_index: Optional[int] = None,
+        trace: bool = True,
+    ) -> None:
+        """Writes a TFRecord file holding one Waymo Open Motion `Scenario`."""
     def export_carla(
         self,
         directory: str,
@@ -331,6 +342,14 @@ class Map:
         speed: Optional[float] = None,
         route: Optional[Sequence[str]] = None,
     ) -> str: ...
+    def to_womd_bytes(
+        self,
+        scenario_id: Optional[str] = None,
+        steps: Optional[int] = None,
+        time_step: Optional[float] = None,
+        current_time_index: Optional[int] = None,
+    ) -> bytes:
+        """One serialized `waymo.open_dataset.Scenario`, not framed as a TFRecord."""
     def to_opendrive_xml(self) -> str: ...
     def to_lanelet2_osm(self) -> str: ...
     def to_osm_xml(self) -> str: ...

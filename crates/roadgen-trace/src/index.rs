@@ -121,6 +121,7 @@ fn default_kind(format: &str) -> Option<&'static str> {
         "opendrive" => "road",
         "clipgt" => "lane",
         "gpudrive" => "road",
+        "womd" => "feature",
         "carla" => "actor",
         _ => return None,
     })

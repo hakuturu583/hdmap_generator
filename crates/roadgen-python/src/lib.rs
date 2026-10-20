@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 
 use roadgen_core::builder::CrossSectionSpec;
 use roadgen_core::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
@@ -1303,6 +1303,16 @@ impl PyMap {
         Ok(roadgen_gpudrive::check(map, config.as_ref()))
     }
 
+    /// What a WOMD export loses: the tracks a generated map has none of, the lights
+    /// it can only hold as lane states, the signs and rules it has no feature for.
+    ///
+    /// Kept apart from `format_warnings` for the same reason as the GPUDrive ones.
+    fn womd_warnings(&mut self) -> PyResult<Vec<String>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(roadgen_womd::check(map, None))
+    }
+
     /// Writes the IR dump: every road, lane, junction, connection, object, rule and
     /// building by its identifier, with what it belongs to and connects to, and
     /// none of its geometry.
@@ -1566,6 +1576,44 @@ impl PyMap {
             self.gpudrive_config(scenario, name, scenario_id, steps, time_step, speed, route)?;
         let map = self.built.as_ref().expect("just built");
         let written = roadgen_gpudrive::write_traced(map, &path, &config).map_err(runtime_error)?;
+        if trace {
+            self.write_sidecar(&written, roadgen_trace::sidecar_path(&path))?;
+        }
+        Ok(())
+    }
+
+    /// Writes the map as a Waymo Open Motion Dataset scenario: a TFRecord file
+    /// holding one `waymo.open_dataset.Scenario`, the way WOMD ships its own, which
+    /// the dataset's tooling and Waymax read as they are.
+    ///
+    /// The scenario is the map — lanes with their entry, exit and neighbouring lanes
+    /// and their boundaries, the painted lines and road edges, crossings and stop
+    /// signs, all with their heights — and a signal state for every lane a traffic
+    /// light governs at each of its `steps` timesteps. It has no tracks. `steps`,
+    /// `time_step` and `current_time_index` default to WOMD's 91, 0.1 s and 10.
+    ///
+    /// Also writes `<path>.trace.json` — which feature each lane and object became —
+    /// unless `trace` is false.
+    #[pyo3(signature = (
+        path,
+        scenario_id = None,
+        steps = None,
+        time_step = None,
+        current_time_index = None,
+        trace = true,
+    ))]
+    fn export_womd(
+        &mut self,
+        path: PathBuf,
+        scenario_id: Option<&str>,
+        steps: Option<usize>,
+        time_step: Option<f64>,
+        current_time_index: Option<usize>,
+        trace: bool,
+    ) -> PyResult<()> {
+        let config = self.womd_config(scenario_id, steps, time_step, current_time_index)?;
+        let map = self.built.as_ref().expect("just built");
+        let written = roadgen_womd::write_traced(map, &path, &config).map_err(runtime_error)?;
         if trace {
             self.write_sidecar(&written, roadgen_trace::sidecar_path(&path))?;
         }
@@ -1862,6 +1910,29 @@ impl PyMap {
             self.gpudrive_config(scenario, name, scenario_id, steps, time_step, speed, route)?;
         let map = self.built.as_ref().expect("just built");
         roadgen_gpudrive::to_json(map, &config).map_err(runtime_error)
+    }
+
+    /// The WOMD scenario as one serialized `Scenario` message, not framed as a
+    /// TFRecord, with the same arguments as `export_womd`.
+    #[pyo3(signature = (
+        scenario_id = None,
+        steps = None,
+        time_step = None,
+        current_time_index = None,
+    ))]
+    #[allow(clippy::wrong_self_convention)]
+    fn to_womd_bytes<'py>(
+        &mut self,
+        py: Python<'py>,
+        scenario_id: Option<&str>,
+        steps: Option<usize>,
+        time_step: Option<f64>,
+        current_time_index: Option<usize>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let config = self.womd_config(scenario_id, steps, time_step, current_time_index)?;
+        let map = self.built.as_ref().expect("just built");
+        let bytes = roadgen_womd::to_bytes(map, &config).map_err(runtime_error)?;
+        Ok(PyBytes::new(py, &bytes))
     }
 
     // `&mut self` because the map builds itself on demand; the name is the one the
@@ -2839,6 +2910,33 @@ impl PyMap {
             config.sdc_mut().route = Some(roadgen_gpudrive::Route::Lanes(
                 route.iter().map(LaneId::parse_printed).collect(),
             ));
+        }
+        Ok(config)
+    }
+
+    /// The scenario configuration the WOMD methods share: the map's own defaults and
+    /// the arguments over them.
+    fn womd_config(
+        &mut self,
+        scenario_id: Option<&str>,
+        steps: Option<usize>,
+        time_step: Option<f64>,
+        current_time_index: Option<usize>,
+    ) -> PyResult<roadgen_womd::ScenarioConfig> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let mut config = roadgen_womd::ScenarioConfig::for_map(map);
+        if let Some(scenario_id) = scenario_id {
+            config.scenario_id = scenario_id.to_owned();
+        }
+        if let Some(steps) = steps {
+            config.steps = steps;
+        }
+        if let Some(time_step) = time_step {
+            config.time_step = time_step;
+        }
+        if let Some(index) = current_time_index {
+            config.current_time_index = index;
         }
         Ok(config)
     }
