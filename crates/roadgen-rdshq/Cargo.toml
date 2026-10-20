@@ -1,0 +1,18 @@
+[package]
+name = "roadgen-rdshq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto NVIDIA Cosmos-Drive-Dreams' RDS-HQ dataset layout"
+
+[dependencies]
+roadgen-core.workspace = true
+roadgen-clipgt.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

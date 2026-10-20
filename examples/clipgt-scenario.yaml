@@ -5,6 +5,10 @@
 #
 #     m.export_clipgt("clips/", scenario="examples/clipgt-scenario.yaml")
 #
+# An RDS-HQ clip takes the same file, and drives the same route with the same rig:
+#
+#     m.export_rdshq("rds_hq/", scenario="examples/clipgt-scenario.yaml")
+#
 # Every key is optional; anything left out keeps the value it already had. An
 # unknown key is an error rather than being ignored.
 

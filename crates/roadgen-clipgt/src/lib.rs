@@ -329,7 +329,7 @@ fn route_lanes(config: &ClipConfig) -> &[LaneId] {
 
 /// A clip id has to be a single path component, because it is the prefix of every
 /// file name in the directory.
-fn validate_clip_id(id: &str) -> Result<&str, ExportError> {
+pub fn validate_clip_id(id: &str) -> Result<&str, ExportError> {
     let usable = !id.is_empty()
         && id.chars().all(|character| {
             character.is_ascii_alphanumeric() || character == '-' || character == '_'

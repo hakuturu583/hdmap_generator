@@ -245,6 +245,7 @@ class Map:
     def write_read_trace(self, path: Optional[str] = None) -> str: ...
     def format_warnings(self) -> list[str]: ...
     def clipgt_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
+    def rdshq_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def gpudrive_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def carla_warnings(
         self,
@@ -282,6 +283,19 @@ class Map:
         route: Optional[Sequence[str]] = None,
         trace: bool = True,
     ) -> str: ...
+    def export_rdshq(
+        self,
+        directory: str,
+        scenario: Optional[str] = None,
+        clip_id: Optional[str] = None,
+        frame_rate: Optional[float] = None,
+        speed: Optional[float] = None,
+        route: Optional[Sequence[str]] = None,
+        trace: bool = True,
+    ) -> str:
+        """The map as an RDS-HQ clip under `directory`, the dataset root: one
+        `<clip id>.tar` in each of `3d_lanes/`, `pose/`, `ftheta_intrinsic/` and the
+        rest. Takes the same scenario as `export_clipgt`; returns the clip id."""
     def export_gpudrive(
         self,
         path: str,
