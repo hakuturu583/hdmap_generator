@@ -14,11 +14,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use ll2_core::map::{as_lanelet, as_regulatory_element};
+use ll2_core::lanelet::Lanelet;
+use ll2_core::map::{as_lanelet, as_regulatory_element, LaneletMap};
 use ll2_core::regelem::RuleParameter;
 use roadgen_core::prelude::*;
 use roadgen_core::trace::{IrRef, Relation, Trace};
-use roadgen_integration_tests::reload_lanelet2_traced;
+use roadgen_integration_tests::scenarios::{metadata, one_way, two_way};
+use roadgen_integration_tests::{reload_lanelet2_traced, routing_graph};
 use roadgen_opendrive::{from_xml, Imported};
 
 /// Two roads into one junction and one road out of it: road 1 from the west with
@@ -176,9 +178,10 @@ fn sorted(lanes: &[LaneId]) -> Vec<LaneId> {
 }
 
 /// How each traffic-light rule of a map reached Lanelet2: the elements it was
-/// written as, the lanelets of its lanes that carry one of them, whether that one
-/// has a `ref_line` which is a `stop_line` way, and how many elements refer to
-/// fewer of the rule's lights than all of them.
+/// written as, the lanes that meet one of them on their way to their stop — on
+/// their own lanelet, or on one of the lanes they lead into, across which the
+/// line is painted — whether that one has a `ref_line` which is a `stop_line` way,
+/// and how many elements refer to fewer of the rule's lights than all of them.
 #[derive(Debug, PartialEq, Eq)]
 struct Reached {
     rules: usize,
@@ -189,6 +192,11 @@ struct Reached {
     narrowed: usize,
     /// Traffic-light elements in the file that no lanelet holds.
     orphans: usize,
+    /// Lanes of the map written as more than one lanelet, cut at a stop line.
+    cut: usize,
+    /// Lanelets holding a traffic-light element that do not end on its
+    /// `ref_line` (to within 0.3 m).
+    off_line: usize,
 }
 
 /// Exports `map` as Lanelet2, reads the file back with `simple_lanelet2`'s loader
@@ -220,7 +228,31 @@ fn reach_lanelet2(map: &ValidatedMap) -> Reached {
         with_ref_line: 0,
         narrowed: 0,
         orphans: 0,
+        cut: 0,
+        off_line: 0,
     };
+    reached.cut = map
+        .lanes
+        .iter()
+        .filter(|lane| written(IrRef::Lane(lane.id.clone()), "lanelet").len() > 1)
+        .count();
+    for lanelet in lanelets.values() {
+        let end = midpoint(
+            lanelet.left_bound().back().unwrap().xyz(),
+            lanelet.right_bound().back().unwrap().xyz(),
+        );
+        for element in lanelet.regulatory_elements() {
+            if element.attributes().read()["subtype"].value() != "traffic_light" {
+                continue;
+            }
+            for parameter in element.parameters_for("ref_line") {
+                if let RuleParameter::LineString(line) = parameter {
+                    let points: Vec<[f64; 3]> = line.points().iter().map(|p| p.xyz()).collect();
+                    reached.off_line += usize::from(distance_to_line(end, &points) >= 0.3);
+                }
+            }
+        }
+    }
     let held: BTreeSet<i64> = lanelets
         .values()
         .flat_map(|lanelet| lanelet.regulatory_elements())
@@ -248,17 +280,20 @@ fn reach_lanelet2(map: &ValidatedMap) -> Reached {
         let mut seen: BTreeSet<i64> = BTreeSet::new();
         for lane in lanes {
             reached.lanes += 1;
-            let Some(lanelet) = written(IrRef::Lane(lane.clone()), "lanelet")
-                .first()
-                .and_then(|id| lanelets.get(id))
-            else {
+            if written(IrRef::Lane(lane.clone()), "lanelet").is_empty() {
                 continue;
-            };
-            let held: Vec<_> = lanelet
-                .regulatory_elements()
-                .into_iter()
+            }
+            // The lanelets the lane runs through up to its stop: its own, and those
+            // of the lanes it leads into, which a line painted inside a junction cut.
+            let mut held: Vec<_> = std::iter::once(lane.clone())
+                .chain(map.successors(lane))
+                .flat_map(|lane| written(IrRef::Lane(lane), "lanelet"))
+                .filter_map(|id| lanelets.get(&id))
+                .flat_map(|lanelet| lanelet.regulatory_elements())
                 .filter(|held| elements.contains(&held.id()))
                 .collect();
+            held.sort_by_key(|held| held.id());
+            held.dedup_by_key(|held| held.id());
             assert!(held.len() <= 1, "a lane stops at one of its rule's lines");
             let Some(held) = held.first() else {
                 continue;
@@ -287,6 +322,63 @@ fn reach_lanelet2(map: &ValidatedMap) -> Reached {
         }
     }
     reached
+}
+
+/// The lanelets of a loaded map that `lane` became, in the order the trace names
+/// them — the order the lane runs through them.
+fn lanelets_of(loaded: &LaneletMap, trace: &Trace, lane: &LaneId) -> Vec<Lanelet> {
+    trace
+        .links_of(&IrRef::Lane(lane.clone()))
+        .filter(|link| link.role.as_deref() == Some("lanelet"))
+        .map(|link| {
+            let id = link
+                .local
+                .strip_prefix("lanelet:")
+                .unwrap()
+                .parse()
+                .unwrap();
+            as_lanelet(&loaded.lanelets.get(id).unwrap())
+                .unwrap()
+                .clone()
+        })
+        .collect()
+}
+
+/// How many regulatory elements of `subtype` `lanelet` holds.
+fn held(lanelet: &Lanelet, subtype: &str) -> usize {
+    lanelet
+        .regulatory_elements()
+        .iter()
+        .filter(|element| element.attributes().read()["subtype"].value() == subtype)
+        .count()
+}
+
+/// Where a lanelet starts and ends: the middle of its bounds' first points, and
+/// of their last.
+fn ends_of(lanelet: &Lanelet) -> ([f64; 2], [f64; 2]) {
+    let (left, right) = (lanelet.left_bound(), lanelet.right_bound());
+    (
+        midpoint(left.front().unwrap().xyz(), right.front().unwrap().xyz()),
+        midpoint(left.back().unwrap().xyz(), right.back().unwrap().xyz()),
+    )
+}
+
+fn midpoint(a: [f64; 3], b: [f64; 3]) -> [f64; 2] {
+    [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]
+}
+
+/// How far `point` is from the polyline through `line`, on the ground.
+fn distance_to_line(point: [f64; 2], line: &[[f64; 3]]) -> f64 {
+    line.windows(2)
+        .map(|segment| {
+            let (a, b) = (segment[0], segment[1]);
+            let along = [b[0] - a[0], b[1] - a[1]];
+            let squared = along[0] * along[0] + along[1] * along[1];
+            let t = (((point[0] - a[0]) * along[0] + (point[1] - a[1]) * along[1]) / squared)
+                .clamp(0.0, 1.0);
+            (point[0] - a[0] - t * along[0]).hypot(point[1] - a[1] - t * along[1])
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// The traffic-light rules of a map, as `(lights, stop lines, lanes)`.
@@ -411,6 +503,8 @@ fn a_carla_junction_light_governs_the_approaches_and_stops_them_at_the_mouth() {
             with_ref_line: 3,
             narrowed: 0,
             orphans: 0,
+            cut: 0,
+            off_line: 0,
         }
     );
     assert!(roadgen_lanelet2::check(&map).is_empty());
@@ -483,6 +577,8 @@ fn each_mouth_of_a_controller_refers_to_the_lights_over_it() {
             with_ref_line: 3,
             narrowed: 2,
             orphans: 0,
+            cut: 0,
+            off_line: 0,
         }
     );
 }
@@ -549,13 +645,13 @@ fn od_document(body: &[String]) -> String {
 /// `ref_line`, on both lanelets.
 #[test]
 fn a_stop_line_across_one_lane_of_a_rule_stops_all_of_its_lanes() {
-    let mut builder = MapBuilder::new(roadgen_integration_tests::scenarios::metadata("two"));
+    let mut builder = MapBuilder::new(metadata("two"));
     let road = builder
         .add_road(
             RoadSpec::line(
                 Point3::new(0.0, 0.0, 0.0),
                 Point3::new(100.0, 0.0, 0.0),
-                roadgen_integration_tests::scenarios::one_way(2),
+                one_way(2),
             )
             .unwrap(),
         )
@@ -567,6 +663,8 @@ fn a_stop_line_across_one_lane_of_a_rule_stops_all_of_its_lanes() {
         .unwrap();
     builder.add_traffic_light_rule(vec![light], Some(stop), vec![first, second]);
     let map = builder.finish().unwrap().validate().unwrap();
+    // The lane beside the line ends nowhere near it, and holds the element all
+    // the same: the line is the first lane's, the rule both lanes'.
     assert_eq!(
         reach_lanelet2(&map),
         Reached {
@@ -577,6 +675,194 @@ fn a_stop_line_across_one_lane_of_a_rule_stops_all_of_its_lanes() {
             with_ref_line: 2,
             narrowed: 0,
             orphans: 0,
+            cut: 0,
+            off_line: 1,
+        }
+    );
+}
+
+/// A stop line painted inside a lane, 10 m back from its end — as CARLA paints
+/// one a little way into a junction — cuts the lane's lanelet in two there, since
+/// Autoware expects the lanelet holding a light to end on its stop line. The light hangs
+/// off the piece before the line and off nothing past it; what else the rules say
+/// of the lane — who has right of way — stays with the piece that carries on, and
+/// its speed limit, the whole lane's, with both. The line stays where it is
+/// painted, the two pieces are one lane to the routing graph, and the trace takes
+/// the lane to both. A backward lane, whose bounds are written against the way it
+/// runs and whose end is the road's start, is cut the same way round.
+#[test]
+fn a_stop_line_inside_a_lane_cuts_its_lanelet_where_the_light_stops_it() {
+    for (lanes, index, end) in [
+        (one_way(2), 0, LaneEnd::End),
+        (two_way(), 1, LaneEnd::Start),
+    ] {
+        let mut builder = MapBuilder::new(metadata("inside"));
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    lanes,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (first, second) = (
+            LaneRef::new(road.clone(), index),
+            LaneRef::new(road.clone(), 1 - index),
+        );
+        let stop = builder.add_stop_line_at(&first, end, 10.0).unwrap();
+        let light = builder.add_traffic_light(&first, end, 5.0).unwrap();
+        builder.add_traffic_light_rule(vec![light], Some(stop.clone()), vec![first.clone()]);
+        builder.add_right_of_way(vec![first.clone()], vec![second.clone()], None);
+        builder.add_speed_limit_rule(SpeedLimit::from_kph(30.0).unwrap(), vec![first]);
+        let map = builder.finish().unwrap().validate().unwrap();
+        let (lane, beside) = (
+            LaneId::of_road(&road, index),
+            LaneId::of_road(&road, 1 - index),
+        );
+
+        let (loaded, trace) = reload_lanelet2_traced(&map);
+        let links: Vec<_> = trace
+            .links_of(&IrRef::Lane(lane.clone()))
+            .filter(|link| link.role.as_deref() == Some("lanelet"))
+            .collect();
+        assert_eq!(links.len(), 2, "{links:?}");
+        assert!(links.iter().all(|link| link.relation == Relation::Part));
+        let [before, after] = lanelets_of(&loaded, &trace, &lane).try_into().unwrap();
+
+        // Cut on the line, which is where the builder painted it.
+        let ObjectGeometry::Line(painted) = &map.objects.get(&stop).unwrap().geometry else {
+            panic!("a stop line is a line");
+        };
+        let line: Vec<[f64; 3]> = painted
+            .to_polyline(SamplingConfig::default())
+            .unwrap()
+            .points()
+            .iter()
+            .map(|point| [point.x, point.y, point.z])
+            .collect();
+        let (start, end) = ends_of(&before);
+        assert!(distance_to_line(start, &line) > 80.0, "{start:?}");
+        assert!(distance_to_line(end, &line) < 1e-6, "{end:?}");
+        let (start, end) = ends_of(&after);
+        assert!(distance_to_line(start, &line) < 1e-6, "{start:?}");
+        assert!(
+            (distance_to_line(end, &line) - 10.0).abs() < 1e-6,
+            "{end:?}"
+        );
+        assert_eq!(
+            before.left_bound().back().unwrap().id(),
+            after.left_bound().front().unwrap().id()
+        );
+        assert_eq!(
+            before.right_bound().back().unwrap().id(),
+            after.right_bound().front().unwrap().id()
+        );
+        let following: Vec<i64> = routing_graph(&loaded)
+            .following(&before, false)
+            .iter()
+            .map(|lanelet| lanelet.id())
+            .collect();
+        assert_eq!(following, vec![after.id()]);
+
+        // The light before the line, the rest of the rules past it.
+        assert_eq!(held(&before, "traffic_light"), 1);
+        assert_eq!(held(&after, "traffic_light"), 0);
+        assert_eq!(held(&before, "right_of_way"), 0);
+        assert_eq!(held(&after, "right_of_way"), 1);
+        for piece in [&before, &after] {
+            assert_eq!(piece.attributes().read()["speed_limit"].value(), "30");
+        }
+        let element = before
+            .regulatory_elements()
+            .into_iter()
+            .find(|element| element.attributes().read()["subtype"].value() == "traffic_light")
+            .unwrap();
+        let ref_lines = element.parameters_for("ref_line");
+        let [RuleParameter::LineString(ref_line)] = ref_lines.as_slice() else {
+            panic!("one ref_line");
+        };
+        for point in ref_line.points() {
+            let [x, y, z] = point.xyz();
+            assert!(distance_to_line([x, y], &line) < 1e-6, "{:?}", [x, y, z]);
+        }
+        assert!(trace
+            .links_of(&IrRef::Rule(0))
+            .any(|link| link.local == format!("regulatory_element:{}", element.id())));
+
+        // The lane beside the line is not cut.
+        let [beside] = lanelets_of(&loaded, &trace, &beside).try_into().unwrap();
+        assert_eq!(held(&beside, "traffic_light"), 0);
+        assert_eq!(held(&beside, "right_of_way"), 1);
+        assert_eq!(loaded.lanelets.len(), 3);
+        assert_eq!(
+            reach_lanelet2(&map),
+            Reached {
+                rules: 1,
+                elements: 1,
+                lanes: 1,
+                lanes_carrying: 1,
+                with_ref_line: 1,
+                narrowed: 0,
+                orphans: 0,
+                cut: 1,
+                off_line: 0,
+            }
+        );
+        assert!(roadgen_lanelet2::check(&map).is_empty());
+    }
+}
+
+/// A stop line already where its lane ends — the builder's at a lane's end, or
+/// the reader's drawn at a junction's mouth — cuts nothing: each lane is still one
+/// lanelet, traced exactly, and the light hangs off the one that ends on the line.
+#[test]
+fn a_stop_line_at_a_lanelets_end_cuts_nothing() {
+    let mut builder = MapBuilder::new(metadata("at_end"));
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(100.0, 0.0, 0.0),
+                one_way(2),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let first = LaneRef::new(road.clone(), 0);
+    let stop = builder.add_stop_line(&first, LaneEnd::End).unwrap();
+    let light = builder
+        .add_traffic_light(&first, LaneEnd::End, 5.0)
+        .unwrap();
+    builder.add_traffic_light_rule(vec![light], Some(stop), vec![first]);
+    let map = builder.finish().unwrap().validate().unwrap();
+
+    let (loaded, trace) = reload_lanelet2_traced(&map);
+    assert_eq!(loaded.lanelets.len(), 2);
+    for index in 0..2 {
+        let lane = LaneId::of_road(&road, index);
+        let links: Vec<_> = trace
+            .links_of(&IrRef::Lane(lane.clone()))
+            .filter(|link| link.role.as_deref() == Some("lanelet"))
+            .collect();
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].relation, Relation::Exact);
+        let [lanelet] = lanelets_of(&loaded, &trace, &lane).try_into().unwrap();
+        assert_eq!(held(&lanelet, "traffic_light"), usize::from(index == 0));
+    }
+    assert_eq!(
+        reach_lanelet2(&map),
+        Reached {
+            rules: 1,
+            elements: 1,
+            lanes: 1,
+            lanes_carrying: 1,
+            with_ref_line: 1,
+            narrowed: 0,
+            orphans: 0,
+            cut: 0,
+            off_line: 0,
         }
     );
 }
@@ -602,6 +888,8 @@ fn a_document_line_across_part_of_a_mouth_is_kept_and_no_lane_goes_bare() {
         &vec![ObjectId::new("900"), ObjectId::new("stopline/3/end")]
     );
     assert!(map.objects.get(&ObjectId::new("stopline/1/end")).is_none());
+    // The document's line is 2 m short of the mouth, so the lane it is across is
+    // cut there.
     assert_eq!(
         reach_lanelet2(&map),
         Reached {
@@ -612,6 +900,8 @@ fn a_document_line_across_part_of_a_mouth_is_kept_and_no_lane_goes_bare() {
             with_ref_line: 2,
             narrowed: 0,
             orphans: 0,
+            cut: 1,
+            off_line: 0,
         }
     );
 }
@@ -702,6 +992,9 @@ fn a_carla_stop_line_stops_the_mouth_it_is_painted_across() {
         }
     }
 
+    // Both lines lie inside the junction, across its connecting lanes, which are
+    // cut there: the elements hang off the pieces before the lines, not off the
+    // approaches, which end short of them.
     assert_eq!(
         reach_lanelet2(&map),
         Reached {
@@ -712,8 +1005,20 @@ fn a_carla_stop_line_stops_the_mouth_it_is_painted_across() {
             with_ref_line: 3,
             narrowed: 0,
             orphans: 0,
+            cut: 3,
+            off_line: 0,
         }
     );
+    let (loaded, trace) = reload_lanelet2_traced(&map);
+    for lane in west.iter().chain(&south) {
+        let [approach] = lanelets_of(&loaded, &trace, lane).try_into().unwrap();
+        assert_eq!(held(&approach, "traffic_light"), 0, "{lane}");
+        for next in map.successors(lane) {
+            let [before, after] = lanelets_of(&loaded, &trace, &next).try_into().unwrap();
+            assert_eq!(held(&before, "traffic_light"), 1, "{next}");
+            assert_eq!(held(&after, "traffic_light"), 0, "{next}");
+        }
+    }
     assert!(roadgen_lanelet2::check(&map).is_empty());
     every_other_export(&map, true);
 }
@@ -976,10 +1281,17 @@ fn a_carla_town_hands_autoware_every_light_on_its_approaches() {
         reached.lanes_carrying,
         reached.with_ref_line
     );
+    println!(
+        "lanes cut at a stop line {}, lanelets holding a light that do not end on its line {}",
+        reached.cut, reached.off_line
+    );
     assert_eq!(
         reached.orphans, 0,
         "every traffic-light element is on a lanelet"
     );
+    // CARLA paints its lines a little way into the junction, so the connecting
+    // lanes are cut there, and every lanelet holding a light ends on its line.
+    assert_eq!(reached.off_line, 0);
     assert_eq!(light_inside, 0);
     assert_eq!(rules_inside, 0);
     assert_eq!(without_stop_line, 0);

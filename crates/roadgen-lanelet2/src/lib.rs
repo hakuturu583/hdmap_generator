@@ -23,16 +23,28 @@
 //! routing graph then finds the same topology the IR holds. Lateral adjacency works
 //! the same way, through the shared boundary linestring between neighbouring lanes.
 //!
+//! ## Lanelets end at a traffic light's stop line
+//!
+//! Autoware expects the lanelet carrying a traffic light's regulatory element to
+//! end on the element's stop line: that is where it looks for the stop. The IR's
+//! lanes need not: CARLA paints its lines a little way into the junction, across
+//! the connecting lanes. So a lanelet the line crosses is cut in
+//! two there — the stop line stays where it is painted — and the element hangs off
+//! the lanelets that end on the line, and off none before or past it. The piece
+//! past the line keeps the lanelet's id and everything else the IR's lane says;
+//! the piece before it is a lanelet of its own, the same lane again.
+//!
 //! ## Tracing ids back to the IR
 //!
 //! Every id here comes from a counter, in the order the primitives are built, so no
 //! lanelet id can be worked out from the IR alone. The `_traced` entry points return
 //! a [`Trace`] read off the same tables the export built the map from, naming each
 //! lanelet, linestring and regulatory element as `lanelet:<id>`, `linestring:<id>`
-//! and `regulatory_element:<id>`. Points are left out: there are far more of them
-//! than anything else, and none has an IR element of its own.
+//! and `regulatory_element:<id>`. A lane cut at a stop line is each of its pieces.
+//! Points are left out: there are far more of them than anything else, and none has
+//! an IR element of its own.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,7 +52,7 @@ use ll2_core::attribute::AttributeMap;
 use ll2_core::id::Id;
 use ll2_core::lanelet::Lanelet;
 use ll2_core::linestring::LineString;
-use ll2_core::map::{LaneletMap, Primitive};
+use ll2_core::map::{as_lanelet, LaneletMap, Primitive};
 use ll2_core::point::Point;
 use ll2_core::regelem::{roles, RegElemKind, RegulatoryElement, RuleParameter, RuleParameterMap};
 use ll2_io::osm::WriteParams;
@@ -361,6 +373,20 @@ fn same_line(a: &Curve3, b: &Curve3, config: SamplingConfig) -> Result<bool, Exp
             .all(|(p, q)| p.distance_to(*q) <= WELD_TOLERANCE))
 }
 
+/// A lanelet whose end is this close to a stop line ends on it.
+const ON_LINE: f64 = 0.3;
+
+/// A stop line that crosses a lanelet's bound this close to one of its ends
+/// crosses it at that end, and does not cut it.
+const AT_END: f64 = 0.2;
+
+/// How far a stop line is carried on past each of its ends, to meet the outer
+/// bound of a lane it is painted just short of.
+const LINE_REACH: f64 = 1.5;
+
+/// A cut this close to a vertex of the bound is made at that vertex.
+const AT_VERTEX: f64 = 0.05;
+
 /// The type of a traffic light's lamp way, and its role in the light's regulatory
 /// element: Autoware's, not Lanelet2's own.
 const LIGHT_BULBS: &str = "light_bulbs";
@@ -440,7 +466,17 @@ struct Exporter<'a> {
     /// The boundaries a lane does not share with its neighbour, because the two
     /// put the edge at different heights.
     own_boundaries: HashMap<(LaneId, i32), LineString>,
+    /// The lanelet each lane became — for a lane cut at a stop line, the piece
+    /// that carries on past it.
     lanelets: HashMap<LaneId, Lanelet>,
+    /// The pieces cut off the front of a lane at stop lines, in the order it runs
+    /// through them; the lane's lanelet in [`lanelets`](Self::lanelets) follows the
+    /// last of them.
+    cut_off: HashMap<LaneId, Vec<Lanelet>>,
+    /// Each linestring cut at a stop line, by its id and the line's: the part
+    /// before the cut and the part after it, in the linestring's own direction.
+    /// Two lanelets that share a bound share its halves too.
+    cuts: HashMap<(Id, Id), (LineString, LineString)>,
     objects: HashMap<ObjectId, Vec<LineString>>,
     /// The lanelet a crosswalk object became, besides its two linestrings.
     crosswalks: HashMap<ObjectId, Id>,
@@ -470,6 +506,8 @@ impl<'a> Exporter<'a> {
             boundaries: HashMap::new(),
             own_boundaries: HashMap::new(),
             lanelets: HashMap::new(),
+            cut_off: HashMap::new(),
+            cuts: HashMap::new(),
             objects: HashMap::new(),
             crosswalks: HashMap::new(),
             regulatory_elements: BTreeMap::new(),
@@ -492,7 +530,9 @@ impl<'a> Exporter<'a> {
         self.build_boundaries()?;
         self.build_lanelets()?;
         self.build_objects()?;
+        self.split_at_stop_lines()?;
         self.build_rules()?;
+        self.drop_cut_lines();
         let trace = self.trace();
         Ok((self.lanelet_map, trace))
     }
@@ -508,43 +548,22 @@ impl<'a> Exporter<'a> {
         // sharing that makes them neighbours — so each lane is only part of the
         // reason it exists. Counted by id, since an inverted bound is the same line.
         let mut bound_users: HashMap<Id, usize> = HashMap::new();
-        for lanelet in self.lanelets.values() {
+        for lanelet in self
+            .lanelets
+            .values()
+            .chain(self.cut_off.values().flatten())
+        {
             for bound in [lanelet.left_bound(), lanelet.right_bound()] {
                 *bound_users.entry(bound.id()).or_default() += 1;
             }
         }
 
         for lane in self.map.lanes.iter() {
-            let Some(lanelet) = self.lanelets.get(&lane.id) else {
-                continue;
-            };
             let ir = IrRef::Lane(lane.id.clone());
-            trace.link_as(
-                ir.clone(),
-                format!("lanelet:{}", lanelet.id()),
-                Relation::Exact,
-                "lanelet",
-            );
-            trace.link_as(
-                ir.clone(),
-                format!("linestring:{}", lanelet.centerline().id()),
-                Relation::Exact,
-                "centerline",
-            );
-            // The lanelet's bounds, which for a backward lane are the IR's swapped:
-            // the role is the side the written element is on, the driver's.
-            for (role, bound) in [
-                ("left_boundary", lanelet.left_bound()),
-                ("right_boundary", lanelet.right_bound()),
-            ] {
-                let relation =
-                    Relation::shared_by(bound_users.get(&bound.id()).copied().unwrap_or(0));
-                trace.link_as(
-                    ir.clone(),
-                    format!("linestring:{}", bound.id()),
-                    relation,
-                    role,
-                );
+            // A lane cut at a stop line is each of its lanelets, as a whole: what
+            // it says of itself, each of them says.
+            for lanelet in self.pieces_of(&lane.id) {
+                self.trace_lanelet(&mut trace, &ir, &lanelet, &bound_users);
             }
         }
 
@@ -613,6 +632,64 @@ impl<'a> Exporter<'a> {
             }
         }
         trace
+    }
+
+    /// The links of one lanelet a lane became: the lanelet, its centreline and
+    /// its bounds. A lane cut at a stop line is several lanelets, each a part of it.
+    fn trace_lanelet(
+        &self,
+        trace: &mut Trace,
+        ir: &IrRef,
+        lanelet: &Lanelet,
+        bound_users: &HashMap<Id, usize>,
+    ) {
+        let whole = match ir {
+            IrRef::Lane(lane) => !self.cut_off.get(lane).is_some_and(|cut| !cut.is_empty()),
+            _ => true,
+        };
+        let own = if whole {
+            Relation::Exact
+        } else {
+            Relation::Part
+        };
+        trace.link_as(
+            ir.clone(),
+            format!("lanelet:{}", lanelet.id()),
+            own,
+            "lanelet",
+        );
+        trace.link_as(
+            ir.clone(),
+            format!("linestring:{}", lanelet.centerline().id()),
+            own,
+            "centerline",
+        );
+        // The lanelet's bounds, which for a backward lane are the IR's swapped:
+        // the role is the side the written element is on, the driver's.
+        for (role, bound) in [
+            ("left_boundary", lanelet.left_bound()),
+            ("right_boundary", lanelet.right_bound()),
+        ] {
+            let relation =
+                match Relation::shared_by(bound_users.get(&bound.id()).copied().unwrap_or(0)) {
+                    Relation::Exact => own,
+                    shared => shared,
+                };
+            trace.link_as(
+                ir.clone(),
+                format!("linestring:{}", bound.id()),
+                relation,
+                role,
+            );
+        }
+    }
+
+    /// The lanelets `lane` became, in the order it runs through them: one, or one
+    /// more for each stop line it was cut at. None for a lane written as nothing.
+    fn pieces_of(&self, lane: &LaneId) -> Vec<Lanelet> {
+        let mut pieces = self.cut_off.get(lane).cloned().unwrap_or_default();
+        pieces.extend(self.lanelets.get(lane).cloned());
+        pieces
     }
 
     /// One linestring per cross-section edge of each road.
@@ -870,6 +947,269 @@ impl<'a> Exporter<'a> {
             .ok_or_else(|| ExportError::Unknown(id.to_string()))
     }
 
+    /// Cuts each lanelet a traffic light's stop line crosses in two at the line,
+    /// so that the light's element can hang off lanelets that end on it.
+    ///
+    /// Only the lanelets of the lanes the element is for, and the lanes either
+    /// side of them along the road, are cut: those are the lanes that run up to
+    /// the line, and a line painted inside a junction also lies across lanes that
+    /// merely pass by it. A lanelet is cut when the line — carried on a little past
+    /// its ends, to meet the outer bound of a lane it is painted just short of —
+    /// crosses both its bounds away from their ends; a lanelet the line meets at
+    /// an end already ends, or starts, on it.
+    ///
+    /// The piece past the line is the lanelet as it was, now starting on the line:
+    /// it keeps the id, and everything the rules hang on the lane. The piece before
+    /// it is a new lanelet with the same tags. Both have the IR's centreline, cut
+    /// where the line crosses it, and share the points on the line, so the routing
+    /// graph runs from one into the other.
+    fn split_at_stop_lines(&mut self) -> Result<(), ExportError> {
+        for rule in self.map.rules.clone() {
+            let TrafficRule::TrafficLight {
+                lights,
+                stop_lines,
+                lanes,
+            } = rule
+            else {
+                continue;
+            };
+            for (stop_line, at, lights) in self.traffic_light_groups(&lights, &stop_lines, &lanes) {
+                let Some(stop_line) = stop_line else {
+                    continue;
+                };
+                if !self.writes_traffic_light(&lights, &at) {
+                    continue;
+                }
+                let lines = self.object_lines(&stop_line)?;
+                let [line] = lines.as_slice() else {
+                    continue;
+                };
+                for lane in self.around(&at) {
+                    for piece in self.pieces_of(&lane) {
+                        self.cut(&lane, &piece, line)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `lanes`, and the lanes that lead into and out of each of them, each once.
+    fn around(&self, lanes: &[LaneId]) -> Vec<LaneId> {
+        let mut seen = HashSet::new();
+        lanes
+            .iter()
+            .flat_map(|lane| {
+                std::iter::once(lane.clone())
+                    .chain(self.map.predecessors(lane))
+                    .chain(self.map.successors(lane))
+            })
+            .filter(|lane| seen.insert(lane.clone()))
+            .collect()
+    }
+
+    /// The lanelets a traffic light stopping `lanes` at `line` hangs off.
+    ///
+    /// For each lane, those that end on the line among its own lanelets, those of
+    /// the lanes either side of it along the road ([`Self::around`]) and those of
+    /// the lanes leading into them: the light is for the lane, and is obeyed where
+    /// the lane stops. A lane none of whose lanelets ends on the line — one beside
+    /// a line drawn across only some of the rule's lanes, or a line drawn away
+    /// from every lane — still has its own lanelet hold the element, as it did
+    /// before any was cut: what the rule says of it does not go unsaid.
+    fn ending_on(&self, line: &LineString, lanes: &[LaneId]) -> Vec<Lanelet> {
+        let line: Vec<[f64; 2]> = line.points().iter().map(plan).collect();
+        let ends_on_line = |lanelet: &Lanelet| {
+            let (Some(left), Some(right)) =
+                (lanelet.left_bound().back(), lanelet.right_bound().back())
+            else {
+                return false;
+            };
+            let (left, right) = (plan(&left), plan(&right));
+            let end = [(left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0];
+            distance_to_polyline(end, &line) < ON_LINE
+        };
+        let mut seen = HashSet::new();
+        let mut holders = Vec::new();
+        for lane in lanes {
+            let near = self.around(std::slice::from_ref(lane));
+            let ending: Vec<Lanelet> = near
+                .iter()
+                .cloned()
+                .chain(near.iter().flat_map(|lane| self.map.predecessors(lane)))
+                .flat_map(|lane| self.pieces_of(&lane))
+                .filter(ends_on_line)
+                .collect();
+            let ending = if ending.is_empty() {
+                self.lanelets.get(lane).cloned().into_iter().collect()
+            } else {
+                ending
+            };
+            holders.extend(
+                ending
+                    .into_iter()
+                    .filter(|lanelet| seen.insert(lanelet.id())),
+            );
+        }
+        holders
+    }
+
+    /// Cuts `piece`, one of `lane`'s lanelets, in two where `line` crosses it, if
+    /// it does away from its ends ([`Self::split_at_stop_lines`]).
+    fn cut(
+        &mut self,
+        lane: &LaneId,
+        piece: &Lanelet,
+        line: &LineString,
+    ) -> Result<(), ExportError> {
+        if !piece.has_custom_centerline() {
+            return Ok(());
+        }
+        let reach = carried_on(&line.points().iter().map(plan).collect::<Vec<_>>());
+        let (left, right, centre) = (piece.left_bound(), piece.right_bound(), piece.centerline());
+        let crossings = [&left, &right, &centre].map(|bound| crossing(&bound.points(), &reach));
+        let [Some(on_left), Some(on_right), Some(on_centre)] = crossings else {
+            return Ok(());
+        };
+        let inside = |bound: &LineString, at: &Crossing, margin: f64| {
+            at.along >= margin && polyline_length(&bound.points()) - at.along >= margin
+        };
+        if !inside(&left, &on_left, AT_END)
+            || !inside(&right, &on_right, AT_END)
+            || !inside(&centre, &on_centre, AT_VERTEX)
+        {
+            return Ok(());
+        }
+
+        let (left_before, left_after) = self.cut_line(&left, &on_left, line.id())?;
+        let (right_before, right_after) = self.cut_line(&right, &on_right, line.id())?;
+        let (centre_before, centre_after) = self.cut_line(&centre, &on_centre, line.id())?;
+
+        let id = self.take_id();
+        let before = Lanelet::new(
+            id,
+            left_before,
+            right_before,
+            piece.attributes().read().clone(),
+        );
+        before.set_centerline(centre_before);
+        piece.set_left_bound(left_after);
+        piece.set_right_bound(right_after);
+        piece.set_centerline(centre_after);
+        self.lanelet_map.add(Primitive::Lanelet(before.clone()));
+
+        let cut_off = self.cut_off.entry(lane.clone()).or_default();
+        let at = cut_off
+            .iter()
+            .position(|earlier| earlier.id() == piece.id())
+            .unwrap_or(cut_off.len());
+        cut_off.insert(at, before);
+        Ok(())
+    }
+
+    /// `bound` cut `at` a crossing of the stop line `line`: the part before the
+    /// cut and the part after it, both running the way `bound` does. A linestring
+    /// is cut once per line, however many lanelets it bounds.
+    fn cut_line(
+        &mut self,
+        bound: &LineString,
+        at: &Crossing,
+        line: Id,
+    ) -> Result<(LineString, LineString), ExportError> {
+        if !self.cuts.contains_key(&(bound.id(), line)) {
+            let points = bound.points();
+            let (a, b) = (&points[at.segment], &points[at.segment + 1]);
+            let length = distance(plan(a), plan(b));
+            let (before, after) = if at.fraction * length < AT_VERTEX {
+                (
+                    points[..=at.segment].to_vec(),
+                    points[at.segment..].to_vec(),
+                )
+            } else if (1.0 - at.fraction) * length < AT_VERTEX {
+                (
+                    points[..=at.segment + 1].to_vec(),
+                    points[at.segment + 1..].to_vec(),
+                )
+            } else {
+                let [ax, ay, az] = a.xyz();
+                let [bx, by, bz] = b.xyz();
+                let f = at.fraction;
+                let middle = self.welder.intern(Point3::new(
+                    ax + f * (bx - ax),
+                    ay + f * (by - ay),
+                    az + f * (bz - az),
+                ))?;
+                let mut before = points[..=at.segment].to_vec();
+                before.push(middle.clone());
+                let mut after = vec![middle];
+                after.extend_from_slice(&points[at.segment + 1..]);
+                (before, after)
+            };
+            // Stored the way the linestring itself runs, which an inverted bound
+            // does not.
+            let (first, second) = if bound.is_inverted() {
+                (
+                    after.into_iter().rev().collect(),
+                    before.into_iter().rev().collect(),
+                )
+            } else {
+                (before, after)
+            };
+            let attributes = bound.attributes().read().clone();
+            let halves = [first, second].map(|points| {
+                let half = LineString::new(self.take_id(), points, attributes.clone());
+                self.lanelet_map.add(Primitive::LineString(half.clone()));
+                half
+            });
+            let [first, second] = halves;
+            self.cuts.insert((bound.id(), line), (first, second));
+        }
+        let (first, second) = &self.cuts[&(bound.id(), line)];
+        Ok(if bound.is_inverted() {
+            (second.invert(), first.invert())
+        } else {
+            (first.clone(), second.clone())
+        })
+    }
+
+    /// Leaves out of the map the linestrings cut at a stop line that no lanelet
+    /// is bounded by any more, nor has as its centreline: their halves replaced
+    /// them. A layer cannot lose a primitive, so the map is built again without
+    /// them.
+    fn drop_cut_lines(&mut self) {
+        let mut cut: HashSet<Id> = self.cuts.keys().map(|(line, _)| *line).collect();
+        for primitive in self.lanelet_map.lanelets.all() {
+            if let Some(lanelet) = as_lanelet(&primitive) {
+                cut.remove(&lanelet.left_bound().id());
+                cut.remove(&lanelet.right_bound().id());
+                if lanelet.has_custom_centerline() {
+                    cut.remove(&lanelet.centerline().id());
+                }
+            }
+        }
+        if cut.is_empty() {
+            return;
+        }
+        let map = LaneletMap::new_map();
+        for layer in [
+            &self.lanelet_map.points,
+            &self.lanelet_map.line_strings,
+            &self.lanelet_map.polygons,
+            &self.lanelet_map.lanelets,
+            &self.lanelet_map.areas,
+            &self.lanelet_map.regulatory_elements,
+        ] {
+            for primitive in layer.all() {
+                let dropped =
+                    matches!(&primitive, Primitive::LineString(line) if cut.contains(&line.id()));
+                if !dropped {
+                    map.add(primitive);
+                }
+            }
+        }
+        self.lanelet_map = map;
+    }
+
     fn build_rules(&mut self) -> Result<(), ExportError> {
         for (index, rule) in self.map.rules.clone().into_iter().enumerate() {
             match rule {
@@ -878,37 +1218,10 @@ impl<'a> Exporter<'a> {
                     stop_lines,
                     lanes,
                 } => {
-                    // A Lanelet2 traffic light has one `ref_line`, so a rule that
-                    // stops at several lines — one per junction mouth — is one
-                    // element per line, on the rule's lanes that stop at it
-                    // (`Map::traffic_light_stops`, as the SUMO export has it) and
-                    // referring to the lights over them, or to all the rule's
-                    // lights when none is. A rule with no line, or one, is one
-                    // element over all its lanes.
-                    let groups: Vec<(Option<ObjectId>, Vec<LaneId>, Vec<ObjectId>)> = self
-                        .map
-                        .traffic_light_stops(&stop_lines, &lanes)
-                        .into_iter()
-                        .map(|(line, at)| {
-                            let over: Vec<ObjectId> = lights
-                                .iter()
-                                .filter(|light| {
-                                    self.map.objects.get(light).is_some_and(|object| {
-                                        object.lanes.iter().any(|lane| at.contains(lane))
-                                    })
-                                })
-                                .cloned()
-                                .collect();
-                            let over = if over.is_empty() {
-                                lights.clone()
-                            } else {
-                                over
-                            };
-                            (line, at, over)
-                        })
-                        .collect();
                     let mut elements = Vec::new();
-                    for (stop_line, at, lights) in groups {
+                    for (stop_line, at, lights) in
+                        self.traffic_light_groups(&lights, &stop_lines, &lanes)
+                    {
                         if let Some(element) =
                             self.traffic_light_element(&lights, stop_line.as_ref(), &at)?
                         {
@@ -958,7 +1271,7 @@ impl<'a> Exporter<'a> {
                         "right_of_way",
                         parameters,
                         &attached,
-                    )?;
+                    );
                     self.regulatory_elements.insert(index, vec![element]);
                 }
                 // Lanelet2's `SpeedLimit` is a kind of traffic sign and needs one to
@@ -966,7 +1279,7 @@ impl<'a> Exporter<'a> {
                 // which is also where Autoware looks for it.
                 TrafficRule::SpeedLimit { limit, lanes } => {
                     for lane in &lanes {
-                        if let Some(lanelet) = self.lanelets.get(lane) {
+                        for lanelet in self.pieces_of(lane) {
                             let mut attributes = lanelet.attributes().read().clone();
                             attributes.insert(
                                 "speed_limit".to_owned(),
@@ -985,17 +1298,68 @@ impl<'a> Exporter<'a> {
         Ok(())
     }
 
-    /// One `traffic_light` element: `lights` stopping `lanes` at `stop_line`.
-    /// `None` when none of the lights has a way to refer to, since Lanelet2's
-    /// TrafficLight refuses to exist without one, and when none of the lanes was
-    /// written as a lanelet, since an element no lanelet holds governs nothing.
+    /// The elements a traffic-light rule is written as, each as `(stop line,
+    /// lanes, lights)`.
+    ///
+    /// A Lanelet2 traffic light has one `ref_line`, so a rule that stops at several
+    /// lines — one per junction mouth — is one element per line, on the rule's
+    /// lanes that stop at it (`Map::traffic_light_stops`, as the SUMO export has
+    /// it) and referring to the lights over them, or to all the rule's lights when
+    /// none is. A rule with no line, or one, is one element over all its lanes.
+    fn traffic_light_groups(
+        &self,
+        lights: &[ObjectId],
+        stop_lines: &[ObjectId],
+        lanes: &[LaneId],
+    ) -> Vec<(Option<ObjectId>, Vec<LaneId>, Vec<ObjectId>)> {
+        self.map
+            .traffic_light_stops(stop_lines, lanes)
+            .into_iter()
+            .map(|(line, at)| {
+                let over: Vec<ObjectId> = lights
+                    .iter()
+                    .filter(|light| {
+                        self.map
+                            .objects
+                            .get(light)
+                            .is_some_and(|object| object.lanes.iter().any(|lane| at.contains(lane)))
+                    })
+                    .cloned()
+                    .collect();
+                let over = if over.is_empty() {
+                    lights.to_vec()
+                } else {
+                    over
+                };
+                (line, at, over)
+            })
+            .collect()
+    }
+
+    /// Whether `lights` stopping `lanes` is written as a `traffic_light` element at
+    /// all: not when none of the lights has a way to refer to, since Lanelet2's
+    /// TrafficLight refuses to exist without one, and not when none of the lanes
+    /// was written as a lanelet, since an element no lanelet holds governs nothing.
+    fn writes_traffic_light(&self, lights: &[ObjectId], lanes: &[LaneId]) -> bool {
+        lanes.iter().any(|lane| self.lanelets.contains_key(lane))
+            && lights.iter().any(|light| {
+                self.objects
+                    .get(light)
+                    .is_some_and(|lines| !lines.is_empty())
+            })
+    }
+
+    /// One `traffic_light` element: `lights` stopping `lanes` at `stop_line`, on
+    /// the lanelets that end on the line ([`Self::ending_on`]), or on the lanes'
+    /// own lanelets when there is no line. `None` when it is not written at all
+    /// ([`Self::writes_traffic_light`]).
     fn traffic_light_element(
         &mut self,
         lights: &[ObjectId],
         stop_line: Option<&ObjectId>,
         lanes: &[LaneId],
     ) -> Result<Option<Id>, ExportError> {
-        if !lanes.iter().any(|lane| self.lanelets.contains_key(lane)) {
+        if !self.writes_traffic_light(lights, lanes) {
             return Ok(None);
         }
         let mut parameters = RuleParameterMap::new();
@@ -1007,9 +1371,6 @@ impl<'a> Exporter<'a> {
             .flatten()
             .map(RuleParameter::LineString)
             .collect();
-        if refers.is_empty() {
-            return Ok(None);
-        }
         parameters.insert(roles::REFERS.to_owned(), refers);
         let bulbs: Vec<RuleParameter> = lights
             .iter()
@@ -1019,22 +1380,29 @@ impl<'a> Exporter<'a> {
         if !bulbs.is_empty() {
             parameters.insert(LIGHT_BULBS.to_owned(), bulbs);
         }
+        let mut holders = None;
         if let Some(stop_line) = stop_line {
+            let lines = self.object_lines(stop_line)?;
+            if let [line] = lines.as_slice() {
+                holders = Some(self.ending_on(line, lanes));
+            }
             parameters.insert(
                 roles::REF_LINE.to_owned(),
-                self.object_lines(stop_line)?
-                    .into_iter()
-                    .map(RuleParameter::LineString)
-                    .collect(),
+                lines.into_iter().map(RuleParameter::LineString).collect(),
             );
         }
-        self.attach(
+        let holders = holders.unwrap_or_else(|| {
+            lanes
+                .iter()
+                .filter_map(|lane| self.lanelets.get(lane).cloned())
+                .collect()
+        });
+        Ok(Some(self.attach_to(
             RegElemKind::TrafficLight,
             "traffic_light",
             parameters,
-            lanes,
-        )
-        .map(Some)
+            &holders,
+        )))
     }
 
     fn attach(
@@ -1043,7 +1411,22 @@ impl<'a> Exporter<'a> {
         subtype: &str,
         parameters: RuleParameterMap,
         lanes: &[LaneId],
-    ) -> Result<Id, ExportError> {
+    ) -> Id {
+        let lanelets: Vec<Lanelet> = lanes
+            .iter()
+            .filter_map(|lane| self.lanelets.get(lane).cloned())
+            .collect();
+        self.attach_to(kind, subtype, parameters, &lanelets)
+    }
+
+    /// A new regulatory element, held by each of `lanelets`.
+    fn attach_to(
+        &mut self,
+        kind: RegElemKind,
+        subtype: &str,
+        parameters: RuleParameterMap,
+        lanelets: &[Lanelet],
+    ) -> Id {
         let id = self.take_id();
         let element = RegulatoryElement::new(
             kind,
@@ -1054,12 +1437,106 @@ impl<'a> Exporter<'a> {
             ]),
             parameters,
         );
-        for lane in lanes {
-            if let Some(lanelet) = self.lanelets.get(lane) {
-                lanelet.add_regulatory_element(element.clone());
-            }
+        for lanelet in lanelets {
+            lanelet.add_regulatory_element(element.clone());
         }
         self.lanelet_map.add(Primitive::RegulatoryElement(element));
-        Ok(id)
+        id
     }
+}
+
+/// Where a stop line crosses a bound: on which of its segments, how far along that
+/// segment, and how far along the bound.
+struct Crossing {
+    segment: usize,
+    fraction: f64,
+    along: f64,
+}
+
+/// A point's position on the ground.
+fn plan(point: &Point) -> [f64; 2] {
+    [point.x(), point.y()]
+}
+
+fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
+    (a[0] - b[0]).hypot(a[1] - b[1])
+}
+
+fn polyline_length(points: &[Point]) -> f64 {
+    points
+        .windows(2)
+        .map(|pair| distance(plan(&pair[0]), plan(&pair[1])))
+        .sum()
+}
+
+/// The first place, walking `bound` from its start, where `line` crosses it.
+fn crossing(bound: &[Point], line: &[[f64; 2]]) -> Option<Crossing> {
+    let mut along = 0.0;
+    for (segment, pair) in bound.windows(2).enumerate() {
+        let (a, b) = (plan(&pair[0]), plan(&pair[1]));
+        for across in line.windows(2) {
+            if let Some(fraction) = intersection(a, b, across[0], across[1]) {
+                return Some(Crossing {
+                    segment,
+                    fraction,
+                    along: along + fraction * distance(a, b),
+                });
+            }
+        }
+        along += distance(a, b);
+    }
+    None
+}
+
+/// How far along `p`–`q` the segment `a`–`b` crosses it, if it does.
+fn intersection(p: [f64; 2], q: [f64; 2], a: [f64; 2], b: [f64; 2]) -> Option<f64> {
+    let r = [q[0] - p[0], q[1] - p[1]];
+    let s = [b[0] - a[0], b[1] - a[1]];
+    let denominator = r[0] * s[1] - r[1] * s[0];
+    if denominator.abs() < 1e-12 {
+        return None;
+    }
+    let t = ((a[0] - p[0]) * s[1] - (a[1] - p[1]) * s[0]) / denominator;
+    let u = ((a[0] - p[0]) * r[1] - (a[1] - p[1]) * r[0]) / denominator;
+    ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)).then_some(t)
+}
+
+/// `line` carried on [`LINE_REACH`] past each of its ends.
+fn carried_on(line: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let [first, second, ..] = line else {
+        return line.to_vec();
+    };
+    let [.., before_last, last] = line else {
+        unreachable!("two points or more");
+    };
+    let away = |end: [f64; 2], from: [f64; 2]| {
+        let length = distance(end, from).max(1e-12);
+        [
+            end[0] + (end[0] - from[0]) / length * LINE_REACH,
+            end[1] + (end[1] - from[1]) / length * LINE_REACH,
+        ]
+    };
+    let mut carried = line.to_vec();
+    carried[0] = away(*first, *second);
+    let end = carried.len() - 1;
+    carried[end] = away(*last, *before_last);
+    carried
+}
+
+/// How far `point` is from the nearest part of `line`.
+fn distance_to_polyline(point: [f64; 2], line: &[[f64; 2]]) -> f64 {
+    line.windows(2)
+        .map(|segment| {
+            let (a, b) = (segment[0], segment[1]);
+            let along = [b[0] - a[0], b[1] - a[1]];
+            let squared = along[0] * along[0] + along[1] * along[1];
+            let t = if squared > 0.0 {
+                (((point[0] - a[0]) * along[0] + (point[1] - a[1]) * along[1]) / squared)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            distance(point, [a[0] + t * along[0], a[1] + t * along[1]])
+        })
+        .fold(f64::INFINITY, f64::min)
 }
