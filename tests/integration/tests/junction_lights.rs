@@ -10,7 +10,9 @@
 //! feed what the document names, reads each painted line as stopping the mouth it
 //! is across, and draws a line at a mouth the document paints none at; these
 //! check that it does, and that the Lanelet2 export then hangs the regulatory
-//! element, with a `ref_line`, on the approach lanelets.
+//! element, with a `ref_line`, on the lanelets through the junction that the
+//! approaches feed — where the document referred to it — and not on the
+//! approaches themselves.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -176,9 +178,10 @@ fn sorted(lanes: &[LaneId]) -> Vec<LaneId> {
 }
 
 /// How each traffic-light rule of a map reached Lanelet2: the elements it was
-/// written as, the lanelets of its lanes that carry one of them, whether that one
-/// has a `ref_line` which is a `stop_line` way, and how many elements refer to
-/// fewer of the rule's lights than all of them.
+/// written as, its lanes whose lanelets through the junction (or, feeding none,
+/// whose own) all carry one of them, whether those have a `ref_line` which is a
+/// `stop_line` way, and how many elements refer to fewer of the rule's lights than
+/// all of them.
 #[derive(Debug, PartialEq, Eq)]
 struct Reached {
     rules: usize,
@@ -189,6 +192,9 @@ struct Reached {
     narrowed: usize,
     /// Traffic-light elements in the file that no lanelet holds.
     orphans: usize,
+    /// Approach lanelets that hold one themselves rather than leaving it to the
+    /// junction's.
+    approaches_carrying: usize,
 }
 
 /// Exports `map` as Lanelet2, reads the file back with `simple_lanelet2`'s loader
@@ -220,6 +226,7 @@ fn reach_lanelet2(map: &ValidatedMap) -> Reached {
         with_ref_line: 0,
         narrowed: 0,
         orphans: 0,
+        approaches_carrying: 0,
     };
     let held: BTreeSet<i64> = lanelets
         .values()
@@ -248,41 +255,73 @@ fn reach_lanelet2(map: &ValidatedMap) -> Reached {
         let mut seen: BTreeSet<i64> = BTreeSet::new();
         for lane in lanes {
             reached.lanes += 1;
-            let Some(lanelet) = written(IrRef::Lane(lane.clone()), "lanelet")
-                .first()
-                .and_then(|id| lanelets.get(id))
-            else {
-                continue;
+            let lanelet_of = |lane: &LaneId| {
+                written(IrRef::Lane(lane.clone()), "lanelet")
+                    .first()
+                    .and_then(|id| lanelets.get(id))
             };
-            let held: Vec<_> = lanelet
-                .regulatory_elements()
+            let held_by = |lanelet: &ll2_core::lanelet::Lanelet| -> Vec<_> {
+                lanelet
+                    .regulatory_elements()
+                    .into_iter()
+                    .filter(|held| elements.contains(&held.id()))
+                    .collect()
+            };
+            // The element hangs on the junction connectors the lane feeds, or on
+            // the lane itself when it feeds none.
+            let through: Vec<LaneId> = map
+                .successors(lane)
                 .into_iter()
-                .filter(|held| elements.contains(&held.id()))
+                .filter(|next| {
+                    map.lane(next)
+                        .and_then(|next| map.road(&next.road))
+                        .is_some_and(|road| road.is_connector())
+                })
                 .collect();
-            assert!(held.len() <= 1, "a lane stops at one of its rule's lines");
-            let Some(held) = held.first() else {
-                continue;
-            };
-            assert_eq!(held.attributes().read()["subtype"].value(), "traffic_light");
-            reached.lanes_carrying += 1;
-            let stops = held.parameters_for("ref_line").iter().any(|parameter| {
-                matches!(parameter, RuleParameter::LineString(line)
-                    if line.attributes().read().get("type").map(|v| v.value()) == Some("stop_line"))
-            });
-            if stops {
-                reached.with_ref_line += 1;
+            if !through.is_empty()
+                && lanelet_of(lane).is_some_and(|lanelet| !held_by(lanelet).is_empty())
+            {
+                reached.approaches_carrying += 1;
             }
-            if seen.insert(held.id()) {
-                let refers: BTreeSet<i64> = held
-                    .parameters_for("refers")
-                    .iter()
-                    .filter_map(|parameter| match parameter {
-                        RuleParameter::LineString(line) => Some(line.id()),
-                        _ => None,
-                    })
-                    .collect();
-                assert!(refers.is_subset(&every_light), "{refers:?} {every_light:?}");
-                reached.narrowed += usize::from(refers != every_light);
+            let carriers = if through.is_empty() {
+                vec![lane.clone()]
+            } else {
+                through
+            };
+            let (mut carried, mut stopped) = (true, true);
+            for carrier in &carriers {
+                let Some(lanelet) = lanelet_of(carrier) else {
+                    carried = false;
+                    continue;
+                };
+                let held = held_by(lanelet);
+                assert!(held.len() <= 1, "a lane stops at one of its rule's lines");
+                let Some(held) = held.first() else {
+                    carried = false;
+                    continue;
+                };
+                assert_eq!(held.attributes().read()["subtype"].value(), "traffic_light");
+                let stops = held.parameters_for("ref_line").iter().any(|parameter| {
+                    matches!(parameter, RuleParameter::LineString(line)
+                        if line.attributes().read().get("type").map(|v| v.value()) == Some("stop_line"))
+                });
+                stopped &= stops;
+                if seen.insert(held.id()) {
+                    let refers: BTreeSet<i64> = held
+                        .parameters_for("refers")
+                        .iter()
+                        .filter_map(|parameter| match parameter {
+                            RuleParameter::LineString(line) => Some(line.id()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(refers.is_subset(&every_light), "{refers:?} {every_light:?}");
+                    reached.narrowed += usize::from(refers != every_light);
+                }
+            }
+            if carried {
+                reached.lanes_carrying += 1;
+                reached.with_ref_line += usize::from(stopped);
             }
         }
     }
@@ -398,8 +437,8 @@ fn a_carla_junction_light_governs_the_approaches_and_stops_them_at_the_mouth() {
         "the light is traced once to its controller, though it is listed twice"
     );
 
-    // And Autoware gets it the way it looks for it: every approach lanelet holds
-    // a regulatory element, one per mouth, with that mouth's stop line as its
+    // And Autoware gets it the way it looks for it: every lanelet through the
+    // junction holds a regulatory element, one per mouth, with that mouth's stop line as its
     // ref_line — and the light over both mouths is referred to by both.
     assert_eq!(
         reach_lanelet2(&map),
@@ -411,6 +450,7 @@ fn a_carla_junction_light_governs_the_approaches_and_stops_them_at_the_mouth() {
             with_ref_line: 3,
             narrowed: 0,
             orphans: 0,
+            approaches_carrying: 0,
         }
     );
     assert!(roadgen_lanelet2::check(&map).is_empty());
@@ -483,6 +523,7 @@ fn each_mouth_of_a_controller_refers_to_the_lights_over_it() {
             with_ref_line: 3,
             narrowed: 2,
             orphans: 0,
+            approaches_carrying: 0,
         }
     );
 }
@@ -577,6 +618,7 @@ fn a_stop_line_across_one_lane_of_a_rule_stops_all_of_its_lanes() {
             with_ref_line: 2,
             narrowed: 0,
             orphans: 0,
+            approaches_carrying: 0,
         }
     );
 }
@@ -612,6 +654,7 @@ fn a_document_line_across_part_of_a_mouth_is_kept_and_no_lane_goes_bare() {
             with_ref_line: 2,
             narrowed: 0,
             orphans: 0,
+            approaches_carrying: 0,
         }
     );
 }
@@ -712,6 +755,7 @@ fn a_carla_stop_line_stops_the_mouth_it_is_painted_across() {
             with_ref_line: 3,
             narrowed: 0,
             orphans: 0,
+            approaches_carrying: 0,
         }
     );
     assert!(roadgen_lanelet2::check(&map).is_empty());

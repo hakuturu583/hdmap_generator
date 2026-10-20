@@ -1008,6 +1008,7 @@ impl<'a> Exporter<'a> {
         stop_line: Option<&ObjectId>,
         lanes: &[LaneId],
     ) -> Result<Option<Id>, ExportError> {
+        let lanes = &self.junction_lanes(lanes);
         if !lanes.iter().any(|lane| self.lanelets.contains_key(lane)) {
             return Ok(None);
         }
@@ -1048,6 +1049,47 @@ impl<'a> Exporter<'a> {
             lanes,
         )
         .map(Some)
+    }
+
+    /// The lanes a traffic light's element hangs on, for a rule over `lanes`.
+    ///
+    /// The IR's rule is about the approaches, the lanes that stop for the light.
+    /// OpenDRIVE refers to a junction's light from the connecting roads, though,
+    /// and Lanelet2 maps for Autoware hang it on the lanelets through the
+    /// intersection — the ones `turn_direction` marks — with the stop line as the
+    /// `ref_line` before them. So each approach gives way to the junction
+    /// connectors it feeds; a lane that is a connector already, or that feeds none
+    /// (a light short of no junction), keeps the element itself.
+    fn junction_lanes(&self, lanes: &[LaneId]) -> Vec<LaneId> {
+        let connector = |lane: &LaneId| {
+            self.map
+                .lane(lane)
+                .and_then(|lane| self.map.road(&lane.road))
+                .is_some_and(|road| road.is_connector())
+        };
+        let mut carriers: Vec<LaneId> = Vec::new();
+        for lane in lanes {
+            let through: Vec<LaneId> = if connector(lane) {
+                Vec::new()
+            } else {
+                self.map
+                    .successors(lane)
+                    .into_iter()
+                    .filter(|next| connector(next))
+                    .collect()
+            };
+            let held = if through.is_empty() {
+                vec![lane.clone()]
+            } else {
+                through
+            };
+            for lane in held {
+                if !carriers.contains(&lane) {
+                    carriers.push(lane);
+                }
+            }
+        }
+        carriers
     }
 
     fn attach(

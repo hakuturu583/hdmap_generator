@@ -526,7 +526,7 @@ govern — and both formats get them:
 | --- | --- | --- |
 | Traffic light | `<signal dynamic="true">` with `<validity>`, its housing's `height`, a `<userData>` per lamp | `traffic_light` way with its `height`, `light_bulbs` way + `traffic_light` regulatory element |
 | Traffic sign | `<signal>` carrying the caller's catalogue code | `traffic_sign` way, code as its subtype |
-| Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` — a traffic-light rule with several (one per junction mouth) is one regulatory element per line, on the rule's lanelets it names, referring to the lights over them |
+| Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` — a traffic-light rule with several (one per junction mouth) is one regulatory element per line, on the junction lanelets the rule's lanes it names feed, referring to the lights over them |
 | Crosswalk | `<object type="crosswalk">` with its outline as `<cornerLocal>` corners | a lanelet of subtype `crosswalk` |
 | Right of way | `<junction><priority high low>` | `right_of_way` regulatory element |
 
@@ -2498,9 +2498,9 @@ Python, one line per thing the map now says less exactly than the file did:
 - a traffic light that names the lanes *inside* a junction — CARLA's Town maps
   stand a junction's light on a post valid on no lane of its own road and refer to
   it with a `<signalReference>` from each connecting road — is read as governing
-  the approaches that feed those lanes instead: the IR's traffic light, like
-  Autoware's, is about the lanes that stop for it, and a regulatory element on the
-  lanelets inside the junction is one a vehicle on the approach never sees. A sign
+  the approaches that feed those lanes instead: the IR's traffic light is about
+  the lanes that stop for it (the Lanelet2 export hangs it back on the lanes
+  through the junction, as below). A sign
   keeps the lanes it names, since what a sign means is its code, which the reader
   passes through without reading;
 - a `<controller>` is one traffic-light rule, with the stop lines of each junction
@@ -2520,6 +2520,11 @@ and referring to the lights over them; a lane no line names — a mouth whose
 document line crosses only some of its lanes — gets an element of its own without
 a `ref_line`. The SUMO export stops lanes at a line by the same rule
 (`Map::traffic_light_stops`), and no element is written that no lanelet holds.
+The element hangs on the lanelets *through* the junction that a rule's lane feeds
+— the ones tagged `turn_direction`, where the OpenDRIVE refers to the light and
+where Lanelet2 maps for Autoware hang it, with the stop line before them as the
+`ref_line` — and on the lane itself only when it feeds no junction. A vehicle on
+the approach meets the element on the lanelet its route enters next.
 
 What is an error rather than a note is a document that is not a road network: a
 reference line with a gap in it wider than 10 cm (a narrower one is closed and
