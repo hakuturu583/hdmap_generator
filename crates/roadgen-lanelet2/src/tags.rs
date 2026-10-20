@@ -70,6 +70,25 @@ pub fn participant(subtype: &str) -> &'static str {
     }
 }
 
+/// The `turn_direction` of a lanelet through a junction whose heading swings by
+/// `swing` radians, counter-clockwise positive: `straight` within 45 degrees either
+/// way, else `left` or `right`.
+///
+/// 45 degrees is half a right angle, so a turn at an ordinary crossroads (90) and
+/// a straight on that bends to meet a skewed arm (CARLA's run to about 15) fall
+/// clearly to either side.
+pub fn turn_direction(swing: f64) -> &'static str {
+    use std::f64::consts::{PI, TAU};
+    let swing = (swing + PI).rem_euclid(TAU) - PI;
+    if swing.abs() <= PI / 4.0 {
+        "straight"
+    } else if swing > 0.0 {
+        "left"
+    } else {
+        "right"
+    }
+}
+
 /// The `type` of the linestring a map object becomes.
 pub fn object_type(kind: &MapObjectKind) -> &'static str {
     match kind {
@@ -80,5 +99,22 @@ pub fn object_type(kind: &MapObjectKind) -> &'static str {
         // Lanelet2 has no berm; what one is to a vehicle is the edge of the road it
         // may not cross.
         MapObjectKind::Barrier { .. } => "road_border",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn_direction;
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    #[test]
+    fn a_swing_reads_as_the_turn_it_makes_whichever_way_round_it_is_measured() {
+        assert_eq!(turn_direction(0.0), "straight");
+        assert_eq!(turn_direction(0.25), "straight");
+        assert_eq!(turn_direction(FRAC_PI_2), "left");
+        assert_eq!(turn_direction(-FRAC_PI_2), "right");
+        // Headings either side of +-pi: a quarter turn left measured across the seam.
+        assert_eq!(turn_direction(-1.5 * PI), "left");
+        assert_eq!(turn_direction(2.0 * PI - 0.1), "straight");
     }
 }

@@ -724,6 +724,7 @@ impl<'a> Exporter<'a> {
                 Direction::Backward => (inner_right.invert(), inner_left.invert()),
             };
 
+            let travel = lane.travel_geometry(self.config())?;
             let mut attributes = vec![
                 ("type", "lanelet".to_owned()),
                 ("subtype", subtype.to_owned()),
@@ -735,13 +736,25 @@ impl<'a> Exporter<'a> {
                 // A bare number in a Lanelet2 `speed_limit` tag is km/h.
                 attributes.push(("speed_limit", format!("{:.0}", limit.kph())));
             }
+            // Autoware reads a lanelet with `turn_direction` as one inside an
+            // intersection, and the value as the movement it makes there: a
+            // junction connector's road lanelet, by how far it swings. A motorway
+            // junction's connector is a slip road (`highway`), not an intersection.
+            let connector = self
+                .map
+                .road(&lane.road)
+                .is_some_and(|road| road.is_connector());
+            if connector && subtype == "road" {
+                let swing = travel.centerline.end_tangent()?.heading()
+                    - travel.centerline.start_tangent()?.heading();
+                attributes.push(("turn_direction", tags::turn_direction(swing).to_owned()));
+            }
 
             let id = self.take_id();
             let lanelet = Lanelet::new(id, left, right, tags::attributes(attributes));
 
             // The IR's centreline is a generated 3D curve, not the midpoint of the
             // boundaries, so it is written out rather than left to be recomputed.
-            let travel = lane.travel_geometry(self.config())?;
             let centerline = self.linestring(
                 &travel.centerline,
                 tags::attributes([("type", "centerline".to_owned())]),
