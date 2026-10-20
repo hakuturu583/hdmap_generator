@@ -7,6 +7,7 @@ members = [
     "crates/roadgen-opendrive",
     "crates/roadgen-lanelet2",
     "crates/roadgen-clipgt",
+    "crates/roadgen-rdshq",
     "crates/roadgen-gpudrive",
     "crates/roadgen-osm",
     "crates/roadgen-proto",
@@ -32,6 +33,7 @@ roadgen-carla = { path = "crates/roadgen-carla" }
 roadgen-opendrive = { path = "crates/roadgen-opendrive" }
 roadgen-lanelet2 = { path = "crates/roadgen-lanelet2" }
 roadgen-clipgt = { path = "crates/roadgen-clipgt" }
+roadgen-rdshq = { path = "crates/roadgen-rdshq" }
 roadgen-gpudrive = { path = "crates/roadgen-gpudrive" }
 roadgen-osm = { path = "crates/roadgen-osm" }
 roadgen-proto = { path = "crates/roadgen-proto" }
@@ -75,6 +77,11 @@ parquet = { version = "59", default-features = false, features = ["arrow", "snap
 # Apache-2.0 project may redistribute. It is the only `ChunkReader` parquet offers
 # that is not a file on disk, and the viewer has no disk to put one on.
 bytes = { version = "1", default-features = false }
+
+# tar, for RDS-HQ: every file of that dataset is a one-sample WebDataset shard,
+# which is a plain tar archive. MIT/Apache-2.0. Default features off, because the
+# one they bring is reading extended attributes off disk, and nothing here reads.
+tar = { version = "0.4", default-features = false }
 
 # The ClipGT scenario file, and the rig JSON a clip's calibration table carries.
 # serde and serde_json are MIT/Apache-2.0; serde_norway is the maintained fork of

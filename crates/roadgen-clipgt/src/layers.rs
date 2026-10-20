@@ -39,9 +39,9 @@ pub struct Layer {
 /// are ClipGT's own defaults for a device whose dimensions are missing, which makes
 /// them the one size a reader is already prepared to see, and keeps this exporter
 /// from inventing a measurement the IR never made.
-const LIGHT_DIMENSIONS: Point3 = Point3::new(0.6, 0.6, 1.0);
+pub const LIGHT_DIMENSIONS: Point3 = Point3::new(0.6, 0.6, 1.0);
 /// The same for a sign's plate.
-const SIGN_DIMENSIONS: Point3 = Point3::new(0.8, 0.3, 0.8);
+pub const SIGN_DIMENSIONS: Point3 = Point3::new(0.8, 0.3, 0.8);
 
 /// The format name a ClipGT [`Trace`] is recorded under.
 pub const TRACE_FORMAT: &str = "clipgt";
@@ -354,7 +354,7 @@ fn devices(
 
 /// Which way a device faces: back along the traffic it governs, so it looks at the
 /// drivers who have to read it.
-fn facing_of(
+pub fn facing_of(
     map: &Map,
     object: &MapObject,
     center: Point3,
@@ -407,7 +407,7 @@ fn objects_of<'a>(
 /// Found through the edge indices rather than by looking at each side's lanes,
 /// because a cross-section need not have lanes on both sides — a junction connector
 /// has one lane, and both of its boundaries are edges of the carriageway.
-fn outer_boundaries<'a>(lanes: &[&'a Lane]) -> Vec<(i32, &'a Curve3)> {
+pub fn outer_boundaries<'a>(lanes: &[&'a Lane]) -> Vec<(i32, &'a Curve3)> {
     let leftmost = lanes
         .iter()
         .max_by_key(|lane| lane.left_edge)
@@ -429,7 +429,7 @@ fn row_ref(layer: &str, row: usize) -> String {
 ///
 /// An edge between two lanes is one row for both, so each of them is `Merged` into
 /// it; an edge only one lane touches is that lane's own.
-fn link_edge(trace: &mut Trace, section: &[&Lane], edge: i32, local: &str) {
+pub fn link_edge(trace: &mut Trace, section: &[&Lane], edge: i32, local: &str) {
     let bordering: Vec<(&Lane, &str)> = section
         .iter()
         .filter_map(|lane| {
@@ -448,12 +448,12 @@ fn link_edge(trace: &mut Trace, section: &[&Lane], edge: i32, local: &str) {
     }
 }
 
-fn vertices(curve: &Curve3, config: SamplingConfig) -> Result<Vec<Point3>, ExportError> {
+pub fn vertices(curve: &Curve3, config: SamplingConfig) -> Result<Vec<Point3>, ExportError> {
     Ok(curve.to_polyline(config)?.points().to_vec())
 }
 
 /// A strip's outline: up one edge and back down the other.
-fn band_polygon(
+pub fn band_polygon(
     left: &Curve3,
     right: &Curve3,
     config: SamplingConfig,
