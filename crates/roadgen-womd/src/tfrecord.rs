@@ -28,7 +28,7 @@ pub fn record(data: &[u8]) -> Vec<u8> {
 }
 
 /// The records of a TFRecord file, each checked against both of its checksums.
-pub fn records(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>, ExportError> {
+pub fn records(mut bytes: &[u8]) -> Result<Vec<&[u8]>, ExportError> {
     let mut out = Vec::new();
     while !bytes.is_empty() {
         let index = out.len();
@@ -45,7 +45,7 @@ pub fn records(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>, ExportError> {
         if masked_crc(data) != u32_at(crc) {
             return Err(malformed("the data's checksum does not match"));
         }
-        out.push(data.to_vec());
+        out.push(data);
         bytes = rest;
     }
     Ok(out)

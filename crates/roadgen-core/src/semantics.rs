@@ -546,6 +546,11 @@ impl MapObjectKind {
         matches!(self, MapObjectKind::TrafficLight { .. })
     }
 
+    /// A traffic sign whose code [`is_stop_sign`] recognises.
+    pub fn is_stop_sign(&self) -> bool {
+        matches!(self, MapObjectKind::TrafficSign { code } if is_stop_sign(code))
+    }
+
     /// A traffic light's housing and lamps; `None` for anything else.
     pub fn light_head(&self) -> Option<&LightHead> {
         match self {
@@ -563,6 +568,17 @@ impl MapObjectKind {
             MapObjectKind::Barrier { .. } => "barrier",
         }
     }
+}
+
+/// Whether a sign's catalogue code names a stop sign.
+///
+/// The IR does not define a sign catalogue — `code` is whatever the caller uses — so
+/// this recognises the spellings a caller is likely to have written, and nothing
+/// else: "stop" and "stop-sign" in any case and with any separator, R1-1 (MUTCD) and
+/// 206 (the Vienna Convention).
+pub fn is_stop_sign(code: &str) -> bool {
+    let code = code.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+    code.starts_with("stop") || code == "r1-1" || code == "206"
 }
 
 /// A piece of road furniture, and the lanes it applies to.

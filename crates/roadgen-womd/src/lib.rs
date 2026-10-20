@@ -31,7 +31,7 @@
 //! - **No tracks.** A generated map has no logged traffic; [`check`] says so.
 
 pub mod error;
-pub mod features;
+mod features;
 pub mod tfrecord;
 
 use std::path::{Path, PathBuf};
@@ -158,8 +158,7 @@ pub fn to_scenario_traced(
 ) -> Result<(Scenario, Trace), ExportError> {
     config.validate()?;
     let mut trace = Trace::new(TRACE_FORMAT);
-    let written = features::all_traced(map, &mut trace)?;
-    let lane_states = features::signal_states(map, &written, &mut trace);
+    let (map_features, lane_states) = features::all_traced(map, &mut trace)?;
     let scenario = Scenario {
         scenario_id: Some(config.scenario_id.clone()),
         timestamps_seconds: (0..config.steps)
@@ -167,13 +166,8 @@ pub fn to_scenario_traced(
             .collect(),
         current_time_index: Some(config.current_time_index as i32),
         tracks: Vec::new(),
-        dynamic_map_states: vec![
-            pb::DynamicMapState {
-                lane_states: lane_states.clone()
-            };
-            config.steps
-        ],
-        map_features: written.features,
+        dynamic_map_states: vec![pb::DynamicMapState { lane_states }; config.steps],
+        map_features,
         // No tracks, so there is no self-driving car to point at and nothing to
         // predict.
         sdc_track_index: None,
@@ -233,8 +227,8 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<Scenario>, ExportError> {
 /// Every scenario in TFRecord bytes already in hand.
 pub fn from_tfrecord(bytes: &[u8]) -> Result<Vec<Scenario>, ExportError> {
     tfrecord::records(bytes)?
-        .iter()
-        .map(|record| from_bytes(record))
+        .into_iter()
+        .map(from_bytes)
         .collect()
 }
 
@@ -297,7 +291,13 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
         ));
     }
 
-    let lights = features::objects_of(map, |kind| kind.is_traffic_light()).count();
+    let objects = |wanted: fn(&MapObjectKind) -> bool| {
+        map.objects
+            .iter()
+            .filter(|object| wanted(&object.kind))
+            .count()
+    };
+    let lights = objects(MapObjectKind::is_traffic_light);
     let ruled = map
         .rules
         .iter()
@@ -309,19 +309,15 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
              has no signal timing every lane state is LANE_STATE_UNKNOWN"
         ));
     }
-    let stop_lines =
-        features::objects_of(map, |kind| matches!(kind, MapObjectKind::StopLine)).count();
+    let stop_lines = objects(|kind| matches!(kind, MapObjectKind::StopLine));
     if stop_lines > 0 {
         problems.push(format!(
             "there is no stop-line feature: the {stop_lines} stop lines are dropped, \
              and a signalled lane stops at the start of its way through the junction"
         ));
     }
-    let other_signs = features::objects_of(map, |kind| match kind {
-        MapObjectKind::TrafficSign { code } => !features::is_stop_sign(code),
-        _ => false,
-    })
-    .count();
+    let other_signs =
+        objects(|kind| matches!(kind, MapObjectKind::TrafficSign { .. }) && !kind.is_stop_sign());
     if other_signs > 0 {
         problems.push(format!(
             "WOMD's map has one sign in it — the stop sign — so the {other_signs} signs \

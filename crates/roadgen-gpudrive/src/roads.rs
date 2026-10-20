@@ -30,13 +30,11 @@
 //! row's index is the only identifier GPUDrive keeps, so the push is the one place the
 //! correspondence is known; the [`Trace`] names an element `road:<id>`.
 
-use std::collections::BTreeMap;
-
 use roadgen_core::geometry::plan::{ring_contains, PlanPoint};
 use roadgen_core::geometry::{Curve3, Point3, SamplingConfig};
-use roadgen_core::map::Lane;
+use roadgen_core::map::{EdgeKind, Lane, SectionEdge};
 use roadgen_core::semantics::{
-    BoundaryMarking, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType,
+    BoundaryMarking, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
 };
 use roadgen_core::structure::{self, RoadSpan, Underneath};
 use roadgen_core::{IrRef, LaneType, Relation, RoadId, Trace, ValidatedMap};
@@ -63,18 +61,10 @@ pub fn all_traced(map: &ValidatedMap, trace: &mut Trace) -> Result<Vec<Road>, Ex
     Ok(rows.finish())
 }
 
-/// Whether a sign's catalogue code names a stop sign.
-///
-/// The IR does not define a sign catalogue — `code` is whatever the caller uses — so
-/// this recognises the spellings a caller is likely to have written, and nothing
-/// else. GPUDrive's map vocabulary has exactly one sign in it, so a sign this does not
-/// recognise has nowhere to go; [`crate::check`] says how many were left out.
-pub fn is_stop_sign(code: &str) -> bool {
-    let code = code.trim().to_ascii_lowercase().replace([' ', '_'], "-");
-    // "stop" and "stop-sign" are the plain spellings; R1-1 is the MUTCD code and 206
-    // the Vienna Convention one.
-    code.starts_with("stop") || code == "r1-1" || code == "206"
-}
+// The sign catalogue's one stop sign is the IR's to recognise: GPUDrive's map
+// vocabulary has exactly one sign in it, so a sign it does not recognise has nowhere
+// to go, and [`crate::check`] says how many were left out.
+pub use roadgen_core::semantics::is_stop_sign;
 
 /// The rows under construction, numbered as they are added, and the trace of where
 /// each came from.
@@ -166,57 +156,23 @@ fn lane_element(map: &ValidatedMap, lane: &Lane) -> MapElement {
     // A motorway carriageway or a slip road is a freeway lane by its form of way,
     // whatever its road type says about where it runs.
     match map.road(&lane.road) {
-        Some(road) if road.form.is_controlled_access() => MapElement::LaneFreeway,
-        Some(road) if road.road_type == RoadType::Motorway => MapElement::LaneFreeway,
+        Some(road) if road.is_freeway() => MapElement::LaneFreeway,
         Some(_) => MapElement::LaneSurfaceStreet,
         None => MapElement::LaneUndefined,
     }
 }
 
-/// What sits against one cross-section edge, from the edge's own point of view.
-#[derive(Default)]
-struct Edge<'a> {
-    /// The lane to the left of the edge, which is the one whose `right_edge` it is.
-    left: Option<&'a Lane>,
-    /// The lane to the right of it: the one whose `left_edge` it is.
-    right: Option<&'a Lane>,
-}
-
-impl<'a> Edge<'a> {
-    /// The curve and the paint, from whichever lane bounds the edge.
-    ///
-    /// The lane on the right is asked first — an arbitrary but fixed choice, and the
-    /// two answers differ only in a map that said two different things about one line.
-    fn boundary(&self) -> Option<(&'a Curve3, BoundaryMarking)> {
-        self.right
-            .map(|lane| (&lane.left_boundary, lane.left_marking))
-            .or_else(|| {
-                self.left
-                    .map(|lane| (&lane.right_boundary, lane.right_marking))
-            })
-    }
-
-    fn drivable_sides(&self) -> usize {
-        [self.left, self.right]
-            .iter()
-            .filter(|lane| lane.is_some_and(|lane| lane.lane_type.is_drivable()))
-            .count()
-    }
-
-    /// The lanes either side of the edge, each linked to the one element written for
-    /// it: `Merged` when two lanes share the edge, `Exact` when only one touches it.
-    fn sources(&self, role: &'static str) -> Vec<Source> {
-        let lanes: Vec<&Lane> = [self.left, self.right].into_iter().flatten().collect();
-        let relation = Relation::shared_by(lanes.len());
-        lanes
-            .into_iter()
-            .map(|lane| Source {
-                ir: IrRef::Lane(lane.id.clone()),
-                relation,
-                role: Some(role),
-            })
-            .collect()
-    }
+/// The lanes either side of an edge, each linked to the one element written for it:
+/// `Merged` when two lanes share the edge, `Exact` when only one touches it.
+fn edge_sources(edge: &SectionEdge<'_>, role: &'static str) -> Vec<Source> {
+    let relation = Relation::shared_by(edge.lanes().count());
+    edge.lanes()
+        .map(|lane| Source {
+            ir: IrRef::Lane(lane.id.clone()),
+            relation,
+            role: Some(role),
+        })
+        .collect()
 }
 
 /// The boundaries of every cross-section, as one element each — a road edge cut
@@ -231,13 +187,11 @@ fn edges_and_lines(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportErro
         }
         let zones = crossed_ground(map, &road.id)?;
         for section in 0..road.sections.len() {
-            for edge in edges_of(&map.lanes_of_section(&road.id, section)).values() {
-                let Some((curve, marking)) = edge.boundary() else {
+            for edge in map.section_edges(&road.id, section).values() {
+                let Some((curve, edge_kind)) = edge.kind() else {
                     continue;
                 };
-                let Some((kind, element)) = classify(edge, marking) else {
-                    continue;
-                };
+                let (kind, element) = classify(edge_kind);
                 let role = match kind {
                     RoadKind::RoadLine => "road_line",
                     _ => "road_edge",
@@ -245,10 +199,10 @@ fn edges_and_lines(map: &ValidatedMap, rows: &mut Rows) -> Result<(), ExportErro
                 let line = vertices(curve, config)?;
                 if kind == RoadKind::RoadEdge && !zones.is_empty() {
                     for piece in cut_out(&line, &zones) {
-                        rows.push(kind, element, piece, edge.sources(role));
+                        rows.push(kind, element, piece, edge_sources(edge, role));
                     }
                 } else {
-                    rows.push(kind, element, line, edge.sources(role));
+                    rows.push(kind, element, line, edge_sources(edge, role));
                 }
             }
         }
@@ -386,32 +340,13 @@ fn crossing_fraction(a: PlanPoint, b: PlanPoint, r: PlanPoint, s: PlanPoint) -> 
     ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)).then_some(t)
 }
 
-/// The edges of one cross-section, keyed by edge index so that two lanes meeting at
-/// one produce one element rather than two.
-fn edges_of<'a>(lanes: &[&'a Lane]) -> BTreeMap<i32, Edge<'a>> {
-    let mut edges: BTreeMap<i32, Edge<'a>> = BTreeMap::new();
-    for lane in lanes {
-        edges.entry(lane.left_edge).or_default().right = Some(lane);
-        edges.entry(lane.right_edge).or_default().left = Some(lane);
-    }
-    edges
-}
-
-/// What an edge becomes, or `None` when GPUDrive has nothing to say about it.
-fn classify(edge: &Edge<'_>, marking: BoundaryMarking) -> Option<(RoadKind, MapElement)> {
-    match edge.drivable_sides() {
-        // Out in the verge or between two footways: nothing an agent drives on, and
-        // nothing GPUDrive's vocabulary has a word for.
-        0 => None,
-        // The drivable surface ends here, whatever is painted on it.
-        1 => Some((RoadKind::RoadEdge, MapElement::RoadEdgeBoundary)),
-        _ => match marking.marking {
-            // A kerb between two drivable lanes is a median: something an agent hits
-            // rather than something it may cross.
-            RoadMarking::Curbstone => Some((RoadKind::RoadEdge, MapElement::RoadEdgeMedian)),
-            RoadMarking::None => None,
-            _ => Some((RoadKind::RoadLine, line_element(marking))),
-        },
+/// What an edge becomes in GPUDrive's vocabulary. A median is a `road_edge`: an
+/// agent hits a kerb between two lanes rather than crossing it.
+fn classify(kind: EdgeKind) -> (RoadKind, MapElement) {
+    match kind {
+        EdgeKind::RoadBoundary => (RoadKind::RoadEdge, MapElement::RoadEdgeBoundary),
+        EdgeKind::Median => (RoadKind::RoadEdge, MapElement::RoadEdgeMedian),
+        EdgeKind::Line(marking) => (RoadKind::RoadLine, line_element(marking)),
     }
 }
 

@@ -10,7 +10,8 @@
 //! The same three decisions as the GPUDrive export hold, for the same reasons:
 //!
 //! - **One feature per cross-section edge.** An edge is the boundary of the drivable
-//!   surface or a painted line between lanes, not both.
+//!   surface or a painted line between lanes, not both — [`SectionEdge::kind`] says
+//!   which, for both exports.
 //! - **A junction connector has no edges.** Its centreline is written — marked
 //!   `interpolating`, which is what WOMD calls a lane through an intersection — and
 //!   its boundaries are not: there is no wall down the middle of a junction.
@@ -23,71 +24,91 @@
 //! identifier WOMD keeps. The [`Trace`] names a feature `feature:<id>` and a signal's
 //! lane state `signal:<lane id>`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use roadgen_core::geometry::{Curve3, Point3, SamplingConfig};
-use roadgen_core::map::Lane;
+use roadgen_core::geometry::{Point3, SamplingConfig};
+use roadgen_core::map::{EdgeKind, Lane, SectionEdge};
 use roadgen_core::semantics::{
-    BoundaryMarking, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType,
-    TrafficRule,
+    BoundaryMarking, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, TrafficRule,
 };
-use roadgen_core::{Direction, IrRef, LaneId, LaneType, Relation, RoadId, Trace, ValidatedMap};
+use roadgen_core::{
+    Direction, IrRef, LaneId, LaneType, Relation, RoadId, SpeedLimit, Trace, ValidatedMap,
+};
 
 use crate::error::ExportError;
 use crate::pb::{
     self, lane_center, map_feature::FeatureData, road_edge, road_line, traffic_signal_lane_state,
 };
 
-/// Metres per second in one mile per hour, which is how WOMD holds a speed limit.
-const MPS_PER_MPH: f64 = 0.447_04;
-
-/// The map features of a scenario, and the number each written lane was given.
-pub struct Written {
-    /// In the order they are written; feature `n` is at index `n - 1`.
-    pub features: Vec<pb::MapFeature>,
-    pub lanes: HashMap<LaneId, i64>,
-}
-
-/// Every map feature of the scenario, in the order they are written.
-pub fn all_traced(map: &ValidatedMap, trace: &mut Trace) -> Result<Written, ExportError> {
+/// Every map feature of the scenario, in the order they are written, and one step's
+/// signal states.
+pub(crate) fn all_traced(
+    map: &ValidatedMap,
+    trace: &mut Trace,
+) -> Result<(Vec<pb::MapFeature>, Vec<pb::TrafficSignalLaneState>), ExportError> {
     let config = map.metadata.sampling;
-    let mut out = Features {
-        features: Vec::new(),
-        trace,
-    };
-
-    // The lanes are numbered before anything is built, because a lane names the
-    // features either side of it and they name nothing back: the lanes come first in
-    // the scenario all the same, which is where a reader looks for them.
     let lanes: Vec<&Lane> = map
         .lanes
         .iter()
         .filter(|lane| lane.lane_type.is_drivable())
         .collect();
+    // Lane `i` is feature `i + 1`. They are numbered before anything is built,
+    // because a lane names the lines either side of it and its neighbours.
     let ids: HashMap<&LaneId, i64> = lanes
         .iter()
         .enumerate()
         .map(|(index, lane)| (&lane.id, index as i64 + 1))
         .collect();
+    let polylines = lanes
+        .iter()
+        .map(|lane| Ok(points(lane.travel_polyline(config)?.points())))
+        .collect::<Result<Vec<_>, ExportError>>()?;
+    let context = Context {
+        map,
+        ids: &ids,
+        polylines: &polylines,
+        graph: graph(map, &ids),
+        speeds: rule_speeds(map),
+        sections: map
+            .roads
+            .iter()
+            .flat_map(|road| {
+                (0..road.sections.len())
+                    .map(move |section| ((&road.id, section), map.section_edges(&road.id, section)))
+            })
+            .collect(),
+    };
 
-    let mut boundaries = Vec::new();
-    let edges = edges_and_lines(map, config, lanes.len() as i64 + 1, &mut boundaries)?;
-
-    for lane in &lanes {
-        let feature = lane_feature(map, lane, &ids, &edges, config)?;
-        out.push(feature, vec![Source::exact(lane.id.clone())]);
+    let mut out = Features {
+        features: Vec::new(),
+        trace,
+    };
+    let (boundaries, edges) = edges_and_lines(&context, lanes.len() as i64 + 1, config)?;
+    for (index, lane) in lanes.iter().enumerate() {
+        out.push(
+            context.lane_feature(lane, index, &edges),
+            vec![Source::exact(lane.id.clone())],
+        );
     }
-    for (feature, sources) in boundaries {
-        out.push(feature, sources);
+    for (data, sources) in boundaries {
+        out.push(data, sources);
     }
     crosswalks(map, config, &mut out)?;
     stop_signs(map, &ids, &mut out);
-    let features = out.features;
-    let lanes = ids
-        .into_iter()
-        .map(|(lane, id)| (lane.clone(), id))
-        .collect();
-    Ok(Written { features, lanes })
+    let signals = signal_states(&context, out.trace);
+    Ok((out.features, signals))
+}
+
+/// What building a lane needs to know about the map, worked out once.
+struct Context<'a> {
+    map: &'a ValidatedMap,
+    ids: &'a HashMap<&'a LaneId, i64>,
+    /// Each written lane's centreline in travel order, by feature id − 1.
+    polylines: &'a [Vec<pb::MapPoint>],
+    /// The feature ids each written lane is entered from and exits to.
+    graph: HashMap<&'a LaneId, (Vec<i64>, Vec<i64>)>,
+    speeds: HashMap<&'a LaneId, SpeedLimit>,
+    sections: HashMap<(&'a RoadId, usize), BTreeMap<i32, SectionEdge<'a>>>,
 }
 
 /// The features under construction, and the trace of where each came from.
@@ -133,277 +154,219 @@ impl Features<'_> {
     }
 }
 
-/// A lane: its centreline in travel order, and everything it says about the lanes
-/// and lines around it.
-fn lane_feature(
-    map: &ValidatedMap,
-    lane: &Lane,
-    ids: &HashMap<&LaneId, i64>,
-    edges: &EdgeFeatures,
-    config: SamplingConfig,
-) -> Result<FeatureData, ExportError> {
-    let polyline = points(lane.travel_polyline(config)?.points());
-    let last = polyline.len().saturating_sub(1) as i32;
-    let written = |lanes: Vec<LaneId>| -> Vec<i64> {
-        lanes
-            .iter()
-            .filter_map(|lane| ids.get(lane).copied())
-            .collect()
-    };
+/// Entry and exit lanes for every written lane, from one pass over the connections:
+/// the order of each list is the connections' own.
+fn graph<'a>(
+    map: &'a ValidatedMap,
+    ids: &HashMap<&'a LaneId, i64>,
+) -> HashMap<&'a LaneId, (Vec<i64>, Vec<i64>)> {
+    let mut graph: HashMap<&LaneId, (Vec<i64>, Vec<i64>)> = HashMap::new();
+    for connection in map.connections.iter() {
+        let (from, to) = (&connection.from.lane, &connection.to.lane);
+        let (Some(&from_id), Some(&to_id)) = (ids.get(from), ids.get(to)) else {
+            continue;
+        };
+        graph.entry(from).or_default().1.push(to_id);
+        graph.entry(to).or_default().0.push(from_id);
+    }
+    graph
+}
 
-    // Which edge is on the driver's left: the lane's own left for a lane that runs
-    // with the road's reference line, its right for one that runs against it.
-    let (left, right) = if lane.direction == Direction::Forward {
-        (lane.left_edge, lane.right_edge)
-    } else {
-        (lane.right_edge, lane.left_edge)
-    };
-    let boundary = |edge: i32| -> Vec<pb::BoundarySegment> {
-        edges
-            .get(&(lane.road.clone(), lane.section, edge))
-            .map(|written| vec![written.segment(last)])
-            .unwrap_or_default()
-    };
-    let neighbors = |edge: i32| -> Result<Vec<pb::LaneNeighbor>, ExportError> {
-        let Some(other) = across(map, lane, edge) else {
-            return Ok(Vec::new());
+/// The limit each lane a speed-limit rule names is held to: where several rules
+/// name one lane, the lowest, which is the one a driver has to keep to — as the
+/// SUMO export reads it.
+fn rule_speeds(map: &ValidatedMap) -> HashMap<&LaneId, SpeedLimit> {
+    let mut speeds: HashMap<&LaneId, SpeedLimit> = HashMap::new();
+    for rule in &map.rules {
+        let TrafficRule::SpeedLimit { limit, lanes } = rule else {
+            continue;
         };
-        let Some(&feature_id) = ids.get(&other.id) else {
-            return Ok(Vec::new());
-        };
-        let written = edges.get(&(lane.road.clone(), lane.section, edge));
-        // A kerb between two lanes is a median: they are side by side, but nobody
-        // changes lanes across it.
-        if written.is_some_and(|written| written.is_edge) {
-            return Ok(Vec::new());
+        for lane in lanes {
+            speeds
+                .entry(lane)
+                .and_modify(|held| {
+                    if limit.mps() < held.mps() {
+                        *held = *limit;
+                    }
+                })
+                .or_insert(*limit);
         }
-        let theirs = other
-            .travel_polyline(config)?
-            .points()
-            .len()
-            .saturating_sub(1) as i32;
-        Ok(vec![pb::LaneNeighbor {
-            feature_id: Some(feature_id),
-            self_start_index: Some(0),
-            self_end_index: Some(last),
-            neighbor_start_index: Some(0),
-            neighbor_end_index: Some(theirs),
-            boundaries: written
-                .map(|written| vec![written.segment(last)])
-                .unwrap_or_default(),
-        }])
-    };
-
-    Ok(FeatureData::Lane(pb::LaneCenter {
-        speed_limit_mph: speed_limit(map, lane).map(|mps| mps / MPS_PER_MPH),
-        r#type: Some(lane_type(map, lane) as i32),
-        interpolating: Some(map.road(&lane.road).is_some_and(|road| road.is_connector())),
-        polyline,
-        entry_lanes: written(map.predecessors(&lane.id)),
-        exit_lanes: written(map.successors(&lane.id)),
-        left_boundaries: boundary(left),
-        right_boundaries: boundary(right),
-        left_neighbors: neighbors(left)?,
-        right_neighbors: neighbors(right)?,
-    }))
-}
-
-/// The lane on the other side of `edge` from `lane` in its cross-section, when it is
-/// one going the same way: WOMD's neighbours are only those.
-fn across<'a>(map: &'a ValidatedMap, lane: &Lane, edge: i32) -> Option<&'a Lane> {
-    map.lanes_of_section(&lane.road, lane.section)
-        .into_iter()
-        .find(|other| {
-            other.id != lane.id
-                && ((edge == lane.left_edge && other.right_edge == edge)
-                    || (edge == lane.right_edge && other.left_edge == edge))
-        })
-        .filter(|other| other.direction == lane.direction && other.lane_type.is_drivable())
-}
-
-/// The lane's limit in metres per second: a rule naming the lane, else the lane's
-/// own, which already carries its road's.
-fn speed_limit(map: &ValidatedMap, lane: &Lane) -> Option<f64> {
-    map.rules
-        .iter()
-        .find_map(|rule| match rule {
-            TrafficRule::SpeedLimit { limit, lanes } if lanes.contains(&lane.id) => Some(*limit),
-            _ => None,
-        })
-        .or(lane.speed_limit)
-        .map(|limit| limit.mps())
-}
-
-/// Which WOMD lane type a lane is: a bike lane is its own, and the rest of the
-/// distinction is the road's — the same reading the GPUDrive export makes.
-fn lane_type(map: &ValidatedMap, lane: &Lane) -> lane_center::LaneType {
-    use lane_center::LaneType as T;
-    if lane.lane_type == LaneType::Biking {
-        return T::TypeBikeLane;
     }
-    match map.road(&lane.road) {
-        Some(road) if road.form.is_controlled_access() => T::TypeFreeway,
-        Some(road) if road.road_type == RoadType::Motorway => T::TypeFreeway,
-        Some(_) => T::TypeSurfaceStreet,
-        None => T::TypeUndefined,
-    }
+    speeds
 }
 
 /// A boundary feature as the lanes beside it refer to it.
 struct EdgeFeature {
     id: i64,
-    /// A `RoadEdge` rather than a `RoadLine`.
-    is_edge: bool,
-    /// The line's type; `TYPE_UNKNOWN` for an edge, as WOMD has it.
-    line_type: road_line::RoadLineType,
+    /// The line's type; `None` for a road edge.
+    line: Option<road_line::RoadLineType>,
 }
 
 impl EdgeFeature {
     /// The boundary as it runs the whole length of a lane whose last vertex is `last`.
+    /// A road edge's type is `TYPE_UNKNOWN`, as WOMD has it.
     fn segment(&self, last: i32) -> pb::BoundarySegment {
         pb::BoundarySegment {
             lane_start_index: Some(0),
             lane_end_index: Some(last),
             boundary_feature_id: Some(self.id),
-            boundary_type: Some(self.line_type as i32),
+            boundary_type: Some(self.line.unwrap_or(road_line::RoadLineType::TypeUnknown) as i32),
         }
     }
 }
 
 /// The boundary features, by the road, cross-section and edge index they lie on.
-type EdgeFeatures = HashMap<(RoadId, usize, i32), EdgeFeature>;
+type EdgeFeatures<'a> = HashMap<(&'a RoadId, usize, i32), EdgeFeature>;
 
-/// What sits against one cross-section edge.
-#[derive(Default)]
-struct Edge<'a> {
-    /// The lane whose `right_edge` it is.
-    left: Option<&'a Lane>,
-    /// The lane whose `left_edge` it is.
-    right: Option<&'a Lane>,
-}
+impl<'a> Context<'a> {
+    /// A lane: its centreline in travel order, and everything it says about the
+    /// lanes and lines around it.
+    fn lane_feature(&self, lane: &Lane, index: usize, edges: &EdgeFeatures) -> FeatureData {
+        let polyline = self.polylines[index].clone();
+        let last = last_index(&polyline);
 
-impl<'a> Edge<'a> {
-    /// The curve and the paint, from the lane on the right when there is one — the
-    /// same fixed choice the GPUDrive export makes.
-    fn boundary(&self) -> Option<(&'a Curve3, BoundaryMarking)> {
-        self.right
-            .map(|lane| (&lane.left_boundary, lane.left_marking))
-            .or_else(|| {
-                self.left
-                    .map(|lane| (&lane.right_boundary, lane.right_marking))
-            })
+        // Which edge is on the driver's left: the lane's own left for a lane that
+        // runs with the road's reference line, its right for one that runs against it.
+        let (left, right) = if lane.direction == Direction::Forward {
+            (lane.left_edge, lane.right_edge)
+        } else {
+            (lane.right_edge, lane.left_edge)
+        };
+        let side = |edge: i32| {
+            let written = edges.get(&(&lane.road, lane.section, edge));
+            let boundaries: Vec<pb::BoundarySegment> = written
+                .map(|written| written.segment(last))
+                .into_iter()
+                .collect();
+            // A kerb between two lanes is a median: they are side by side, but nobody
+            // changes lanes across it.
+            let neighbors = match (written, self.across(lane, edge)) {
+                (Some(EdgeFeature { line: None, .. }), _) | (_, None) => Vec::new(),
+                (_, Some(feature_id)) => vec![pb::LaneNeighbor {
+                    feature_id: Some(feature_id),
+                    self_start_index: Some(0),
+                    self_end_index: Some(last),
+                    neighbor_start_index: Some(0),
+                    neighbor_end_index: Some(last_index(&self.polylines[feature_id as usize - 1])),
+                    boundaries: boundaries.clone(),
+                }],
+            };
+            (boundaries, neighbors)
+        };
+        let (left_boundaries, left_neighbors) = side(left);
+        let (right_boundaries, right_neighbors) = side(right);
+        let (entry_lanes, exit_lanes) = self.graph.get(&lane.id).cloned().unwrap_or_default();
+
+        FeatureData::Lane(pb::LaneCenter {
+            speed_limit_mph: self
+                .speeds
+                .get(&lane.id)
+                .copied()
+                .or(lane.speed_limit)
+                .map(SpeedLimit::mph),
+            r#type: Some(self.lane_type(lane) as i32),
+            interpolating: Some(self.map.is_connector_lane(&lane.id)),
+            polyline,
+            entry_lanes,
+            exit_lanes,
+            left_boundaries,
+            right_boundaries,
+            left_neighbors,
+            right_neighbors,
+        })
     }
 
-    fn drivable_sides(&self) -> usize {
-        [self.left, self.right]
-            .iter()
-            .filter(|lane| lane.is_some_and(|lane| lane.lane_type.is_drivable()))
-            .count()
+    /// The feature id of the lane on the other side of `edge` from `lane`, when it
+    /// is written and goes the same way: WOMD's neighbours are only those.
+    fn across(&self, lane: &Lane, edge: i32) -> Option<i64> {
+        let sides = self.sections.get(&(&lane.road, lane.section))?.get(&edge)?;
+        let other = sides.lanes().find(|other| other.id != lane.id)?;
+        (other.direction == lane.direction)
+            .then(|| self.ids.get(&other.id).copied())
+            .flatten()
     }
 
-    fn sources(&self, role: &'static str) -> Vec<Source> {
-        let lanes: Vec<&Lane> = [self.left, self.right].into_iter().flatten().collect();
-        let relation = Relation::shared_by(lanes.len());
-        lanes
-            .into_iter()
-            .map(|lane| Source {
-                ir: IrRef::Lane(lane.id.clone()),
-                relation,
-                role: Some(role),
-            })
-            .collect()
-    }
-}
-
-/// What a boundary is in WOMD's terms.
-enum Boundary {
-    Edge(road_edge::RoadEdgeType),
-    Line(road_line::RoadLineType),
-}
-
-/// The edges and lines of every cross-section, numbered from `first`, into
-/// `features` with their sources; and how the lanes beside each find it.
-fn edges_and_lines(
-    map: &ValidatedMap,
-    config: SamplingConfig,
-    first: i64,
-    features: &mut Vec<(FeatureData, Vec<Source>)>,
-) -> Result<EdgeFeatures, ExportError> {
-    let mut written = EdgeFeatures::new();
-    for road in map.roads.iter() {
-        if road.is_connector() {
-            continue;
+    /// Which WOMD lane type a lane is: a bike lane is its own, and the rest of the
+    /// distinction is the road's — the same reading the GPUDrive export makes.
+    fn lane_type(&self, lane: &Lane) -> lane_center::LaneType {
+        use lane_center::LaneType as T;
+        if lane.lane_type == LaneType::Biking {
+            return T::TypeBikeLane;
         }
+        match self.map.road(&lane.road) {
+            Some(road) if road.is_freeway() => T::TypeFreeway,
+            Some(_) => T::TypeSurfaceStreet,
+            None => T::TypeUndefined,
+        }
+    }
+}
+
+/// The edges and lines of every cross-section but a connector's, numbered from
+/// `first` in the order they come back, with their sources; and how the lanes
+/// beside each find it.
+#[allow(clippy::type_complexity)]
+fn edges_and_lines<'a>(
+    context: &Context<'a>,
+    first: i64,
+    config: SamplingConfig,
+) -> Result<(Vec<(FeatureData, Vec<Source>)>, EdgeFeatures<'a>), ExportError> {
+    let mut features = Vec::new();
+    let mut written = EdgeFeatures::new();
+    for road in context.map.roads.iter().filter(|road| !road.is_connector()) {
         for section in 0..road.sections.len() {
-            let lanes = map.lanes_of_section(&road.id, section);
-            for (&index, edge) in &edges_of(&lanes) {
-                let Some((curve, marking)) = edge.boundary() else {
-                    continue;
-                };
-                let Some(boundary) = classify(edge, marking) else {
+            let Some(edges) = context.sections.get(&(&road.id, section)) else {
+                continue;
+            };
+            for (&index, edge) in edges {
+                let Some((curve, kind)) = edge.kind() else {
                     continue;
                 };
                 let polyline = points(curve.to_polyline(config)?.points());
                 if polyline.is_empty() {
                     continue;
                 }
-                let id = first + features.len() as i64;
-                let (data, feature, role) = match boundary {
-                    Boundary::Edge(kind) => (
-                        FeatureData::RoadEdge(pb::RoadEdge {
+                let (data, line, role) = match kind {
+                    EdgeKind::RoadBoundary | EdgeKind::Median => {
+                        let kind = if kind == EdgeKind::Median {
+                            road_edge::RoadEdgeType::TypeRoadEdgeMedian
+                        } else {
+                            road_edge::RoadEdgeType::TypeRoadEdgeBoundary
+                        };
+                        let edge = pb::RoadEdge {
                             r#type: Some(kind as i32),
                             polyline,
-                        }),
-                        EdgeFeature {
-                            id,
-                            is_edge: true,
-                            line_type: road_line::RoadLineType::TypeUnknown,
-                        },
-                        "road_edge",
-                    ),
-                    Boundary::Line(kind) => (
-                        FeatureData::RoadLine(pb::RoadLine {
+                        };
+                        (FeatureData::RoadEdge(edge), None, "road_edge")
+                    }
+                    EdgeKind::Line(marking) => {
+                        let kind = line_type(marking);
+                        let line = pb::RoadLine {
                             r#type: Some(kind as i32),
                             polyline,
-                        }),
-                        EdgeFeature {
-                            id,
-                            is_edge: false,
-                            line_type: kind,
-                        },
-                        "road_line",
-                    ),
+                        };
+                        (FeatureData::RoadLine(line), Some(kind), "road_line")
+                    }
                 };
-                features.push((data, edge.sources(role)));
-                written.insert((road.id.clone(), section, index), feature);
+                let id = first + features.len() as i64;
+                written.insert((&road.id, section, index), EdgeFeature { id, line });
+                features.push((data, edge_sources(edge, role)));
             }
         }
     }
-    Ok(written)
+    Ok((features, written))
 }
 
-/// The edges of one cross-section, keyed by edge index.
-fn edges_of<'a>(lanes: &[&'a Lane]) -> BTreeMap<i32, Edge<'a>> {
-    let mut edges: BTreeMap<i32, Edge<'a>> = BTreeMap::new();
-    for lane in lanes {
-        edges.entry(lane.left_edge).or_default().right = Some(lane);
-        edges.entry(lane.right_edge).or_default().left = Some(lane);
-    }
-    edges
-}
-
-/// What an edge becomes, or `None` when WOMD has nothing to say about it.
-fn classify(edge: &Edge<'_>, marking: BoundaryMarking) -> Option<Boundary> {
-    use road_edge::RoadEdgeType as E;
-    match edge.drivable_sides() {
-        0 => None,
-        1 => Some(Boundary::Edge(E::TypeRoadEdgeBoundary)),
-        _ => match marking.marking {
-            RoadMarking::Curbstone => Some(Boundary::Edge(E::TypeRoadEdgeMedian)),
-            RoadMarking::None => None,
-            _ => Some(Boundary::Line(line_type(marking))),
-        },
-    }
+/// The lanes either side of an edge, each linked to the one feature written for it:
+/// `Merged` when two lanes share the edge, `Exact` when only one touches it.
+fn edge_sources(edge: &SectionEdge<'_>, role: &'static str) -> Vec<Source> {
+    let relation = Relation::shared_by(edge.lanes().count());
+    edge.lanes()
+        .map(|lane| Source {
+            ir: IrRef::Lane(lane.id.clone()),
+            relation,
+            role: Some(role),
+        })
+        .collect()
 }
 
 /// Which WOMD line type a marking is written as.
@@ -434,17 +397,22 @@ fn crosswalks(
     config: SamplingConfig,
     out: &mut Features,
 ) -> Result<(), ExportError> {
-    for object in objects_of(map, |kind| matches!(kind, MapObjectKind::Crosswalk)) {
-        if let ObjectGeometry::Band { left, right } = &object.geometry {
-            let mut polygon = points(left.to_polyline(config)?.points());
-            let mut back = points(right.to_polyline(config)?.points());
-            back.reverse();
-            polygon.extend(back);
-            out.push(
-                FeatureData::Crosswalk(pb::Crosswalk { polygon }),
-                vec![Source::exact(object.id.clone())],
-            );
-        }
+    let crossings = map
+        .objects
+        .iter()
+        .filter(|object| matches!(object.kind, MapObjectKind::Crosswalk));
+    for object in crossings {
+        let ObjectGeometry::Band { left, right } = &object.geometry else {
+            continue;
+        };
+        let mut polygon = points(left.to_polyline(config)?.points());
+        let mut back = points(right.to_polyline(config)?.points());
+        back.reverse();
+        polygon.extend(back);
+        out.push(
+            FeatureData::Crosswalk(pb::Crosswalk { polygon }),
+            vec![Source::exact(object.id.clone())],
+        );
     }
     Ok(())
 }
@@ -452,10 +420,11 @@ fn crosswalks(
 /// A stop sign, at the middle of the bar the IR hangs it on, naming the lanes it
 /// controls.
 fn stop_signs(map: &ValidatedMap, ids: &HashMap<&LaneId, i64>, out: &mut Features) {
-    for object in objects_of(map, |kind| match kind {
-        MapObjectKind::TrafficSign { code } => is_stop_sign(code),
-        _ => false,
-    }) {
+    for object in map
+        .objects
+        .iter()
+        .filter(|object| object.kind.is_stop_sign())
+    {
         let position = match &object.geometry {
             ObjectGeometry::Point(point) => *point,
             ObjectGeometry::Line(bar) => bar.start_point().lerp(bar.end_point(), 0.5),
@@ -475,104 +444,43 @@ fn stop_signs(map: &ValidatedMap, ids: &HashMap<&LaneId, i64>, out: &mut Feature
     }
 }
 
-/// Whether a sign's catalogue code names a stop sign: the spellings the GPUDrive
-/// export recognises, since the IR defines no catalogue of its own.
-pub fn is_stop_sign(code: &str) -> bool {
-    let code = code.trim().to_ascii_lowercase().replace([' ', '_'], "-");
-    code.starts_with("stop") || code == "r1-1" || code == "206"
-}
-
-/// One step's signal states: a lane state for every lane through a junction a
-/// traffic light governs, stopping where the lane begins.
+/// One step's signal states: a lane state for every lane a traffic light's state is
+/// carried by ([`roadgen_core::Map::signal_carriers`]: the lanes through the junction
+/// its approaches feed), stopping where the lane begins.
 ///
-/// The IR's traffic-light rule names the approaches, the lanes that stop for the
-/// light. WOMD gives a signal's state to the lane through the intersection, with
-/// the stop point at its mouth, so each approach hands the state on to the junction
-/// connectors it feeds — the reading the Lanelet2 export makes — and keeps it
-/// itself only when it feeds none. The IR holds no timing, so every state is
-/// `LANE_STATE_UNKNOWN`: what a light shows is the simulator's to decide.
-pub fn signal_states(
-    map: &ValidatedMap,
-    written: &Written,
-    trace: &mut Trace,
-) -> Vec<pb::TrafficSignalLaneState> {
-    let mut states: Vec<pb::TrafficSignalLaneState> = Vec::new();
-    let mut links: Vec<(usize, i64)> = Vec::new();
-    for (index, rule) in map.rules.iter().enumerate() {
+/// The IR holds no timing, so every state is `LANE_STATE_UNKNOWN`: what a light
+/// shows is the simulator's to decide.
+fn signal_states(context: &Context, trace: &mut Trace) -> Vec<pb::TrafficSignalLaneState> {
+    let mut states = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, rule) in context.map.rules.iter().enumerate() {
         let TrafficRule::TrafficLight { lanes, .. } = rule else {
             continue;
         };
-        for lane in junction_lanes(map, lanes) {
-            let Some(&id) = written.lanes.get(&lane) else {
+        for lane in context.map.signal_carriers(lanes) {
+            let Some(&id) = context.ids.get(&lane) else {
                 continue;
             };
-            let Some(FeatureData::Lane(center)) = written
-                .features
-                .get(id as usize - 1)
-                .and_then(|feature| feature.feature_data.as_ref())
-            else {
-                continue;
-            };
-            links.push((index, id));
-            if states.iter().any(|state| state.lane == Some(id)) {
-                continue;
+            trace.link_as(
+                IrRef::Rule(index),
+                format!("signal:{id}"),
+                Relation::Part,
+                "traffic_light",
+            );
+            if seen.insert(id) {
+                states.push(pb::TrafficSignalLaneState {
+                    lane: Some(id),
+                    state: Some(traffic_signal_lane_state::State::LaneStateUnknown as i32),
+                    stop_point: context.polylines[id as usize - 1].first().cloned(),
+                });
             }
-            states.push(pb::TrafficSignalLaneState {
-                lane: Some(id),
-                state: Some(traffic_signal_lane_state::State::LaneStateUnknown as i32),
-                stop_point: center.polyline.first().cloned(),
-            });
         }
-    }
-    for (index, id) in links {
-        trace.link_as(
-            IrRef::Rule(index),
-            format!("signal:{id}"),
-            Relation::Part,
-            "traffic_light",
-        );
     }
     states
 }
 
-/// The lanes a traffic light's state is given to, for a rule over `lanes`.
-fn junction_lanes(map: &ValidatedMap, lanes: &[LaneId]) -> Vec<LaneId> {
-    let connector = |lane: &LaneId| {
-        map.lane(lane)
-            .and_then(|lane| map.road(&lane.road))
-            .is_some_and(|road| road.is_connector())
-    };
-    let mut carriers: Vec<LaneId> = Vec::new();
-    for lane in lanes {
-        let through: Vec<LaneId> = if connector(lane) {
-            Vec::new()
-        } else {
-            map.successors(lane)
-                .into_iter()
-                .filter(|next| connector(next))
-                .collect()
-        };
-        let held = if through.is_empty() {
-            vec![lane.clone()]
-        } else {
-            through
-        };
-        for lane in held {
-            if !carriers.contains(&lane) {
-                carriers.push(lane);
-            }
-        }
-    }
-    carriers
-}
-
-pub(crate) fn objects_of<'a>(
-    map: &'a ValidatedMap,
-    wanted: impl Fn(&MapObjectKind) -> bool + 'a,
-) -> impl Iterator<Item = &'a MapObject> {
-    map.objects
-        .iter()
-        .filter(move |object| wanted(&object.kind))
+fn last_index(polyline: &[pb::MapPoint]) -> i32 {
+    polyline.len().saturating_sub(1) as i32
 }
 
 fn point(point: Point3) -> pb::MapPoint {

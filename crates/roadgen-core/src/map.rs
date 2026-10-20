@@ -6,7 +6,7 @@
 //! junctions, the connections between them, 3D geometry and semantics — with each of
 //! those concerns kept in its own module.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::arena::Arena;
 use crate::buildings::{Building, BuildingPart};
@@ -21,7 +21,8 @@ use crate::id::{
 };
 use crate::land_cover::LandCover;
 use crate::semantics::{
-    BoundaryMarking, FormOfWay, LaneType, MapObject, PavementProfile, RoadType, TrafficRule,
+    BoundaryMarking, FormOfWay, LaneType, MapObject, PavementProfile, RoadMarking, RoadType,
+    TrafficRule,
 };
 use crate::site::Site;
 use crate::structure::{GradeSeparation, Interchange, Structure, StructureProfile};
@@ -251,6 +252,12 @@ impl Road {
         self.junction.is_some()
     }
 
+    /// A freeway's road: controlled access by its form of way, or a motorway by its
+    /// type, whatever the other says.
+    pub fn is_freeway(&self) -> bool {
+        self.form.is_controlled_access() || self.road_type == RoadType::Motorway
+    }
+
     /// The station range section `index` covers: from its own station to the next
     /// one's, or to the end of the road.
     pub fn section_range(&self, index: usize) -> Result<(f64, f64), GeometryError> {
@@ -441,6 +448,71 @@ impl Lane {
     }
 }
 
+/// One cross-section edge, from the edge's own point of view: the lanes either side.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SectionEdge<'a> {
+    /// The lane to the left of the edge, whose `right_edge` it is.
+    pub left: Option<&'a Lane>,
+    /// The lane to the right of it, whose `left_edge` it is.
+    pub right: Option<&'a Lane>,
+}
+
+/// What a cross-section edge is to a format that draws the drivable surface: the
+/// reading the GPUDrive and WOMD exports share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// The drivable surface ends here, whatever is painted on it.
+    RoadBoundary,
+    /// A kerb between two drivable lanes: something hit rather than crossed.
+    Median,
+    /// Paint between two drivable lanes.
+    Line(BoundaryMarking),
+}
+
+impl<'a> SectionEdge<'a> {
+    /// The curve and the paint, from the lane on the right when there is one — an
+    /// arbitrary but fixed choice; the two answers differ only in a map that said
+    /// two different things about one line.
+    pub fn boundary(&self) -> Option<(&'a Curve3, BoundaryMarking)> {
+        self.right
+            .map(|lane| (&lane.left_boundary, lane.left_marking))
+            .or_else(|| {
+                self.left
+                    .map(|lane| (&lane.right_boundary, lane.right_marking))
+            })
+    }
+
+    /// How many of the lanes either side are drivable.
+    pub fn drivable_sides(&self) -> usize {
+        [self.left, self.right]
+            .iter()
+            .filter(|lane| lane.is_some_and(|lane| lane.lane_type.is_drivable()))
+            .count()
+    }
+
+    /// The lanes either side, left first.
+    pub fn lanes(&self) -> impl Iterator<Item = &'a Lane> {
+        [self.left, self.right].into_iter().flatten()
+    }
+
+    /// What the edge is, with its curve, or `None` when it bounds nothing anyone
+    /// drives — out in the verge or between two footways — or is two drivable lanes
+    /// with no paint between them.
+    pub fn kind(&self) -> Option<(&'a Curve3, EdgeKind)> {
+        let (curve, marking) = self.boundary()?;
+        let kind = match self.drivable_sides() {
+            0 => return None,
+            1 => EdgeKind::RoadBoundary,
+            _ => match marking.marking {
+                RoadMarking::Curbstone => EdgeKind::Median,
+                RoadMarking::None => return None,
+                _ => EdgeKind::Line(marking),
+            },
+        };
+        Some((curve, kind))
+    }
+}
+
 /// The map itself: everything the generator produced, before or after validation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Map {
@@ -588,6 +660,60 @@ impl Map {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The edges of one cross-section, keyed by edge index (see [`Lane::left_edge`]),
+    /// each with the lanes either side of it — so that two lanes meeting at an edge
+    /// make one entry rather than two.
+    pub fn section_edges(&self, road: &RoadId, section: usize) -> BTreeMap<i32, SectionEdge<'_>> {
+        let mut edges: BTreeMap<i32, SectionEdge<'_>> = BTreeMap::new();
+        for lane in self.lanes_of_section(road, section) {
+            edges.entry(lane.left_edge).or_default().right = Some(lane);
+            edges.entry(lane.right_edge).or_default().left = Some(lane);
+        }
+        edges
+    }
+
+    /// Whether `lane` is on a road through a junction.
+    pub fn is_connector_lane(&self, lane: &LaneId) -> bool {
+        self.lane(lane)
+            .and_then(|lane| self.road(&lane.road))
+            .is_some_and(Road::is_connector)
+    }
+
+    /// The lanes a traffic light's state is carried by, for a rule over `lanes`.
+    ///
+    /// The IR's rule is about the approaches, the lanes that stop for the light.
+    /// OpenDRIVE refers to a junction's light from the connecting roads, though,
+    /// Lanelet2 maps for Autoware hang it on the lanelets through the intersection,
+    /// and WOMD gives the state to the lane through it. So each approach gives way
+    /// to the junction connectors it feeds; a lane that is a connector already, or
+    /// that feeds none (a light short of no junction), keeps it itself. Each lane
+    /// comes once, in the order first reached.
+    pub fn signal_carriers(&self, lanes: &[LaneId]) -> Vec<LaneId> {
+        let mut carriers: Vec<LaneId> = Vec::new();
+        let mut seen: HashSet<LaneId> = HashSet::new();
+        for lane in lanes {
+            let through: Vec<LaneId> = if self.is_connector_lane(lane) {
+                Vec::new()
+            } else {
+                self.successors(lane)
+                    .into_iter()
+                    .filter(|next| self.is_connector_lane(next))
+                    .collect()
+            };
+            let held = if through.is_empty() {
+                vec![lane.clone()]
+            } else {
+                through
+            };
+            for lane in held {
+                if seen.insert(lane.clone()) {
+                    carriers.push(lane);
+                }
+            }
+        }
+        carriers
     }
 
     /// Lanes of a road, in cross-section order.
