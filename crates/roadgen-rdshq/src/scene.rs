@@ -18,6 +18,10 @@ use roadgen_core::ValidatedMap;
 
 use crate::error::ExportError;
 use crate::wds::{npy, npy_matrix, Sample};
+use crate::Shard;
+
+/// The camera the toolkit's single-view dataset configuration renders.
+pub const DEFAULT_CAMERA: &str = "camera:front_wide_120fov";
 
 /// How many coefficients an f-theta polynomial has in an RDS-HQ intrinsics array.
 const FTHETA_COEFFICIENTS: usize = 6;
@@ -27,18 +31,21 @@ const FTHETA_COEFFICIENTS: usize = 6;
 /// equidistant 120° lens the name describes, mounted where ClipGT's example rig puts
 /// it.
 pub fn default_sensors() -> Vec<Sensor> {
-    let width = 1920;
-    let focal = (width as f64 / 2.0) / 60.0_f64.to_radians();
+    let (width, height) = (1920, 1080);
+    let polynomial_type = PolynomialType::AngleToPixelDistance;
+    let polynomial =
+        roadgen_clipgt::scenario::equidistant(DEFAULT_CAMERA, width, 120.0, polynomial_type)
+            .expect("120° is a lens");
     vec![Sensor {
-        name: "camera:front_wide_120fov".into(),
+        name: DEFAULT_CAMERA.into(),
         position: [1.7, 0.0, 1.45],
         roll_pitch_yaw: [0.0; 3],
         width,
-        height: 1080,
-        cx: 960.0,
-        cy: 540.0,
-        polynomial: vec![0.0, focal, 0.0, 0.0, 0.0, 0.0],
-        polynomial_type: PolynomialType::AngleToPixelDistance,
+        height,
+        cx: width as f64 / 2.0,
+        cy: height as f64 / 2.0,
+        polynomial,
+        polynomial_type,
         linear: [1.0, 0.0, 0.0],
     }]
 }
@@ -52,14 +59,21 @@ pub fn sensors(config: &ClipConfig) -> Vec<Sensor> {
     }
 }
 
-/// The scene's shards, as `(folder, sample)`, in the order they are written.
-pub fn all(
-    map: &ValidatedMap,
-    config: &ClipConfig,
-    clip: &str,
-) -> Result<Vec<(&'static str, Sample)>, ExportError> {
+/// The scene's shards, in the order they are written.
+pub fn all(map: &ValidatedMap, config: &ClipConfig, clip: &str) -> Result<Vec<Shard>, ExportError> {
     let poses = roadgen_clipgt::layers::poses(map, config)?;
     let sensors = sensors(config);
+    // Where each camera sits on the rig, and the name its poses are filed under,
+    // are the same at every frame.
+    let mounts: Vec<(String, Matrix)> = sensors
+        .iter()
+        .map(|sensor| {
+            (
+                format!(".pose.{}.npy", sensor.canonical_name()),
+                sensor_to_rig(sensor),
+            )
+        })
+        .collect();
 
     let mut vehicle = Sample::new(clip);
     let mut cameras = Sample::new(clip);
@@ -68,12 +82,9 @@ pub fn all(
     for (frame, pose) in poses.iter().enumerate() {
         let rig = rig_to_world(pose);
         vehicle.push(format!("{frame:06}.vehicle_pose.npy"), npy_matrix(&rig));
-        for sensor in &sensors {
-            let camera = opencv_from_flu(&multiply(&rig, &sensor_to_rig(sensor)));
-            cameras.push(
-                format!("{frame:06}.pose.{}.npy", sensor.canonical_name()),
-                npy_matrix(&camera),
-            );
+        for (suffix, mount) in &mounts {
+            let camera = opencv_from_flu(&multiply(&rig, mount));
+            cameras.push(format!("{frame:06}{suffix}"), npy_matrix(&camera));
         }
         timestamps.push(
             format!("{frame:06}.timestamp_micros.txt"),
@@ -82,10 +93,7 @@ pub fn all(
         // The IR has no traffic, so every frame has no objects in it — written out
         // rather than left missing, because a reader fills a missing frame by
         // interpolating between the frames either side of it.
-        objects.push_json(
-            format!("{frame:06}.all_object_info.json"),
-            &serde_json::json!({}),
-        );
+        objects.push(format!("{frame:06}.all_object_info.json"), b"{}".to_vec());
     }
 
     let mut ftheta = Sample::new(clip);
@@ -104,14 +112,20 @@ pub fn all(
         }
     }
 
-    Ok(vec![
+    Ok([
         ("pose", cameras),
         ("vehicle_pose", vehicle),
         ("timestamp", timestamps),
         ("all_object_info", objects),
         ("ftheta_intrinsic", ftheta),
         ("pinhole_intrinsic", pinhole),
-    ])
+    ]
+    .into_iter()
+    .map(|(folder, sample)| Shard {
+        folder: folder.to_owned(),
+        sample,
+    })
+    .collect())
 }
 
 /// `cx, cy, width, height`, the six polynomial coefficients, whether the polynomial
@@ -170,30 +184,14 @@ pub fn pinhole_intrinsic(sensor: &Sensor) -> Option<[f64; 6]> {
 
 type Matrix = [[f64; 4]; 4];
 
-/// The rig's pose: the track's orientation, a unit quaternion `(x, y, z, w)` taking
-/// forward-left-up into the map, and its position.
+/// The rig's pose: the track's axes as the rotation's columns, and its position.
 fn rig_to_world(pose: &Pose) -> Matrix {
-    let [x, y, z, w] = pose.orientation;
+    let [f, l, u] = pose.axes();
     let p = pose.position;
     [
-        [
-            1.0 - 2.0 * (y * y + z * z),
-            2.0 * (x * y - z * w),
-            2.0 * (x * z + y * w),
-            p.x,
-        ],
-        [
-            2.0 * (x * y + z * w),
-            1.0 - 2.0 * (x * x + z * z),
-            2.0 * (y * z - x * w),
-            p.y,
-        ],
-        [
-            2.0 * (x * z - y * w),
-            2.0 * (y * z + x * w),
-            1.0 - 2.0 * (x * x + y * y),
-            p.z,
-        ],
+        [f.x, l.x, u.x, p.x],
+        [f.y, l.y, u.y, p.y],
+        [f.z, l.z, u.z, p.z],
         [0.0, 0.0, 0.0, 1.0],
     ]
 }

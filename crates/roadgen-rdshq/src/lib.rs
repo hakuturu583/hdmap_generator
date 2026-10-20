@@ -88,23 +88,19 @@ pub fn to_shards_traced(
     let mut shards = Vec::new();
     for layer in labels::all_traced(map, &mut trace)? {
         let mut sample = Sample::new(clip);
-        sample.push_json(format!("{}.json", layer.name), &layer.document());
-        shards.push(Shard {
-            folder: format!("3d_{}", layer.name),
-            sample,
-        });
+        let folder = format!("3d_{}", layer.name);
+        let entry = format!("{}.json", layer.name);
+        sample.push(entry, layer.into_document().to_string().into_bytes());
+        shards.push(Shard { folder, sample });
     }
-    for (folder, sample) in scene::all(map, config, clip)? {
-        // A tar with nothing in it is not a sample, and a reader that opens one
-        // fails; a folder with no file for the clip is how the toolkit already
-        // spells "not available".
-        if !sample.entries.is_empty() {
-            shards.push(Shard {
-                folder: folder.to_owned(),
-                sample,
-            });
-        }
-    }
+    // A tar with nothing in it is not a sample, and a reader that opens one fails;
+    // a folder with no file for the clip is how the toolkit already spells "not
+    // available".
+    shards.extend(
+        scene::all(map, config, clip)?
+            .into_iter()
+            .filter(|shard| !shard.sample.entries.is_empty()),
+    );
     Ok((shards, trace))
 }
 
@@ -120,14 +116,14 @@ pub fn write(
 }
 
 /// [`write`], with the [`Trace`] of which IR element each label came from. The
-/// trace's files are the map layers' tars, in the order they were written.
+/// trace's files are the tars written, in the order they were written.
 pub fn write_traced(
     map: &ValidatedMap,
     root: impl AsRef<Path>,
     config: &ClipConfig,
 ) -> Result<(String, Trace), ExportError> {
     let root = root.as_ref();
-    let clip = clip_id(config)?.to_owned();
+    let clip = config.clip_id.clone();
     let (shards, mut trace) = to_shards_traced(map, config)?;
     let mut files: Vec<PathBuf> = Vec::new();
     for shard in shards {
@@ -136,9 +132,7 @@ pub fn write_traced(
             .map_err(|error| ExportError::Io(format!("{}: {error}", folder.display())))?;
         let path = folder.join(format!("{clip}.tar"));
         shard.sample.write(&path)?;
-        if shard.folder.starts_with("3d_") {
-            files.push(path);
-        }
+        files.push(path);
     }
     trace.files = files;
     Ok((clip, trace))
@@ -205,17 +199,19 @@ pub fn check(map: &ValidatedMap, config: Option<&ClipConfig>) -> Vec<String> {
              codes are not written"
         ));
     }
-    let mut trace = Trace::new(TRACE_FORMAT);
-    if let Ok(layers) = labels::all_traced(map, &mut trace) {
-        for layer in layers {
-            if layer.labels.len() == 1 && matches!(layer.name, "lanelines" | "traffic_lights") {
-                problems.push(format!(
-                    "the map has exactly one of {}: the toolkit's world-scenario \
-                     renderer reads a {} layer with one label as a placeholder for \
-                     none, so it will not draw it",
-                    layer.name, layer.name
-                ));
-            }
+    let lights = roadgen_clipgt::layers::device_frames(map, |kind| kind.is_traffic_light())
+        .map(|frames| frames.len())
+        .unwrap_or(0);
+    for (layer, count) in [
+        ("lanelines", labels::painted_edges(map).len()),
+        ("traffic_lights", lights),
+    ] {
+        if count == 1 {
+            problems.push(format!(
+                "the map has exactly one of {layer}: the toolkit's world-scenario \
+                 renderer reads a {layer} layer with one label as a placeholder for \
+                 none, so it will not draw it"
+            ));
         }
     }
 
@@ -245,21 +241,22 @@ pub fn check(map: &ValidatedMap, config: Option<&ClipConfig>) -> Vec<String> {
     }
     let sensors = scene::sensors(config);
     if config.sensors.is_empty() {
-        problems.push(
-            "the scenario configures no sensors, so the clip is given one: \
-             camera_front_wide_120fov, an equidistant 120° lens 1.7 m ahead of the \
-             rig and 1.45 m up"
-                .into(),
-        );
+        let camera = &sensors[0];
+        let [ahead, _, up] = camera.position;
+        problems.push(format!(
+            "the scenario configures no sensors, so the clip is given one: {}, an \
+             equidistant 120° lens {ahead} m ahead of the rig and {up} m up",
+            camera.canonical_name()
+        ));
     } else if !sensors
         .iter()
-        .any(|sensor| sensor.canonical_name() == "camera_front_wide_120fov")
+        .any(|sensor| sensor.name == scene::DEFAULT_CAMERA)
     {
-        problems.push(
-            "no camera is named camera:front_wide_120fov, which is the one camera the \
-             toolkit's single-view dataset configuration renders"
-                .into(),
-        );
+        problems.push(format!(
+            "no camera is named {}, which is the one camera the toolkit's single-view \
+             dataset configuration renders",
+            scene::DEFAULT_CAMERA
+        ));
     }
     for sensor in &sensors {
         if let Err(error) = scene::ftheta_intrinsic(sensor) {
@@ -287,16 +284,8 @@ pub fn check(map: &ValidatedMap, config: Option<&ClipConfig>) -> Vec<String> {
 
 /// A clip id has to be a single path component with no dots: it is the file name in
 /// every folder, and a WebDataset reader takes everything before a member's first
-/// dot as the sample's key.
+/// dot as the sample's key. ClipGT's rule is exactly that, so it is the one used.
 fn clip_id(config: &ClipConfig) -> Result<&str, ExportError> {
-    let id = config.clip_id.as_str();
-    let usable = !id.is_empty()
-        && id.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '-' || character == '_'
-        });
-    if usable {
-        Ok(id)
-    } else {
-        Err(ExportError::InvalidClipId(id.to_owned()))
-    }
+    roadgen_clipgt::validate_clip_id(&config.clip_id)
+        .map_err(|_| ExportError::InvalidClipId(config.clip_id.clone()))
 }

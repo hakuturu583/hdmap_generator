@@ -285,7 +285,7 @@ fn sensor_of(document: SensorDocument) -> Result<Sensor, ExportError> {
 ///
 /// This is a convenience, not a calibration. A real lens is measured; this is the
 /// textbook fisheye that a caller who only knows "120 degrees across" means.
-fn equidistant(
+pub fn equidistant(
     name: &str,
     width: u32,
     fov_degrees: f64,

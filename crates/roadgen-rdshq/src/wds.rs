@@ -32,18 +32,6 @@ impl Sample {
         self.entries.push((entry.into(), contents));
     }
 
-    pub fn push_json(&mut self, entry: impl Into<String>, value: &serde_json::Value) {
-        self.push(entry, value.to_string().into_bytes());
-    }
-
-    /// The entry's contents, if the sample has it.
-    pub fn get(&self, entry: &str) -> Option<&[u8]> {
-        self.entries
-            .iter()
-            .find(|(name, _)| name == entry)
-            .map(|(_, contents)| contents.as_slice())
-    }
-
     /// The sample as a tar archive.
     ///
     /// Every header has the same mode, owner and a zero timestamp, so writing the same
@@ -113,8 +101,7 @@ pub fn npy(shape: &[usize], values: &[f64]) -> Vec<u8> {
 
 /// A 4 × 4 matrix, rows first, as `.npy`.
 pub fn npy_matrix(matrix: &[[f64; 4]; 4]) -> Vec<u8> {
-    let values: Vec<f64> = matrix.iter().flatten().copied().collect();
-    npy(&[4, 4], &values)
+    npy(&[4, 4], matrix.as_flattened())
 }
 
 #[cfg(test)]

@@ -27,6 +27,18 @@ pub struct Pose {
     pub orientation: [f64; 4],
 }
 
+impl Pose {
+    /// The vehicle's forward, left and up axes in map coordinates — the columns of
+    /// the rotation [`Pose::orientation`] stands for.
+    pub fn axes(&self) -> [Vector3; 3] {
+        [
+            rotate(self.orientation, Vector3::new(1.0, 0.0, 0.0)),
+            rotate(self.orientation, Vector3::new(0.0, 1.0, 0.0)),
+            rotate(self.orientation, Vector3::new(0.0, 0.0, 1.0)),
+        ]
+    }
+}
+
 /// A point on the driven path, with the roll of the surface under it.
 #[derive(Debug, Clone, Copy)]
 struct Node {

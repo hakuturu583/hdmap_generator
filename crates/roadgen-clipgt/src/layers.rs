@@ -322,28 +322,18 @@ fn devices(
     wanted: impl Fn(&MapObjectKind) -> bool,
     dimensions: Point3,
 ) -> Result<Devices, ExportError> {
-    let config = map.metadata.sampling;
     let mut devices = Devices {
         centers: Vec::new(),
         dimensions: Vec::new(),
         orientations: Vec::new(),
         categories: Vec::new(),
     };
-    for object in objects_of(map, &wanted) {
-        let ObjectGeometry::Line(bar) = &object.geometry else {
-            continue;
-        };
-        let (from, to) = (bar.start_point(), bar.end_point());
-        let center = from.lerp(to, 0.5);
-        let facing = facing_of(map, object, center, config)?;
-
+    for (object, frame) in device_frames(map, wanted)? {
         let local = row_ref(layer, devices.centers.len());
         trace.link(object.id.clone(), local, Relation::Exact);
-        devices.centers.push(center);
+        devices.centers.push(frame.origin);
         devices.dimensions.push(dimensions);
-        devices
-            .orientations
-            .push(ego::orientation_of(&Frame3::from_tangent(center, facing)?));
+        devices.orientations.push(ego::orientation_of(&frame));
         devices.categories.push(match &object.kind {
             MapObjectKind::TrafficSign { code } => code.clone(),
             other => other.as_str().to_owned(),
@@ -352,9 +342,29 @@ fn devices(
     Ok(devices)
 }
 
+/// Where each wanted light or sign stands and which way it faces: centred on the
+/// middle of the bar the IR draws across the lanes, looking back at the traffic it
+/// governs. Every format that boxes a device boxes it here, so they all agree.
+pub fn device_frames<'a>(
+    map: &'a ValidatedMap,
+    wanted: impl Fn(&MapObjectKind) -> bool + 'a,
+) -> Result<Vec<(&'a MapObject, Frame3)>, ExportError> {
+    let config = map.metadata.sampling;
+    let mut frames = Vec::new();
+    for object in objects_of(map, wanted) {
+        let ObjectGeometry::Line(bar) = &object.geometry else {
+            continue;
+        };
+        let center = bar.start_point().lerp(bar.end_point(), 0.5);
+        let facing = facing_of(map, object, center, config)?;
+        frames.push((object, Frame3::from_tangent(center, facing)?));
+    }
+    Ok(frames)
+}
+
 /// Which way a device faces: back along the traffic it governs, so it looks at the
 /// drivers who have to read it.
-pub fn facing_of(
+fn facing_of(
     map: &Map,
     object: &MapObject,
     center: Point3,
@@ -392,7 +402,7 @@ fn object_bar_direction(object: &MapObject) -> Result<UnitVector3, ExportError> 
     }
 }
 
-fn objects_of<'a>(
+pub fn objects_of<'a>(
     map: &'a ValidatedMap,
     wanted: impl Fn(&MapObjectKind) -> bool + 'a,
 ) -> impl Iterator<Item = &'a MapObject> {
@@ -420,7 +430,7 @@ pub fn outer_boundaries<'a>(lanes: &[&'a Lane]) -> Vec<(i32, &'a Curve3)> {
 }
 
 /// A row's name in the trace: `<layer>:<row>`.
-fn row_ref(layer: &str, row: usize) -> String {
+pub fn row_ref(layer: &str, row: usize) -> String {
     format!("{layer}:{row}")
 }
 
@@ -507,7 +517,7 @@ fn convex_hull(points: &[Point3]) -> Vec<Point3> {
     hull
 }
 
-fn clipgt_color(color: roadgen_core::semantics::MarkingColor) -> &'static str {
+pub fn clipgt_color(color: roadgen_core::semantics::MarkingColor) -> &'static str {
     match color {
         roadgen_core::semantics::MarkingColor::White => "WHITE",
         roadgen_core::semantics::MarkingColor::Yellow => "YELLOW",
