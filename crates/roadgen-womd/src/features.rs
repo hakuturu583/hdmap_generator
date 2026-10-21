@@ -7,14 +7,19 @@
 //! or edge on either side of it, and a stop sign names the lanes it controls. So the
 //! map written here is a graph as well as a set of polylines.
 //!
-//! The same three decisions as the GPUDrive export hold, for the same reasons:
+//! Four decisions shape the features; the first two are the GPUDrive export's too,
+//! for the same reasons:
 //!
 //! - **One feature per cross-section edge.** An edge is the boundary of the drivable
 //!   surface or a painted line between lanes, not both — [`SectionEdge::kind`] says
 //!   which, for both exports.
 //! - **A junction connector has no edges.** Its centreline is written — marked
 //!   `interpolating`, which is what WOMD calls a lane through an intersection — and
-//!   its boundaries are not: there is no wall down the middle of a junction.
+//!   its boundaries are not: there is no wall down the middle of a junction. The
+//!   pavement round a junction's corner is the exception, below.
+//! - **A pavement's outline is a road edge.** WOMD has no footway, so a sidewalk is
+//!   not written as a lane, but its edges are, as `TYPE_UNKNOWN` road edges — the
+//!   kerb beside the carriageway is the carriageway's own `ROAD_EDGE_BOUNDARY`.
 //! - **The road edge stays whole where another road crosses over it.** Unlike
 //!   GPUDrive's, a WOMD point has a height, so a bridge's edges and the street's
 //!   beneath it are apart where they cross and nothing is cut.
@@ -26,7 +31,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use roadgen_core::geometry::{Point3, SamplingConfig};
+use roadgen_core::geometry::{Curve3, Point3, SamplingConfig};
 use roadgen_core::map::{EdgeKind, Lane, SectionEdge};
 use roadgen_core::semantics::{
     BoundaryMarking, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, TrafficRule,
@@ -301,7 +306,7 @@ impl<'a> Context<'a> {
     }
 }
 
-/// The edges and lines of every cross-section but a connector's, numbered from
+/// The edges and lines of every cross-section, numbered from
 /// `first` in the order they come back, with their sources; and how the lanes
 /// beside each find it.
 #[allow(clippy::type_complexity)]
@@ -312,13 +317,13 @@ fn edges_and_lines<'a>(
 ) -> Result<(Vec<(FeatureData, Vec<Source>)>, EdgeFeatures<'a>), ExportError> {
     let mut features = Vec::new();
     let mut written = EdgeFeatures::new();
-    for road in context.map.roads.iter().filter(|road| !road.is_connector()) {
+    for road in context.map.roads.iter() {
         for section in 0..road.sections.len() {
             let Some(edges) = context.sections.get(&(&road.id, section)) else {
                 continue;
             };
             for (&index, edge) in edges {
-                let Some((curve, kind)) = edge.kind() else {
+                let Some((curve, kind)) = classify(edge, road.is_connector()) else {
                     continue;
                 };
                 let polyline = points(curve.to_polyline(config)?.points());
@@ -326,19 +331,14 @@ fn edges_and_lines<'a>(
                     continue;
                 }
                 let (data, line, role) = match kind {
-                    EdgeKind::RoadBoundary | EdgeKind::Median => {
-                        let kind = if kind == EdgeKind::Median {
-                            road_edge::RoadEdgeType::TypeRoadEdgeMedian
-                        } else {
-                            road_edge::RoadEdgeType::TypeRoadEdgeBoundary
-                        };
+                    Boundary::Edge(kind) => {
                         let edge = pb::RoadEdge {
                             r#type: Some(kind as i32),
                             polyline,
                         };
                         (FeatureData::RoadEdge(edge), None, "road_edge")
                     }
-                    EdgeKind::Line(marking) => {
+                    Boundary::Line(marking) => {
                         let kind = line_type(marking);
                         let line = pb::RoadLine {
                             r#type: Some(kind as i32),
@@ -354,6 +354,43 @@ fn edges_and_lines<'a>(
         }
     }
     Ok((features, written))
+}
+
+/// What a cross-section edge is written as.
+enum Boundary {
+    Edge(road_edge::RoadEdgeType),
+    Line(BoundaryMarking),
+}
+
+/// What an edge becomes, with its curve, or `None` when WOMD has nothing to say
+/// about it.
+///
+/// The drivable surface's edges, medians and lines are [`SectionEdge::kind`]'s,
+/// except on a junction connector, which has none (see the module documentation).
+/// A footway's edges that no carriageway shares — the back of a pavement, both
+/// sides of the pavement round a junction's corner — are road edges too, of
+/// `TYPE_UNKNOWN`: WOMD has no footway, and the outline of one is still where the
+/// road's surroundings begin. The kerb between a pavement and the carriageway is
+/// the carriageway's own edge already.
+fn classify<'a>(edge: &SectionEdge<'a>, connector: bool) -> Option<(&'a Curve3, Boundary)> {
+    use road_edge::RoadEdgeType as E;
+    if edge.drivable_sides() == 0 {
+        let footway = edge
+            .lanes()
+            .any(|lane| lane.lane_type == LaneType::Sidewalk);
+        let (curve, _) = edge.boundary()?;
+        return footway.then_some((curve, Boundary::Edge(E::TypeUnknown)));
+    }
+    if connector {
+        return None;
+    }
+    let (curve, kind) = edge.kind()?;
+    let boundary = match kind {
+        EdgeKind::RoadBoundary => Boundary::Edge(E::TypeRoadEdgeBoundary),
+        EdgeKind::Median => Boundary::Edge(E::TypeRoadEdgeMedian),
+        EdgeKind::Line(marking) => Boundary::Line(marking),
+    };
+    Some((curve, boundary))
 }
 
 /// The lanes either side of an edge, each linked to the one feature written for it:

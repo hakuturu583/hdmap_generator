@@ -260,3 +260,69 @@ fn the_check_says_what_the_format_cannot_hold() {
     assert!(said("stop lines are dropped"));
     assert!(said("right-of-way"));
 }
+
+#[test]
+fn a_pavements_outline_goes_out_as_road_edges() {
+    let map = scenarios::sidewalk_crossroads(TrafficHandedness::RightHand);
+    let scenario = reread(&map);
+    let (_, trace) =
+        roadgen_womd::to_scenario_traced(&map, &ScenarioConfig::for_map(&map)).unwrap();
+    let edge_of = |id: i64| {
+        scenario
+            .map_features
+            .iter()
+            .find(|feature| feature.id == Some(id))
+            .and_then(|feature| match &feature.feature_data {
+                Some(FeatureData::RoadEdge(edge)) => Some(edge.r#type()),
+                _ => None,
+            })
+    };
+    let mut kinds = Vec::new();
+    for lane in map
+        .lanes
+        .iter()
+        .filter(|lane| lane.lane_type == LaneType::Sidewalk)
+    {
+        let edges: Vec<_> = trace
+            .links_of(&IrRef::Lane(lane.id.clone()))
+            .filter_map(|link| link.local.strip_prefix("feature:")?.parse().ok())
+            .filter_map(edge_of)
+            .collect();
+        assert!(!edges.is_empty(), "{} has no edge in the scenario", lane.id);
+        assert!(
+            map.lanes_of(&lane.road).len() > 1 || edges.len() == 2,
+            "a corner's pavement is bounded on both sides: {} has {edges:?}",
+            lane.id
+        );
+        kinds.extend(edges);
+    }
+    use pb::road_edge::RoadEdgeType;
+    assert!(
+        kinds.contains(&RoadEdgeType::TypeUnknown),
+        "the backs of the pavements"
+    );
+    assert!(
+        kinds.contains(&RoadEdgeType::TypeRoadEdgeBoundary),
+        "the kerbs, which the carriageway shares"
+    );
+    // No sidewalk is a lane.
+    let written: std::collections::HashSet<i64> =
+        lanes(&scenario).iter().map(|(id, _)| *id).collect();
+    for lane in map
+        .lanes
+        .iter()
+        .filter(|lane| lane.lane_type == LaneType::Sidewalk)
+    {
+        assert!(trace
+            .links_of(&IrRef::Lane(lane.id.clone()))
+            .filter(|link| link.relation == Relation::Exact && link.role.is_none())
+            .all(|link| !written.contains(
+                &link
+                    .local
+                    .strip_prefix("feature:")
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            )));
+    }
+}

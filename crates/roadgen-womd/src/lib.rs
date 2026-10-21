@@ -23,8 +23,8 @@
 //! - **Map features**, built in [`features`]: every drivable lane as its centreline
 //!   in travel order, with the lanes it is entered from and exits to, its
 //!   same-direction neighbours, and the line or edge on each side; the painted lines
-//!   and the edges of the drivable surface; crossings; stop signs, with the lanes
-//!   they control.
+//!   and the edges of the drivable surface; the outline of every pavement, as road
+//!   edges of unknown type; crossings; stop signs, with the lanes they control.
 //! - **Dynamic map states**: one per timestep, each holding the lanes a traffic
 //!   light governs with the point they stop at. The IR has no signal timing, so every
 //!   state is `LANE_STATE_UNKNOWN`.
@@ -287,7 +287,7 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
         problems.push(format!(
             "WOMD's lanes are lanes a vehicle or a bicycle travels, so the map's \
              {non_drivable} footways, verges and other lanes nobody drives are not \
-             written"
+             written as lanes; a footway's outline goes out as TYPE_UNKNOWN road edges"
         ));
     }
 
