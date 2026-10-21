@@ -1532,7 +1532,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "roadgen-buildings"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "roadgen-core",
  "symbios-shape",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-carla"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "opendrive",
  "roadgen-buildings",
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-clipgt"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "arrow",
  "parquet",
@@ -1567,11 +1567,11 @@ dependencies = [
 
 [[package]]
 name = "roadgen-core"
-version = "0.38.0"
+version = "0.38.1"
 
 [[package]]
 name = "roadgen-gpudrive"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "roadgen-core",
  "serde",
@@ -1581,7 +1581,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-integration-tests"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "arrow",
  "ll2-core",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-lanelet2"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "ll2-core",
  "ll2-io",
@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-opendrive"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "ll2-projection",
  "opendrive",
@@ -1640,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-osm"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "ll2-io",
  "ll2-projection",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-proto"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-python"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "pyo3",
  "roadgen-buildings",
@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-rdshq"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "roadgen-clipgt",
  "roadgen-core",
@@ -1693,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-sumo"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "ll2-projection",
  "quick-xml",
@@ -1702,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-trace"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "quick-xml",
  "roadgen-core",
@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-viewer"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "arrow",
  "bytes",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-womd"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "prost",
  "prost-build",
