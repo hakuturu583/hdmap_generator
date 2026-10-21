@@ -328,7 +328,7 @@ fn devices(
         orientations: Vec::new(),
         categories: Vec::new(),
     };
-    for (object, frame) in device_frames(map, wanted)? {
+    for (object, frame) in device_boxes(map, wanted, dimensions)? {
         let local = row_ref(layer, devices.centers.len());
         trace.link(object.id.clone(), local, Relation::Exact);
         devices.centers.push(frame.origin);
@@ -342,9 +342,10 @@ fn devices(
     Ok(devices)
 }
 
-/// Where each wanted light or sign stands and which way it faces: centred on the
-/// middle of the bar the IR draws across the lanes, looking back at the traffic it
-/// governs. Every format that boxes a device boxes it here, so they all agree.
+/// Where each wanted light or sign stands and which way it faces: on the middle
+/// of the bar the IR draws across the lanes — the device's bottom edge — looking
+/// back at the traffic it governs. Every format that boxes a device boxes it from
+/// here ([`device_boxes`]), so they all agree.
 pub fn device_frames<'a>(
     map: &'a ValidatedMap,
     wanted: impl Fn(&MapObjectKind) -> bool + 'a,
@@ -360,6 +361,25 @@ pub fn device_frames<'a>(
         frames.push((object, Frame3::from_tangent(center, facing)?));
     }
     Ok(frames)
+}
+
+/// The box each wanted light or sign is drawn as, `dimensions` along its forward,
+/// left and up axes: the frame of [`device_frames`], raised by half the box's
+/// height. The IR's bar is a device's bottom edge — a light's housing rises from
+/// it, and OpenDRIVE's `zOffset` stands it there — so the box stands on the bar
+/// rather than straddling it.
+pub fn device_boxes<'a>(
+    map: &'a ValidatedMap,
+    wanted: impl Fn(&MapObjectKind) -> bool + 'a,
+    dimensions: Point3,
+) -> Result<Vec<(&'a MapObject, Frame3)>, ExportError> {
+    Ok(device_frames(map, wanted)?
+        .into_iter()
+        .map(|(object, frame)| {
+            let origin = frame.origin + frame.up.scaled(dimensions.z / 2.0);
+            (object, Frame3 { origin, ..frame })
+        })
+        .collect())
 }
 
 /// Which way a device faces: back along the traffic it governs, so it looks at the

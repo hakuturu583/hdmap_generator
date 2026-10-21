@@ -26,7 +26,7 @@
 use std::collections::HashSet;
 
 use roadgen_clipgt::layers::{
-    band_polygon, clipgt_color, device_frames, link_edge, objects_of, outer_boundaries, row_ref,
+    band_polygon, clipgt_color, device_boxes, link_edge, objects_of, outer_boundaries, row_ref,
     vertices, LIGHT_DIMENSIONS, SIGN_DIMENSIONS,
 };
 use roadgen_core::geometry::{Curve3, Frame3, Point3};
@@ -200,7 +200,7 @@ fn crosswalks(map: &ValidatedMap, trace: &mut Trace) -> Result<MapLayer, ExportE
 }
 
 /// Lights and signs as the boxes ClipGT gives them: placed by
-/// [`device_frames`], with ClipGT's default sizes — the IR has no measurement of a
+/// [`device_boxes`], standing on the IR's bar, with ClipGT's default sizes — the IR has no measurement of a
 /// housing, so these are the same boxes a ClipGT clip of the same map holds.
 ///
 /// A cuboid carries its eight corners as `vertices`, the four at the bottom first,
@@ -216,7 +216,7 @@ fn devices(
     wanted: impl Fn(&MapObjectKind) -> bool,
 ) -> Result<MapLayer, ExportError> {
     let mut layer = MapLayer::new(name);
-    for (object, frame) in device_frames(map, wanted)? {
+    for (object, frame) in device_boxes(map, wanted, dimensions)? {
         let mut shape = json!({ "cuboid3d": cuboid(&frame, dimensions) });
         if object.kind.is_traffic_light() {
             shape["attributes"] = json!([{ "name": "feature_id", "text": object.id.as_str() }]);

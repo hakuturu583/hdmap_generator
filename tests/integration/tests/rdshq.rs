@@ -160,6 +160,18 @@ fn lights_and_signs_are_boxes_with_eight_corners() {
         .iter()
         .find(|object| object.kind.is_traffic_light())
         .unwrap();
+    // It stands on the bar the IR draws, the housing's bottom edge: the four
+    // bottom corners are the bar's height.
+    let ObjectGeometry::Line(bar) = &light.geometry else {
+        panic!("a light is a bar across the lane")
+    };
+    let bar_z = bar.start_point().lerp(bar.end_point(), 0.5).z;
+    for corner in &corners[..4] {
+        assert!(
+            (corner.z - bar_z).abs() < 1e-6,
+            "{corner:?} is not on the bar at {bar_z}"
+        );
+    }
     assert_eq!(shape["attributes"][0]["name"], "feature_id");
     assert_eq!(shape["attributes"][0]["text"], light.id.as_str());
 
