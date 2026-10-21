@@ -1209,6 +1209,89 @@ def test_sumo_says_what_it_cannot_carry():
 
 
 # --------------------------------------------------------------------------- #
+# RDS-HQ
+#
+# These open the tars with the standard library the way a WebDataset reader does —
+# a member is `{clip}.{entry}`, decoded by its extension — so that a test failing
+# here means the Cosmos-Drive-Dreams toolkit would have failed too.
+# --------------------------------------------------------------------------- #
+
+
+def read_rdshq(root, folder, clip_id):
+    import tarfile
+
+    entries = {}
+    with tarfile.open(root / folder / f"{clip_id}.tar") as archive:
+        for member in archive.getmembers():
+            key, entry = member.name.split(".", 1)
+            assert key == clip_id, member.name
+            entries[entry] = archive.extractfile(member).read()
+    return entries
+
+
+def test_an_rdshq_clip_has_every_folder_the_renderer_opens(tmp_path):
+    clip_id = clipgt_map().export_rdshq(tmp_path)
+    assert clip_id == "demo_town"
+    for layer in (
+        "lanelines", "road_boundaries", "crosswalks", "road_markings",
+        "wait_lines", "poles", "traffic_signs", "traffic_lights", "lanes",
+    ):
+        document = json.loads(read_rdshq(tmp_path, f"3d_{layer}", clip_id)[f"{layer}.json"])
+        assert isinstance(document["labels"], list), layer
+    for folder in ("pose", "vehicle_pose", "timestamp", "all_object_info",
+                   "ftheta_intrinsic", "pinhole_intrinsic"):
+        assert read_rdshq(tmp_path, folder, clip_id), folder
+    assert (tmp_path / f"{clip_id}.rdshq.trace.json").is_file()
+
+
+def test_rdshq_poses_and_intrinsics_load_as_numpy_arrays(tmp_path):
+    np = pytest.importorskip("numpy")
+    import io
+
+    clip_id = clipgt_map().export_rdshq(tmp_path, speed=8.0)
+    camera = "camera_front_wide_120fov"
+    poses = read_rdshq(tmp_path, "pose", clip_id)
+    names = sorted(name for name in poses if name.endswith(f".pose.{camera}.npy"))
+    assert len(names) > 121, "long enough for one of the toolkit's videos"
+    first = np.load(io.BytesIO(poses[names[0]]))
+    assert first.shape == (4, 4)
+    rotation = first[:3, :3]
+    assert np.allclose(rotation.T @ rotation, np.eye(3))
+    # OpenCV axes: y is down, so it points against the world's up.
+    assert first[2, 1] < -0.9
+
+    ftheta = np.load(io.BytesIO(read_rdshq(tmp_path, "ftheta_intrinsic", clip_id)[f"ftheta_intrinsic.{camera}.npy"]))
+    assert ftheta.shape == (14,)
+    assert list(ftheta[:4]) == [960.0, 540.0, 1920.0, 1080.0]
+
+
+def test_rdshq_lines_and_lights_carry_what_the_renderer_reads(tmp_path):
+    clip_id = clipgt_map().export_rdshq(tmp_path)
+
+    def labels(layer):
+        return json.loads(read_rdshq(tmp_path, f"3d_{layer}", clip_id)[f"{layer}.json"])["labels"]
+
+    line = labels("lanelines")[0]["labelData"]["shape3d"]
+    names = {attribute["name"]: attribute["enumsList"]["enumsList"][0] for attribute in line["attributes"]}
+    assert names["colors"] in ("WHITE", "YELLOW")
+    assert all(len(point) == 3 for point in line["polyline3d"]["vertices"])
+
+    (light,) = labels("traffic_lights")
+    corners = light["labelData"]["shape3d"]["cuboid3d"]["vertices"]
+    assert len(corners) == 8
+    assert sum(corner[2] for corner in corners) / 8 > 4.9, "a light hangs above the road"
+
+
+def test_rdshq_says_what_the_toolkit_will_do(tmp_path):
+    m = clipgt_map()
+    warnings = m.rdshq_warnings()
+    assert any("topology" in warning for warning in warnings)
+    assert any("traffic_lights" in warning for warning in warnings), "one light reads as none"
+    with pytest.raises(RuntimeError, match="clip id"):
+        m.export_rdshq(tmp_path, clip_id="a.b")
+
+
+# --------------------------------------------------------------------------- #
 # GPUDrive
 #
 # A GPUDrive scene is JSON with no schema: what makes a file a scene is that the

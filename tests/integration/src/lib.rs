@@ -7,6 +7,7 @@ pub mod clipgt_read;
 pub mod highway;
 pub mod mine;
 pub mod opendrive_eval;
+pub mod rdshq_read;
 pub mod scenarios;
 pub mod sumo_build;
 

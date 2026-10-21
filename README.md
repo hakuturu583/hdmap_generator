@@ -4,8 +4,8 @@ Generate 3D road networks — with a town beside them, or an open-pit mine round
 if you want one — and write the
 same network out as **OpenDRIVE**, as an **Autoware-ready Lanelet2** map, as plain
 **OpenStreetMap**, as a **SUMO** network, as a **CARLA UE5 asset package**, as a
-**ClipGT** clip for NVIDIA Cosmos, as a **GPUDrive** scene, and as the map of a
-**Waymo Open Motion Dataset** scenario.
+**ClipGT** clip and an **RDS-HQ** clip for NVIDIA Cosmos, as a **GPUDrive** scene, and
+as the map of a **Waymo Open Motion Dataset** scenario.
 
 This is a generator, not a converter. You describe roads, lanes, junctions and the
 movements between them, and the library builds the geometry and writes the files.
@@ -48,6 +48,7 @@ m.export_osm("openstreetmap.osm")
 m.export_sumo("sumo/")
 m.export_carla("Import/")       # .fbx + .xodr + the descriptor CARLA imports
 m.export_clipgt("clip/")
+m.export_rdshq("rds_hq/")       # the layout Cosmos-Drive-Dreams renders from
 m.export_gpudrive("scene.json")
 m.export_womd("map.tfrecord")
 ```
@@ -82,6 +83,7 @@ m.export_womd("map.tfrecord")
                      ├──▶ SUMO           .nod/.edg/.con.xml  `quick-xml` + netconvert
                      ├──▶ CARLA          .fbx + .xodr        `roadgen-opendrive`
                      ├──▶ ClipGT         .parquet layers     `arrow`/`parquet`
+                     ├──▶ RDS-HQ         WebDataset .tar     `tar`
                      ├──▶ GPUDrive       scene .json         `serde_json`
                      ├──▶ WOMD           .tfrecord Scenario  `prost`
                      └──▶ the IR itself  .roadgen.pb         `prost`
@@ -2156,6 +2158,62 @@ reports that rather than letting a caller assume a round trip, and checks the
 scenario's route against the map while it is there. The `pole`, `road_island` and
 `road_marking` layers have no counterpart in the IR and are not written.
 
+## RDS-HQ
+
+RDS-HQ is the dataset layout NVIDIA's
+[Cosmos-Drive-Dreams](https://github.com/nv-tlabs/Cosmos-Drive-Dreams) toolkit renders
+its HD-map and world-scenario control videos from, and the one the
+[PhysicalAI-Autonomous-Vehicle-Cosmos-Drive-Dreams](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicle-Cosmos-Drive-Dreams)
+dataset is published in. A dataset is a root of folders, each holding one
+`{clip_id}.tar` per clip; each tar is a single WebDataset sample.
+
+```python
+clip_id = m.export_rdshq("rds_hq/", scenario="scenario.yaml")
+```
+
+```
+rds_hq/
+├── 3d_lanes/demo_town.tar             each drivable lane's centreline, in travel order
+├── 3d_lanelines/demo_town.tar         painted edges, with `colors` and `styles`
+├── 3d_road_boundaries/demo_town.tar   the outermost edge on each side of a cross-section
+├── 3d_wait_lines/demo_town.tar        stop lines
+├── 3d_crosswalks/demo_town.tar        crossings, as polygons
+├── 3d_traffic_lights/demo_town.tar    boxes, with each light's IR id as `feature_id`
+├── 3d_traffic_signs/demo_town.tar     boxes
+├── 3d_poles/, 3d_road_markings/       written empty: the IR has neither
+├── pose/demo_town.tar                 camera-to-world per frame and camera, OpenCV axes
+├── vehicle_pose/demo_town.tar         rig-to-world per frame, forward-left-up
+├── timestamp/demo_town.tar            microseconds per frame
+├── all_object_info/demo_town.tar      an empty object list per frame: the IR has no traffic
+├── ftheta_intrinsic/demo_town.tar     cx, cy, w, h, polynomial, direction, c, d, e
+└── pinhole_intrinsic/demo_town.tar    fx, fy, cx, cy, w, h
+```
+
+Map layers are in the IR's own east-north-up frame, heights and all; a shape's points
+are `labels[i].labelData.shape3d.{polyline3d,surface,cuboid3d}.vertices`, the keys the
+toolkit's renderer reads and its Waymo converter writes. Several clips can share one
+root, and the output renders as it stands:
+
+```sh
+python render_from_rds_hq.py -i rds_hq/ -o render/ -d rds_hq -cj demo_town -c ftheta
+```
+
+**It takes ClipGT's scenario file.** The route, the speed and the rig are the same
+[scenario](#the-scenario-file), and the ego track and the boxes for lights and signs
+are ClipGT's own, so a map exported both ways is the same drive in both. A camera's
+f-theta lens goes into `ftheta_intrinsic` as it is; the pinhole beside it has the same
+focal length at the centre of the frame, which is where the two lenses agree. With no
+`sensors`, the clip is given the one camera the toolkit's single-view configuration
+renders, `camera_front_wide_120fov`, an equidistant 120° lens.
+
+**What the toolkit will make of it.** `Map.rdshq_warnings(scenario)` reports what the
+map loses — topology, junctions, sign codes, everything off the road surface — and,
+given the scenario, what the renderer will do that a caller may not expect: it reads
+every pose at 30 fps whatever the clip was made at, it cuts 121-frame videos and drops
+a shorter tail, it renders only 16:9 f-theta cameras, and its world-scenario path
+reads a lane-line or traffic-light layer holding exactly one label as a placeholder
+for none.
+
 ## GPUDrive
 
 [GPUDrive](https://github.com/Emerge-Lab/gpudrive) is a GPU-accelerated driving
@@ -2758,6 +2816,7 @@ roadgen/
 │   ├── roadgen-opendrive/   lowering onto the `opendrive` crate, and reading it back
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
+│   ├── roadgen-rdshq/       lowering onto RDS-HQ's WebDataset shards
 │   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON
 │   ├── roadgen-womd/        lowering onto a Waymo Open Motion `Scenario`, with
 │   │                        Waymo's schema (`proto/`) and the TFRecord framing
@@ -2768,7 +2827,7 @@ roadgen/
 │   ├── roadgen-trace/       the IR dump, trace files, and lookups across them
 │   ├── roadgen-viewer/      reading the exports back, and drawing them as SVG
 │   └── roadgen-python/      PyO3 bindings
-├── examples/                ClipGT and GPUDrive scenario files, and an IR importer
+├── examples/                ClipGT/RDS-HQ and GPUDrive scenario files, and an IR importer
 │                            that knows only the Protocol Buffers schema
 ├── web/                     the demo page: roadgen in a browser, through Pyodide
 ├── python/roadgen/          the Python package

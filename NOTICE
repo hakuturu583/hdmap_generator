@@ -36,6 +36,10 @@ under its own terms.
   Serialization, for the ClipGT and GPUDrive scenario files, the GPUDrive scene and
   the CARLA package descriptor. MIT and/or Apache-2.0.
 
+* tar (https://github.com/alexcrichton/tar-rs)
+  Tar archives, for the WebDataset shards an RDS-HQ clip is made of. MIT and/or
+  Apache-2.0.
+
 * uom, vec1, xml-rs, chrono, url, thiserror, derive_more, paste, backtrace
   Transitive dependencies of `opendrive`, each under MIT and/or Apache-2.0.
 

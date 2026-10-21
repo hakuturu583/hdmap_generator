@@ -39,9 +39,9 @@ pub struct Layer {
 /// are ClipGT's own defaults for a device whose dimensions are missing, which makes
 /// them the one size a reader is already prepared to see, and keeps this exporter
 /// from inventing a measurement the IR never made.
-const LIGHT_DIMENSIONS: Point3 = Point3::new(0.6, 0.6, 1.0);
+pub const LIGHT_DIMENSIONS: Point3 = Point3::new(0.6, 0.6, 1.0);
 /// The same for a sign's plate.
-const SIGN_DIMENSIONS: Point3 = Point3::new(0.8, 0.3, 0.8);
+pub const SIGN_DIMENSIONS: Point3 = Point3::new(0.8, 0.3, 0.8);
 
 /// The format name a ClipGT [`Trace`] is recorded under.
 pub const TRACE_FORMAT: &str = "clipgt";
@@ -322,34 +322,64 @@ fn devices(
     wanted: impl Fn(&MapObjectKind) -> bool,
     dimensions: Point3,
 ) -> Result<Devices, ExportError> {
-    let config = map.metadata.sampling;
     let mut devices = Devices {
         centers: Vec::new(),
         dimensions: Vec::new(),
         orientations: Vec::new(),
         categories: Vec::new(),
     };
-    for object in objects_of(map, &wanted) {
-        let ObjectGeometry::Line(bar) = &object.geometry else {
-            continue;
-        };
-        let (from, to) = (bar.start_point(), bar.end_point());
-        let center = from.lerp(to, 0.5);
-        let facing = facing_of(map, object, center, config)?;
-
+    for (object, frame) in device_boxes(map, wanted, dimensions)? {
         let local = row_ref(layer, devices.centers.len());
         trace.link(object.id.clone(), local, Relation::Exact);
-        devices.centers.push(center);
+        devices.centers.push(frame.origin);
         devices.dimensions.push(dimensions);
-        devices
-            .orientations
-            .push(ego::orientation_of(&Frame3::from_tangent(center, facing)?));
+        devices.orientations.push(ego::orientation_of(&frame));
         devices.categories.push(match &object.kind {
             MapObjectKind::TrafficSign { code } => code.clone(),
             other => other.as_str().to_owned(),
         });
     }
     Ok(devices)
+}
+
+/// Where each wanted light or sign stands and which way it faces: on the middle
+/// of the bar the IR draws across the lanes — the device's bottom edge — looking
+/// back at the traffic it governs. Every format that boxes a device boxes it from
+/// here ([`device_boxes`]), so they all agree.
+pub fn device_frames<'a>(
+    map: &'a ValidatedMap,
+    wanted: impl Fn(&MapObjectKind) -> bool + 'a,
+) -> Result<Vec<(&'a MapObject, Frame3)>, ExportError> {
+    let config = map.metadata.sampling;
+    let mut frames = Vec::new();
+    for object in objects_of(map, wanted) {
+        let ObjectGeometry::Line(bar) = &object.geometry else {
+            continue;
+        };
+        let center = bar.start_point().lerp(bar.end_point(), 0.5);
+        let facing = facing_of(map, object, center, config)?;
+        frames.push((object, Frame3::from_tangent(center, facing)?));
+    }
+    Ok(frames)
+}
+
+/// The box each wanted light or sign is drawn as, `dimensions` along its forward,
+/// left and up axes: the frame of [`device_frames`], raised by half the box's
+/// height. The IR's bar is a device's bottom edge — a light's housing rises from
+/// it, and OpenDRIVE's `zOffset` stands it there — so the box stands on the bar
+/// rather than straddling it.
+pub fn device_boxes<'a>(
+    map: &'a ValidatedMap,
+    wanted: impl Fn(&MapObjectKind) -> bool + 'a,
+    dimensions: Point3,
+) -> Result<Vec<(&'a MapObject, Frame3)>, ExportError> {
+    Ok(device_frames(map, wanted)?
+        .into_iter()
+        .map(|(object, frame)| {
+            let origin = frame.origin + frame.up.scaled(dimensions.z / 2.0);
+            (object, Frame3 { origin, ..frame })
+        })
+        .collect())
 }
 
 /// Which way a device faces: back along the traffic it governs, so it looks at the
@@ -392,7 +422,7 @@ fn object_bar_direction(object: &MapObject) -> Result<UnitVector3, ExportError> 
     }
 }
 
-fn objects_of<'a>(
+pub fn objects_of<'a>(
     map: &'a ValidatedMap,
     wanted: impl Fn(&MapObjectKind) -> bool + 'a,
 ) -> impl Iterator<Item = &'a MapObject> {
@@ -407,7 +437,7 @@ fn objects_of<'a>(
 /// Found through the edge indices rather than by looking at each side's lanes,
 /// because a cross-section need not have lanes on both sides — a junction connector
 /// has one lane, and both of its boundaries are edges of the carriageway.
-fn outer_boundaries<'a>(lanes: &[&'a Lane]) -> Vec<(i32, &'a Curve3)> {
+pub fn outer_boundaries<'a>(lanes: &[&'a Lane]) -> Vec<(i32, &'a Curve3)> {
     let leftmost = lanes
         .iter()
         .max_by_key(|lane| lane.left_edge)
@@ -420,7 +450,7 @@ fn outer_boundaries<'a>(lanes: &[&'a Lane]) -> Vec<(i32, &'a Curve3)> {
 }
 
 /// A row's name in the trace: `<layer>:<row>`.
-fn row_ref(layer: &str, row: usize) -> String {
+pub fn row_ref(layer: &str, row: usize) -> String {
     format!("{layer}:{row}")
 }
 
@@ -429,7 +459,7 @@ fn row_ref(layer: &str, row: usize) -> String {
 ///
 /// An edge between two lanes is one row for both, so each of them is `Merged` into
 /// it; an edge only one lane touches is that lane's own.
-fn link_edge(trace: &mut Trace, section: &[&Lane], edge: i32, local: &str) {
+pub fn link_edge(trace: &mut Trace, section: &[&Lane], edge: i32, local: &str) {
     let bordering: Vec<(&Lane, &str)> = section
         .iter()
         .filter_map(|lane| {
@@ -448,12 +478,12 @@ fn link_edge(trace: &mut Trace, section: &[&Lane], edge: i32, local: &str) {
     }
 }
 
-fn vertices(curve: &Curve3, config: SamplingConfig) -> Result<Vec<Point3>, ExportError> {
+pub fn vertices(curve: &Curve3, config: SamplingConfig) -> Result<Vec<Point3>, ExportError> {
     Ok(curve.to_polyline(config)?.points().to_vec())
 }
 
 /// A strip's outline: up one edge and back down the other.
-fn band_polygon(
+pub fn band_polygon(
     left: &Curve3,
     right: &Curve3,
     config: SamplingConfig,
@@ -507,7 +537,7 @@ fn convex_hull(points: &[Point3]) -> Vec<Point3> {
     hull
 }
 
-fn clipgt_color(color: roadgen_core::semantics::MarkingColor) -> &'static str {
+pub fn clipgt_color(color: roadgen_core::semantics::MarkingColor) -> &'static str {
     match color {
         roadgen_core::semantics::MarkingColor::White => "WHITE",
         roadgen_core::semantics::MarkingColor::Yellow => "YELLOW",

@@ -1280,6 +1280,25 @@ impl PyMap {
         Ok(roadgen_clipgt::check(map, config.as_ref()))
     }
 
+    /// What an RDS-HQ export loses, and what the Cosmos-Drive-Dreams toolkit will
+    /// make of the clip.
+    ///
+    /// Kept apart from `format_warnings` for the same reason as the ClipGT ones. An
+    /// RDS-HQ clip takes the same scenario file as a ClipGT clip; pass it to have the
+    /// drive and the cameras checked against what the toolkit's renderer expects.
+    #[pyo3(signature = (scenario = None))]
+    fn rdshq_warnings(&mut self, scenario: Option<PathBuf>) -> PyResult<Vec<String>> {
+        let config = match scenario {
+            Some(path) => Some(self.clipgt_config(Some(path), None, None, None, None)?),
+            None => {
+                self.ensure_built()?;
+                None
+            }
+        };
+        let map = self.built.as_ref().expect("just built");
+        Ok(roadgen_rdshq::check(map, config.as_ref()))
+    }
+
     /// What a GPUDrive export loses, and what its scene runs up against.
     ///
     /// Kept apart from `format_warnings` for the same reason as the ClipGT ones:
@@ -1530,6 +1549,51 @@ impl PyMap {
         let map = self.built.as_ref().expect("just built");
         let (clip, written) =
             roadgen_clipgt::write_traced(map, &directory, &config).map_err(runtime_error)?;
+        if trace {
+            let path = roadgen_trace::directory_sidecar(&directory, &clip, &written.format);
+            self.write_sidecar(&written, path)?;
+        }
+        Ok(clip)
+    }
+
+    /// Writes the map as an RDS-HQ clip: the dataset layout the Cosmos-Drive-Dreams
+    /// toolkit renders its HD-map and world-scenario videos from.
+    ///
+    /// `directory` is the dataset root. Each map layer, pose track, timestamp list
+    /// and camera's intrinsics goes in a folder of its own under it — `3d_lanes/`,
+    /// `pose/`, `ftheta_intrinsic/` — as `<clip id>.tar`, so several clips can share
+    /// a root. Returns the clip id.
+    ///
+    /// The arguments are `export_clipgt`'s, and so is the scenario file: the same
+    /// route, the same speed and the same rig make the same drive in both formats. A
+    /// scenario with no sensors gets one front camera, `camera_front_wide_120fov`.
+    ///
+    /// Also writes `<clip id>.rdshq.trace.json` in `directory` — which label of which
+    /// layer each lane and object became — unless `trace` is false.
+    #[pyo3(signature = (
+        directory,
+        scenario = None,
+        clip_id = None,
+        frame_rate = None,
+        speed = None,
+        route = None,
+        trace = true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn export_rdshq(
+        &mut self,
+        directory: PathBuf,
+        scenario: Option<PathBuf>,
+        clip_id: Option<&str>,
+        frame_rate: Option<f64>,
+        speed: Option<f64>,
+        route: Option<Vec<String>>,
+        trace: bool,
+    ) -> PyResult<String> {
+        let config = self.clipgt_config(scenario, clip_id, frame_rate, speed, route)?;
+        let map = self.built.as_ref().expect("just built");
+        let (clip, written) =
+            roadgen_rdshq::write_traced(map, &directory, &config).map_err(runtime_error)?;
         if trace {
             let path = roadgen_trace::directory_sidecar(&directory, &clip, &written.format);
             self.write_sidecar(&written, path)?;

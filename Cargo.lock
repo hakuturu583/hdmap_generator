@@ -476,6 +476,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1522,7 +1532,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "roadgen-buildings"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "roadgen-core",
  "symbios-shape",
@@ -1530,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-carla"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "opendrive",
  "roadgen-buildings",
@@ -1544,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-clipgt"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "arrow",
  "parquet",
@@ -1557,11 +1567,11 @@ dependencies = [
 
 [[package]]
 name = "roadgen-core"
-version = "0.36.0"
+version = "0.37.1"
 
 [[package]]
 name = "roadgen-gpudrive"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "roadgen-core",
  "serde",
@@ -1571,7 +1581,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-integration-tests"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "arrow",
  "ll2-core",
@@ -1591,18 +1601,20 @@ dependencies = [
  "roadgen-opendrive",
  "roadgen-osm",
  "roadgen-proto",
+ "roadgen-rdshq",
  "roadgen-sumo",
  "roadgen-trace",
  "roadgen-viewer",
  "roadgen-womd",
  "serde_json",
+ "tar",
  "tempfile",
  "uom",
 ]
 
 [[package]]
 name = "roadgen-lanelet2"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "ll2-core",
  "ll2-io",
@@ -1614,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-opendrive"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "ll2-projection",
  "opendrive",
@@ -1628,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-osm"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "ll2-io",
  "ll2-projection",
@@ -1637,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-proto"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -1649,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-python"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "pyo3",
  "roadgen-buildings",
@@ -1661,6 +1673,7 @@ dependencies = [
  "roadgen-opendrive",
  "roadgen-osm",
  "roadgen-proto",
+ "roadgen-rdshq",
  "roadgen-sumo",
  "roadgen-trace",
  "roadgen-viewer",
@@ -1668,8 +1681,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "roadgen-rdshq"
+version = "0.37.1"
+dependencies = [
+ "roadgen-clipgt",
+ "roadgen-core",
+ "serde_json",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
 name = "roadgen-sumo"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "ll2-projection",
  "quick-xml",
@@ -1678,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-trace"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "quick-xml",
  "roadgen-core",
@@ -1690,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-viewer"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "arrow",
  "bytes",
@@ -1705,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-womd"
-version = "0.36.0"
+version = "0.37.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -1956,6 +1980,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
 ]
 
 [[package]]
