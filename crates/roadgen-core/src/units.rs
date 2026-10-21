@@ -52,6 +52,11 @@ impl SpeedLimit {
     pub fn kph(self) -> f64 {
         self.0 * 3.6
     }
+
+    /// Miles per hour, the unit WOMD holds a limit in.
+    pub fn mph(self) -> f64 {
+        self.0 / 0.447_04
+    }
 }
 
 /// A geodetic anchor for the map's metric coordinates.

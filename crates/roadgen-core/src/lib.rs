@@ -87,7 +87,10 @@ pub use id::{
     LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
 };
 pub use land_cover::LandCover;
-pub use map::{CrossSection, Lane, Map, MapMetadata, Projection, Road, Route, TrafficHandedness};
+pub use map::{
+    CrossSection, EdgeKind, Lane, Map, MapMetadata, Projection, Road, Route, SectionEdge,
+    TrafficHandedness,
+};
 pub use semantics::{
     BoundaryMarking, FormOfWay, LaneType, LightArrow, LightBulb, LightColor, LightHead, MapObject,
     MapObjectKind, MarkingColor, ObjectGeometry, PavedSurface, Pavement, PavementProfile,

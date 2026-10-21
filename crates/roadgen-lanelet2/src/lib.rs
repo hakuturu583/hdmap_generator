@@ -1023,7 +1023,9 @@ impl<'a> Exporter<'a> {
         stop_line: Option<&ObjectId>,
         lanes: &[LaneId],
     ) -> Result<Option<Id>, ExportError> {
-        let lanes = &self.junction_lanes(lanes);
+        // The element hangs on the lanelets through the junction, with the stop line
+        // as the `ref_line` before them, as Autoware's maps have it.
+        let lanes = &self.map.signal_carriers(lanes);
         if !lanes.iter().any(|lane| self.lanelets.contains_key(lane)) {
             return Ok(None);
         }
@@ -1066,52 +1068,9 @@ impl<'a> Exporter<'a> {
         .map(Some)
     }
 
-    /// The lanes a traffic light's element hangs on, for a rule over `lanes`.
-    ///
-    /// The IR's rule is about the approaches, the lanes that stop for the light.
-    /// OpenDRIVE refers to a junction's light from the connecting roads, though,
-    /// and Lanelet2 maps for Autoware hang it on the lanelets through the
-    /// intersection — the ones `turn_direction` marks — with the stop line as the
-    /// `ref_line` before them. So each approach gives way to the junction
-    /// connectors it feeds; a lane that is a connector already, or that feeds none
-    /// (a light short of no junction), keeps the element itself.
-    fn junction_lanes(&self, lanes: &[LaneId]) -> Vec<LaneId> {
-        let mut carriers: Vec<LaneId> = Vec::new();
-        for lane in lanes {
-            let through: Vec<LaneId> = if self.is_connector(lane) {
-                Vec::new()
-            } else {
-                self.map
-                    .successors(lane)
-                    .into_iter()
-                    .filter(|next| self.is_connector(next))
-                    .collect()
-            };
-            let held = if through.is_empty() {
-                vec![lane.clone()]
-            } else {
-                through
-            };
-            for lane in held {
-                if !carriers.contains(&lane) {
-                    carriers.push(lane);
-                }
-            }
-        }
-        carriers
-    }
-
-    /// Is `lane` on a road through a junction?
-    fn is_connector(&self, lane: &LaneId) -> bool {
-        self.map
-            .lane(lane)
-            .and_then(|lane| self.map.road(&lane.road))
-            .is_some_and(|road| road.is_connector())
-    }
-
     /// Each stop sign as Autoware reads one: a `traffic_sign` element referring to
     /// the sign, the stop line its lanes stop at as the `ref_line`, hung where a
-    /// junction's light hangs (`junction_lanes`).
+    /// junction's light hangs (`Map::signal_carriers`).
     ///
     /// The IR has no rule for a sign — what a sign means is its code — so a stop
     /// sign is its own rule here, and only a stop sign: Autoware stops for a
@@ -1134,7 +1093,7 @@ impl<'a> Exporter<'a> {
             .map(|object| (object.id.clone(), object.lanes.clone()))
             .collect();
         for (sign, lanes) in signs {
-            let carriers = self.junction_lanes(&lanes);
+            let carriers = self.map.signal_carriers(&lanes);
             if !carriers.iter().any(|lane| self.lanelets.contains_key(lane)) {
                 continue;
             }
@@ -1148,7 +1107,7 @@ impl<'a> Exporter<'a> {
             }
             let mut approaches: Vec<LaneId> = Vec::new();
             for lane in &lanes {
-                if self.is_connector(lane) {
+                if self.map.is_connector_lane(lane) {
                     approaches.extend(self.map.predecessors(lane));
                 } else {
                     approaches.push(lane.clone());

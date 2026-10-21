@@ -49,6 +49,18 @@ under its own terms.
 * glam, nom, rand, rand_pcg, symbios-genetics
   Transitive dependencies of `symbios-shape`, each under MIT and/or Apache-2.0.
 
+* prost, prost-build, protox
+  Protocol Buffers, for the IR's own schema and the Waymo Open Motion scenario.
+  Apache-2.0 and MIT/Apache-2.0.
+
+* Waymo Open Dataset protocol buffer schema
+  (https://github.com/waymo-research/waymo-open-dataset)
+  `crates/roadgen-womd/proto/waymo_open_dataset/protos/map.proto` and
+  `scenario.proto`, Copyright 2021 The Waymo Open Dataset Authors, Apache-2.0.
+  `scenario.proto` is modified: its lidar and camera-token fields and their imports
+  are removed, as the file itself says. Only the schema is included, not the dataset;
+  the dataset is under its own terms, which this project does not touch.
+
 --------------------------------------------------------------------------------
 Assets a CARLA package fetches
 --------------------------------------------------------------------------------

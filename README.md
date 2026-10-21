@@ -4,7 +4,8 @@ Generate 3D road networks — with a town beside them, or an open-pit mine round
 if you want one — and write the
 same network out as **OpenDRIVE**, as an **Autoware-ready Lanelet2** map, as plain
 **OpenStreetMap**, as a **SUMO** network, as a **CARLA UE5 asset package**, as a
-**ClipGT** clip and an **RDS-HQ** clip for NVIDIA Cosmos, and as a **GPUDrive** scene.
+**ClipGT** clip and an **RDS-HQ** clip for NVIDIA Cosmos, as a **GPUDrive** scene, and
+as the map of a **Waymo Open Motion Dataset** scenario.
 
 This is a generator, not a converter. You describe roads, lanes, junctions and the
 movements between them, and the library builds the geometry and writes the files.
@@ -49,6 +50,7 @@ m.export_carla("Import/")       # .fbx + .xodr + the descriptor CARLA imports
 m.export_clipgt("clip/")
 m.export_rdshq("rds_hq/")       # the layout Cosmos-Drive-Dreams renders from
 m.export_gpudrive("scene.json")
+m.export_womd("map.tfrecord")
 ```
 
 ## How it is put together
@@ -83,6 +85,7 @@ m.export_gpudrive("scene.json")
                      ├──▶ ClipGT         .parquet layers     `arrow`/`parquet`
                      ├──▶ RDS-HQ         WebDataset .tar     `tar`
                      ├──▶ GPUDrive       scene .json         `serde_json`
+                     ├──▶ WOMD           .tfrecord Scenario  `prost`
                      └──▶ the IR itself  .roadgen.pb         `prost`
 
               the written files ──▶ roadgen-viewer ──▶ SVG
@@ -268,6 +271,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
 | `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
 | `gpudrive_warnings(scenario=None)` | what a GPUDrive export would lose, and what its scene runs up against |
+| `womd_warnings()` | what a Waymo Open Motion scenario would lose |
 | `carla_warnings(name=, package=, buildings=, ...)` | what a CARLA package cannot carry, and what its import will get wrong quietly |
 | `osm_warnings()` | what a plain OpenStreetMap export would lose |
 | `sumo_warnings()` | what a SUMO export would lose |
@@ -277,6 +281,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
+| `export_womd(path, scenario_id=, steps=, time_step=, current_time_index=)` | write a TFRecord holding one Waymo Open Motion `Scenario` |
 | `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=, furniture=, carla_root=, engine=, sun_altitude=, sun_azimuth=)` | write a CARLA UE5 package and the script that imports it; returns what was written and what each mesh will be tagged |
 | `export_pointcloud_map(directory, name=, buildings=, kerb_height=, verge_width=, ground_extent=, spacing=, cell_size=)` | write Autoware's point-cloud map of the surface a CARLA package is built of: `pointcloud_map/*.pcd` and `pointcloud_map_metadata.yaml`, in the Lanelet2 map's frame |
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
@@ -284,6 +289,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `carla_furniture(carla_root, package, map_name, engine=, manifest=)` | after `Import.py`: stand the package's traffic lights, signs and props town in the level, and make CARLA adopt the lights and signs |
 | `carla_water(carla_root, package, map_name, engine=, descriptor=, flowing=, still=)` | after `Import.py`: put the Unreal materials the descriptor names in the water's slots — `M_Water_Flowing` on rivers, whose UVs run downstream for a panning normal map, and `M_Water_Still` on lakes and ponds |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
+| `to_womd_bytes(scenario_id=, steps=, time_step=, current_time_index=)` | one serialized `Scenario`, not framed as a TFRecord |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 | `render_opendrive(path)` / `render_sumo(directory)` / `render_carla(path)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
 | `read_opendrive(path, sampling=, origin=, projection=)` | read an OpenDRIVE file as a `Map` — one that exports like any other and cannot be added to |
@@ -762,7 +768,7 @@ part/high_street/left/3/0/1        ← the one standing on it
 | **OpenStreetMap** | [Simple 3D Buildings](https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings): the outline as a closed `building=<kind>` way, a `building:part=yes` way per part where there is more than one, with `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and `roof:direction`. The solid survives; the frontage, a sloping base and the union of several parts' outlines do not, and `check` says so. |
 | **OpenDRIVE** | one `<object type="building">` carrying an `<outline>` per part, corners as `<cornerLocal>`. The massing survives; the roof shape does not, and `format_warnings()` says how many were flattened. |
 | **CARLA** | actual walls and roofs, from `Solid::shell()`. The whole solid survives — it is the only export that draws the roof rather than describing it — but CARLA's import will tag it `Terrain` unless the town is exported as [props](#where-the-town-goes-and-why-it-is-a-choice), in which case it is tagged and the package's script places it. |
-| Lanelet2, SUMO, ClipGT, GPUDrive | nothing; each one's warnings say how many were dropped. |
+| Lanelet2, SUMO, ClipGT, GPUDrive, WOMD | nothing; each one's warnings say how many were dropped. |
 
 OSM measures a roof's direction clockwise from north, as a bearing; the IR measures it
 anticlockwise from east, as an angle. That conversion is the whole of the difference
@@ -939,7 +945,8 @@ stands under a deck or on a corridor's slopes.
 Every format gets what it can hold. OpenDRIVE writes `<bridge>` and `<tunnel>` and
 reads them back; OpenStreetMap splits a way at each structure and tags `bridge=`,
 `tunnel=`, `layer=` and `motorway_link`; Lanelet2 marks motorway lanelets `highway`;
-GPUDrive, which is flat, cuts the road edges where one road passes over another;
+GPUDrive, which is flat, cuts the road edges where one road passes over another,
+and WOMD, which keeps the z, leaves them whole at their own heights;
 CARLA draws the decks' undersides and parapets, the piers and abutments, the tunnel
 bores and portals, and lays the land under the bridges and over the tunnels. The
 design — and what is not done yet — is in [`docs/highway-design.md`](docs/highway-design.md).
@@ -2305,6 +2312,54 @@ past which the simulator silently drops what does not fit. The `speed_bump` and
 `driveway` elements go the other way: the IR has nothing that means either, so they
 are never written.
 
+## Waymo Open Motion Dataset
+
+The [Waymo Open Motion Dataset](https://waymo.com/open/data/motion/) (WOMD) ships its
+scenarios as TFRecord files of `waymo.open_dataset.Scenario` protocol buffers. A
+scenario is a map, the traffic-signal states on it at every timestep, and the logged
+tracks of the agents; `export_womd` writes the first two, in the same container, so the
+dataset's own tooling, [Waymax](https://github.com/waymo-research/waymax) and anything
+else that reads WOMD read the file as it is.
+
+```python
+m.export_womd("map.tfrecord")                  # 91 steps of 0.1 s, "now" at step 10
+data = m.to_womd_bytes(scenario_id="town-1")   # the bare Scenario message
+```
+
+The schema is Waymo's own: `map.proto` and `scenario.proto` are carried in
+`crates/roadgen-womd/proto/` (Apache-2.0) and compiled at build time, with only the
+per-step lidar and camera-token fields of `Scenario` taken out and their numbers
+reserved. Every other field keeps its upstream name and number, so the upstream schema
+reads the file unchanged.
+
+| Feature | What goes in it |
+| --- | --- |
+| `lane` | each drivable lane's centreline in travel order, with its `entry_lanes` and `exit_lanes`, its same-direction `left_neighbors` and `right_neighbors`, the line or edge on either side as `left_boundaries` and `right_boundaries`, its type, and its speed limit in mph. A lane through a junction is `interpolating` and has no boundaries. |
+| `road_line` | a painted boundary between lanes, with its line type |
+| `road_edge` | the edge of the drivable surface (`TYPE_ROAD_EDGE_BOUNDARY`), a kerbed median (`TYPE_ROAD_EDGE_MEDIAN`), and the rest of every pavement's outline — its back edge, and both sides of the pavement round a junction's corner (`TYPE_UNKNOWN`) |
+| `crosswalk` | the outline of a crossing |
+| `stop_sign` | where the sign stands, and the lanes it controls |
+| `dynamic_map_states` | at every step, a state for each lane through a junction a traffic light governs, with its stop point at the lane's mouth |
+
+**WOMD keeps the z.** Every point is `(x, y, z)` in the IR's own metres, so the
+elevation reaches the file, and where one road passes over another both keep their
+edges whole, apart in height — unlike GPUDrive's flat scene, where they are cut.
+
+The line types and edge kinds are the ones the GPUDrive export writes, since GPUDrive
+borrowed WOMD's vocabulary, and the same two decisions hold: an edge is one feature,
+a line or a road edge but never both, and a junction connector has no edges.
+A traffic light's state goes, as in the Lanelet2 export, to the lanes *through* the
+junction its approaches feed.
+
+**What it cannot carry.** The scenario has no tracks: a generated map has no logged
+traffic, so there is no self-driving car and nothing to predict. The IR has no signal
+timing, so every lane state is `LANE_STATE_UNKNOWN`; the light heads themselves, stop
+lines, right-of-way rules and signs other than the stop sign have no feature. Footways
+and verges are not lanes in WOMD's sense and are not written as lanes — a pavement
+survives as its outline of road edges, a verge not at all — and the lane widths go
+with them. Feature ids are numbered as they are written. `Map.womd_warnings()` says all of
+that.
+
 ## The demo page
 
 <https://hakuturu583.github.io/hdmap_generator/>
@@ -2666,6 +2721,7 @@ one more trace and changes none.
 | SUMO | `<dir>/<prefix>.sumo.trace.json` | `edge:north.fwd`, `lane:north.fwd_0`, `node:j_x`, `connection:north.fwd_0>west.bwd_0` |
 | ClipGT | `<dir>/<clip id>.clipgt.trace.json` | `<layer>:<row>` — `lane:17`, `lane_line:3`, `wait_line:0` |
 | GPUDrive | `<file>.trace.json` | `road:42`, `agent:1` |
+| WOMD | `<file>.trace.json` | `feature:12`, `signal:12` (the lane state on feature 12) |
 | CARLA | `<dir>/<name>.carla.trace.json` | the package's `.xodr` as OpenDRIVE, and `actor:<name>` for each light and sign; the meshes are not traced |
 
 **A file read has a trace too.** `read_opendrive` records which element of the map
@@ -2762,6 +2818,8 @@ roadgen/
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
 │   ├── roadgen-rdshq/       lowering onto RDS-HQ's WebDataset shards
 │   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON
+│   ├── roadgen-womd/        lowering onto a Waymo Open Motion `Scenario`, with
+│   │                        Waymo's schema (`proto/`) and the TFRecord framing
 │   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
 │   ├── roadgen-sumo/        lowering onto SUMO's plain-XML network
 │   ├── roadgen-proto/       the IR as Protocol Buffers: the schema (`proto/`),
@@ -2878,4 +2936,9 @@ The GPUDrive scene fields were read the same way, off the simulator's own reader
 [`src/json_serialization.hpp`](https://github.com/Emerge-Lab/gpudrive/blob/main/src/json_serialization.hpp),
 and its `init.hpp` and `types.hpp` beside it. Nothing from those files is reproduced
 either — what is written down here is the shape of the document they accept.
+
+The WOMD schema is Waymo's own `map.proto` and `scenario.proto`, from
+[waymo-open-dataset](https://github.com/waymo-research/waymo-open-dataset), under
+Apache-2.0 and carried with their copyright headers; the one change is said at the top
+of `scenario.proto`.
 Check licence compatibility before adding a dependency.

@@ -9,6 +9,7 @@ members = [
     "crates/roadgen-clipgt",
     "crates/roadgen-rdshq",
     "crates/roadgen-gpudrive",
+    "crates/roadgen-womd",
     "crates/roadgen-osm",
     "crates/roadgen-proto",
     "crates/roadgen-sumo",
@@ -35,6 +36,7 @@ roadgen-lanelet2 = { path = "crates/roadgen-lanelet2" }
 roadgen-clipgt = { path = "crates/roadgen-clipgt" }
 roadgen-rdshq = { path = "crates/roadgen-rdshq" }
 roadgen-gpudrive = { path = "crates/roadgen-gpudrive" }
+roadgen-womd = { path = "crates/roadgen-womd" }
 roadgen-osm = { path = "crates/roadgen-osm" }
 roadgen-proto = { path = "crates/roadgen-proto" }
 roadgen-sumo = { path = "crates/roadgen-sumo" }

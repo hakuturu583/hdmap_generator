@@ -1605,6 +1605,7 @@ dependencies = [
  "roadgen-sumo",
  "roadgen-trace",
  "roadgen-viewer",
+ "roadgen-womd",
  "serde_json",
  "tar",
  "tempfile",
@@ -1676,6 +1677,7 @@ dependencies = [
  "roadgen-sumo",
  "roadgen-trace",
  "roadgen-viewer",
+ "roadgen-womd",
 ]
 
 [[package]]
@@ -1723,6 +1725,17 @@ dependencies = [
  "roadgen-gpudrive",
  "serde_json",
  "uom",
+]
+
+[[package]]
+name = "roadgen-womd"
+version = "0.37.1"
+dependencies = [
+ "prost",
+ "prost-build",
+ "protox",
+ "roadgen-core",
+ "tempfile",
 ]
 
 [[package]]
