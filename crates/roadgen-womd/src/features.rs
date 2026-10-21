@@ -19,7 +19,9 @@
 //!   pavement round a junction's corner is the exception, below.
 //! - **A pavement's outline is a road edge.** WOMD has no footway, so a sidewalk is
 //!   not written as a lane, but its edges are, as `TYPE_UNKNOWN` road edges — the
-//!   kerb beside the carriageway is the carriageway's own `ROAD_EDGE_BOUNDARY`.
+//!   kerb beside the carriageway is the carriageway's own `ROAD_EDGE_BOUNDARY`, and
+//!   round a junction's corner, where the pavement is all there is, its inner edge
+//!   is that kerb carried on and a `ROAD_EDGE_BOUNDARY` too.
 //! - **The road edge stays whole where another road crosses over it.** Unlike
 //!   GPUDrive's, a WOMD point has a height, so a bridge's edges and the street's
 //!   beneath it are apart where they cross and nothing is cut.
@@ -37,7 +39,8 @@ use roadgen_core::semantics::{
     BoundaryMarking, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, TrafficRule,
 };
 use roadgen_core::{
-    Direction, IrRef, LaneId, LaneType, Relation, RoadId, SpeedLimit, Trace, ValidatedMap,
+    Direction, IrRef, JunctionId, LaneId, LaneType, Relation, RoadId, SpeedLimit, Trace,
+    ValidatedMap,
 };
 
 use crate::error::ExportError;
@@ -322,8 +325,13 @@ fn edges_and_lines<'a>(
             let Some(edges) = context.sections.get(&(&road.id, section)) else {
                 continue;
             };
+            let kerb = match &road.junction {
+                Some(junction) => corner_kerb(context.map, junction, edges, config)?,
+                None => None,
+            };
             for (&index, edge) in edges {
-                let Some((curve, kind)) = classify(edge, road.is_connector()) else {
+                let Some((curve, kind)) = classify(edge, road.is_connector(), kerb == Some(index))
+                else {
                     continue;
                 };
                 let polyline = points(curve.to_polyline(config)?.points());
@@ -367,19 +375,30 @@ enum Boundary {
 ///
 /// The drivable surface's edges, medians and lines are [`SectionEdge::kind`]'s,
 /// except on a junction connector, which has none (see the module documentation).
-/// A footway's edges that no carriageway shares — the back of a pavement, both
-/// sides of the pavement round a junction's corner — are road edges too, of
+/// A footway's edges that no carriageway shares — the back of a pavement, the
+/// outer side of the pavement round a junction's corner — are road edges too, of
 /// `TYPE_UNKNOWN`: WOMD has no footway, and the outline of one is still where the
 /// road's surroundings begin. The kerb between a pavement and the carriageway is
-/// the carriageway's own edge already.
-fn classify<'a>(edge: &SectionEdge<'a>, connector: bool) -> Option<(&'a Curve3, Boundary)> {
+/// the carriageway's own edge already; round a corner, where the pavement is a
+/// connector of its own, that kerb is the edge `kerb` marks, and is a
+/// `ROAD_EDGE_BOUNDARY` like the kerbs along the arms it joins.
+fn classify<'a>(
+    edge: &SectionEdge<'a>,
+    connector: bool,
+    kerb: bool,
+) -> Option<(&'a Curve3, Boundary)> {
     use road_edge::RoadEdgeType as E;
     if edge.drivable_sides() == 0 {
         let footway = edge
             .lanes()
             .any(|lane| lane.lane_type == LaneType::Sidewalk);
         let (curve, _) = edge.boundary()?;
-        return footway.then_some((curve, Boundary::Edge(E::TypeUnknown)));
+        let kind = if kerb {
+            E::TypeRoadEdgeBoundary
+        } else {
+            E::TypeUnknown
+        };
+        return footway.then_some((curve, Boundary::Edge(kind)));
     }
     if connector {
         return None;
@@ -391,6 +410,47 @@ fn classify<'a>(edge: &SectionEdge<'a>, connector: bool) -> Option<(&'a Curve3, 
         EdgeKind::Line(marking) => Boundary::Line(marking),
     };
     Some((curve, boundary))
+}
+
+/// Which edge of a pavement round a junction's corner is the kerb: of the footway
+/// edges of a connector's cross-section, the one nearest the junction's centre,
+/// since the corner wraps round the junction. `None` when the cross-section is not
+/// such a pavement — fewer than two footway edges, or a junction with no centre.
+fn corner_kerb(
+    map: &ValidatedMap,
+    junction: &JunctionId,
+    edges: &BTreeMap<i32, SectionEdge<'_>>,
+    config: SamplingConfig,
+) -> Result<Option<i32>, ExportError> {
+    let footway: Vec<(i32, &Curve3)> = edges
+        .iter()
+        .filter(|(_, edge)| {
+            edge.drivable_sides() == 0
+                && edge
+                    .lanes()
+                    .any(|lane| lane.lane_type == LaneType::Sidewalk)
+        })
+        .filter_map(|(&index, edge)| Some((index, edge.boundary()?.0)))
+        .collect();
+    if footway.len() < 2 {
+        return Ok(None);
+    }
+    let Some(centre) = map.junction_centre(junction) else {
+        return Ok(None);
+    };
+    let mut nearest: Option<(f64, i32)> = None;
+    for (index, curve) in footway {
+        let polyline = curve.to_polyline(config)?;
+        let points = polyline.points();
+        let Some(middle) = points.get(points.len() / 2) else {
+            continue;
+        };
+        let distance = (middle.x - centre.x).hypot(middle.y - centre.y);
+        if nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, index));
+        }
+    }
+    Ok(nearest.map(|(_, index)| index))
 }
 
 /// The lanes either side of an edge, each linked to the one feature written for it:

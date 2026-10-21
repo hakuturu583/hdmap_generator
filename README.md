@@ -2336,7 +2336,7 @@ reads the file unchanged.
 | --- | --- |
 | `lane` | each drivable lane's centreline in travel order, with its `entry_lanes` and `exit_lanes`, its same-direction `left_neighbors` and `right_neighbors`, the line or edge on either side as `left_boundaries` and `right_boundaries`, its type, and its speed limit in mph. A lane through a junction is `interpolating` and has no boundaries. |
 | `road_line` | a painted boundary between lanes, with its line type |
-| `road_edge` | the edge of the drivable surface (`TYPE_ROAD_EDGE_BOUNDARY`), a kerbed median (`TYPE_ROAD_EDGE_MEDIAN`), and the rest of every pavement's outline — its back edge, and both sides of the pavement round a junction's corner (`TYPE_UNKNOWN`) |
+| `road_edge` | the edge of the drivable surface (`TYPE_ROAD_EDGE_BOUNDARY`), a kerbed median (`TYPE_ROAD_EDGE_MEDIAN`), and the rest of every pavement's outline — its back edge, and the outer side of the pavement round a junction's corner (`TYPE_UNKNOWN`). The inner side of that corner pavement is the kerb carried round the corner, so it is a `TYPE_ROAD_EDGE_BOUNDARY` like the kerbs along the arms |
 | `crosswalk` | the outline of a crossing |
 | `stop_sign` | where the sign stands, and the lanes it controls |
 | `dynamic_map_states` | at every step, a state for each lane through a junction a traffic light governs, with its stop point at the lane's mouth |
