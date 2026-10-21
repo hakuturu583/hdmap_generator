@@ -278,6 +278,7 @@ fn a_pavements_outline_goes_out_as_road_edges() {
             })
     };
     let mut kinds = Vec::new();
+    let mut corners = 0;
     for lane in map
         .lanes
         .iter()
@@ -289,13 +290,24 @@ fn a_pavements_outline_goes_out_as_road_edges() {
             .filter_map(edge_of)
             .collect();
         assert!(!edges.is_empty(), "{} has no edge in the scenario", lane.id);
-        assert!(
-            map.lanes_of(&lane.road).len() > 1 || edges.len() == 2,
-            "a corner's pavement is bounded on both sides: {} has {edges:?}",
-            lane.id
-        );
+        if map.road(&lane.road).unwrap().is_connector() {
+            // Round a corner: the kerb on the junction side, the outline outside.
+            let mut sorted = edges.clone();
+            sorted.sort_by_key(|kind| *kind as i32);
+            assert_eq!(
+                sorted,
+                vec![
+                    pb::road_edge::RoadEdgeType::TypeUnknown,
+                    pb::road_edge::RoadEdgeType::TypeRoadEdgeBoundary
+                ],
+                "{}",
+                lane.id
+            );
+            corners += 1;
+        }
         kinds.extend(edges);
     }
+    assert_eq!(corners, 4, "a pavement round each of the four corners");
     use pb::road_edge::RoadEdgeType;
     assert!(
         kinds.contains(&RoadEdgeType::TypeUnknown),
