@@ -266,12 +266,10 @@ pub(crate) fn add_crossing(phases: &mut [Phase], from_road: &[bool]) {
     };
     let yellow = |phase: &Phase| phase.state.contains('y');
     let count = phases.len();
-    let mut signals = vec!['r'; count];
-    for index in 0..count {
-        if green(&phases[index]) {
-            signals[index] = 'g';
-        }
-    }
+    let mut signals: Vec<char> = phases
+        .iter()
+        .map(|phase| if green(phase) { 'g' } else { 'r' })
+        .collect();
     // Twice round, so that a yellow after the last phase's green reaches the first.
     for _ in 0..2 {
         for index in 0..count {

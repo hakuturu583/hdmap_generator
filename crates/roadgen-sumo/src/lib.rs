@@ -1362,8 +1362,8 @@ struct Signal {
     /// What the light is called in SUMO, which is the node's own id: a name that
     /// follows from the IR junction rather than from netconvert's choice of one.
     id: String,
-    /// The connections it controls, by their key in [`Exporter::movements`], in
-    /// link-index order: the n-th is the n-th signal of every state.
+    /// The connections it controls, by their key in [`Exporter::movements`] or, for
+    /// a bicycle's, [`Exporter::cycling`], in link-index order: the n-th is the n-th signal of every state.
     links: Vec<(usize, usize, usize, usize)>,
     phases: Vec<signals::Phase>,
 }
@@ -2104,12 +2104,9 @@ impl<'a> Exporter<'a> {
         // At a dead end, the end of the sidewalk where both its cycleways meet; see
         // [`Exporter::cycle_round_dead_ends`].
         let turn = |node: &str| {
-            let dead_end = self
-                .nodes
-                .get(node)
-                .is_some_and(|node| node.kind == NodeKind::DeadEnd);
             let end = if node == edge.from { "start" } else { "end" };
-            dead_end.then(|| format!("n_{}.bike{}_{end}", edge.id, slot.index))
+            self.is_dead_end(node)
+                .then(|| format!("n_{}.bike{}_{end}", edge.id, slot.index))
         };
         let ends = [
             turn(from).map(|node| (node, shape.first())),
@@ -2718,6 +2715,13 @@ impl<'a> Exporter<'a> {
         }
     }
 
+    /// Whether `node` is a dead end.
+    fn is_dead_end(&self, node: &str) -> bool {
+        self.nodes
+            .get(node)
+            .is_some_and(|node| node.kind == NodeKind::DeadEnd)
+    }
+
     /// A turn back at every dead end a sidewalk runs into, for bicycles: from the
     /// cycleway arriving there onto the one leaving.
     ///
@@ -2726,35 +2730,23 @@ impl<'a> Exporter<'a> {
     /// small loop ahead of it. They lie along the same strip, so a connection with no
     /// shape would have no length, and netconvert says so.
     fn cycle_round_dead_ends(&mut self) -> Result<(), ExportError> {
-        let mut turns = Vec::new();
         for (&(edge, index), &(along, against)) in &self.cycleways {
             let road_edge = &self.edges[edge];
             for (node, arriving, leaving) in [
                 (&road_edge.to, along, against),
                 (&road_edge.from, against, along),
             ] {
-                let dead_end = self
-                    .nodes
-                    .get(node)
-                    .is_some_and(|node| node.kind == NodeKind::DeadEnd);
-                if !dead_end {
+                if !self.is_dead_end(node) {
                     continue;
                 }
                 let lane = &self.edges[arriving].lanes[0];
-                let shape = turn_loop(&lane.shape, lane.width)?;
-                turns.push((
-                    arriving,
-                    leaving,
-                    shape,
-                    road_edge.lanes[index].lane.clone(),
-                ));
+                let mut ride = Ride::new(RideKind::Turn);
+                ride.movement.shape = Some(turn_loop(&lane.shape, lane.width)?);
+                ride.movement
+                    .connectors
+                    .insert(road_edge.lanes[index].lane.clone());
+                self.cycling.insert((arriving, 0, leaving, 0), ride);
             }
-        }
-        for (arriving, leaving, shape, sidewalk) in turns {
-            let mut ride = Ride::new(RideKind::Turn);
-            ride.movement.connectors.insert(sidewalk);
-            ride.movement.shape = Some(shape);
-            self.cycling.insert((arriving, 0, leaving, 0), ride);
         }
         Ok(())
     }
@@ -2786,36 +2778,40 @@ impl<'a> Exporter<'a> {
         };
         // The kerbmost lane each pair of carriageways is joined by, and the movements
         // between them.
-        let mut pairs: BTreeMap<(usize, usize), (usize, usize, Vec<&Movement>)> = BTreeMap::new();
+        let mut pairs: BTreeMap<(usize, usize), (usize, usize, Movement)> = BTreeMap::new();
         for (&(from, from_lane, to, to_lane), movement) in &self.movements {
             if !admits(&self.edges[from], from_lane) || !admits(&self.edges[to], to_lane) {
                 continue;
             }
             let pair = pairs
                 .entry((from, to))
-                .or_insert((from_lane, to_lane, Vec::new()));
+                .or_insert((from_lane, to_lane, Movement::default()));
             pair.0 = pair.0.min(from_lane);
             pair.1 = pair.1.min(to_lane);
-            pair.2.push(movement);
+            pair.2
+                .connections
+                .extend(movement.connections.iter().cloned());
+            pair.2
+                .connectors
+                .extend(movement.connectors.iter().cloned());
         }
         let mut rides = Vec::new();
-        for (&(from, to), (from_lane, to_lane, movements)) in &pairs {
+        for ((from, to), (from_lane, to_lane, ride)) in pairs {
             let node = &self.edges[from].to;
-            let kerb = |edge: usize| {
-                let slot = Slot { edge, index: 0 };
-                self.cycleways.contains_key(&(edge, 0)).then_some(slot)
-            };
-            let mut ride = Movement::default();
-            for movement in movements {
-                ride.connections
-                    .extend(movement.connections.iter().cloned());
-                ride.connectors.extend(movement.connectors.iter().cloned());
+            let joining = self.cycleway_at(
+                Slot {
+                    edge: from,
+                    index: 0,
+                },
+                node,
+                true,
+            );
+            let leaving = self.cycleway_at(Slot { edge: to, index: 0 }, node, false);
+            if let Some(cycleway) = joining {
+                rides.push(((cycleway, 0, to, to_lane), RideKind::Join, ride.clone()));
             }
-            if let Some(cycleway) = kerb(from).and_then(|slot| self.cycleway_at(slot, node, true)) {
-                rides.push(((cycleway, 0, to, *to_lane), RideKind::Join, ride.clone()));
-            }
-            if let Some(cycleway) = kerb(to).and_then(|slot| self.cycleway_at(slot, node, false)) {
-                rides.push(((from, *from_lane, cycleway, 0), RideKind::Leave, ride));
+            if let Some(cycleway) = leaving {
+                rides.push(((from, from_lane, cycleway, 0), RideKind::Leave, ride));
             }
         }
         for (key, kind, movement) in rides {
@@ -2835,23 +2831,26 @@ impl<'a> Exporter<'a> {
     /// only such a road has a crossing (see [`place_crosswalk`]). At a signalised node
     /// the light gives it a green of its own; see [`Exporter::build_signals`].
     fn cycle_across_crossings(&mut self) {
+        // The sidewalks of each road at each of its ends, whichever edge carries them.
+        let mut sidewalks: HashMap<(&RoadId, &str), Vec<Slot>> = HashMap::new();
+        for &(edge, index) in self.cycleways.keys() {
+            let carrier = &self.edges[edge];
+            let ends = [&carrier.from].into_iter();
+            for node in ends.chain((carrier.to != carrier.from).then_some(&carrier.to)) {
+                sidewalks
+                    .entry((&carrier.road, node))
+                    .or_default()
+                    .push(Slot { edge, index });
+            }
+        }
         let mut rides = Vec::new();
         for ((node, crossed), crossing) in &self.crossings {
             let Some(&first) = crossed.first() else {
                 continue;
             };
             let road = &self.edges[first].road;
-            // The sidewalks of the road at this end, whichever edge carries them.
-            let sidewalks: Vec<Slot> = self
-                .cycleways
-                .keys()
-                .map(|&(edge, index)| Slot { edge, index })
-                .filter(|slot| {
-                    let edge = &self.edges[slot.edge];
-                    &edge.road == road && (&edge.from == node || &edge.to == node)
-                })
-                .collect();
-            let [one, other] = sidewalks[..] else {
+            let Some(&[one, other]) = sidewalks.get(&(road, node.as_str())).map(Vec::as_slice)
+            else {
                 continue;
             };
             for (from, to) in [(one, other), (other, one)] {
@@ -3017,27 +3016,35 @@ impl<'a> Exporter<'a> {
     /// [`signals`] for what is made of them.
     fn build_signals(&mut self) {
         let handedness = self.map.metadata.handedness;
+        let rides = |kind: RideKind| {
+            self.cycling
+                .iter()
+                .filter(move |(_, ride)| ride.kind == kind)
+                .map(|(key, _)| key)
+        };
+        // At each node, the IR's movements, then the bicycles' ways onto and off the
+        // carriageways, which go when the carriageway beside them does; and apart,
+        // the bicycles' ways across the road.
+        type Key = (usize, usize, usize, usize);
+        let mut at: HashMap<&str, (Vec<Key>, Vec<Key>)> = HashMap::new();
+        for key in self
+            .movements
+            .keys()
+            .chain(rides(RideKind::Join))
+            .chain(rides(RideKind::Leave))
+        {
+            at.entry(&self.edges[key.0].to).or_default().0.push(*key);
+        }
+        for key in rides(RideKind::Cross) {
+            at.entry(&self.edges[key.0].to).or_default().1.push(*key);
+        }
         for (id, node) in &self.nodes {
             if node.kind != NodeKind::TrafficLight {
                 continue;
             }
-            let into = |(from, ..): &&(usize, usize, usize, usize)| self.edges[*from].to == *id;
-            let rides = |kind: RideKind| {
-                self.cycling
-                    .iter()
-                    .filter(move |(_, ride)| ride.kind == kind)
-                    .map(|(key, _)| key)
+            let Some((keys, crossings)) = at.remove(id.as_str()) else {
+                continue;
             };
-            // The IR's movements, then the bicycles' ways onto and off the
-            // carriageways, which go when the carriageway beside them does.
-            let keys: Vec<(usize, usize, usize, usize)> = self
-                .movements
-                .keys()
-                .chain(rides(RideKind::Join))
-                .chain(rides(RideKind::Leave))
-                .filter(into)
-                .copied()
-                .collect();
             if keys.is_empty() {
                 // Nothing to control, so nothing to program: the node stays a
                 // `traffic_light`, and what netconvert makes of it is its own.
@@ -3064,8 +3071,6 @@ impl<'a> Exporter<'a> {
             let mut phases = signals::program(&links, handedness);
             // The bicycles' ways across the road, after everything else: each green
             // in the phases that hold the road it crosses at red.
-            let crossings: Vec<(usize, usize, usize, usize)> =
-                rides(RideKind::Cross).filter(into).copied().collect();
             for key in &crossings {
                 let road = &self.edges[key.0].road;
                 let from_road: Vec<bool> = links
@@ -4397,24 +4402,14 @@ fn crossing(path: &Polyline3, line: &Polyline3) -> Option<LineCrossing> {
     best
 }
 
-/// How far along `path` the point of it nearest `point` is, in plan, and how long
-/// `path` is in plan: the station of `point` on a road whose reference line `path`
-/// samples, and the road's length measured the same way.
 /// The path a bicycle turns back on at the end of `lane` (a polyline in travel
 /// order, `width` wide), onto a lane laid along the same strip the other way: out a
 /// little beyond the end and round, back to where it started.
 fn turn_loop(lane: &Polyline3, width: f64) -> Result<Polyline3, ExportError> {
     let end = lane.last();
-    let heading = final_heading(lane);
-    let (dx, dy) = (heading.cos(), heading.sin());
+    let frame = lane.frame_at(lane.points().len() - 1)?;
     let (ahead, side) = (width.max(1.0), width / 4.0);
-    let at = |forward: f64, left: f64| {
-        Point3::new(
-            end.x + dx * forward - dy * left,
-            end.y + dy * forward + dx * left,
-            end.z,
-        )
-    };
+    let at = |forward: f64, left: f64| frame.to_global([forward, left, 0.0]);
     Ok(Polyline3::new([
         end,
         at(ahead * 0.6, -side),
@@ -4424,6 +4419,9 @@ fn turn_loop(lane: &Polyline3, width: f64) -> Result<Polyline3, ExportError> {
     ])?)
 }
 
+/// How far along `path` the point of it nearest `point` is, in plan, and how long
+/// `path` is in plan: the station of `point` on a road whose reference line `path`
+/// samples, and the road's length measured the same way.
 fn station_along(path: &Polyline3, point: Point3) -> (f64, f64) {
     let mut travelled = 0.0;
     let mut best = (f64::INFINITY, 0.0);

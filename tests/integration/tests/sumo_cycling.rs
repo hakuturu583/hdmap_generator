@@ -227,61 +227,144 @@ fn the_pedestrians_keep_their_walking_areas_and_crossings() {
     }
 }
 
-/// A bicycle rides round every corner the IR paves, both ways, on the sidewalks — a
-/// few metres each, where any other way round is hundreds.
+/// Each network built once, for both rides below.
 #[test]
-fn a_bicycle_rides_round_every_corner_both_ways() {
+fn a_bicycle_rides_round_every_corner_gets_on_and_off_the_road_crosses_it_and_turns_back() {
     if !sumo_build::sumo_available() {
         return;
     }
     for handedness in HANDEDNESS {
         for map in maps(handedness) {
-            let name = roadgen_sumo::network_name(&map);
             let built = sumo_build::build_with(&map, &cycling());
-            let network = &built.network;
-
-            let mut rides = Vec::new();
-            for corner in corners(&map) {
-                let (into_from, out_of_from) = ways_through(network, &corner.from, "j_x");
-                let (into_to, out_of_to) = ways_through(network, &corner.to, "j_x");
-                rides.push((into_from, out_of_to));
-                rides.push((into_to, out_of_from));
-            }
-            assert_eq!(
-                rides.len(),
-                8,
-                "{name}: two rides round each of four corners"
-            );
-
-            let mut trips = String::new();
-            for (index, (from, to)) in rides.iter().enumerate() {
-                let (from_edge, from_lane) = from.rsplit_once('_').unwrap();
-                let (to_edge, to_lane) = to.rsplit_once('_').unwrap();
-                let depart = network.edge(from_edge).lanes[0].length - 1.0;
-                trips.push_str(&format!(
-                    r#"    <trip id="b{index}" type="bike" depart="0" from="{from_edge}" to="{to_edge}" departLane="{from_lane}" departPos="{depart:.2}" arrivalLane="{to_lane}" arrivalPos="1.00"/>
-"#
-                ));
-            }
-            let routes = format!(
-                "<routes>\n    <vType id=\"bike\" vClass=\"bicycle\"/>\n{trips}</routes>\n"
-            );
-            std::fs::write(built.directory.path().join("rides.rou.xml"), routes).unwrap();
-
-            let ridden = sumo_build::ride(built.directory.path(), &built.prefix);
-            assert_eq!(
-                ridden.len(),
-                rides.len(),
-                "{name}: every bicycle should arrive: {ridden:?}"
-            );
-            for (bicycle, length) in &ridden {
-                let (from, to) = &rides[bicycle.trim_start_matches('b').parse::<usize>().unwrap()];
-                assert!(
-                    *length < 40.0,
-                    "{name}: {from} to {to} took {length} m, so it did not go round the corner"
-                );
-            }
+            rides_round_every_corner(&map, &built);
+            gets_on_and_off_the_road_crosses_it_and_turns_back(&map, &built);
         }
+    }
+}
+
+/// A bicycle rides round every corner the IR paves, both ways, on the sidewalks — a
+/// few metres each, where any other way round is hundreds.
+fn rides_round_every_corner(map: &ValidatedMap, built: &sumo_build::Built) {
+    let name = roadgen_sumo::network_name(map);
+    let network = &built.network;
+
+    let mut rides = Vec::new();
+    for corner in corners(map) {
+        let (into_from, out_of_from) = ways_through(network, &corner.from, "j_x");
+        let (into_to, out_of_to) = ways_through(network, &corner.to, "j_x");
+        rides.push((into_from, out_of_to));
+        rides.push((into_to, out_of_from));
+    }
+    assert_eq!(
+        rides.len(),
+        8,
+        "{name}: two rides round each of four corners"
+    );
+
+    let mut trips = String::new();
+    for (index, (from, to)) in rides.iter().enumerate() {
+        let (from_edge, from_lane) = from.rsplit_once('_').unwrap();
+        let (to_edge, to_lane) = to.rsplit_once('_').unwrap();
+        let depart = network.edge(from_edge).lanes[0].length - 1.0;
+        trips.push_str(&format!(
+            r#"    <trip id="b{index}" type="bike" depart="0" from="{from_edge}" to="{to_edge}" departLane="{from_lane}" departPos="{depart:.2}" arrivalLane="{to_lane}" arrivalPos="1.00"/>
+"#
+        ));
+    }
+    let routes =
+        format!("<routes>\n    <vType id=\"bike\" vClass=\"bicycle\"/>\n{trips}</routes>\n");
+    std::fs::write(built.directory.path().join("rides.rou.xml"), routes).unwrap();
+
+    let ridden = sumo_build::ride(built.directory.path(), &built.prefix);
+    assert_eq!(
+        ridden.len(),
+        rides.len(),
+        "{name}: every bicycle should arrive: {ridden:?}"
+    );
+    for (bicycle, length) in &ridden {
+        let (from, to) = &rides[bicycle.trim_start_matches('b').parse::<usize>().unwrap()];
+        assert!(
+            *length < 40.0,
+            "{name}: {from} to {to} took {length} m, so it did not go round the corner"
+        );
+    }
+}
+
+/// Every connection a bicycle can ride onto or off a sidewalk, across the road or
+/// back at a dead end is one a bicycle in the simulator does ride: starting a metre
+/// short of the end of the one edge, it arrives a metre into the other having gone
+/// a few metres, where any other way round is hundreds — whether the junction is
+/// signalised or not, and whichever side traffic keeps to.
+///
+/// One bicycle at a time, a full signal cycle and more apart. Released together, a
+/// handful of them giving way to one another across an unsignalised junction can
+/// each wait for the next, as cars on the minor arms of a priority junction can, and
+/// that would say nothing about whether each way is there.
+fn gets_on_and_off_the_road_crosses_it_and_turns_back(
+    map: &ValidatedMap,
+    built: &sumo_build::Built,
+) {
+    let name = roadgen_sumo::network_name(map);
+    let network = &built.network;
+    let crosswalks = map
+        .objects
+        .iter()
+        .any(|object| object.kind == MapObjectKind::Crosswalk);
+
+    let mut rides: Vec<(Ride, &str, usize, &str)> = network
+        .movements()
+        .into_iter()
+        .filter_map(|(from, from_lane, to, _)| Some((ride(from, to)?, from, from_lane, to)))
+        .filter(|(kind, ..)| *kind != Ride::Corner)
+        .collect();
+    rides.sort();
+    let kinds: BTreeSet<Ride> = rides.iter().map(|(kind, ..)| *kind).collect();
+    let mut expected = BTreeSet::from([Ride::OnOrOff, Ride::TurnBack]);
+    if crosswalks {
+        expected.insert(Ride::Across);
+    }
+    assert_eq!(kinds, expected, "{name}: {rides:?}");
+    // A turn back at the far end of every sidewalk of every arm.
+    let sidewalks = map
+        .lanes
+        .iter()
+        .filter(|lane| lane.lane_type == LaneType::Sidewalk)
+        .filter(|lane| {
+            map.road(&lane.road)
+                .is_some_and(|road| !road.is_connector())
+        })
+        .count();
+    let turns = rides
+        .iter()
+        .filter(|(kind, ..)| *kind == Ride::TurnBack)
+        .count();
+    assert_eq!(turns, sidewalks, "{name}: {rides:?}");
+
+    let mut trips = String::new();
+    for (index, (_, from, from_lane, to)) in rides.iter().enumerate() {
+        let depart = network.edge(from).lanes[*from_lane].length - 1.0;
+        let depart_time = index * 100;
+        trips.push_str(&format!(
+            r#"    <trip id="b{index}" type="bike" depart="{depart_time}" from="{from}" to="{to}" departLane="{from_lane}" departPos="{depart:.2}" arrivalPos="1.00"/>
+"#
+        ));
+    }
+    let routes =
+        format!("<routes>\n    <vType id=\"bike\" vClass=\"bicycle\"/>\n{trips}</routes>\n");
+    std::fs::write(built.directory.path().join("rides.rou.xml"), routes).unwrap();
+
+    let ridden = sumo_build::ride(built.directory.path(), &built.prefix);
+    assert_eq!(
+        ridden.len(),
+        rides.len(),
+        "{name}: every bicycle should arrive: {ridden:?} of {rides:?}"
+    );
+    for (bicycle, length) in &ridden {
+        let ride = &rides[bicycle.trim_start_matches('b').parse::<usize>().unwrap()];
+        assert!(
+            *length < 40.0,
+            "{name}: {ride:?} took {length} m, so it went some other way"
+        );
     }
 }
 
@@ -385,91 +468,6 @@ fn ride(from: &str, to: &str) -> Option<Ride> {
         (Some(one), Some(other)) if one == other => Some(Ride::TurnBack),
         _ if arm(from) == arm(to) => Some(Ride::Across),
         _ => Some(Ride::Corner),
-    }
-}
-
-/// Every connection a bicycle can ride onto or off a sidewalk, across the road or
-/// back at a dead end is one a bicycle in the simulator does ride: starting a metre
-/// short of the end of the one edge, it arrives a metre into the other having gone
-/// a few metres, where any other way round is hundreds — whether the junction is
-/// signalised or not, and whichever side traffic keeps to.
-///
-/// One bicycle at a time, a full signal cycle and more apart. Released together, a
-/// handful of them giving way to one another across an unsignalised junction can
-/// each wait for the next, as cars on the minor arms of a priority junction can, and
-/// that would say nothing about whether each way is there.
-#[test]
-fn a_bicycle_gets_on_and_off_the_road_crosses_it_and_turns_back() {
-    if !sumo_build::sumo_available() {
-        return;
-    }
-    for handedness in HANDEDNESS {
-        for map in maps(handedness) {
-            let name = roadgen_sumo::network_name(&map);
-            let built = sumo_build::build_with(&map, &cycling());
-            let network = &built.network;
-            let crosswalks = map
-                .objects
-                .iter()
-                .any(|object| object.kind == MapObjectKind::Crosswalk);
-
-            let mut rides: Vec<(Ride, &str, usize, &str)> = network
-                .movements()
-                .into_iter()
-                .filter_map(|(from, from_lane, to, _)| Some((ride(from, to)?, from, from_lane, to)))
-                .filter(|(kind, ..)| *kind != Ride::Corner)
-                .collect();
-            rides.sort();
-            let kinds: BTreeSet<Ride> = rides.iter().map(|(kind, ..)| *kind).collect();
-            let mut expected = BTreeSet::from([Ride::OnOrOff, Ride::TurnBack]);
-            if crosswalks {
-                expected.insert(Ride::Across);
-            }
-            assert_eq!(kinds, expected, "{name}: {rides:?}");
-            // A turn back at the far end of every sidewalk of every arm.
-            let sidewalks = map
-                .lanes
-                .iter()
-                .filter(|lane| lane.lane_type == LaneType::Sidewalk)
-                .filter(|lane| {
-                    map.road(&lane.road)
-                        .is_some_and(|road| !road.is_connector())
-                })
-                .count();
-            let turns = rides
-                .iter()
-                .filter(|(kind, ..)| *kind == Ride::TurnBack)
-                .count();
-            assert_eq!(turns, sidewalks, "{name}: {rides:?}");
-
-            let mut trips = String::new();
-            for (index, (_, from, from_lane, to)) in rides.iter().enumerate() {
-                let depart = network.edge(from).lanes[*from_lane].length - 1.0;
-                let depart_time = index * 100;
-                trips.push_str(&format!(
-                    r#"    <trip id="b{index}" type="bike" depart="{depart_time}" from="{from}" to="{to}" departLane="{from_lane}" departPos="{depart:.2}" arrivalPos="1.00"/>
-"#
-                ));
-            }
-            let routes = format!(
-                "<routes>\n    <vType id=\"bike\" vClass=\"bicycle\"/>\n{trips}</routes>\n"
-            );
-            std::fs::write(built.directory.path().join("rides.rou.xml"), routes).unwrap();
-
-            let ridden = sumo_build::ride(built.directory.path(), &built.prefix);
-            assert_eq!(
-                ridden.len(),
-                rides.len(),
-                "{name}: every bicycle should arrive: {ridden:?} of {rides:?}"
-            );
-            for (bicycle, length) in &ridden {
-                let ride = &rides[bicycle.trim_start_matches('b').parse::<usize>().unwrap()];
-                assert!(
-                    *length < 40.0,
-                    "{name}: {ride:?} took {length} m, so it went some other way"
-                );
-            }
-        }
     }
 }
 
