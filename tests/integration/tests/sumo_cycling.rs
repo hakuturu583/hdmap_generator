@@ -100,16 +100,8 @@ fn ways_through(network: &SumoNetwork, lane: &str, node: &str) -> (String, Strin
         format!("{edge}.bike{index}"),
         format!("{edge}.bike{index}.rev"),
     );
-    // The piece of a cycleway that runs into `node`.
-    let into = |cycleway: &str| {
-        network
-            .edges
-            .iter()
-            .find(|piece| unpieced(&piece.id) == cycleway && piece.to.as_deref() == Some(node))
-            .unwrap_or_else(|| panic!("{cycleway} runs into {node}"))
-            .id
-            .clone()
-    };
+    // The piece of a cycleway that runs into `node`: its last.
+    let into = |cycleway: &str| pieces_of(network, cycleway).last().unwrap().id.clone();
     if network.edge(&along).from.as_deref() == Some(node) {
         (format!("{}_0", into(&against)), format!("{along}_0"))
     } else {
@@ -146,6 +138,20 @@ fn unpieced(edge: &str) -> String {
         Some((whole, piece)) if piece.chars().all(|c| c.is_ascii_digit()) => whole.to_owned(),
         _ => edge.to_owned(),
     }
+}
+
+/// The pieces `edge` is written as, in travel order: each runs on from the node the
+/// one before it runs into.
+fn pieces_of<'a>(network: &'a SumoNetwork, edge: &str) -> Vec<&'a sumo_build::SumoEdge> {
+    let mut pieces = vec![network.edge(edge)];
+    while let Some(next) = network.edges.iter().find(|piece| {
+        unpieced(&piece.id) == edge
+            && piece.from.is_some()
+            && piece.from == pieces.last().unwrap().to
+    }) {
+        pieces.push(next);
+    }
+    pieces
 }
 
 /// The edges each crossing netconvert built crosses.
@@ -551,53 +557,17 @@ fn on_a_bend_cut_for_its_curve_speed_a_bicycle_gets_on_the_road_between_its_ends
     if !sumo_build::sumo_available() {
         return;
     }
-    let radius = 120.0;
-    let alignment = Alignment::new(Point3::new(0.0, 0.0, 0.0), 0.0)
-        .line(80.0, 1.0)
-        .unwrap()
-        .spiral(60.0, 1.0 / radius, 1.0)
-        .unwrap()
-        .arc(140.0, 1.0 / radius, 2.0)
-        .unwrap()
-        .spiral(60.0, 0.0, 1.0)
-        .unwrap()
-        .line(80.0, 1.0)
-        .unwrap()
-        .finish()
-        .unwrap();
-    let street = vec![
-        scenarios::lane(3.5, Direction::Backward),
-        scenarios::lane(2.0, Direction::Backward).with_type(LaneType::Sidewalk),
-        scenarios::lane(3.5, Direction::Forward),
-        scenarios::lane(2.0, Direction::Forward).with_type(LaneType::Sidewalk),
-    ];
-    let mut builder = MapBuilder::new(scenarios::metadata("sweep_street"));
-    builder
-        .add_road(
-            RoadSpec::new(alignment, street)
-                .with_name("sweep")
-                .with_speed_limit(SpeedLimit::from_kph(80.0).unwrap()),
-        )
-        .unwrap();
-    let map = builder.finish().unwrap().validate().unwrap();
+    let map = scenarios::spiral_transition_street();
     let options = Options {
         curve_lateral_acceleration: Some(2.0),
-        cycle_on_sidewalks: true,
+        ..cycling()
     };
     let built = sumo_build::build_with(&map, &options);
     let network = &built.network;
 
     // The forward carriageway is cut at its bend and at the places a bicycle changes
     // between it and its sidewalk, one piece running on from the last.
-    let mut pieces: Vec<_> = network
-        .edges
-        .iter()
-        .filter(|edge| unpieced(&edge.id) == "sweep.fwd")
-        .collect();
-    pieces.sort_by_key(|edge| (edge.id.len(), edge.id.clone()));
-    for pair in pieces.windows(2) {
-        assert_eq!(pair[0].to, pair[1].from, "{} > {}", pair[0].id, pair[1].id);
-    }
+    let pieces = pieces_of(network, "sweep.fwd");
     let cuts: Vec<&str> = pieces[1..]
         .iter()
         .filter_map(|piece| piece.from.as_deref())

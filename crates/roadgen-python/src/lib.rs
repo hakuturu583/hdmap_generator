@@ -1473,9 +1473,9 @@ impl PyMap {
     /// with every footway connection of the map written as a connection each way
     /// between them. A bicycle may also come off a sidewalk onto the carriageway beside
     /// it, or off a carriageway onto a sidewalk, at any junction or joint, and between
-    /// junctions every 50 m at most, where the carriageway is cut; ride across the
-    /// road wherever a crosswalk became a crossing; and turn back at a dead end. Off,
-    /// sidewalks are for pedestrians only.
+    /// junctions every `CYCLE_TRANSFER_SPACING` (50 m) at most, where the carriageway
+    /// is cut; ride across the road wherever a crosswalk became a crossing; and turn
+    /// back at a dead end. Off, sidewalks are for pedestrians only.
     #[pyo3(signature = (directory, trace = true, curve_lateral_acceleration = None, cycle_on_sidewalks = false))]
     fn export_sumo(
         &mut self,
