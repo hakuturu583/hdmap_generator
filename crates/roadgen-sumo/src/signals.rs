@@ -241,6 +241,53 @@ fn facing(a: f64, b: f64) -> bool {
     PI - swing(a, b).abs() <= AXIS_TOLERANCE_DEGREES.to_radians()
 }
 
+/// Appends to every phase of `phases` the signal of one more link: a bicycle's way
+/// across a road, of which `from_road` says, link by link, which arrive along it.
+///
+/// It is green (`g`: it gives way to whatever else is released) in every phase that
+/// releases something and holds every link off that road at red, which is when the
+/// road it crosses is quiet but for traffic turning into it. A green ends in a
+/// yellow through the yellows that follow it, and red from there on, as every other
+/// link's does: SUMO refuses a program in which a green goes straight to red.
+pub(crate) fn add_crossing(phases: &mut [Phase], from_road: &[bool]) {
+    let held = |phase: &Phase| {
+        phase
+            .state
+            .chars()
+            .zip(from_road)
+            .all(|(signal, &on_road)| !on_road || signal == 'r')
+    };
+    let green = |phase: &Phase| {
+        held(phase)
+            && phase
+                .state
+                .chars()
+                .any(|signal| matches!(signal, 'G' | 'g'))
+    };
+    let yellow = |phase: &Phase| phase.state.contains('y');
+    let count = phases.len();
+    let mut signals: Vec<char> = phases
+        .iter()
+        .map(|phase| if green(phase) { 'g' } else { 'r' })
+        .collect();
+    // Twice round, so that a yellow after the last phase's green reaches the first.
+    for _ in 0..2 {
+        for index in 0..count {
+            let before = signals[(index + count - 1) % count];
+            if signals[index] == 'r'
+                && matches!(before, 'g' | 'y')
+                && yellow(&phases[index])
+                && held(&phases[index])
+            {
+                signals[index] = 'y';
+            }
+        }
+    }
+    for (phase, signal) in phases.iter_mut().zip(signals) {
+        phase.state.push(signal);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +486,26 @@ mod tests {
         assert!((swing(degrees(170.0), degrees(-170.0)) - degrees(20.0)).abs() < 1e-9);
         assert!((swing(degrees(-170.0), degrees(170.0)) + degrees(20.0)).abs() < 1e-9);
         assert!((swing(degrees(-90.0), 0.0) - degrees(90.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_crossing_is_green_while_its_road_is_held_and_ends_in_yellow() {
+        // A crossroads: the first two approaches face each other, as do the last two.
+        let links = crossroads();
+        let mut phases = program(&links, TrafficHandedness::RightHand);
+        // Across the road the first approach arrives along.
+        let from_road: Vec<bool> = links.iter().map(|link| link.approach == 0).collect();
+        add_crossing(&mut phases, &from_road);
+        let signals: String = phases
+            .iter()
+            .map(|phase| phase.state.chars().last().unwrap())
+            .collect();
+        // Held through its own road's green, yellow and all-red; green in the other
+        // road's green, then yellow with it, then red before its road goes again.
+        assert_eq!(signals, "rrrgyr");
+        // And every phase still has one signal per link, the crossing's last.
+        for phase in &phases {
+            assert_eq!(phase.state.len(), links.len() + 1);
+        }
     }
 }

@@ -317,14 +317,14 @@ pub fn walk(directory: &Path, prefix: &str) -> BTreeMap<String, f64> {
 /// Runs the simulator on the built network with the vehicles of `rides.rou.xml`, and
 /// returns how far each one that arrived rode, by id — the counterpart of [`walk`]
 /// for bicycles, which the simulator routes over connections rather than walking
-/// areas.
+/// areas. It runs until the last of them has arrived; one that cannot is teleported
+/// after SUMO's five minutes of waiting, which it complains of, failing the test.
 pub fn ride(directory: &Path, prefix: &str) -> BTreeMap<String, f64> {
     let output = Command::new(tool("sumo").expect("sumo"))
         .args(["-n", &format!("{prefix}.net.xml")])
         .args(["-r", "rides.rou.xml"])
         .args(["--tripinfo-output", "rides.tripinfo.xml"])
         .args(["--no-step-log", "true"])
-        .args(["--end", "600"])
         .current_dir(directory)
         .output()
         .expect("sumo should run");

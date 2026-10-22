@@ -1448,15 +1448,54 @@ details keep netconvert quiet:
 - each edge is cut in two halfway (`….p1`, joined at `n_<edge>_p1`), so it never joins
   the same two nodes as a carriageway of its road, which netconvert would read as a
   second turnaround;
-- at a road end the IR links nowhere, each one ends at a dead end of its own
-  (`n_<edge>_start` / `n_<edge>_end`);
-- at a signalised junction the rides are `uncontrolled`, since the pavement round a
-  corner crosses no traffic.
+- at a road end the IR links nowhere, the two edges of a sidewalk meet at a node of
+  their own (`n_<edge>.bike<index>_start` / `_end`) rather than at the road's dead end;
+- at a signalised junction the rides round a corner are `uncontrolled`, since the
+  pavement round a corner crosses no traffic.
+
+A bicycle can also **change between sidewalk and road, cross the road, and turn
+back**. SUMO only moves a vehicle from one edge to another along a connection at a
+node, so these all happen at nodes:
+
+```xml
+<!-- off the sidewalk onto the carriageway it runs beside, straight on across the junction -->
+<connection from="west.fwd.bike0.p1" to="east.fwd" fromLane="0" toLane="1"/>
+<!-- off the carriageway onto the sidewalk of the road it turns into -->
+<connection from="west.fwd" to="north.fwd.bike0" fromLane="1" toLane="0"/>
+<!-- across the west arm, where a crosswalk is, to the sidewalk on the other kerb -->
+<connection from="west.fwd.bike0.p1" to="west.bwd.bike0" fromLane="0" toLane="0"/>
+<!-- back the other way at the dead end the sidewalk runs out to, round a small loop -->
+<connection from="west.fwd.bike0.rev.p1" to="west.fwd.bike0" fromLane="0" toLane="0" shape="…"/>
+```
+
+| ride | where | how |
+| --- | --- | --- |
+| onto the carriageway | every node the IR has a movement through, with lanes a bicycle may use | from the sidewalk beside the arriving carriageway, riding its way, to the leaving carriageway's kerbmost such lane |
+| off the carriageway | the same | from the arriving carriageway's kerbmost such lane onto the sidewalk beside the leaving carriageway, riding its way |
+| across the road | wherever a crosswalk became a SUMO crossing | from the sidewalk on one kerb to the one on the other, each way |
+| turning back | the end of every sidewalk at a dead end | from the edge arriving onto the one leaving |
+
+The bicycle edges sit below every carriageway in the priority order, so at a junction
+without a light a bicycle coming off the sidewalk gives way to the traffic it meets.
+At a signalised junction the light controls the rides onto and off a carriageway,
+which go with the carriageway's own movements. It also controls the rides across a
+road, which are green while that road is held at red and end in a yellow like every
+other signal.
+
+With a light over bicycles the `.netccfg` also sets `tls.ignore-internal-junction-jam`.
+Some of these rides are released together with a turning car (a bicycle crossing the
+road and a car turning into it, say), and without the option netconvert before 1.2x
+builds such a pair a junction logic in which each waits for the other, which SUMO
+refuses to run. The option drops the logic that holds traffic for a vehicle still
+inside the junction when its phase ends. Newer netconvert builds the same network
+cleanly without it, and nothing is written when no light controls a bicycle.
 
 The bicycle edges get a trip weight of 0, so `randomTrips.py` never starts or ends a
 car trip on them. In the trace, each piece is `part` of its sidewalk with the role
-`bicycle`, and each ride carries the footway connections and the pavement lane it
-stands for, also with the role `bicycle`.
+`bicycle`. Each ride carries what it stands for, also with the role `bicycle`: the
+footway connections and pavement lane round a corner, the IR's movements beside a ride
+onto or off a carriageway, the crosswalks beside a ride across the road, and the
+sidewalk a bicycle turns back on.
 
 ### Traffic lights
 

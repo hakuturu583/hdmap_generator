@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use roadgen_core::prelude::*;
+use roadgen_core::semantics::MapObjectKind;
 use roadgen_core::trace::Relation;
 use roadgen_integration_tests::scenarios;
 use roadgen_integration_tests::sumo_build::{self, SumoNetwork};
@@ -226,61 +227,144 @@ fn the_pedestrians_keep_their_walking_areas_and_crossings() {
     }
 }
 
-/// A bicycle rides round every corner the IR paves, both ways, on the sidewalks — a
-/// few metres each, where any other way round is hundreds.
+/// Each network built once, for both rides below.
 #[test]
-fn a_bicycle_rides_round_every_corner_both_ways() {
+fn a_bicycle_rides_round_every_corner_gets_on_and_off_the_road_crosses_it_and_turns_back() {
     if !sumo_build::sumo_available() {
         return;
     }
     for handedness in HANDEDNESS {
         for map in maps(handedness) {
-            let name = roadgen_sumo::network_name(&map);
             let built = sumo_build::build_with(&map, &cycling());
-            let network = &built.network;
-
-            let mut rides = Vec::new();
-            for corner in corners(&map) {
-                let (into_from, out_of_from) = ways_through(network, &corner.from, "j_x");
-                let (into_to, out_of_to) = ways_through(network, &corner.to, "j_x");
-                rides.push((into_from, out_of_to));
-                rides.push((into_to, out_of_from));
-            }
-            assert_eq!(
-                rides.len(),
-                8,
-                "{name}: two rides round each of four corners"
-            );
-
-            let mut trips = String::new();
-            for (index, (from, to)) in rides.iter().enumerate() {
-                let (from_edge, from_lane) = from.rsplit_once('_').unwrap();
-                let (to_edge, to_lane) = to.rsplit_once('_').unwrap();
-                let depart = network.edge(from_edge).lanes[0].length - 1.0;
-                trips.push_str(&format!(
-                    r#"    <trip id="b{index}" type="bike" depart="0" from="{from_edge}" to="{to_edge}" departLane="{from_lane}" departPos="{depart:.2}" arrivalLane="{to_lane}" arrivalPos="1.00"/>
-"#
-                ));
-            }
-            let routes = format!(
-                "<routes>\n    <vType id=\"bike\" vClass=\"bicycle\"/>\n{trips}</routes>\n"
-            );
-            std::fs::write(built.directory.path().join("rides.rou.xml"), routes).unwrap();
-
-            let ridden = sumo_build::ride(built.directory.path(), &built.prefix);
-            assert_eq!(
-                ridden.len(),
-                rides.len(),
-                "{name}: every bicycle should arrive: {ridden:?}"
-            );
-            for (bicycle, length) in &ridden {
-                let (from, to) = &rides[bicycle.trim_start_matches('b').parse::<usize>().unwrap()];
-                assert!(
-                    *length < 40.0,
-                    "{name}: {from} to {to} took {length} m, so it did not go round the corner"
-                );
-            }
+            rides_round_every_corner(&map, &built);
+            gets_on_and_off_the_road_crosses_it_and_turns_back(&map, &built);
         }
+    }
+}
+
+/// A bicycle rides round every corner the IR paves, both ways, on the sidewalks — a
+/// few metres each, where any other way round is hundreds.
+fn rides_round_every_corner(map: &ValidatedMap, built: &sumo_build::Built) {
+    let name = roadgen_sumo::network_name(map);
+    let network = &built.network;
+
+    let mut rides = Vec::new();
+    for corner in corners(map) {
+        let (into_from, out_of_from) = ways_through(network, &corner.from, "j_x");
+        let (into_to, out_of_to) = ways_through(network, &corner.to, "j_x");
+        rides.push((into_from, out_of_to));
+        rides.push((into_to, out_of_from));
+    }
+    assert_eq!(
+        rides.len(),
+        8,
+        "{name}: two rides round each of four corners"
+    );
+
+    let mut trips = String::new();
+    for (index, (from, to)) in rides.iter().enumerate() {
+        let (from_edge, from_lane) = from.rsplit_once('_').unwrap();
+        let (to_edge, to_lane) = to.rsplit_once('_').unwrap();
+        let depart = network.edge(from_edge).lanes[0].length - 1.0;
+        trips.push_str(&format!(
+            r#"    <trip id="b{index}" type="bike" depart="0" from="{from_edge}" to="{to_edge}" departLane="{from_lane}" departPos="{depart:.2}" arrivalLane="{to_lane}" arrivalPos="1.00"/>
+"#
+        ));
+    }
+    let routes =
+        format!("<routes>\n    <vType id=\"bike\" vClass=\"bicycle\"/>\n{trips}</routes>\n");
+    std::fs::write(built.directory.path().join("rides.rou.xml"), routes).unwrap();
+
+    let ridden = sumo_build::ride(built.directory.path(), &built.prefix);
+    assert_eq!(
+        ridden.len(),
+        rides.len(),
+        "{name}: every bicycle should arrive: {ridden:?}"
+    );
+    for (bicycle, length) in &ridden {
+        let (from, to) = &rides[bicycle.trim_start_matches('b').parse::<usize>().unwrap()];
+        assert!(
+            *length < 40.0,
+            "{name}: {from} to {to} took {length} m, so it did not go round the corner"
+        );
+    }
+}
+
+/// Every connection a bicycle can ride onto or off a sidewalk, across the road or
+/// back at a dead end is one a bicycle in the simulator does ride: starting a metre
+/// short of the end of the one edge, it arrives a metre into the other having gone
+/// a few metres, where any other way round is hundreds — whether the junction is
+/// signalised or not, and whichever side traffic keeps to.
+///
+/// One bicycle at a time, a full signal cycle and more apart. Released together, a
+/// handful of them giving way to one another across an unsignalised junction can
+/// each wait for the next, as cars on the minor arms of a priority junction can, and
+/// that would say nothing about whether each way is there.
+fn gets_on_and_off_the_road_crosses_it_and_turns_back(
+    map: &ValidatedMap,
+    built: &sumo_build::Built,
+) {
+    let name = roadgen_sumo::network_name(map);
+    let network = &built.network;
+    let crosswalks = map
+        .objects
+        .iter()
+        .any(|object| object.kind == MapObjectKind::Crosswalk);
+
+    let mut rides: Vec<(Ride, &str, usize, &str)> = network
+        .movements()
+        .into_iter()
+        .filter_map(|(from, from_lane, to, _)| Some((ride(from, to)?, from, from_lane, to)))
+        .filter(|(kind, ..)| *kind != Ride::Corner)
+        .collect();
+    rides.sort();
+    let kinds: BTreeSet<Ride> = rides.iter().map(|(kind, ..)| *kind).collect();
+    let mut expected = BTreeSet::from([Ride::OnOrOff, Ride::TurnBack]);
+    if crosswalks {
+        expected.insert(Ride::Across);
+    }
+    assert_eq!(kinds, expected, "{name}: {rides:?}");
+    // A turn back at the far end of every sidewalk of every arm.
+    let sidewalks = map
+        .lanes
+        .iter()
+        .filter(|lane| lane.lane_type == LaneType::Sidewalk)
+        .filter(|lane| {
+            map.road(&lane.road)
+                .is_some_and(|road| !road.is_connector())
+        })
+        .count();
+    let turns = rides
+        .iter()
+        .filter(|(kind, ..)| *kind == Ride::TurnBack)
+        .count();
+    assert_eq!(turns, sidewalks, "{name}: {rides:?}");
+
+    let mut trips = String::new();
+    for (index, (_, from, from_lane, to)) in rides.iter().enumerate() {
+        let depart = network.edge(from).lanes[*from_lane].length - 1.0;
+        let depart_time = index * 100;
+        trips.push_str(&format!(
+            r#"    <trip id="b{index}" type="bike" depart="{depart_time}" from="{from}" to="{to}" departLane="{from_lane}" departPos="{depart:.2}" arrivalPos="1.00"/>
+"#
+        ));
+    }
+    let routes =
+        format!("<routes>\n    <vType id=\"bike\" vClass=\"bicycle\"/>\n{trips}</routes>\n");
+    std::fs::write(built.directory.path().join("rides.rou.xml"), routes).unwrap();
+
+    let ridden = sumo_build::ride(built.directory.path(), &built.prefix);
+    assert_eq!(
+        ridden.len(),
+        rides.len(),
+        "{name}: every bicycle should arrive: {ridden:?} of {rides:?}"
+    );
+    for (bicycle, length) in &ridden {
+        let ride = &rides[bicycle.trim_start_matches('b').parse::<usize>().unwrap()];
+        assert!(
+            *length < 40.0,
+            "{name}: {ride:?} took {length} m, so it went some other way"
+        );
     }
 }
 
@@ -326,14 +410,23 @@ fn the_trace_follows_every_ride_and_accepts_the_built_network() {
                         .is_some_and(|road| !road.is_connector())
             })
             .expect("a sidewalk along an arm");
-        // Two pieces each way.
-        let ridden: Vec<&str> = trace
+        // Two pieces each way, and the turn back at the dead end it runs out to.
+        let ridden: Vec<(&str, Relation)> = trace
             .links_of(&sidewalk.id.clone().into())
             .filter(|link| link.role.as_deref() == Some("bicycle"))
-            .inspect(|link| assert_eq!(link.relation, Relation::Part))
-            .map(|link| link.local.as_str())
+            .map(|link| (link.local.as_str(), link.relation))
             .collect();
-        assert_eq!(ridden.len(), 4, "{handedness:?}: {ridden:?}");
+        let pieces = ridden
+            .iter()
+            .filter(|(local, relation)| local.starts_with("lane:") && *relation == Relation::Part)
+            .count();
+        let turns = ridden
+            .iter()
+            .filter(|(local, relation)| {
+                local.starts_with("connection:") && *relation == Relation::Collapsed
+            })
+            .count();
+        assert_eq!((pieces, turns), (4, 1), "{handedness:?}: {ridden:?}");
 
         let net = sumo_build::netconvert(directory.path(), &prefix);
         let mut index = TraceIndex::new();
@@ -343,5 +436,64 @@ fn the_trace_follows_every_ride_and_accepts_the_built_network() {
             .load_sumo_net(&net)
             .expect("the built network, rides and all, is the export's");
         assert_eq!(report.untraced, 0, "{handedness:?}");
+    }
+}
+
+/// What a bicycle does on one connection of the built network that the option adds,
+/// read off the edges it joins: `<arm>.<fwd|bwd>` is a carriageway, and
+/// `<arm>.<fwd|bwd>.bike<i>[.rev][.p1]` a piece of a cycleway along a sidewalk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Ride {
+    /// From one sidewalk round a corner onto the next.
+    Corner,
+    /// Off a sidewalk onto a carriageway, or off a carriageway onto a sidewalk.
+    OnOrOff,
+    /// Across the road from the sidewalk on one kerb to the one on the other.
+    Across,
+    /// Back the other way along the same sidewalk, at a dead end.
+    TurnBack,
+}
+
+fn ride(from: &str, to: &str) -> Option<Ride> {
+    let sidewalk = |edge: &str| {
+        edge.split_once(".bike")
+            .map(|(carriageway, _)| carriageway.to_owned())
+    };
+    let arm = |edge: &str| edge.split('.').next().unwrap().to_owned();
+    match (sidewalk(from), sidewalk(to)) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => Some(Ride::OnOrOff),
+        // The joint between the two halves of one cycleway.
+        _ if to == format!("{from}.p1") => None,
+        (Some(one), Some(other)) if one == other => Some(Ride::TurnBack),
+        _ if arm(from) == arm(to) => Some(Ride::Across),
+        _ => Some(Ride::Corner),
+    }
+}
+
+/// netconvert is told to leave out the junction logic a signal program releasing a
+/// bicycle and a turning car together would conflict with — and only where a light
+/// controls a bicycle, so a map without bicycles is configured as it always was.
+#[test]
+fn a_light_over_bicycles_is_built_without_the_internal_junction_jam() {
+    let jam = "tls.ignore-internal-junction-jam";
+    for handedness in HANDEDNESS {
+        let signalised = scenarios::signalised_crosswalk_crossroads(handedness).0;
+        let plain = roadgen_sumo::to_plain_xml(&signalised).unwrap();
+        assert!(!plain.config.contains(jam), "{}", plain.config);
+        let cycling_network = roadgen_sumo::to_plain_xml_with(&signalised, &cycling()).unwrap();
+        assert!(
+            cycling_network.config.contains(jam),
+            "{}",
+            cycling_network.config
+        );
+
+        let unsignalised = scenarios::crosswalk_crossroads(handedness).0;
+        let cycling_network = roadgen_sumo::to_plain_xml_with(&unsignalised, &cycling()).unwrap();
+        assert!(
+            !cycling_network.config.contains(jam),
+            "{}",
+            cycling_network.config
+        );
     }
 }
