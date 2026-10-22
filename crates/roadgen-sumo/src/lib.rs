@@ -159,14 +159,11 @@
 //!
 //! The cycleways sit below every carriageway in the priority order, so a bicycle
 //! coming off a sidewalk gives way to the traffic it joins or crosses. At a
-//! signalised node the light controls the rides onto and off a carriageway, which go
-//! with the carriageway's own movements, and the rides across a road, which are
-//! green while that road is held at red and end in a yellow, as every other signal
-//! does. With a light over bicycles the configuration also sets
-//! `tls.ignore-internal-junction-jam`: netconvert before 1.2x would otherwise build
-//! some of these, released with a turning car, a junction logic in which each waits
-//! for the other, and SUMO refuses to run such a program. The option drops the logic
-//! that holds traffic for a vehicle still inside the junction when its phase ends.
+//! signalised node the light controls them too: a bicycle coming off a sidewalk goes
+//! in a short green of its own ahead of the traffic of its approach, one getting off
+//! the road goes with the traffic it leaves, and one riding across a road is
+//! protected while that road is held at red, as on a pedestrian crossing. See
+//! [`signals`] for why.
 //!
 //! # Traffic lights
 //!
@@ -3073,8 +3070,8 @@ impl<'a> Exporter<'a> {
             let links: Vec<signals::Link> = keys
                 .iter()
                 .map(|&(from_edge, from_lane, to_edge, to_lane)| {
-                    // A bicycle coming off a sidewalk is released with the carriageway
-                    // it rides beside.
+                    // A bicycle coming off a sidewalk goes in the group of the
+                    // carriageway it rides beside, just ahead of it.
                     let approach = self.edges[from_edge]
                         .rides
                         .map_or(from_edge, |slot| slot.edge);
@@ -3085,19 +3082,24 @@ impl<'a> Exporter<'a> {
                         heading: final_heading(&self.edges[approach].shape),
                         turn: signals::swing(final_heading(leaving), initial_heading(joining)),
                         target: (to_edge, to_lane),
+                        from_sidewalk: self.edges[from_edge].rides.is_some(),
                     }
                 })
                 .collect();
             let mut phases = signals::program(&links, handedness);
-            // The bicycles' ways across the road, after everything else: each green
-            // in the phases that hold the road it crosses at red.
+            // The bicycles' ways across the road, after everything else: each
+            // protected in the phases that hold the road it crosses at red.
             for key in &crossings {
                 let road = &self.edges[key.0].road;
                 let from_road: Vec<bool> = links
                     .iter()
                     .map(|link| &self.edges[link.approach].road == road)
                     .collect();
-                signals::add_crossing(&mut phases, &from_road);
+                let into_road: Vec<bool> = links
+                    .iter()
+                    .map(|link| &self.edges[link.target.0].road == road)
+                    .collect();
+                signals::add_crossing(&mut phases, &from_road, &into_road);
             }
             self.signals.insert(
                 id.clone(),
@@ -3108,14 +3110,6 @@ impl<'a> Exporter<'a> {
                 },
             );
         }
-    }
-
-    /// Whether a light controls any of the bicycles' ways to or from the sidewalks.
-    fn signals_bicycles(&self) -> bool {
-        self.signals
-            .values()
-            .flat_map(|signal| &signal.links)
-            .any(|key| self.cycling.contains_key(key))
     }
 
     /// The light controlling each written connection that one does, and the link
@@ -3535,7 +3529,6 @@ impl<'a> Exporter<'a> {
                 self.map.metadata.handedness,
                 !self.signals.is_empty(),
                 self.options.curve_lateral_acceleration,
-                self.signals_bicycles(),
             ),
             weights: self.render_weights(),
             trace: self.trace(),
@@ -4260,24 +4253,11 @@ fn lane_change(lane: &Lane, neighbour: &Lane, towards: LateralSide) -> bool {
 ///
 /// The traffic-light file is named only when there is one, which is when the map has
 /// a signalised junction with something to control.
-///
-/// Where a light controls a bicycle's way onto, off or across a carriageway (see
-/// [`Options::cycle_on_sidewalks`]), `tls.ignore-internal-junction-jam` is set.
-/// Among those ways and the turns they meet are pairs released together with both
-/// giving way — a bicycle crossing the road and a car turning into it, say — and
-/// netconvert before 1.2x builds such a pair a junction logic in which each waits
-/// for the other, to keep a turn caught inside the junction from being cut off,
-/// which SUMO then refuses to run with the program ("mutual conflict"). With the
-/// option netconvert does not build that, at the cost of not holding traffic for a
-/// vehicle still inside the junction when its phase ends. Newer netconvert builds
-/// the same network cleanly without it; without bicycles under a light, nothing is
-/// written and the configuration is the same as it always was.
 fn render_config(
     prefix: &str,
     handedness: TrafficHandedness,
     traffic_lights: bool,
     turn_acceleration: Option<f64>,
-    bicycles_signalled: bool,
 ) -> String {
     let mut document = xml::Document::new(
         "configuration",
@@ -4312,14 +4292,6 @@ fn render_config(
             &[("value", metres(acceleration))],
         );
         document.close("junctions");
-    }
-    if bicycles_signalled {
-        document.open("tls_building", &[]);
-        document.leaf(
-            "tls.ignore-internal-junction-jam",
-            &[("value", "true".into())],
-        );
-        document.close("tls_building");
     }
     document.open("pedestrian", &[]);
     document.leaf("walkingareas", &[("value", "true".into())]);
