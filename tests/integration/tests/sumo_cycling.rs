@@ -471,29 +471,31 @@ fn ride(from: &str, to: &str) -> Option<Ride> {
     }
 }
 
-/// netconvert is told to leave out the junction logic a signal program releasing a
-/// bicycle and a turning car together would conflict with — and only where a light
-/// controls a bicycle, so a map without bicycles is configured as it always was.
+/// A light over bicycles needs nothing of netconvert's beyond what a light over cars
+/// does: the configuration is the same with them as without, and the program leads
+/// each group whose sidewalks bicycles come off with a green of their own (the
+/// tests above ride it in SUMO). Where no light controls a bicycle, the program is
+/// the same as without them.
 #[test]
-fn a_light_over_bicycles_is_built_without_the_internal_junction_jam() {
-    let jam = "tls.ignore-internal-junction-jam";
+fn a_light_over_bicycles_gives_them_a_green_of_their_own_and_needs_no_option() {
+    let bicycle_green = format!(
+        r#"duration="{}""#,
+        roadgen_sumo::signals::BICYCLE_GREEN_SECONDS
+    );
     for handedness in HANDEDNESS {
         let signalised = scenarios::signalised_crosswalk_crossroads(handedness).0;
         let plain = roadgen_sumo::to_plain_xml(&signalised).unwrap();
-        assert!(!plain.config.contains(jam), "{}", plain.config);
         let cycling_network = roadgen_sumo::to_plain_xml_with(&signalised, &cycling()).unwrap();
-        assert!(
-            cycling_network.config.contains(jam),
-            "{}",
-            cycling_network.config
-        );
-
-        let unsignalised = scenarios::crosswalk_crossroads(handedness).0;
-        let cycling_network = roadgen_sumo::to_plain_xml_with(&unsignalised, &cycling()).unwrap();
-        assert!(
-            !cycling_network.config.contains(jam),
-            "{}",
-            cycling_network.config
+        assert_eq!(cycling_network.config, plain.config);
+        let program = |network: &roadgen_sumo::PlainNetwork| {
+            network.traffic_lights.clone().unwrap_or_default()
+        };
+        assert!(!program(&plain).contains(&bicycle_green));
+        assert_eq!(
+            program(&cycling_network).matches(&bicycle_green).count(),
+            2,
+            "one bicycle green per group: {}",
+            program(&cycling_network)
         );
     }
 }
