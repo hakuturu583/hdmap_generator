@@ -68,6 +68,10 @@ pub fn permission(lane_type: LaneType) -> Option<Permission> {
     })
 }
 
+/// Who may use the edges [`crate::Options::cycle_on_sidewalks`] lays along a
+/// sidewalk for bicycles: bicycles, and pedestrians, since the strip is the sidewalk.
+pub const SHARED_FOOTWAY: Permission = Permission::Allow("pedestrian bicycle");
+
 /// The vehicle classes a lane change across a line no one may cross is still open
 /// to.
 ///

@@ -20,6 +20,7 @@ const ACCELERATION: f64 = 2.0;
 fn curved() -> Options {
     Options {
         curve_lateral_acceleration: Some(ACCELERATION),
+        ..Options::default()
     }
 }
 
@@ -196,6 +197,7 @@ fn a_lateral_acceleration_has_to_be_positive() {
     for bad in [0.0, -1.0, f64::NAN] {
         let options = Options {
             curve_lateral_acceleration: Some(bad),
+            ..Options::default()
         };
         assert!(roadgen_sumo::to_plain_xml_with(&map, &options).is_err());
     }

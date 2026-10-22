@@ -314,6 +314,63 @@ pub fn walk(directory: &Path, prefix: &str) -> BTreeMap<String, f64> {
     walked
 }
 
+/// Runs the simulator on the built network with the vehicles of `rides.rou.xml`, and
+/// returns how far each one that arrived rode, by id — the counterpart of [`walk`]
+/// for bicycles, which the simulator routes over connections rather than walking
+/// areas.
+pub fn ride(directory: &Path, prefix: &str) -> BTreeMap<String, f64> {
+    let output = Command::new(tool("sumo").expect("sumo"))
+        .args(["-n", &format!("{prefix}.net.xml")])
+        .args(["-r", "rides.rou.xml"])
+        .args(["--tripinfo-output", "rides.tripinfo.xml"])
+        .args(["--no-step-log", "true"])
+        .args(["--end", "600"])
+        .current_dir(directory)
+        .output()
+        .expect("sumo should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "sumo failed:\n{stderr}");
+    let complaints: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !is_about_the_machine_or_the_map(line))
+        .collect();
+    assert!(
+        complaints.is_empty(),
+        "sumo complained about the rides:\n{}",
+        complaints.join("\n")
+    );
+
+    let tripinfo = std::fs::read_to_string(directory.join("rides.tripinfo.xml")).unwrap();
+    let mut ridden = BTreeMap::new();
+    let mut reader = Reader::from_str(&tripinfo);
+    loop {
+        match reader.read_event().expect("valid tripinfo XML") {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element)
+                if element.name().as_ref() == b"tripinfo" =>
+            {
+                let attributes = attributes(&element);
+                let arrived = attributes
+                    .get("arrival")
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .is_some_and(|time| time >= 0.0);
+                if let (true, Some(id), Some(length)) = (
+                    arrived,
+                    attributes.get("id"),
+                    attributes
+                        .get("routeLength")
+                        .and_then(|value| value.parse().ok()),
+                ) {
+                    ridden.insert(id.clone(), length);
+                }
+            }
+            _ => {}
+        }
+    }
+    ridden
+}
+
 /// Drives one passenger car down `edge` of a built network, from `depart_lane` to
 /// `arrival_lane`, and returns every lane it was on — so whether the lane change was
 /// allowed is what the simulator did, not what the attributes are taken to mean.

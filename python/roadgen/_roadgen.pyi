@@ -273,6 +273,7 @@ class Map:
         directory: str,
         trace: bool = True,
         curve_lateral_acceleration: float | None = None,
+        cycle_on_sidewalks: bool = False,
     ) -> str: ...
     def export_clipgt(
         self,

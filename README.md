@@ -277,7 +277,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `sumo_warnings()` | what a SUMO export would lose |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
 | `export_opendrive(path)` / `export_lanelet2(path)` / `export_osm(path)` | write the files |
-| `export_sumo(directory)` | write a SUMO plain-XML network and its netconvert configuration; returns the prefix |
+| `export_sumo(directory)` | write a SUMO plain-XML network and its netconvert configuration; returns the prefix (`cycle_on_sidewalks=True` lets bicycles ride the sidewalks both ways) |
 | `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
@@ -1409,6 +1409,54 @@ build with nothing leading off one end. The trace names a crossing
 id; once the built network is loaded, the crosswalk also reaches the lane of the
 crossing netconvert built for it (`:j_x_c0_0`, role `crossing`), matched by the
 `crossingEdges` netconvert records on it.
+
+### Bicycles on sidewalks
+
+By default a sidewalk is the pedestrians' (`allow="pedestrian"`), and bicycles keep to
+the carriageway and the cycle lanes. `cycle_on_sidewalks=True` lets them ride the
+sidewalks as well, **both ways**:
+
+```python
+prefix = m.export_sumo("network/", cycle_on_sidewalks=True)
+```
+
+A SUMO bicycle is a vehicle, so it rides an edge in that edge's direction and crosses
+a node along a connection. Each sidewalk therefore gets two edges for bicycles, laid
+along the same strip: `<edge>.bike<index>` runs the same way as the sidewalk's edge,
+and `<edge>.bike<index>.rev` runs the other way (`<index>` is the sidewalk's lane in
+`<edge>`). Every walk the IR has between two footways — the pavement round each
+corner, a joint between two roads — becomes one connection each way between them,
+drawn along the pavement:
+
+```xml
+<edge id="west.fwd.bike0" from="n_west.fwd.bike0_start" to="n_west.fwd.bike0_p1" …>
+    <lane index="0" width="2.000" allow="pedestrian bicycle" …/>
+</edge>
+<connection from="west.fwd.bike0.p1" to="south.bwd.bike0" fromLane="0" toLane="0" shape="…"/>
+<connection from="south.bwd.bike0.rev.p1" to="west.fwd.bike0.rev" fromLane="0" toLane="0" shape="…"/>
+```
+
+The sidewalk lane itself stays the pedestrians' own. A bicycle on a lane of the
+carriageway's edge would be, to netconvert, on a cycle lane beside the traffic: every
+turning car would have to give way to it, and at a signalised junction netconvert
+1.18 builds a program SUMO refuses to run. The two edges also admit pedestrians
+because they *are* the sidewalk. netconvert only joins the footways round a node into
+one walking area when no lane closed to pedestrians lies between them, so with that
+the walking areas and crossings come out exactly as they do without bicycles. A few
+details keep netconvert quiet:
+
+- each edge is cut in two halfway (`….p1`, joined at `n_<edge>_p1`), so it never joins
+  the same two nodes as a carriageway of its road, which netconvert would read as a
+  second turnaround;
+- at a road end the IR links nowhere, each one ends at a dead end of its own
+  (`n_<edge>_start` / `n_<edge>_end`);
+- at a signalised junction the rides are `uncontrolled`, since the pavement round a
+  corner crosses no traffic.
+
+The bicycle edges get a trip weight of 0, so `randomTrips.py` never starts or ends a
+car trip on them. In the trace, each piece is `part` of its sidewalk with the role
+`bicycle`, and each ride carries the footway connections and the pavement lane it
+stands for, also with the role `bicycle`.
 
 ### Traffic lights
 
