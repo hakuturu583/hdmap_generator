@@ -1483,18 +1483,21 @@ road between junctions too, the export puts nodes there:
 
 The bicycle edges sit below every carriageway in the priority order, so at a junction
 without a light a bicycle coming off the sidewalk gives way to the traffic it meets.
-At a signalised junction the light controls the rides onto and off a carriageway,
-which go with the carriageway's own movements. It also controls the rides across a
-road, which are green while that road is held at red and end in a yellow like every
-other signal.
+At a signalised junction the light controls the rides too:
 
-With a light over bicycles the `.netccfg` also sets `tls.ignore-internal-junction-jam`.
-Some of these rides are released together with a turning car (a bicycle crossing the
-road and a car turning into it, say), and without the option netconvert before 1.2x
-builds such a pair a junction logic in which each waits for the other, which SUMO
-refuses to run. The option drops the logic that holds traffic for a vehicle still
-inside the junction when its phase ends. Newer netconvert builds the same network
-cleanly without it, and nothing is written when no light controls a bicycle.
+- **Onto the carriageway.** A bicycle coming off a sidewalk goes first, in an 8 s green
+  and a 3 s yellow of its own, ahead of the green of the traffic of its approach.
+  Released together, the two would meet as two permissive movements each giving way
+  to the other, which netconvert 1.18 builds a junction logic SUMO refuses to run for.
+- **Off the carriageway.** A bicycle getting off the road goes with the traffic it
+  leaves.
+- **Across the road.** A bicycle riding across a road is protected (`G`) while that
+  road is held at red, and its green ends in a yellow. Traffic turning into the road
+  gives way to it, as to someone on a pedestrian crossing.
+
+A light with no bicycle coming off a sidewalk gets no bicycle phase, so the program
+of a map without bicycles is the same as it always was. The `.netccfg` needs no
+option for any of this.
 
 The bicycle edges get a trip weight of 0, so `randomTrips.py` never starts or ends a
 car trip on them. In the trace, each piece is `part` of its sidewalk with the role

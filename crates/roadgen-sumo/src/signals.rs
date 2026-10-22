@@ -52,6 +52,26 @@
 //! approach. A turn off a road with nothing facing it, as on the stem of a tee, has
 //! nothing to give way to, and calling it permissive would only make SUMO slow every
 //! vehicle down for a conflict that cannot happen.
+//!
+//! # Bicycles
+//!
+//! Where bicycles ride the sidewalks (see
+//! [`Options::cycle_on_sidewalks`](crate::Options::cycle_on_sidewalks)) the light
+//! also controls their ways onto, off and across the carriageways. Two additions keep
+//! the program one that SUMO runs as it is, whichever netconvert built the network:
+//!
+//! - A bicycle **coming off a sidewalk** onto the road is released before the
+//!   traffic of its approach, in a green of [`BICYCLE_GREEN_SECONDS`] and a yellow of
+//!   its own; the cars it would otherwise join the same lane as, or cut across, follow
+//!   when it ends. Released together, the two meet as two permissive movements each
+//!   giving way to the other, for which netconvert 1.18 builds a junction logic
+//!   SUMO refuses to run ("mutual conflict"), and no choice of `G` and `g`
+//!   avoids that where a lane takes a car turning in from each side and a bicycle
+//!   besides. A group with no such bicycle gets no such phase, so a program without
+//!   bicycles is the same as it always was.
+//! - A bicycle **riding across a road** is protected (`G`) while that road is held at
+//!   red, as a pedestrian crossing is: traffic turning into the road gives way to it.
+//!   A bicycle getting off the road onto a sidewalk goes with the traffic it leaves.
 
 use std::f64::consts::PI;
 
@@ -83,6 +103,8 @@ pub const YELLOW_SECONDS: u32 = 3;
 /// The all-red after every yellow, which clears the junction before the next group
 /// is released.
 pub const ALL_RED_SECONDS: u32 = 2;
+/// The green, ahead of a group's own, of the bicycles coming off its sidewalks.
+pub const BICYCLE_GREEN_SECONDS: u32 = 8;
 
 /// One controlled movement, as much of it as the program is decided from.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,6 +121,9 @@ pub(crate) struct Link {
     pub turn: f64,
     /// The lane it runs into, as any value two movements into the same lane share.
     pub target: (usize, usize),
+    /// Whether it is a bicycle's way off a sidewalk, which goes in a green of its own
+    /// ahead of its approach's.
+    pub from_sidewalk: bool,
 }
 
 /// One phase of a program: how long it lasts, and one SUMO signal state per link,
@@ -147,7 +172,8 @@ pub(crate) fn groups(links: &[Link]) -> Vec<Vec<usize>> {
 
 /// The program for one junction whose controlled movements are `links`, in the order
 /// their link indices are given: a green, a yellow and an all-red for each group of
-/// approaches, in the order [`groups`] finds them.
+/// approaches, in the order [`groups`] finds them — led, where the group has
+/// bicycles coming off its sidewalks, by their green and yellow.
 pub(crate) fn program(links: &[Link], handedness: TrafficHandedness) -> Vec<Phase> {
     let groups = groups(links);
     let green = if groups.len() <= 2 {
@@ -157,45 +183,31 @@ pub(crate) fn program(links: &[Link], handedness: TrafficHandedness) -> Vec<Phas
     };
     let mut phases = Vec::with_capacity(groups.len() * 3);
     for group in &groups {
-        let released: Vec<bool> = links
-            .iter()
-            .map(|link| group.contains(&link.approach))
-            .collect();
-        let state: String =
+        let released = |bicycles: bool| -> Vec<bool> {
             links
                 .iter()
-                .enumerate()
-                .map(|(index, link)| {
-                    if !released[index] {
-                        return 'r';
-                    }
-                    let oncoming = links
-                        .iter()
-                        .zip(&released)
-                        .any(|(other, &on)| on && other.approach != link.approach);
-                    let shares_target = links.iter().zip(&released).enumerate().any(
-                        |(other_index, (other, &on))| {
-                            on && other_index != index && other.target == link.target
-                        },
-                    );
-                    if (oncoming && crosses_oncoming(link.turn, handedness)) || shares_target {
-                        'g'
-                    } else {
-                        'G'
-                    }
-                })
-                .collect();
-        let yellow: String = released
-            .iter()
-            .map(|&on| if on { 'y' } else { 'r' })
-            .collect();
+                .map(|link| group.contains(&link.approach) && link.from_sidewalk == bicycles)
+                .collect()
+        };
+        let bicycles = released(true);
+        if bicycles.contains(&true) {
+            phases.push(Phase {
+                duration: BICYCLE_GREEN_SECONDS,
+                state: green_state(links, &bicycles, handedness),
+            });
+            phases.push(Phase {
+                duration: YELLOW_SECONDS,
+                state: yellow_state(&bicycles),
+            });
+        }
+        let traffic = released(false);
         phases.push(Phase {
             duration: green,
-            state,
+            state: green_state(links, &traffic, handedness),
         });
         phases.push(Phase {
             duration: YELLOW_SECONDS,
-            state: yellow,
+            state: yellow_state(&traffic),
         });
         phases.push(Phase {
             duration: ALL_RED_SECONDS,
@@ -203,6 +215,46 @@ pub(crate) fn program(links: &[Link], handedness: TrafficHandedness) -> Vec<Phas
         });
     }
     phases
+}
+
+/// The yellow of the links `released` in a green.
+fn yellow_state(released: &[bool]) -> String {
+    released
+        .iter()
+        .map(|&on| if on { 'y' } else { 'r' })
+        .collect()
+}
+
+/// The green that releases the links `released` of `links`: permissive (`g`) where a
+/// link turns across an oncoming approach released with it or runs into a lane another
+/// released link does, protected (`G`) otherwise, and red where not released.
+fn green_state(links: &[Link], released: &[bool], handedness: TrafficHandedness) -> String {
+    links
+        .iter()
+        .enumerate()
+        .map(|(index, link)| {
+            if !released[index] {
+                return 'r';
+            }
+            let oncoming = links
+                .iter()
+                .zip(released)
+                .any(|(other, &on)| on && other.approach != link.approach);
+            let shares_target =
+                links
+                    .iter()
+                    .zip(released)
+                    .enumerate()
+                    .any(|(other_index, (other, &on))| {
+                        on && other_index != index && other.target == link.target
+                    });
+            if (oncoming && crosses_oncoming(link.turn, handedness)) || shares_target {
+                'g'
+            } else {
+                'G'
+            }
+        })
+        .collect()
 }
 
 /// Whether a movement that swings by `turn` crosses the path of the traffic coming
@@ -242,14 +294,17 @@ fn facing(a: f64, b: f64) -> bool {
 }
 
 /// Appends to every phase of `phases` the signal of one more link: a bicycle's way
-/// across a road, of which `from_road` says, link by link, which arrive along it.
+/// across a road, of which `from_road` and `into_road` say, link by link, which
+/// arrive along it and which run into it.
 ///
-/// It is green (`g`: it gives way to whatever else is released) in every phase that
-/// releases something and holds every link off that road at red, which is when the
-/// road it crosses is quiet but for traffic turning into it. A green ends in a
+/// It is green (`G`) in every phase that releases something and holds every link off
+/// that road at red, which is when the road it crosses is quiet but for traffic
+/// turning into it — and that traffic gives way to it, as to someone on a pedestrian
+/// crossing: a link into the road protected in such a phase is made permissive. A
+/// green ends in a
 /// yellow through the yellows that follow it, and red from there on, as every other
 /// link's does: SUMO refuses a program in which a green goes straight to red.
-pub(crate) fn add_crossing(phases: &mut [Phase], from_road: &[bool]) {
+pub(crate) fn add_crossing(phases: &mut [Phase], from_road: &[bool], into_road: &[bool]) {
     let held = |phase: &Phase| {
         phase
             .state
@@ -268,14 +323,14 @@ pub(crate) fn add_crossing(phases: &mut [Phase], from_road: &[bool]) {
     let count = phases.len();
     let mut signals: Vec<char> = phases
         .iter()
-        .map(|phase| if green(phase) { 'g' } else { 'r' })
+        .map(|phase| if green(phase) { 'G' } else { 'r' })
         .collect();
     // Twice round, so that a yellow after the last phase's green reaches the first.
     for _ in 0..2 {
         for index in 0..count {
             let before = signals[(index + count - 1) % count];
             if signals[index] == 'r'
-                && matches!(before, 'g' | 'y')
+                && matches!(before, 'G' | 'y')
                 && yellow(&phases[index])
                 && held(&phases[index])
             {
@@ -284,6 +339,14 @@ pub(crate) fn add_crossing(phases: &mut [Phase], from_road: &[bool]) {
         }
     }
     for (phase, signal) in phases.iter_mut().zip(signals) {
+        if signal == 'G' {
+            phase.state = phase
+                .state
+                .chars()
+                .zip(into_road.iter().chain(std::iter::repeat(&false)))
+                .map(|(signal, &into)| if into && signal == 'G' { 'g' } else { signal })
+                .collect();
+        }
         phase.state.push(signal);
     }
 }
@@ -312,6 +375,7 @@ mod tests {
                     heading: degrees(heading),
                     turn: degrees(turn),
                     target: ((approach + exit) % 4, lane),
+                    from_sidewalk: false,
                 });
             }
         }
@@ -350,6 +414,7 @@ mod tests {
                 heading: degrees(heading),
                 turn: 0.0,
                 target: (approach, 0),
+                from_sidewalk: false,
             })
             .collect();
         assert_eq!(groups(&links), vec![vec![0, 2], vec![1, 3]]);
@@ -373,6 +438,7 @@ mod tests {
                 heading: degrees(heading),
                 turn: 0.0,
                 target: (approach, 0),
+                from_sidewalk: false,
             })
             .collect();
         assert_eq!(groups(&links), vec![vec![0], vec![1]]);
@@ -415,12 +481,14 @@ mod tests {
                 heading: degrees(-90.0),
                 turn: degrees(90.0),
                 target: (1, 0),
+                from_sidewalk: false,
             },
             Link {
                 approach: 1,
                 heading: degrees(180.0),
                 turn: degrees(-90.0),
                 target: (0, 0),
+                from_sidewalk: false,
             },
         ];
         let phases = program(&links, TrafficHandedness::RightHand);
@@ -436,12 +504,14 @@ mod tests {
                 heading: 0.0,
                 turn: 0.0,
                 target: (5, 0),
+                from_sidewalk: false,
             },
             Link {
                 approach: 1,
                 heading: PI,
                 turn: degrees(-90.0),
                 target: (5, 0),
+                from_sidewalk: false,
             },
         ];
         assert_eq!(program(&links, TrafficHandedness::RightHand)[0].state, "gg");
@@ -457,6 +527,7 @@ mod tests {
                 heading: degrees(heading),
                 turn: 0.0,
                 target: (approach, 0),
+                from_sidewalk: false,
             })
             .collect();
         let phases = program(&links, TrafficHandedness::RightHand);
@@ -495,17 +566,56 @@ mod tests {
         let mut phases = program(&links, TrafficHandedness::RightHand);
         // Across the road the first approach arrives along.
         let from_road: Vec<bool> = links.iter().map(|link| link.approach == 0).collect();
-        add_crossing(&mut phases, &from_road);
+        let into_road: Vec<bool> = links.iter().map(|link| link.target.0 == 0).collect();
+        add_crossing(&mut phases, &from_road, &into_road);
         let signals: String = phases
             .iter()
             .map(|phase| phase.state.chars().last().unwrap())
             .collect();
-        // Held through its own road's green, yellow and all-red; green in the other
-        // road's green, then yellow with it, then red before its road goes again.
-        assert_eq!(signals, "rrrgyr");
+        // Held through its own road's green, yellow and all-red; protected in the
+        // other road's green, then yellow with it, then red before its road goes again.
+        assert_eq!(signals, "rrrGyr");
         // And every phase still has one signal per link, the crossing's last.
         for phase in &phases {
             assert_eq!(phase.state.len(), links.len() + 1);
         }
+        // While it is protected, the turns into the road it crosses give way to it:
+        // the right turn off the second approach, protected before (it has a lane of
+        // its own), and the left turn off the fourth, permissive already.
+        assert_eq!(phases[3].state, "rrrgGgrrrgGGG");
+        assert_eq!(
+            program(&links, TrafficHandedness::RightHand)[3].state,
+            "rrrgGGrrrgGG"
+        );
+    }
+
+    #[test]
+    fn a_bicycle_off_a_sidewalk_goes_ahead_of_the_traffic_of_its_approach() {
+        // A crossroads, and on the first approach a bicycle coming off the sidewalk
+        // into the lane the approach's straight movement runs into.
+        let mut links = crossroads();
+        let straight = links[1];
+        links.push(Link {
+            from_sidewalk: true,
+            ..straight
+        });
+        let phases = program(&links, TrafficHandedness::RightHand);
+        let summary: Vec<(u32, &str)> = phases
+            .iter()
+            .map(|phase| (phase.duration, phase.state.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (BICYCLE_GREEN_SECONDS, "rrrrrrrrrrrrG"),
+                (YELLOW_SECONDS, "rrrrrrrrrrrry"),
+                (35, "gGGrrrgGGrrrr"),
+                (3, "yyyrrryyyrrrr"),
+                (2, "rrrrrrrrrrrrr"),
+                (35, "rrrgGGrrrgGGr"),
+                (3, "rrryyyrrryyyr"),
+                (2, "rrrrrrrrrrrrr"),
+            ]
+        );
     }
 }
