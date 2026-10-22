@@ -3797,7 +3797,7 @@ impl<'a> Exporter<'a> {
             };
             let signal = self.signals.get(*node);
             // The IR lanes behind each link of the program, the same for every light.
-            let behind: Vec<(&(usize, usize, usize, usize), Vec<&LaneId>)> = signal
+            let behind: Vec<_> = signal
                 .map(|signal| {
                     signal
                         .links
