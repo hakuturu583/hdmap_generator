@@ -294,15 +294,17 @@ fn facing(a: f64, b: f64) -> bool {
 }
 
 /// Appends to every phase of `phases` the signal of one more link: a bicycle's way
-/// across a road, of which `from_road` says, link by link, which arrive along it.
+/// across a road, of which `from_road` and `into_road` say, link by link, which
+/// arrive along it and which run into it.
 ///
-/// It is green (`G`: traffic turning into the road gives way to it, as to someone on
-/// a pedestrian crossing) in every phase that releases something and holds every link
-/// off that road at red, which is when the road it crosses is quiet but for traffic
-/// turning into it. A green ends in a
+/// It is green (`G`) in every phase that releases something and holds every link off
+/// that road at red, which is when the road it crosses is quiet but for traffic
+/// turning into it — and that traffic gives way to it, as to someone on a pedestrian
+/// crossing: a link into the road protected in such a phase is made permissive. A
+/// green ends in a
 /// yellow through the yellows that follow it, and red from there on, as every other
 /// link's does: SUMO refuses a program in which a green goes straight to red.
-pub(crate) fn add_crossing(phases: &mut [Phase], from_road: &[bool]) {
+pub(crate) fn add_crossing(phases: &mut [Phase], from_road: &[bool], into_road: &[bool]) {
     let held = |phase: &Phase| {
         phase
             .state
@@ -337,6 +339,14 @@ pub(crate) fn add_crossing(phases: &mut [Phase], from_road: &[bool]) {
         }
     }
     for (phase, signal) in phases.iter_mut().zip(signals) {
+        if signal == 'G' {
+            phase.state = phase
+                .state
+                .chars()
+                .zip(into_road.iter().chain(std::iter::repeat(&false)))
+                .map(|(signal, &into)| if into && signal == 'G' { 'g' } else { signal })
+                .collect();
+        }
         phase.state.push(signal);
     }
 }
@@ -556,7 +566,8 @@ mod tests {
         let mut phases = program(&links, TrafficHandedness::RightHand);
         // Across the road the first approach arrives along.
         let from_road: Vec<bool> = links.iter().map(|link| link.approach == 0).collect();
-        add_crossing(&mut phases, &from_road);
+        let into_road: Vec<bool> = links.iter().map(|link| link.target.0 == 0).collect();
+        add_crossing(&mut phases, &from_road, &into_road);
         let signals: String = phases
             .iter()
             .map(|phase| phase.state.chars().last().unwrap())
@@ -568,6 +579,14 @@ mod tests {
         for phase in &phases {
             assert_eq!(phase.state.len(), links.len() + 1);
         }
+        // While it is protected, the turns into the road it crosses give way to it:
+        // the right turn off the second approach, protected before (it has a lane of
+        // its own), and the left turn off the fourth, permissive already.
+        assert_eq!(phases[3].state, "rrrgGgrrrgGGG");
+        assert_eq!(
+            program(&links, TrafficHandedness::RightHand)[3].state,
+            "rrrgGGrrrgGG"
+        );
     }
 
     #[test]

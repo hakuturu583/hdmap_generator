@@ -3095,7 +3095,11 @@ impl<'a> Exporter<'a> {
                     .iter()
                     .map(|link| &self.edges[link.approach].road == road)
                     .collect();
-                signals::add_crossing(&mut phases, &from_road);
+                let into_road: Vec<bool> = links
+                    .iter()
+                    .map(|link| &self.edges[link.target.0].road == road)
+                    .collect();
+                signals::add_crossing(&mut phases, &from_road, &into_road);
             }
             self.signals.insert(
                 id.clone(),
