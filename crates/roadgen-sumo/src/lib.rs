@@ -1441,9 +1441,12 @@ impl Ride {
 /// road, and off the road onto the sidewalk. See [`Exporter::plan_transfers`].
 struct Transfer {
     node: String,
+    /// Where it is, on the carriageway's reference line; each edge it joins is cut
+    /// across there.
+    point: Point3,
     carriageway: usize,
-    /// The lane of the carriageway bicycles join and leave it by: the one nearest the
-    /// sidewalk that a bicycle may ride.
+    /// The lane of the carriageway bicycles join and leave it by: the kerbmost one a
+    /// bicycle may ride.
     lane: usize,
     /// The sidewalk, as its lane of the carriageway's edge.
     sidewalk: usize,
@@ -1499,9 +1502,6 @@ struct Exporter<'a> {
     /// The nodes between junctions where bicycles change between a sidewalk and the
     /// carriageway beside it; see [`Exporter::plan_transfers`].
     transfers: Vec<Transfer>,
-    /// Where each edge is cut at a transfer: the point on the carriageway's reference
-    /// line, and the node there, which the carriageway and the cycleway beside it share.
-    transfer_cuts: HashMap<usize, Vec<(Point3, String)>>,
     /// The pedestrian crossings, by the node each is at and the edges it crosses
     /// there, in the order they are written; see [`Exporter::build_crossings`].
     crossings: BTreeMap<(String, Vec<usize>), Crossing>,
@@ -1600,7 +1600,6 @@ impl<'a> Exporter<'a> {
             cycleways: HashMap::new(),
             cycling: BTreeMap::new(),
             transfers: Vec::new(),
-            transfer_cuts: HashMap::new(),
             crossings: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: BTreeMap::new(),
@@ -2210,26 +2209,17 @@ impl<'a> Exporter<'a> {
             sidewalks.entry(edge).or_default().insert(index);
         }
         for (index, positions) in sidewalks {
-            let edge = &self.edges[index];
-            let ridden: Vec<(usize, usize, usize)> = positions
-                .into_iter()
-                .filter_map(|sidewalk| {
-                    let lane = (0..edge.lanes.len())
-                        .filter(|&lane| {
-                            !self.is_footway(Slot {
-                                edge: index,
-                                index: lane,
-                            }) && edge.lanes[lane]
-                                .permission
-                                .is_none_or(|permission| permission.admits("bicycle"))
-                        })
-                        .min_by_key(|lane| lane.abs_diff(sidewalk))?;
-                    Some((sidewalk, lane, self.cycleways[&(index, sidewalk)].0))
+            // The kerbmost lane a bicycle may ride, as at a junction (see
+            // [`Exporter::cycle_onto_carriageways`]).
+            let Some(lane) = (0..self.edges[index].lanes.len()).find(|&lane| {
+                self.admits_bicycles(Slot {
+                    edge: index,
+                    index: lane,
                 })
-                .collect();
-            if ridden.is_empty() {
+            }) else {
                 continue;
-            }
+            };
+            let edge = &self.edges[index];
             let centre = curves::Plan::new(&edge.shape);
             let length = centre.length();
             let latest = self.latest_cut(index);
@@ -2239,35 +2229,17 @@ impl<'a> Exporter<'a> {
                 if station >= latest {
                     break;
                 }
-                let point = centre.point_at(station);
-                let node = format!("n_{}_x{k}", edge.id);
-                self.transfer_cuts
-                    .entry(index)
-                    .or_default()
-                    .push((point, node.clone()));
-                for &(sidewalk, lane, cycleway) in &ridden {
-                    self.transfer_cuts
-                        .entry(cycleway)
-                        .or_default()
-                        .push((point, node.clone()));
+                for &sidewalk in &positions {
                     self.transfers.push(Transfer {
-                        node: node.clone(),
+                        node: format!("n_{}_x{k}", edge.id),
+                        point: centre.point_at(station),
                         carriageway: index,
                         lane,
                         sidewalk,
-                        cycleway,
+                        cycleway: self.cycleways[&(index, sidewalk)].0,
                     });
                 }
             }
-        }
-        let nodes: Vec<(String, Point3)> = self
-            .transfer_cuts
-            .values()
-            .flatten()
-            .map(|(point, node)| (node.clone(), *point))
-            .collect();
-        for (node, point) in nodes {
-            self.node(node, point, NodeKind::Unstated, false, None);
         }
     }
 
@@ -2317,13 +2289,20 @@ impl<'a> Exporter<'a> {
     /// [`Exporter::cycle_footways`].
     fn pieces_of(&self, index: usize) -> Result<Vec<Piece>, ExportError> {
         let edge = &self.edges[index];
-        let transfers: Vec<(f64, String)> = self
-            .transfer_cuts
-            .get(&index)
-            .into_iter()
-            .flatten()
-            .map(|(point, node)| (station_along(&edge.shape, *point).0, node.clone()))
+        // A carriageway is cut once at each of its transfers, however many sidewalks
+        // beside it share the node.
+        let mut transfers: Vec<(f64, String)> = self
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.carriageway == index || transfer.cycleway == index)
+            .map(|transfer| {
+                (
+                    station_along(&edge.shape, transfer.point).0,
+                    transfer.node.clone(),
+                )
+            })
             .collect();
+        transfers.dedup_by(|a, b| a.1 == b.1);
         // A curve cut next to a transfer gives way to it rather than leave a sliver of
         // an edge between the two.
         let mut cuts: Vec<(f64, Option<String>)> = self
@@ -2951,16 +2930,12 @@ impl<'a> Exporter<'a> {
     /// edge. A bicycle riding a sidewalk against its carriageway joins the road only
     /// by first riding to where it meets one going its way, or by turning back.
     fn cycle_onto_carriageways(&mut self) {
-        let admits = |edge: &Edge, lane: usize| {
-            edge.lanes[lane]
-                .permission
-                .is_none_or(|permission| permission.admits("bicycle"))
-        };
+        let admits = |edge: usize, index: usize| self.admits_bicycles(Slot { edge, index });
         // The kerbmost lane each pair of carriageways is joined by, and the movements
         // between them.
         let mut pairs: BTreeMap<(usize, usize), (usize, usize, Movement)> = BTreeMap::new();
         for (&(from, from_lane, to, to_lane), movement) in &self.movements {
-            if !admits(&self.edges[from], from_lane) || !admits(&self.edges[to], to_lane) {
+            if !admits(from, from_lane) || !admits(to, to_lane) {
                 continue;
             }
             let pair = pairs
@@ -3048,6 +3023,13 @@ impl<'a> Exporter<'a> {
                 .or_insert_with(|| Ride::new(RideKind::Cross));
             ride.crosswalks.extend(crosswalks);
         }
+    }
+
+    /// Whether a bicycle may ride a written lane.
+    fn admits_bicycles(&self, slot: Slot) -> bool {
+        self.edges[slot.edge].lanes[slot.index]
+            .permission
+            .is_none_or(|permission| permission.admits("bicycle"))
     }
 
     /// Whether a written lane is one only pedestrians may use.
@@ -5753,9 +5735,9 @@ mod tests {
                 )
             })
             .collect();
-        let edges = elements(&network.edges, "edge");
+        let edges = edges_file(&network);
         let ends = |id: &str| {
-            let edge = edges.iter().find(|edge| edge["id"] == id).unwrap();
+            let edge = &edges[id].attributes;
             (edge["from"].clone(), edge["to"].clone())
         };
         for carriageway in ["street.fwd", "street.bwd"] {
@@ -5792,7 +5774,7 @@ mod tests {
         // The cycleway the other way is cut only in two, at a node of its own.
         for rev in ["street.fwd.bike0.rev", "street.bwd.bike0.rev"] {
             assert!(!ends(rev).1.contains("_x"), "{rev}");
-            assert!(!edges.iter().any(|edge| edge["id"] == format!("{rev}.p2")));
+            assert!(!edges.contains_key(&format!("{rev}.p2")));
         }
     }
 
@@ -6879,7 +6861,6 @@ mod tests {
     // Traffic lights
     // ----------------------------------------------------------------------- //
 
-    /// The attributes of every `element` in `xml`, in document order.
     /// A written edge or lane id with the piece it is of taken off: `west.fwd.p2_0`
     /// is a lane of `west.fwd`, as `west.fwd_0` is.
     fn unpieced(id: &str) -> String {
@@ -6897,6 +6878,7 @@ mod tests {
         }
     }
 
+    /// The attributes of every `element` in `xml`, in document order.
     fn elements(xml: &str, element: &str) -> Vec<HashMap<String, String>> {
         let mut reader = quick_xml::Reader::from_str(xml);
         let mut found = Vec::new();
