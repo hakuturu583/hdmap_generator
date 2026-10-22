@@ -359,8 +359,27 @@ pub fn bent_polyline() -> ValidatedMap {
 /// The transitions are clothoids, which is how a road actually enters a bend — and
 /// the reason OpenDRIVE has a `<spiral>` element at all.
 pub fn spiral_transition_road() -> ValidatedMap {
+    spiral_transition("spiral", 4.0, two_way())
+}
+
+/// [`spiral_transition_road`] as a street, level, with a sidewalk at each kerb.
+pub fn spiral_transition_street() -> ValidatedMap {
+    spiral_transition("sweep_street", 0.0, sidewalk_street())
+}
+
+/// Two driving lanes, one each way, each with a sidewalk at its kerb.
+pub fn sidewalk_street() -> Vec<LaneSpec> {
+    vec![
+        lane(3.5, Direction::Backward),
+        lane(2.0, Direction::Backward).with_type(LaneType::Sidewalk),
+        lane(3.5, Direction::Forward),
+        lane(2.0, Direction::Forward).with_type(LaneType::Sidewalk),
+    ]
+}
+
+fn spiral_transition(name: &str, height: f64, lanes: Vec<LaneSpec>) -> ValidatedMap {
     let radius = 120.0;
-    let alignment = Alignment::new(Point3::new(0.0, 0.0, 4.0), 0.0)
+    let alignment = Alignment::new(Point3::new(0.0, 0.0, height), 0.0)
         .line(80.0, 1.0)
         .unwrap()
         .spiral(60.0, 1.0 / radius, 1.0)
@@ -374,10 +393,10 @@ pub fn spiral_transition_road() -> ValidatedMap {
         .finish()
         .unwrap();
 
-    let mut builder = MapBuilder::new(metadata("spiral"));
+    let mut builder = MapBuilder::new(metadata(name));
     builder
         .add_road(
-            RoadSpec::new(alignment, two_way())
+            RoadSpec::new(alignment, lanes)
                 .with_name("sweep")
                 .with_speed_limit(SpeedLimit::from_kph(80.0).unwrap()),
         )
@@ -718,14 +737,6 @@ fn sidewalk_crossroads_builder(
         handedness,
         ..metadata(name)
     });
-    let street = || {
-        vec![
-            lane(3.5, Direction::Backward),
-            lane(2.0, Direction::Backward).with_type(LaneType::Sidewalk),
-            lane(3.5, Direction::Forward),
-            lane(2.0, Direction::Forward).with_type(LaneType::Sidewalk),
-        ]
-    };
     let one_way = || {
         vec![
             lane(2.0, Direction::Backward).with_type(LaneType::Sidewalk),
@@ -738,7 +749,7 @@ fn sidewalk_crossroads_builder(
         let lanes = if one_way_west && name == "west" {
             one_way()
         } else {
-            street()
+            sidewalk_street()
         };
         builder
             .add_road(

@@ -100,11 +100,12 @@ fn ways_through(network: &SumoNetwork, lane: &str, node: &str) -> (String, Strin
         format!("{edge}.bike{index}"),
         format!("{edge}.bike{index}.rev"),
     );
-    if network.edge(edge).to.as_deref() == Some(node) {
-        (format!("{along}.p1_0"), format!("{against}_0"))
+    // The piece of a cycleway that runs into `node`: its last.
+    let into = |cycleway: &str| pieces_of(network, cycleway).last().unwrap().id.clone();
+    if network.edge(&along).from.as_deref() == Some(node) {
+        (format!("{}_0", into(&against)), format!("{along}_0"))
     } else {
-        assert_eq!(network.edge(edge).from.as_deref(), Some(node), "{lane}");
-        (format!("{against}.p1_0"), format!("{along}_0"))
+        (format!("{}_0", into(&along)), format!("{against}_0"))
     }
 }
 
@@ -130,6 +131,29 @@ fn walking_areas_at(network: &SumoNetwork, node: &str) -> BTreeSet<BTreeSet<Stri
     touching.into_values().collect()
 }
 
+/// A written edge with the piece it is of taken off: `west.fwd.p2` is a piece of
+/// `west.fwd`, and so is `west.fwd` itself.
+fn unpieced(edge: &str) -> String {
+    match edge.rsplit_once(".p") {
+        Some((whole, piece)) if piece.chars().all(|c| c.is_ascii_digit()) => whole.to_owned(),
+        _ => edge.to_owned(),
+    }
+}
+
+/// The pieces `edge` is written as, in travel order: each runs on from the node the
+/// one before it runs into.
+fn pieces_of<'a>(network: &'a SumoNetwork, edge: &str) -> Vec<&'a sumo_build::SumoEdge> {
+    let mut pieces = vec![network.edge(edge)];
+    while let Some(next) = network.edges.iter().find(|piece| {
+        unpieced(&piece.id) == edge
+            && piece.from.is_some()
+            && piece.from == pieces.last().unwrap().to
+    }) {
+        pieces.push(next);
+    }
+    pieces
+}
+
 /// The edges each crossing netconvert built crosses.
 fn crossings(network: &SumoNetwork) -> BTreeSet<Vec<String>> {
     network
@@ -137,7 +161,12 @@ fn crossings(network: &SumoNetwork) -> BTreeSet<Vec<String>> {
         .iter()
         .filter(|edge| edge.function.as_deref() == Some("crossing"))
         .map(|edge| {
-            let mut crossed = edge.crossing_edges.clone();
+            // An arm is crossed on the piece of it that meets the junction.
+            let mut crossed: Vec<String> = edge
+                .crossing_edges
+                .iter()
+                .map(|crossed| unpieced(crossed))
+                .collect();
             crossed.sort();
             crossed
         })
@@ -187,7 +216,9 @@ fn every_sidewalk_is_ridden_both_ways_and_only_when_asked() {
             .count()
     };
     assert_eq!(allowing("pedestrian bicycle"), 8 * 4);
-    assert_eq!(allowing("pedestrian"), 8);
+    // Each carriageway is cut once, halfway along its 56 m, where bicycles change
+    // between it and its sidewalk, and its sidewalk lane with it.
+    assert_eq!(allowing("pedestrian"), 8 * 2);
 }
 
 /// Every crossroads builds and loads with the sidewalks ridden both ways, and keeps
@@ -208,6 +239,14 @@ fn the_pedestrians_keep_their_walking_areas_and_crossings() {
             assert_eq!(crossings(&built.network), crossings(&plain), "{name}");
             // A walking area of the cycling network, with the edges bicycles ride
             // the sidewalks on taken out, is one of the plain network's.
+            // The carriageways are cut where bicycles change between them and the
+            // sidewalks, so an arm arrives on its last piece: the same edge.
+            let unpieced_areas = |areas: BTreeSet<BTreeSet<String>>| -> BTreeSet<BTreeSet<String>> {
+                areas
+                    .into_iter()
+                    .map(|area| area.iter().map(|edge| unpieced(edge)).collect())
+                    .collect()
+            };
             let without_rides: BTreeSet<BTreeSet<String>> = walking_areas_at(&built.network, "j_x")
                 .into_iter()
                 .map(|area| {
@@ -216,7 +255,11 @@ fn the_pedestrians_keep_their_walking_areas_and_crossings() {
                         .collect()
                 })
                 .collect();
-            assert_eq!(without_rides, walking_areas_at(&plain, "j_x"), "{name}");
+            assert_eq!(
+                unpieced_areas(without_rides),
+                unpieced_areas(walking_areas_at(&plain, "j_x")),
+                "{name}"
+            );
             // And each takes in both of the edges along each sidewalk it joins.
             for area in walking_areas_at(&built.network, "j_x") {
                 let sidewalks = area.iter().filter(|edge| !edge.contains(".bike")).count();
@@ -319,7 +362,7 @@ fn gets_on_and_off_the_road_crosses_it_and_turns_back(
         .collect();
     rides.sort();
     let kinds: BTreeSet<Ride> = rides.iter().map(|(kind, ..)| *kind).collect();
-    let mut expected = BTreeSet::from([Ride::OnOrOff, Ride::TurnBack]);
+    let mut expected = BTreeSet::from([Ride::OnOrOff, Ride::Between, Ride::TurnBack]);
     if crosswalks {
         expected.insert(Ride::Across);
     }
@@ -446,8 +489,12 @@ fn the_trace_follows_every_ride_and_accepts_the_built_network() {
 enum Ride {
     /// From one sidewalk round a corner onto the next.
     Corner,
-    /// Off a sidewalk onto a carriageway, or off a carriageway onto a sidewalk.
+    /// Off a sidewalk onto a carriageway, or off a carriageway onto a sidewalk, at a
+    /// junction.
     OnOrOff,
+    /// Off a sidewalk onto the carriageway beside it, or off that carriageway onto
+    /// it, between junctions.
+    Between,
     /// Across the road from the sidewalk on one kerb to the one on the other.
     Across,
     /// Back the other way along the same sidewalk, at a dead end.
@@ -462,9 +509,11 @@ fn ride(from: &str, to: &str) -> Option<Ride> {
     let arm = |edge: &str| edge.split('.').next().unwrap().to_owned();
     match (sidewalk(from), sidewalk(to)) {
         (None, None) => None,
+        (Some(sidewalk), None) if sidewalk == unpieced(to) => Some(Ride::Between),
+        (None, Some(sidewalk)) if sidewalk == unpieced(from) => Some(Ride::Between),
         (Some(_), None) | (None, Some(_)) => Some(Ride::OnOrOff),
-        // The joint between the two halves of one cycleway.
-        _ if to == format!("{from}.p1") => None,
+        // A joint between two pieces of one cycleway.
+        _ if unpieced(from) == unpieced(to) => None,
         (Some(one), Some(other)) if one == other => Some(Ride::TurnBack),
         _ if arm(from) == arm(to) => Some(Ride::Across),
         _ => Some(Ride::Corner),
@@ -498,4 +547,43 @@ fn a_light_over_bicycles_gives_them_a_green_of_their_own_and_needs_no_option() {
             program(&cycling_network)
         );
     }
+}
+
+/// A bend cut for its curve speed is cut where bicycles change between the sidewalk
+/// and the road as well, and a bicycle setting off on the sidewalk reaches the far end
+/// of the carriageway: a dead end it can only have got onto the road short of.
+#[test]
+fn on_a_bend_cut_for_its_curve_speed_a_bicycle_gets_on_the_road_between_its_ends() {
+    if !sumo_build::sumo_available() {
+        return;
+    }
+    let map = scenarios::spiral_transition_street();
+    let options = Options {
+        curve_lateral_acceleration: Some(2.0),
+        ..cycling()
+    };
+    let built = sumo_build::build_with(&map, &options);
+    let network = &built.network;
+
+    // The forward carriageway is cut at its bend and at the places a bicycle changes
+    // between it and its sidewalk, one piece running on from the last.
+    let pieces = pieces_of(network, "sweep.fwd");
+    let cuts: Vec<&str> = pieces[1..]
+        .iter()
+        .filter_map(|piece| piece.from.as_deref())
+        .collect();
+    assert!(cuts.iter().any(|node| node.contains("_x")), "{cuts:?}");
+    assert!(cuts.iter().any(|node| node.contains("_p")), "{cuts:?}");
+
+    let last = &pieces.last().unwrap().id;
+    let routes = format!(
+        r#"<routes>
+    <vType id="bike" vClass="bicycle"/>
+    <trip id="b0" type="bike" depart="0" from="sweep.fwd.bike0" to="{last}" departLane="0" departPos="1.00" arrivalPos="1.00"/>
+</routes>
+"#
+    );
+    std::fs::write(built.directory.path().join("rides.rou.xml"), routes).unwrap();
+    let ridden = sumo_build::ride(built.directory.path(), &built.prefix);
+    assert_eq!(ridden.len(), 1, "the bicycle should arrive: {ridden:?}");
 }

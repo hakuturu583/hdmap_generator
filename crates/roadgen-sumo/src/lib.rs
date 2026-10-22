@@ -133,10 +133,11 @@
 //! netconvert 1.18 builds a program SUMO refuses to run. Both admit pedestrians as
 //! well as bicycles, because netconvert joins the footways round a node into a
 //! walking area only where nothing pedestrians may not use lies between them; the
-//! walking areas and the crossings come out as they do without bicycles. Each is cut
-//! in two halfway, `….p1`, so that it never joins the same two nodes as a carriageway
-//! of its road — netconvert would take it for that carriageway's turnaround — and
-//! where the road ends at a dead end, the two meet at a node of their own there,
+//! walking areas and the crossings come out as they do without bicycles. Neither is
+//! ever written whole: cut nowhere else, it is cut in two halfway, `….p1`, so that it
+//! never runs back between the two nodes a carriageway of its road runs between,
+//! which netconvert would take for that carriageway's turnaround. Where the road
+//! ends at a dead end, the two meet at a node of their own there,
 //! `n_<edge>.bike<index>_start` or `_end`, at the end of the sidewalk. The rides
 //! round a corner are `uncontrolled` at a signalised node: the pavement round a
 //! corner crosses no carriageway, so a signal has nothing to say about it.
@@ -150,6 +151,11 @@
 //!   use, a bicycle on the sidewalk beside the arriving one, riding its way, may join
 //!   the leaving one, and a bicycle on the arriving one may get off onto the sidewalk
 //!   beside the leaving one, riding its way.
+//! - **Onto and off the carriageway between junctions.** A carriageway with a
+//!   sidewalk beside it is cut, every [`CYCLE_TRANSFER_SPACING`] at most and evenly
+//!   along it, and the cycleway along the sidewalk its way is cut with it, at the same
+//!   node, `n_<edge>_x<i>`. There a bicycle on the sidewalk may join the road, and one
+//!   on the road may get off onto the sidewalk.
 //! - **Across the road where a crosswalk is.** Wherever a crosswalk became a
 //!   crossing, a connection each way joins the sidewalks on either kerb, from the
 //!   cycleway arriving at the node to the one leaving it on the far side.
@@ -299,6 +305,16 @@ const DEFAULT_NAME: &str = "network";
 /// across it — gives way to the traffic it meets there.
 const CYCLEWAY_PRIORITY: i32 = 0;
 
+/// The longest stretch of carriageway, metres, a bicycle on the sidewalk beside it
+/// rides without a place to change between the two: a carriageway this long or more
+/// gets as many nodes between its ends, evenly spaced, as it is this many times long.
+/// See [`Exporter::plan_transfers`].
+pub const CYCLE_TRANSFER_SPACING: f64 = 50.0;
+
+/// The closest a cut at a curve may come to a transfer, metres, before it gives way
+/// to it; see [`Exporter::pieces_of`].
+const MIN_CUT_GAP: f64 = 1.0;
+
 /// The shortest stop offset worth writing, metres.
 ///
 /// A stop line this close to the end of its lane is, to any precision a simulation
@@ -418,13 +434,16 @@ pub struct Options {
     /// a sidewalk both ways takes an edge each way. Set, every sidewalk gets two edges
     /// for bicycles laid along the same strip: `<edge>.bike<index>` the way the
     /// sidewalk's edge runs and `<edge>.bike<index>.rev` the other way, each
-    /// `allow="pedestrian bicycle"` and each cut in two halfway (the second half
-    /// `….p1`), with the IR's footway connections written as connections between them
-    /// for both directions. The sidewalk lane itself stays the pedestrians'.
+    /// `allow="pedestrian bicycle"` and each written in at least two pieces (the
+    /// second `….p1`), with the IR's footway connections written as connections
+    /// between them for both directions. The sidewalk lane itself stays the
+    /// pedestrians'.
     ///
     /// At every node a movement of the IR's crosses, a bicycle may also come off the
     /// sidewalk onto the carriageway it runs beside, or off the carriageway onto the
-    /// sidewalk of the road it turns into; it may ride across the road wherever a
+    /// sidewalk of the road it turns into, and it may do the same between junctions,
+    /// where each carriageway with a sidewalk is cut every
+    /// [`CYCLE_TRANSFER_SPACING`] at most; it may ride across the road wherever a
     /// crosswalk became a crossing; and it may turn back where a sidewalk runs out to
     /// a dead end. See the crate documentation, under *Bicycles on sidewalks*.
     ///
@@ -1325,6 +1344,11 @@ struct Piece {
 }
 
 impl Edge {
+    /// The speed limit of `lane`, one of this edge's: its own, or the edge's.
+    fn limit(&self, lane: &EdgeLane) -> f64 {
+        lane.speed.unwrap_or(self.speed)
+    }
+
     /// The piece traffic leaves the edge from, which connections, signals and stop
     /// offsets belong to.
     fn exit(&self) -> &Piece {
@@ -1413,6 +1437,23 @@ impl Ride {
     }
 }
 
+/// A node between junctions where bicycles change between a sidewalk and the
+/// carriageway it runs beside, the way the carriageway runs: off the sidewalk onto the
+/// road, and off the road onto the sidewalk. See [`Exporter::plan_transfers`].
+struct Transfer {
+    node: String,
+    /// Where it is, on the carriageway's reference line; each edge it joins is cut
+    /// across there.
+    point: Point3,
+    carriageway: usize,
+    /// The lane of the carriageway bicycles join and leave it by: the kerbmost one a
+    /// bicycle may ride.
+    lane: usize,
+    /// Each sidewalk beside the carriageway, as its lane of the carriageway's edge,
+    /// with the cycleway along it the carriageway's way.
+    sidewalks: Vec<(usize, usize)>,
+}
+
 /// The IR behind one written connection: the lane connections it was followed along,
 /// and the connector lanes it crossed a junction on.
 #[derive(Default, Clone)]
@@ -1458,6 +1499,12 @@ struct Exporter<'a> {
     /// is, and what of the IR it stands for. Kept apart from the movements because
     /// they are not the IR's own; see [`Ride`].
     cycling: BTreeMap<(usize, usize, usize, usize), Ride>,
+    /// The nodes between junctions where bicycles change between a sidewalk and the
+    /// carriageway beside it; see [`Exporter::plan_transfers`].
+    transfers: Vec<Transfer>,
+    /// The transfers cutting each edge, carriageway or cycleway, by their index in
+    /// [`Exporter::transfers`].
+    transfers_by_edge: HashMap<usize, Vec<usize>>,
     /// The pedestrian crossings, by the node each is at and the edges it crosses
     /// there, in the order they are written; see [`Exporter::build_crossings`].
     crossings: BTreeMap<(String, Vec<usize>), Crossing>,
@@ -1555,6 +1602,8 @@ impl<'a> Exporter<'a> {
             walking: BTreeMap::new(),
             cycleways: HashMap::new(),
             cycling: BTreeMap::new(),
+            transfers: Vec::new(),
+            transfers_by_edge: HashMap::new(),
             crossings: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: BTreeMap::new(),
@@ -1732,6 +1781,7 @@ impl<'a> Exporter<'a> {
         self.build_signals();
         self.open_dead_ends();
         self.place_stop_lines()?;
+        self.plan_transfers();
         self.cut_curves()?;
         let points = self
             .nodes
@@ -2050,11 +2100,10 @@ impl<'a> Exporter<'a> {
     /// use round it, and a lane they may not use between two sidewalks would split the
     /// pavement round the corner in two.
     ///
-    /// Each is always written as at least two pieces, cut halfway (see
-    /// [`Exporter::pieces_of`]). Whole, it would join the same two nodes as the
-    /// carriageways of its road, and netconvert takes any edge back to the node
-    /// another came from as that one's turnaround: with two candidates for one, it
-    /// cannot tell which, and says so.
+    /// Neither is ever written whole (see [`Exporter::pieces_of`]). Whole, it would
+    /// join the same two nodes as the carriageways of its road, and netconvert takes
+    /// any edge back to the node another came from as that one's turnaround: with two
+    /// candidates for one, it cannot tell which, and says so.
     ///
     /// Where the road ends at a dead end, the two meet at a node of their own there,
     /// `n_<edge>.bike<index>_start` or `_end`, at the end of the sidewalk, where a
@@ -2139,8 +2188,109 @@ impl<'a> Exporter<'a> {
         Ok(self.edges.len() - 1)
     }
 
-    /// Cuts every edge into the pieces [`curves`] finds along it, or writes it whole
-    /// when the options ask for no curve speeds; see [`Options`].
+    /// The nodes between junctions where a bicycle may change between a sidewalk and
+    /// the carriageway it runs beside.
+    ///
+    /// SUMO moves a vehicle from one edge to another only along a connection at a
+    /// node, so without these a bicycle could get on or off the road only at the ends
+    /// of a carriageway. A carriageway with a sidewalk beside it, and a lane a bicycle
+    /// may ride, gets one node every [`CYCLE_TRANSFER_SPACING`] at most: as many as
+    /// it is that many times long, evenly spaced along it, none past its furthest-back
+    /// stop line. The carriageway and the cycleway along the sidewalk its way are both
+    /// cut there (see [`Exporter::pieces_of`]), at the one node, `n_<edge>_x<i>`, and
+    /// two connections join them: off the sidewalk onto the road, and off the road onto
+    /// the sidewalk. A bicycle riding the sidewalk the other way joins the road where
+    /// it can already, at a junction or at the dead end it turns back at; its cycleway
+    /// is not cut here, since it would then run back between the nodes the carriageway
+    /// runs between, which netconvert takes for a second turnaround.
+    fn plan_transfers(&mut self) {
+        let mut sidewalks: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+        for (&(edge, sidewalk), &(along, _)) in &self.cycleways {
+            sidewalks.entry(edge).or_default().push((sidewalk, along));
+        }
+        for (index, mut sidewalks) in sidewalks {
+            sidewalks.sort_unstable();
+            // The kerbmost lane a bicycle may ride, as at a junction (see
+            // [`Exporter::cycle_onto_carriageways`]).
+            let Some(lane) =
+                (0..self.edges[index].lanes.len()).find(|&lane| self.admits_bicycles(index, lane))
+            else {
+                continue;
+            };
+            let edge = &self.edges[index];
+            let centre = curves::Plan::new(&edge.shape);
+            let length = centre.length();
+            let latest = self.latest_cut(index);
+            let count = (length / CYCLE_TRANSFER_SPACING).floor() as usize;
+            for k in 1..=count {
+                let station = length * k as f64 / (count + 1) as f64;
+                if station >= latest {
+                    break;
+                }
+                let transfer = self.transfers.len();
+                for edge in std::iter::once(index).chain(sidewalks.iter().map(|&(_, along)| along))
+                {
+                    self.transfers_by_edge
+                        .entry(edge)
+                        .or_default()
+                        .push(transfer);
+                }
+                self.transfers.push(Transfer {
+                    node: format!("n_{}_x{k}", edge.id),
+                    point: centre.point_at(station),
+                    carriageway: index,
+                    lane,
+                    sidewalks: sidewalks.clone(),
+                });
+            }
+        }
+    }
+
+    /// The connections at each transfer, as (from piece, from lane, to piece, to
+    /// lane, the transfer, the sidewalk): off each sidewalk onto the road, then off the
+    /// road onto it.
+    fn transfer_connections(
+        &self,
+    ) -> impl Iterator<Item = (&str, usize, &str, usize, &Transfer, usize)> {
+        self.transfers.iter().flat_map(move |transfer| {
+            let around = move |edge: usize| {
+                let pieces = &self.edges[edge].pieces;
+                let after = pieces
+                    .iter()
+                    .position(|piece| piece.from == transfer.node)
+                    .expect("a transfer cuts the edges it joins");
+                (pieces[after - 1].id.as_str(), pieces[after].id.as_str())
+            };
+            let (road_before, road_after) = around(transfer.carriageway);
+            transfer
+                .sidewalks
+                .iter()
+                .flat_map(move |&(sidewalk, cycleway)| {
+                    let (side_before, side_after) = around(cycleway);
+                    [
+                        (
+                            side_before,
+                            0,
+                            road_after,
+                            transfer.lane,
+                            transfer,
+                            sidewalk,
+                        ),
+                        (
+                            road_before,
+                            transfer.lane,
+                            side_after,
+                            0,
+                            transfer,
+                            sidewalk,
+                        ),
+                    ]
+                })
+        })
+    }
+
+    /// Cuts every edge into its pieces, or writes it whole where it has none to be cut
+    /// into; see [`Exporter::pieces_of`].
     ///
     /// Done last, once the stop offsets are placed: the last piece is kept long
     /// enough to carry the edge's.
@@ -2156,119 +2306,134 @@ impl<'a> Exporter<'a> {
         Ok(())
     }
 
+    /// The pieces edge `index` is written as: cut at the curves [`curves`] finds along
+    /// it, where the options ask for curve speeds, and at the nodes bicycles change
+    /// between a sidewalk and the carriageway beside it (see
+    /// [`Exporter::plan_transfers`]). An edge bicycles ride a sidewalk on is never
+    /// written whole, so one with no other cut is cut halfway; see
+    /// [`Exporter::cycle_footways`].
     fn pieces_of(&self, index: usize) -> Result<Vec<Piece>, ExportError> {
-        let mut pieces = self.curve_pieces(index)?;
-        if self.edges[index].rides.is_some() && pieces.len() == 1 {
-            // An edge bicycles ride a sidewalk on is never written whole; see
-            // [`Exporter::cycle_footways`].
-            pieces = self.halve(&self.edges[index], pieces.remove(0))?;
-        }
-        Ok(pieces)
-    }
-
-    /// `whole`, the only piece of `edge`, cut in two halfway along, the second half
-    /// named and joined to the first as a piece cut at a curve is.
-    fn halve(&self, edge: &Edge, whole: Piece) -> Result<Vec<Piece>, ExportError> {
-        let longest = |lanes: &[Polyline3]| lanes.iter().map(Polyline3::length).fold(0.0, f64::max);
-        let centre = curves::Plan::new(&whole.shape);
-        let middle = centre.length() / 2.0;
-        let length = centre.length();
-        let (first_shape, second_shape) =
-            (centre.slice(0.0, middle)?, centre.slice(middle, length)?);
-        let (mut first_lanes, mut second_lanes) = (Vec::new(), Vec::new());
-        for lane in &whole.lanes {
-            let plan = curves::Plan::new(lane);
-            let cut = station_along(lane, centre.point_at(middle)).0;
-            first_lanes.push(plan.slice(0.0, cut)?);
-            second_lanes.push(plan.slice(cut, plan.length())?);
-        }
-        let node = format!("n_{}_p1", edge.id);
-        Ok(vec![
-            Piece {
-                id: whole.id,
-                from: whole.from,
-                to: node.clone(),
-                shape: first_shape,
-                length: longest(&first_lanes),
-                speeds: whole.speeds.clone(),
-                lanes: first_lanes,
-            },
-            Piece {
-                id: format!("{}.p1", edge.id),
-                from: node,
-                to: whole.to,
-                shape: second_shape,
-                length: longest(&second_lanes),
-                speeds: whole.speeds,
-                lanes: second_lanes,
-            },
-        ])
-    }
-
-    /// The pieces [`curves`] cuts edge `index` into, or the edge whole when the
-    /// options ask for no curve speeds or it has no bend to cut at.
-    fn curve_pieces(&self, index: usize) -> Result<Vec<Piece>, ExportError> {
         let edge = &self.edges[index];
-        let longest = |lanes: &[Polyline3]| lanes.iter().map(Polyline3::length).fold(0.0, f64::max);
+        let transfers: Vec<(f64, String)> = self
+            .transfers_by_edge
+            .get(&index)
+            .into_iter()
+            .flatten()
+            .map(|&transfer| {
+                let transfer = &self.transfers[transfer];
+                (
+                    station_along(&edge.shape, transfer.point).0,
+                    transfer.node.clone(),
+                )
+            })
+            .collect();
+        // A curve cut next to a transfer gives way to it rather than leave a sliver of
+        // an edge between the two.
+        let mut cuts: Vec<(f64, Option<String>)> = self
+            .curve_cuts(index)
+            .into_iter()
+            .filter(|&station| {
+                transfers
+                    .iter()
+                    .all(|(transfer, _)| (station - transfer).abs() > MIN_CUT_GAP)
+            })
+            .map(|station| (station, None))
+            .collect();
+        cuts.extend(
+            transfers
+                .into_iter()
+                .map(|(station, node)| (station, Some(node))),
+        );
+        if cuts.is_empty() && edge.rides.is_some() {
+            cuts.push((curves::Plan::new(&edge.shape).length() / 2.0, None));
+        }
+        cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        self.cut(edge, &cuts)
+    }
+
+    /// Where along its reference line [`curves`] cuts edge `index`: nowhere when the
+    /// options ask for no curve speeds or it has no bend to cut at.
+    fn curve_cuts(&self, index: usize) -> Vec<f64> {
         let Some(acceleration) = self.options.curve_lateral_acceleration else {
-            let lanes: Vec<Polyline3> = edge.lanes.iter().map(|lane| lane.shape.clone()).collect();
-            return Ok(vec![Piece {
-                id: edge.id.clone(),
-                from: edge.from.clone(),
-                to: edge.to.clone(),
-                shape: edge.shape.clone(),
-                length: longest(&lanes),
-                speeds: vec![None; lanes.len()],
-                lanes,
-            }]);
+            return Vec::new();
         };
-        let limit = |lane: &EdgeLane| lane.speed.unwrap_or(edge.speed);
+        let edge = &self.edges[index];
+        let centre = curves::Plan::new(&edge.shape);
+        let fastest = edge
+            .lanes
+            .iter()
+            .map(|lane| edge.limit(lane))
+            .fold(edge.speed, f64::max);
+        let stretches = curves::stretches(
+            &centre.curve_speeds(acceleration),
+            centre.length(),
+            fastest,
+            self.latest_cut(index),
+        );
+        stretches[1..].iter().map(|stretch| stretch.start).collect()
+    }
+
+    /// How far along its reference line edge `index` may be cut: no further than the
+    /// furthest-back stop line, as each lane measures it, so every stop offset lands
+    /// on the last piece and fits on its lane.
+    fn latest_cut(&self, index: usize) -> f64 {
+        let edge = &self.edges[index];
+        self.stop_offsets
+            .range((index, 0)..(index + 1, 0))
+            .map(|(&(_, lane), (_, distance))| {
+                let plan = curves::Plan::new(&edge.lanes[lane].shape);
+                let line = plan.point_at(plan.length() - distance - MIN_STOP_OFFSET);
+                station_along(&edge.shape, line).0
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// `edge` cut at `cuts`, stations along its reference line in order, each with
+    /// the node it is cut at or `None` for a node of its own, `n_<edge>_p<k>`. The
+    /// first piece keeps the edge's id and the k-th after it is `<edge>.p<k>`; each
+    /// lane is cut where the reference line is, across the carriageway.
+    fn cut(&self, edge: &Edge, cuts: &[(f64, Option<String>)]) -> Result<Vec<Piece>, ExportError> {
+        let longest = |lanes: &[Polyline3]| lanes.iter().map(Polyline3::length).fold(0.0, f64::max);
         let centre = curves::Plan::new(&edge.shape);
         let plans: Vec<curves::Plan> = edge
             .lanes
             .iter()
             .map(|lane| curves::Plan::new(&lane.shape))
             .collect();
-        // No cut after the furthest-back stop line, as each lane measures it, so
-        // every stop offset lands on the last piece and fits on its lane.
-        let latest_cut = self
-            .stop_offsets
-            .range((index, 0)..(index + 1, 0))
-            .map(|(&(_, lane), (_, distance))| {
-                let plan = &plans[lane];
-                let line = plan.point_at(plan.length() - distance - MIN_STOP_OFFSET);
-                station_along(&edge.shape, line).0
-            })
-            .fold(f64::INFINITY, f64::min);
-        let fastest = edge.lanes.iter().map(limit).fold(edge.speed, f64::max);
-        let stretches = curves::stretches(
-            &centre.curve_speeds(acceleration),
-            centre.length(),
-            fastest,
-            latest_cut,
-        );
-        let whole = stretches.len() == 1;
-        // Each lane is cut where the centre line is, across the carriageway.
+        let count = cuts.len() + 1;
+        let whole = count == 1;
+        let centre_stations: Vec<f64> = std::iter::once(0.0)
+            .chain(cuts.iter().map(|(station, _)| *station))
+            .chain(std::iter::once(centre.length()))
+            .collect();
         let lane_stations: Vec<Vec<f64>> = edge
             .lanes
             .iter()
             .zip(&plans)
             .map(|(lane, plan)| {
                 std::iter::once(0.0)
-                    .chain(stretches[1..].iter().map(|stretch| {
-                        station_along(&lane.shape, centre.point_at(stretch.start)).0
+                    .chain(cuts.iter().map(|(station, _)| {
+                        station_along(&lane.shape, centre.point_at(*station)).0
                     }))
                     .chain(std::iter::once(plan.length()))
                     .collect()
             })
             .collect();
-        let lane_speeds: Vec<Vec<f64>> = plans
-            .iter()
-            .map(|plan| plan.curve_speeds(acceleration))
-            .collect();
-        let node = |k: usize| format!("n_{}_p{k}", edge.id);
-        let mut pieces = Vec::with_capacity(stretches.len());
-        for (k, stretch) in stretches.iter().enumerate() {
+        let lane_speeds: Option<Vec<Vec<f64>>> =
+            self.options.curve_lateral_acceleration.map(|acceleration| {
+                plans
+                    .iter()
+                    .map(|plan| plan.curve_speeds(acceleration))
+                    .collect()
+            });
+        let node = |k: usize| {
+            cuts[k - 1]
+                .1
+                .clone()
+                .unwrap_or_else(|| format!("n_{}_p{k}", edge.id))
+        };
+        let mut pieces = Vec::with_capacity(count);
+        for k in 0..count {
             let lanes: Vec<Polyline3> = if whole {
                 edge.lanes.iter().map(|lane| lane.shape.clone()).collect()
             } else {
@@ -2285,7 +2450,7 @@ impl<'a> Exporter<'a> {
                     format!("{}.p{k}", edge.id)
                 },
                 from: if k == 0 { edge.from.clone() } else { node(k) },
-                to: if k + 1 == stretches.len() {
+                to: if k + 1 == count {
                     edge.to.clone()
                 } else {
                     node(k + 1)
@@ -2293,17 +2458,20 @@ impl<'a> Exporter<'a> {
                 shape: if whole {
                     edge.shape.clone()
                 } else {
-                    centre.slice(stretch.start, stretch.end)?
+                    centre.slice(centre_stations[k], centre_stations[k + 1])?
                 },
-                speeds: edge
-                    .lanes
-                    .iter()
-                    .zip(&lane_speeds)
-                    .zip(&lane_stations)
-                    .map(|((lane, speeds), stations)| {
-                        curves::cap(speeds, stations[k], stations[k + 1], limit(lane))
-                    })
-                    .collect(),
+                speeds: match &lane_speeds {
+                    Some(lane_speeds) => edge
+                        .lanes
+                        .iter()
+                        .zip(lane_speeds)
+                        .zip(&lane_stations)
+                        .map(|((lane, speeds), stations)| {
+                            curves::cap(speeds, stations[k], stations[k + 1], edge.limit(lane))
+                        })
+                        .collect(),
+                    None => vec![None; edge.lanes.len()],
+                },
                 length: longest(&lanes),
                 lanes,
             });
@@ -2788,16 +2956,11 @@ impl<'a> Exporter<'a> {
     /// edge. A bicycle riding a sidewalk against its carriageway joins the road only
     /// by first riding to where it meets one going its way, or by turning back.
     fn cycle_onto_carriageways(&mut self) {
-        let admits = |edge: &Edge, lane: usize| {
-            edge.lanes[lane]
-                .permission
-                .is_none_or(|permission| permission.admits("bicycle"))
-        };
         // The kerbmost lane each pair of carriageways is joined by, and the movements
         // between them.
         let mut pairs: BTreeMap<(usize, usize), (usize, usize, Movement)> = BTreeMap::new();
         for (&(from, from_lane, to, to_lane), movement) in &self.movements {
-            if !admits(&self.edges[from], from_lane) || !admits(&self.edges[to], to_lane) {
+            if !self.admits_bicycles(from, from_lane) || !self.admits_bicycles(to, to_lane) {
                 continue;
             }
             let pair = pairs
@@ -2885,6 +3048,13 @@ impl<'a> Exporter<'a> {
                 .or_insert_with(|| Ride::new(RideKind::Cross));
             ride.crosswalks.extend(crosswalks);
         }
+    }
+
+    /// Whether a bicycle may ride lane `lane` of edge `edge`.
+    fn admits_bicycles(&self, edge: usize, lane: usize) -> bool {
+        self.edges[edge].lanes[lane]
+            .permission
+            .is_none_or(|permission| permission.admits("bicycle"))
     }
 
     /// Whether a written lane is one only pedestrians may use.
@@ -3737,6 +3907,20 @@ impl<'a> Exporter<'a> {
                 Relation::Part,
             );
         }
+        // A bicycle's way between a sidewalk and the carriageway beside it, between
+        // junctions, is part of both lanes, for bicycles.
+        for (from, from_lane, to, to_lane, transfer, sidewalk) in self.transfer_connections() {
+            let local = format!("connection:{from}_{from_lane}>{to}_{to_lane}");
+            let lanes = &self.edges[transfer.carriageway].lanes;
+            for lane in [sidewalk, transfer.lane] {
+                trace.link_as(
+                    lanes[lane].lane.clone(),
+                    local.clone(),
+                    Relation::Part,
+                    "bicycle",
+                );
+            }
+        }
 
         // A stop line is carried by the stop offset of each lane it was measured
         // against: one attribute of a lane that is otherwise the IR's lane.
@@ -4005,6 +4189,19 @@ impl<'a> Exporter<'a> {
                     ("to", to.id.clone()),
                     ("fromLane", lane.to_string()),
                     ("toLane", lane.to_string()),
+                ],
+            );
+        }
+        // A bicycle's way off a sidewalk onto the road beside it, or off the road onto
+        // it, between junctions.
+        for (from, from_lane, to, to_lane, ..) in self.transfer_connections() {
+            document.leaf(
+                "connection",
+                &[
+                    ("from", from.to_owned()),
+                    ("to", to.to_owned()),
+                    ("fromLane", from_lane.to_string()),
+                    ("toLane", to_lane.to_string()),
                 ],
             );
         }
@@ -5470,16 +5667,22 @@ mod tests {
                 )
             })
             .filter(|(from, to)| from.contains(".bike") && to.contains(".bike"))
-            // Not the joint between the two halves of one of them.
-            .filter(|(from, to)| !to.starts_with(&from.replace("_0", ".p1_0")))
+            // Not a joint between two pieces of one of them.
+            .filter(|(from, to)| unpieced(from) != unpieced(to))
             .collect();
         let (forward, backward) = (sidewalk(Direction::Forward), sidewalk(Direction::Backward));
+        let edges = edges_file(&network);
         // The edge bicycles ride `lane` on, `way` being "" or ".rev", arriving at the
-        // node it rides into or leaving the one it rides out of.
+        // node it rides into (on its last piece) or leaving the one it rides out of.
         let bike = |lane: &str, way: &str, arriving: bool| {
             let (edge, index) = lane.rsplit_once('_').unwrap();
-            let piece = if arriving { ".p1" } else { "" };
-            format!("{edge}.bike{index}{way}{piece}_0")
+            let whole = format!("{edge}.bike{index}{way}");
+            let piece = if arriving {
+                last_piece(&edges, &whole)
+            } else {
+                whole
+            };
+            format!("{piece}_0")
         };
         // Round the end the forward sidewalk arrives and the backward one leaves;
         // round the start, the other way about. Each way round is ridden both ways.
@@ -5490,18 +5693,81 @@ mod tests {
             (bike(&forward, ".rev", true), bike(&backward, ".rev", false)),
         ]);
         assert_eq!(rides, expected, "{}", network.connections);
-        // And the sidewalks themselves are still joined by nothing but the walking
-        // areas.
+        // And the sidewalks themselves are still joined to nothing but the walking
+        // areas, and the next piece of their own edge.
         assert!(
             !elements(&network.connections, "connection")
                 .into_iter()
                 .any(|connection| {
                     let from = format!("{}_{}", connection["from"], connection["fromLane"]);
-                    from == forward || from == backward
+                    (from == forward || from == backward)
+                        && unpieced(&connection["from"]) != unpieced(&connection["to"])
                 }),
             "{}",
             network.connections
         );
+    }
+
+    #[test]
+    fn a_bicycle_changes_between_sidewalk_and_road_between_junctions() {
+        // 100 m of street: two places along each carriageway, a third and two thirds
+        // of the way, where a bicycle changes between it and the sidewalk beside it.
+        let map = turn_back();
+        let network = to_plain_xml_with(&map, &cycling()).unwrap();
+        let nodes: BTreeSet<String> = elements(&network.nodes, "node")
+            .into_iter()
+            .map(|node| node["id"].clone())
+            .collect();
+        let connections: BTreeSet<(String, String)> = elements(&network.connections, "connection")
+            .into_iter()
+            .map(|connection| {
+                (
+                    format!("{}_{}", connection["from"], connection["fromLane"]),
+                    format!("{}_{}", connection["to"], connection["toLane"]),
+                )
+            })
+            .collect();
+        let edges = edges_file(&network);
+        let ends = |id: &str| {
+            let edge = &edges[id].attributes;
+            (edge["from"].clone(), edge["to"].clone())
+        };
+        for carriageway in ["street.fwd", "street.bwd"] {
+            for (k, before, after) in [(1, "", ".p1"), (2, ".p1", ".p2")] {
+                let node = format!("n_{carriageway}_x{k}");
+                assert!(nodes.contains(&node), "{node}");
+                // The carriageway and the cycleway along its sidewalk its way are both
+                // cut there, and a bicycle changes from either to the other.
+                let road = |piece: &str| format!("{carriageway}{piece}");
+                let side = |piece: &str| format!("{carriageway}.bike0{piece}");
+                for edge in [road(before), side(before)] {
+                    assert_eq!(ends(&edge).1, node, "{edge}");
+                }
+                for edge in [road(after), side(after)] {
+                    assert_eq!(ends(&edge).0, node, "{edge}");
+                }
+                for (from, to) in [
+                    (format!("{}_0", side(before)), format!("{}_1", road(after))),
+                    (format!("{}_1", road(before)), format!("{}_0", side(after))),
+                ] {
+                    assert!(
+                        connections.contains(&(from.clone(), to.clone())),
+                        "{from} > {to}"
+                    );
+                    // Traced as part of the sidewalk and of the lane, for bicycles.
+                    let local = format!("connection:{from}>{to}");
+                    let traced: Vec<_> = network.trace.links_to(&local).collect();
+                    assert_eq!(traced.len(), 2, "{local}");
+                    assert!(traced.iter().all(|link| link.relation == Relation::Part
+                        && link.role.as_deref() == Some("bicycle")));
+                }
+            }
+        }
+        // The cycleway the other way is cut only in two, at a node of its own.
+        for rev in ["street.fwd.bike0.rev", "street.bwd.bike0.rev"] {
+            assert!(!ends(rev).1.contains("_x"), "{rev}");
+            assert!(!edges.contains_key(&format!("{rev}.p2")));
+        }
     }
 
     #[test]
@@ -6586,6 +6852,35 @@ mod tests {
     // ----------------------------------------------------------------------- //
     // Traffic lights
     // ----------------------------------------------------------------------- //
+
+    /// The last piece `edge` is written as: following each piece on to the one that
+    /// leaves the node it runs into.
+    fn last_piece(edges: &BTreeMap<String, WrittenEdge>, edge: &str) -> String {
+        let mut last = edge.to_owned();
+        while let Some((next, _)) = edges.iter().find(|(id, next)| {
+            unpieced(id) == edge && next.attributes["from"] == edges[&last].attributes["to"]
+        }) {
+            last = next.clone();
+        }
+        last
+    }
+
+    /// A written edge or lane id with the piece it is of taken off: `west.fwd.p2_0`
+    /// is a lane of `west.fwd`, as `west.fwd_0` is.
+    fn unpieced(id: &str) -> String {
+        let (edge, lane) = match id.rsplit_once('_') {
+            Some((edge, lane)) if lane.chars().all(|c| c.is_ascii_digit()) => (edge, Some(lane)),
+            _ => (id, None),
+        };
+        let edge = match edge.rsplit_once(".p") {
+            Some((whole, piece)) if piece.chars().all(|c| c.is_ascii_digit()) => whole,
+            _ => edge,
+        };
+        match lane {
+            Some(lane) => format!("{edge}_{lane}"),
+            None => edge.to_owned(),
+        }
+    }
 
     /// The attributes of every `element` in `xml`, in document order.
     fn elements(xml: &str, element: &str) -> Vec<HashMap<String, String>> {

@@ -1445,9 +1445,10 @@ one walking area when no lane closed to pedestrians lies between them, so with t
 the walking areas and crossings come out exactly as they do without bicycles. A few
 details keep netconvert quiet:
 
-- each edge is cut in two halfway (`….p1`, joined at `n_<edge>_p1`), so it never joins
-  the same two nodes as a carriageway of its road, which netconvert would read as a
-  second turnaround;
+- each edge is written in at least two pieces (`….p1` and on): cut where bicycles
+  change between it and the carriageway (below), or else halfway, joined at
+  `n_<edge>_p1`, so it never runs back between the two nodes a carriageway of its road
+  runs between, which netconvert would read as a second turnaround;
 - at a road end the IR links nowhere, the two edges of a sidewalk meet at a node of
   their own (`n_<edge>.bike<index>_start` / `_end`) rather than at the road's dead end;
 - at a signalised junction the rides round a corner are `uncontrolled`, since the
@@ -1455,13 +1456,17 @@ details keep netconvert quiet:
 
 A bicycle can also **change between sidewalk and road, cross the road, and turn
 back**. SUMO only moves a vehicle from one edge to another along a connection at a
-node, so these all happen at nodes:
+node, so these all happen at nodes — and for a bicycle to change between sidewalk and
+road between junctions too, the export puts nodes there:
 
 ```xml
 <!-- off the sidewalk onto the carriageway it runs beside, straight on across the junction -->
 <connection from="west.fwd.bike0.p1" to="east.fwd" fromLane="0" toLane="1"/>
 <!-- off the carriageway onto the sidewalk of the road it turns into -->
 <connection from="west.fwd" to="north.fwd.bike0" fromLane="1" toLane="0"/>
+<!-- between junctions, where the carriageway and its sidewalk are cut at one node -->
+<connection from="west.fwd.bike0" to="west.fwd.p1" fromLane="0" toLane="1"/>
+<connection from="west.fwd" to="west.fwd.bike0.p1" fromLane="1" toLane="0"/>
 <!-- across the west arm, where a crosswalk is, to the sidewalk on the other kerb -->
 <connection from="west.fwd.bike0.p1" to="west.bwd.bike0" fromLane="0" toLane="0"/>
 <!-- back the other way at the dead end the sidewalk runs out to, round a small loop -->
@@ -1472,6 +1477,7 @@ node, so these all happen at nodes:
 | --- | --- | --- |
 | onto the carriageway | every node the IR has a movement through, with lanes a bicycle may use | from the sidewalk beside the arriving carriageway, riding its way, to the leaving carriageway's kerbmost such lane |
 | off the carriageway | the same | from the arriving carriageway's kerbmost such lane onto the sidewalk beside the leaving carriageway, riding its way |
+| onto and off the carriageway, between junctions | every 50 m at most along a carriageway with a sidewalk and a lane a bicycle may use, evenly spaced and short of its last stop line | from the sidewalk, riding the carriageway's way, onto that lane, and from that lane onto the sidewalk, at a node `n_<edge>_x<i>` both are cut at |
 | across the road | wherever a crosswalk became a SUMO crossing | from the sidewalk on one kerb to the one on the other, each way |
 | turning back | the end of every sidewalk at a dead end | from the edge arriving onto the one leaving |
 

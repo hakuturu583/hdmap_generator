@@ -1186,9 +1186,14 @@ def test_a_sumo_export_can_let_bicycles_ride_the_sidewalks_both_ways(tmp_path):
     assert ("west.fwd.bike0.p1", "south.bwd.bike0") in rides
     assert ("south.bwd.bike0.rev.p1", "west.fwd.bike0.rev") in rides
     # Off the sidewalk onto the carriageway it runs beside, and off the carriageway
-    # onto the sidewalk of the road it turns into.
+    # onto the sidewalk of the road it turns into. The 56 m carriageway is cut
+    # halfway, where a bicycle changes between it and its sidewalk, so it reaches the
+    # junction on its second piece.
     assert ("west.fwd.bike0.p1", "south.bwd") in rides
-    assert ("west.fwd", "south.bwd.bike0") in rides
+    assert ("west.fwd.p1", "south.bwd.bike0") in rides
+    # And between junctions: on and off the road where it and its sidewalk are cut.
+    assert ("west.fwd.bike0", "west.fwd.p1") in rides
+    assert ("west.fwd", "west.fwd.bike0.p1") in rides
     # And back the other way at the dead end the west arm's sidewalk runs out to.
     assert ("west.fwd.bike0.rev.p1", "west.fwd.bike0") in rides
 
