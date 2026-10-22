@@ -2703,16 +2703,36 @@ impl<'a> Exporter<'a> {
     /// The cycleway of sidewalk `slot` that rides into `node` when `arriving`, or out
     /// of it otherwise: the one along the sidewalk's edge where that edge runs that
     /// way, and the one against it where it does not. `None` for a sidewalk whose edge
-    /// does not reach the node, or one that starts and ends there.
+    /// does not reach the node, or one that starts and ends there — and for one that
+    /// turns back short of it, at a dead end (see [`Exporter::cycleway`]).
     fn cycleway_at(&self, slot: Slot, node: &str, arriving: bool) -> Option<usize> {
         let edge = &self.edges[slot.edge];
         let &(along, against) = self.cycleways.get(&(slot.edge, slot.index))?;
         let (towards, away) = (edge.to == node, edge.from == node);
-        match (towards, away) {
-            (true, false) => Some(if arriving { along } else { against }),
-            (false, true) => Some(if arriving { against } else { along }),
-            _ => None,
-        }
+        let cycleway = match (towards, away) {
+            (true, false) => {
+                if arriving {
+                    along
+                } else {
+                    against
+                }
+            }
+            (false, true) => {
+                if arriving {
+                    against
+                } else {
+                    along
+                }
+            }
+            _ => return None,
+        };
+        let cycleway_edge = &self.edges[cycleway];
+        let end = if arriving {
+            &cycleway_edge.to
+        } else {
+            &cycleway_edge.from
+        };
+        (end == node).then_some(cycleway)
     }
 
     /// Whether `node` is a dead end.
@@ -5425,6 +5445,28 @@ mod tests {
                         assert_eq!(*weight, 0.0, "{edge}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn every_ride_joins_two_edges_at_the_node_they_share() {
+        // `crossing_street` has a crossing at a dead end, where the sidewalks' cycleways
+        // turn back short of the node instead of reaching it.
+        for map in [crossing_street(), turn_back()] {
+            let network = to_plain_xml_with(&map, &cycling()).unwrap();
+            let ends: HashMap<String, (String, String)> = elements(&network.edges, "edge")
+                .into_iter()
+                .map(|edge| {
+                    (
+                        edge["id"].clone(),
+                        (edge["from"].clone(), edge["to"].clone()),
+                    )
+                })
+                .collect();
+            for connection in elements(&network.connections, "connection") {
+                let (from, to) = (&connection["from"], &connection["to"]);
+                assert_eq!(ends[from].1, ends[to].0, "{from} to {to}");
             }
         }
     }
