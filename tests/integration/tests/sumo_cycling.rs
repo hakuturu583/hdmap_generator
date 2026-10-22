@@ -549,6 +549,35 @@ fn a_light_over_bicycles_gives_them_a_green_of_their_own_and_needs_no_option() {
     }
 }
 
+/// Every link of a light's program answers to a light of the IR's, bicycles' too: a
+/// ride off a sidewalk onto the road to the light over the carriageway it joins
+/// beside, one across the road to the lights over that road.
+#[test]
+fn every_link_of_a_program_over_bicycles_is_traced_to_a_light() {
+    for handedness in HANDEDNESS {
+        let map = scenarios::signalised_crosswalk_crossroads(handedness).0;
+        let network = roadgen_sumo::to_plain_xml_with(&map, &cycling()).unwrap();
+        let program = network.traffic_lights.clone().unwrap();
+        let links: BTreeSet<String> = program
+            .match_indices("linkIndex=\"")
+            .map(|(at, found)| {
+                let rest = &program[at + found.len()..];
+                format!("tls:j_x/{}", &rest[..rest.find('"').unwrap()])
+            })
+            .collect();
+        assert!(links.len() > 12, "{program}");
+        for link in &links {
+            assert!(
+                network
+                    .trace
+                    .links_to(link)
+                    .any(|traced| traced.role.as_deref() == Some("link")),
+                "{link} answers to no light"
+            );
+        }
+    }
+}
+
 /// A bend cut for its curve speed is cut where bicycles change between the sidewalk
 /// and the road as well, and a bicycle setting off on the sidewalk reaches the far end
 /// of the carriageway: a dead end it can only have got onto the road short of.
