@@ -112,6 +112,35 @@
 //! one-way road at a dead end, has nothing to be in SUMO and is reported by
 //! [`check`] instead.
 //!
+//! # Bicycles on sidewalks
+//!
+//! By default a sidewalk is the pedestrians' (`allow="pedestrian"`), and bicycles
+//! keep to the carriageway and the cycle lanes. [`Options::cycle_on_sidewalks`] lets
+//! them ride the sidewalks too, both ways.
+//!
+//! A SUMO bicycle is a vehicle: it rides an edge in the edge's direction and crosses
+//! a node along a connection. So each sidewalk gets two edges of its own, laid along
+//! the same strip — `<edge>.bike<index>` the way the sidewalk's edge runs, and
+//! `<edge>.bike<index>.rev` the other way, `<index>` being the sidewalk's lane in
+//! `<edge>` — and each walk the IR has between two footways at a node, the pavement
+//! round a corner among them, is written as a connection each way between the
+//! cycleways that arrive at the node and the ones that leave it, along the
+//! pavement's centreline.
+//!
+//! Neither is a lane of the sidewalk's own edge. A bicycle on a lane of the
+//! carriageway's edge is, to netconvert, on a cycle lane beside the traffic: every
+//! car turning across it has to give way to it, and at a signalised junction
+//! netconvert 1.18 builds a program SUMO refuses to run. Both admit pedestrians as
+//! well as bicycles, because netconvert joins the footways round a node into a
+//! walking area only where nothing pedestrians may not use lies between them; the
+//! walking areas and the crossings come out as they do without bicycles. Each is cut
+//! in two halfway, `….p1`, so that it never joins the same two nodes as a carriageway
+//! of its road — netconvert would take it for that carriageway's turnaround — and
+//! where the road ends at a dead end, each ends at a dead end of its own,
+//! `n_<cycleway>_start` or `n_<cycleway>_end`. The rides are `uncontrolled` at a
+//! signalised node: the pavement round a corner crosses no carriageway, so a signal
+//! has nothing to say about it.
+//!
 //! # Traffic lights
 //!
 //! A junction a light governs an approach to is a `traffic_light` node, and its
@@ -146,6 +175,9 @@
 //! | `lane:<edge>_<index>` | a stop line, role `stopOffset` | merged |
 //! | `node:<id>`, role `walkingarea` | a connection between two footways, and a pavement lane round a corner | collapsed |
 //! | `crossing:<node>/<edge>+<edge>` | a crosswalk | exact, or merged |
+//! | `edge:<edge>.bike<index>`, `edge:<edge>.bike<index>.rev` | a road with a sidewalk, under [`Options::cycle_on_sidewalks`] | part |
+//! | `lane:<edge>.bike<index>_0`, `lane:<edge>.bike<index>.rev_0`, role `bicycle` | the sidewalk | part |
+//! | `connection:…`, role `bicycle` | a connection between two footways, and a pavement lane round a corner, once each way | merged, and collapsed |
 //!
 //! With [`Options::curve_lateral_acceleration`] an edge may be cut into pieces at its
 //! bends (see [`curves`]): the first keeps the edge's id and the rest are
@@ -347,6 +379,20 @@ pub struct Options {
     /// `None` writes every edge whole at its limit, and leaves the internal lanes to
     /// netconvert's default.
     pub curve_lateral_acceleration: Option<f64>,
+    /// Let bicycles ride on the sidewalks, both ways, as well as on the carriageway.
+    ///
+    /// A SUMO edge runs one way, and a bicycle is a vehicle that follows it, so riding
+    /// a sidewalk both ways takes an edge each way. Set, every sidewalk gets two edges
+    /// for bicycles laid along the same strip: `<edge>.bike<index>` the way the
+    /// sidewalk's edge runs and `<edge>.bike<index>.rev` the other way, each
+    /// `allow="pedestrian bicycle"` and each cut in two halfway (the second half
+    /// `….p1`), with the IR's footway connections written as connections between them
+    /// for both directions. The sidewalk lane itself stays the pedestrians'. See the
+    /// crate documentation, under *Bicycles on sidewalks*.
+    ///
+    /// `false` writes the sidewalks for pedestrians only, and bicycles keep to the
+    /// carriageway and the cycle lanes.
+    pub cycle_on_sidewalks: bool,
 }
 
 /// Renders `map` as a SUMO plain-XML network.
@@ -1218,6 +1264,9 @@ struct Edge {
     /// [`curves`] cut it into. Filled in once everything else is built, by
     /// [`Exporter::cut_curves`]; the first piece keeps the edge's id.
     pieces: Vec<Piece>,
+    /// The sidewalk this edge carries bicycles along, one way or the other; see
+    /// [`Exporter::cycle_footways`]. `None` for a carriageway.
+    rides: Option<Slot>,
 }
 
 /// One written edge of an [`Edge`]: the whole of it, or a stretch between two cuts.
@@ -1322,6 +1371,15 @@ struct Exporter<'a> {
     /// walking area at every node footways meet at, and that is how SUMO's
     /// pedestrians get from one to the next. See [`Exporter::connect`].
     walking: BTreeMap<String, Movement>,
+    /// The edges bicycles ride each sidewalk on, along its edge's direction and
+    /// against it, by the sidewalk's (edge, lane index); empty unless
+    /// [`Options::cycle_on_sidewalks`] is set. See [`Exporter::cycle_footways`].
+    cycleways: HashMap<(usize, usize), (usize, usize)>,
+    /// What bicycles may ride from one sidewalk onto the next, by (from edge, from
+    /// lane, to edge, to lane) as [`Exporter::movements`] is keyed, and what of the
+    /// IR each stands for. Kept apart from the movements because no light controls
+    /// them; see [`Exporter::cycle`].
+    cycling: BTreeMap<(usize, usize, usize, usize), Movement>,
     /// The pedestrian crossings, by the node each is at and the edges it crosses
     /// there, in the order they are written; see [`Exporter::build_crossings`].
     crossings: BTreeMap<(String, Vec<usize>), Crossing>,
@@ -1417,6 +1475,8 @@ impl<'a> Exporter<'a> {
             edges: Vec::new(),
             movements: BTreeMap::new(),
             walking: BTreeMap::new(),
+            cycleways: HashMap::new(),
+            cycling: BTreeMap::new(),
             crossings: BTreeMap::new(),
             slots: HashMap::new(),
             signalised: BTreeMap::new(),
@@ -1581,6 +1641,9 @@ impl<'a> Exporter<'a> {
                 self.section_edges(road, section)?;
             }
         }
+        if self.options.cycle_on_sidewalks {
+            self.cycle_footways()?;
+        }
         self.build_connections()?;
         self.build_signals();
         self.build_crossings();
@@ -1620,9 +1683,12 @@ impl<'a> Exporter<'a> {
     /// An edge none of whose lanes lead anywhere is the end of the road rather than
     /// a lane drop, and its paint is written as it is.
     fn open_dead_ends(&mut self) {
+        // A ride along a sidewalk carries its lane on as much as a drive does:
+        // netconvert reads the edge's connections, not who may use them.
         let leaving: HashSet<(usize, usize)> = self
             .movements
             .keys()
+            .chain(self.cycling.keys())
             .map(|&(edge, lane, _, _)| (edge, lane))
             .collect();
         for (index, edge) in self.edges.iter_mut().enumerate() {
@@ -1879,8 +1945,121 @@ impl<'a> Exporter<'a> {
             shape,
             lanes: written,
             pieces: Vec::new(),
+            rides: None,
         });
         Ok(())
+    }
+
+    /// Two more edges for every sidewalk, laid along the same strip, for bicycles to
+    /// ride it: `<edge>.bike<index>` the way its edge runs, and `<edge>.bike<index>.rev`
+    /// the other way.
+    ///
+    /// SUMO's bicycles are vehicles, so they ride an edge its own way and cross a node
+    /// along a connection; riding a sidewalk both ways takes an edge each way. Neither
+    /// is the sidewalk's own edge, whose sidewalk lane stays the pedestrians' alone: a
+    /// bicycle on a lane of the carriageway's edge is, to netconvert, a cycle lane
+    /// beside the traffic — every car turning across it has to give way to it, and at
+    /// a signalised junction netconvert 1.18 builds the program a right of way it
+    /// cannot keep (two turns into one exit, each waiting for the other).
+    ///
+    /// Both admit pedestrians as well as bicycles because they *are* the sidewalk:
+    /// netconvert builds a walking area at a node from the run of lanes pedestrians may
+    /// use round it, and a lane they may not use between two sidewalks would split the
+    /// pavement round the corner in two.
+    ///
+    /// Each is always written as at least two pieces, cut halfway (see
+    /// [`Exporter::pieces_of`]). Whole, it would join the same two nodes as the
+    /// carriageways of its road, and netconvert takes any edge back to the node
+    /// another came from as that one's turnaround: with two candidates for one, it
+    /// cannot tell which, and says so.
+    ///
+    /// Where the road ends at a dead end, each ends at a dead end of its own there,
+    /// `n_<edge>_start` or `n_<edge>_end`, at the end of the sidewalk. Nothing carries
+    /// on round a road end the IR links nowhere, and more edges into or out of the
+    /// road's own dead end would make netconvert take it for a junction whose edges
+    /// lead nowhere, and warn about every one of them.
+    fn cycle_footways(&mut self) -> Result<(), ExportError> {
+        for index in 0..self.edges.len() {
+            for position in 0..self.edges[index].lanes.len() {
+                let slot = Slot {
+                    edge: index,
+                    index: position,
+                };
+                if !self.is_footway(slot) {
+                    continue;
+                }
+                let along = self.cycleway(slot, false)?;
+                let against = self.cycleway(slot, true)?;
+                self.cycleways.insert((index, position), (along, against));
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds the edge bicycles ride the sidewalk in `slot` on — against its edge's
+    /// direction when `against` — and returns its index. See
+    /// [`Exporter::cycle_footways`].
+    fn cycleway(&mut self, slot: Slot, against: bool) -> Result<usize, ExportError> {
+        let edge = &self.edges[slot.edge];
+        let lane = &edge.lanes[slot.index];
+        let id = match against {
+            false => format!("{}.bike{}", edge.id, slot.index),
+            true => format!("{}.bike{}.rev", edge.id, slot.index),
+        };
+        let sidewalk = self
+            .map
+            .lane(&lane.lane)
+            .ok_or_else(|| ExportError::Unknown(format!("lane {}", lane.lane)))?;
+        let road = self
+            .map
+            .road(&edge.road)
+            .ok_or_else(|| ExportError::Unknown(format!("road {}", edge.road)))?;
+        let (shape, from, to, direction) = match against {
+            false => (lane.shape.clone(), &edge.from, &edge.to, edge.direction),
+            true => (
+                lane.shape.reversed(),
+                &edge.to,
+                &edge.from,
+                edge.direction.reversed(),
+            ),
+        };
+        let dead_end = |node: &str| {
+            self.nodes
+                .get(node)
+                .is_some_and(|node| node.kind == NodeKind::DeadEnd)
+        };
+        let ends = [
+            dead_end(from).then(|| (format!("n_{id}_start"), shape.first())),
+            dead_end(to).then(|| (format!("n_{id}_end"), shape.last())),
+        ];
+        let cycleway = Edge {
+            from: ends[0].as_ref().map_or(from, |(node, _)| node).clone(),
+            to: ends[1].as_ref().map_or(to, |(node, _)| node).clone(),
+            id,
+            road: edge.road.clone(),
+            section: edge.section,
+            direction,
+            name: edge.name.clone(),
+            priority: self.priority_of(road, &[sidewalk]),
+            speed: edge.speed,
+            shape: shape.clone(),
+            lanes: vec![EdgeLane {
+                lane: lane.lane.clone(),
+                width: lane.width,
+                speed: lane.speed,
+                permission: Some(classes::SHARED_FOOTWAY),
+                restricted_left: false,
+                restricted_right: false,
+                shape,
+            }],
+            pieces: Vec::new(),
+            rides: Some(slot),
+        };
+        for (node, point) in ends.into_iter().flatten() {
+            self.node(node, point, NodeKind::DeadEnd, false, None);
+        }
+        self.edges.push(cycleway);
+        Ok(self.edges.len() - 1)
     }
 
     /// Cuts every edge into the pieces [`curves`] finds along it, or writes it whole
@@ -1901,6 +2080,57 @@ impl<'a> Exporter<'a> {
     }
 
     fn pieces_of(&self, index: usize) -> Result<Vec<Piece>, ExportError> {
+        let mut pieces = self.curve_pieces(index)?;
+        if self.edges[index].rides.is_some() && pieces.len() == 1 {
+            // An edge bicycles ride a sidewalk on is never written whole; see
+            // [`Exporter::cycle_footways`].
+            pieces = self.halve(&self.edges[index], pieces.remove(0))?;
+        }
+        Ok(pieces)
+    }
+
+    /// `whole`, the only piece of `edge`, cut in two halfway along, the second half
+    /// named and joined to the first as a piece cut at a curve is.
+    fn halve(&self, edge: &Edge, whole: Piece) -> Result<Vec<Piece>, ExportError> {
+        let longest = |lanes: &[Polyline3]| lanes.iter().map(Polyline3::length).fold(0.0, f64::max);
+        let centre = curves::Plan::new(&whole.shape);
+        let middle = centre.length() / 2.0;
+        let length = centre.length();
+        let (first_shape, second_shape) =
+            (centre.slice(0.0, middle)?, centre.slice(middle, length)?);
+        let (mut first_lanes, mut second_lanes) = (Vec::new(), Vec::new());
+        for lane in &whole.lanes {
+            let plan = curves::Plan::new(lane);
+            let cut = station_along(lane, centre.point_at(middle)).0;
+            first_lanes.push(plan.slice(0.0, cut)?);
+            second_lanes.push(plan.slice(cut, plan.length())?);
+        }
+        let node = format!("n_{}_p1", edge.id);
+        Ok(vec![
+            Piece {
+                id: whole.id,
+                from: whole.from,
+                to: node.clone(),
+                shape: first_shape,
+                length: longest(&first_lanes),
+                speeds: whole.speeds.clone(),
+                lanes: first_lanes,
+            },
+            Piece {
+                id: format!("{}.p1", edge.id),
+                from: node,
+                to: whole.to,
+                shape: second_shape,
+                length: longest(&second_lanes),
+                speeds: whole.speeds,
+                lanes: second_lanes,
+            },
+        ])
+    }
+
+    /// The pieces [`curves`] cuts edge `index` into, or the edge whole when the
+    /// options ask for no curve speeds or it has no bend to cut at.
+    fn curve_pieces(&self, index: usize) -> Result<Vec<Piece>, ExportError> {
         let edge = &self.edges[index];
         let longest = |lanes: &[Polyline3]| lanes.iter().map(Polyline3::length).fold(0.0, f64::max);
         let Some(acceleration) = self.options.curve_lateral_acceleration else {
@@ -2316,7 +2546,14 @@ impl<'a> Exporter<'a> {
             return;
         }
         if self.is_footway(from) && self.is_footway(to) {
-            for (node, part) in self.walking_nodes(source, target, movement) {
+            let shape = movement.shape.clone();
+            let parts = self.walking_nodes(source, target, movement);
+            // The IR's path is the path at the node only when the walk turns at one.
+            let shape = shape.filter(|_| parts.len() == 1);
+            for (node, part) in parts {
+                if !self.cycleways.is_empty() {
+                    self.cycle(from, to, &node, &part, shape.as_ref());
+                }
                 let walked = self.walking.entry(node).or_default();
                 walked.connections.extend(part.connections);
                 walked.connectors.extend(part.connectors);
@@ -2329,6 +2566,68 @@ impl<'a> Exporter<'a> {
         merged.connectors.extend(movement.connectors);
         if merged.shape.is_none() {
             merged.shape = movement.shape;
+        }
+    }
+
+    /// Records the rides a walk from sidewalk `from` to sidewalk `to` at `node` stands
+    /// for, where bicycles ride the sidewalks: from the one to the other and back.
+    ///
+    /// A pedestrian crosses the node on its walking area whichever way the sidewalks
+    /// run, but a bicycle rides from an edge arriving at the node to one leaving it.
+    /// Each sidewalk meets the node on its two cycleways (see
+    /// [`Exporter::cycle_footways`]), of which one arrives and the other leaves. So
+    /// the walk is two connections, one each way, between whichever of those arrive
+    /// and leave, and each carries the IR's path across the node as its shape —
+    /// reversed for the ride back.
+    ///
+    /// No light controls them: the IR's footways do not cross the carriageway at the
+    /// node, so they wait for no signal, and they are written `uncontrolled` at a
+    /// signalised node (see [`Exporter::render_connections`]).
+    fn cycle(
+        &mut self,
+        from: Slot,
+        to: Slot,
+        node: &str,
+        part: &Movement,
+        shape: Option<&Polyline3>,
+    ) {
+        let rides = [
+            (
+                self.cycleway_at(from, node, true),
+                self.cycleway_at(to, node, false),
+                shape.cloned(),
+            ),
+            (
+                self.cycleway_at(to, node, true),
+                self.cycleway_at(from, node, false),
+                shape.map(Polyline3::reversed),
+            ),
+        ];
+        for (arriving, leaving, shape) in rides {
+            let (Some(arriving), Some(leaving)) = (arriving, leaving) else {
+                continue;
+            };
+            let ride = self.cycling.entry((arriving, 0, leaving, 0)).or_default();
+            ride.connections.extend(part.connections.iter().cloned());
+            ride.connectors.extend(part.connectors.iter().cloned());
+            if ride.shape.is_none() {
+                ride.shape = shape;
+            }
+        }
+    }
+
+    /// The cycleway of sidewalk `slot` that rides into `node` when `arriving`, or out
+    /// of it otherwise: the one along the sidewalk's edge where that edge runs that
+    /// way, and the one against it where it does not. `None` for a sidewalk whose edge
+    /// does not reach the node, or one that starts and ends there.
+    fn cycleway_at(&self, slot: Slot, node: &str, arriving: bool) -> Option<usize> {
+        let edge = &self.edges[slot.edge];
+        let &(along, against) = self.cycleways.get(&(slot.edge, slot.index))?;
+        let (towards, away) = (edge.to == node, edge.from == node);
+        match (towards, away) {
+            (true, false) => Some(if arriving { along } else { against }),
+            (false, true) => Some(if arriving { against } else { along }),
+            _ => None,
         }
     }
 
@@ -3125,11 +3424,14 @@ impl<'a> Exporter<'a> {
                     Relation::Part,
                 );
                 for (index, lane) in edge.lanes.iter().enumerate() {
-                    trace.link(
-                        lane.lane.clone(),
-                        format!("lane:{}_{index}", piece.id),
-                        lane_relation,
-                    );
+                    let local = format!("lane:{}_{index}", piece.id);
+                    if edge.rides.is_some() {
+                        // The sidewalk again, for bicycles: a part of it, never the
+                        // lane `lanes` names it by.
+                        trace.link_as(lane.lane.clone(), local, Relation::Part, "bicycle");
+                    } else {
+                        trace.link(lane.lane.clone(), local, lane_relation);
+                    }
                 }
             }
         }
@@ -3170,6 +3472,33 @@ impl<'a> Exporter<'a> {
             }
             for connector in &movement.connectors {
                 trace.link(connector.clone(), local.clone(), Relation::Collapsed);
+            }
+        }
+
+        // A ride from one sidewalk to the next is the IR's walk between them
+        // once more, for bicycles, each way: the same connections and pavement lanes
+        // the walking area is traced to.
+        for (&(from_edge, from_lane, to_edge, to_lane), ride) in &self.cycling {
+            let local = format!(
+                "connection:{}_{from_lane}>{}_{to_lane}",
+                self.edges[from_edge].exit().id,
+                self.edges[to_edge].id
+            );
+            for connection in &ride.connections {
+                trace.link_as(
+                    connection.clone(),
+                    local.clone(),
+                    Relation::Merged,
+                    "bicycle",
+                );
+            }
+            for connector in &ride.connectors {
+                trace.link_as(
+                    connector.clone(),
+                    local.clone(),
+                    Relation::Collapsed,
+                    "bicycle",
+                );
             }
         }
 
@@ -3342,6 +3671,24 @@ impl<'a> Exporter<'a> {
             }
             document.leaf("connection", &attributes);
         }
+        // A ride from one sidewalk to the next. At a signalised node it is left
+        // out of the light's program — which lists every other connection into the
+        // node — and says so, or netconvert would take it as one more link for the
+        // program to signal.
+        for (key, ride) in &self.cycling {
+            let mut attributes = self.connection_attributes(key);
+            if let Some(path) = &ride.shape {
+                attributes.push(("shape", shape(path)));
+            }
+            let signalised = self
+                .nodes
+                .get(&self.edges[key.0].to)
+                .is_some_and(|node| node.kind == NodeKind::TrafficLight);
+            if signalised {
+                attributes.push(("uncontrolled", "1".to_owned()));
+            }
+            document.leaf("connection", &attributes);
+        }
         // Each lane carries straight on from one piece of its edge to the next.
         for (_, from, to, lane) in self.piece_joints() {
             document.leaf(
@@ -3492,8 +3839,16 @@ impl<'a> Exporter<'a> {
     ///
     /// A footway is not one of them: pedestrians do not follow connections but cross
     /// a node on its walking area, so there is no movement for netconvert to guess.
+    /// The edges bicycles ride a sidewalk on are, though — a bicycle follows
+    /// connections like any vehicle, and one guessed off the end of a sidewalk would
+    /// put it on whatever lane netconvert chose.
     fn unconnected_edges(&self) -> Vec<usize> {
-        let connected: BTreeSet<usize> = self.movements.keys().map(|key| key.0).collect();
+        let connected: BTreeSet<usize> = self
+            .movements
+            .keys()
+            .chain(self.cycling.keys())
+            .map(|key| key.0)
+            .collect();
         let footway = |edge: &Edge| {
             edge.lanes
                 .iter()
@@ -4688,6 +5043,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn cycling() -> Options {
+        Options {
+            cycle_on_sidewalks: true,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn with_the_sidewalks_ridden_everything_traced_is_written_and_no_car_rides_them() {
+        for map in [crossing_street(), turn_back()] {
+            let network = to_plain_xml_with(&map, &cycling()).unwrap();
+            let written = written(&network);
+            for link in &network.trace.links {
+                assert!(
+                    written.contains(&link.local),
+                    "{} is traced to {}, which was not written",
+                    link.ir,
+                    link.local
+                );
+            }
+            for local in written
+                .iter()
+                .filter(|local| local.starts_with("connection:"))
+            {
+                assert!(
+                    network.trace.links_to(local).next().is_some(),
+                    "{local} has no IR behind it"
+                );
+            }
+            // An edge bicycles ride a sidewalk on is no place for a car trip, and the
+            // weights still name every edge written.
+            let edges: BTreeSet<String> = written
+                .iter()
+                .filter_map(|local| local.strip_prefix("edge:"))
+                .map(str::to_owned)
+                .collect();
+            for xml in [
+                &network.weights.src,
+                &network.weights.dst,
+                &network.weights.via,
+            ] {
+                let weights = weights(xml);
+                assert_eq!(weights.keys().cloned().collect::<BTreeSet<_>>(), edges);
+                for (edge, weight) in &weights {
+                    if edge.contains(".bike") {
+                        assert_eq!(*weight, 0.0, "{edge}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_walk_round_a_road_end_is_ridden_both_ways() {
+        let map = turn_back();
+        let network = to_plain_xml_with(&map, &cycling()).unwrap();
+        let sidewalk = |direction: Direction| {
+            let lane = map
+                .lanes
+                .iter()
+                .find(|lane| {
+                    lane.lane_type == LaneType::Sidewalk
+                        && lane.direction == direction
+                        && map
+                            .road(&lane.road)
+                            .is_some_and(|road| !road.is_connector())
+                })
+                .unwrap();
+            network.lanes[&lane.id].clone()
+        };
+        let rides: BTreeSet<(String, String)> = elements(&network.connections, "connection")
+            .into_iter()
+            .map(|connection| {
+                (
+                    format!("{}_{}", connection["from"], connection["fromLane"]),
+                    format!("{}_{}", connection["to"], connection["toLane"]),
+                )
+            })
+            .filter(|(from, to)| from.contains(".bike") && to.contains(".bike"))
+            // Not the joint between the two halves of one of them.
+            .filter(|(from, to)| !to.starts_with(&from.replace("_0", ".p1_0")))
+            .collect();
+        let (forward, backward) = (sidewalk(Direction::Forward), sidewalk(Direction::Backward));
+        // The edge bicycles ride `lane` on, `way` being "" or ".rev", arriving at the
+        // node it rides into or leaving the one it rides out of.
+        let bike = |lane: &str, way: &str, arriving: bool| {
+            let (edge, index) = lane.rsplit_once('_').unwrap();
+            let piece = if arriving { ".p1" } else { "" };
+            format!("{edge}.bike{index}{way}{piece}_0")
+        };
+        // Round the end the forward sidewalk arrives and the backward one leaves;
+        // round the start, the other way about. Each way round is ridden both ways.
+        let expected = BTreeSet::from([
+            (bike(&forward, "", true), bike(&backward, "", false)),
+            (bike(&backward, ".rev", true), bike(&forward, ".rev", false)),
+            (bike(&backward, "", true), bike(&forward, "", false)),
+            (bike(&forward, ".rev", true), bike(&backward, ".rev", false)),
+        ]);
+        assert_eq!(rides, expected, "{}", network.connections);
+        // And the sidewalks themselves are still joined by nothing but the walking
+        // areas.
+        assert!(
+            !elements(&network.connections, "connection")
+                .into_iter()
+                .any(|connection| {
+                    let from = format!("{}_{}", connection["from"], connection["fromLane"]);
+                    from == forward || from == backward
+                }),
+            "{}",
+            network.connections
+        );
     }
 
     #[test]

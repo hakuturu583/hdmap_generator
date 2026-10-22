@@ -1146,6 +1146,47 @@ def test_a_sumo_export_can_hold_bends_to_their_curve_speed(tmp_path):
         m.export_sumo(str(tmp_path / "bad"), curve_lateral_acceleration=0.0)
 
 
+def test_a_sumo_export_can_let_bicycles_ride_the_sidewalks_both_ways(tmp_path):
+    def street():
+        return [
+            roadgen.Lane(width=3.5, direction="backward"),
+            roadgen.Lane(width=2.0, direction="backward", type_="sidewalk"),
+            roadgen.Lane(width=3.5, direction="forward"),
+            roadgen.Lane(width=2.0, direction="forward", type_="sidewalk"),
+        ]
+
+    m = roadgen.Map(name="cycling")
+    west = m.add_road(start=(-70.0, 0.0, 0.0), end=(-14.0, 0.0, 0.0), lanes=street(), name="west")
+    south = m.add_road(start=(0.0, -70.0, 0.0), end=(0.0, -14.0, 0.0), lanes=street(), name="south")
+    m.connect(west, south, junction=m.add_junction("x"), ends=("end", "end"))
+
+    # Off by default: the sidewalks are the pedestrians' alone.
+    _, plain = build_with_netconvert(m, tmp_path / "plain")
+    assert not any(".bike" in edge.getID() for edge in plain.getEdges())
+
+    prefix, net = build_with_netconvert(m, tmp_path / "cycling", cycle_on_sidewalks=True)
+    # Lane 0 of each carriageway is its kerb lane: the sidewalk.
+    sidewalks = ["west.fwd_0", "west.bwd_0"]
+    assert set(sidewalks) <= set(dict(m.sumo_lane_ids()).values())
+    for sidewalk in sidewalks:
+        edge, index = sidewalk.rsplit("_", 1)
+        for way in ("", ".rev"):
+            for piece in ("", ".p1"):
+                cycleway = net.getEdge(f"{edge}.bike{index}{way}{piece}")
+                assert cycleway.allows("bicycle") and cycleway.allows("pedestrian")
+                assert not cycleway.allows("passenger")
+        # The sidewalk lane itself still admits pedestrians only.
+        assert not net.getLane(sidewalk).allows("bicycle")
+
+    # The corner pavement is ridden both ways: west's forward sidewalk arrives at the
+    # junction and south's backward one leaves it.
+    rides = {
+        (edge.getID(), to.getID()) for edge in net.getEdges() for to in edge.getOutgoing()
+    }
+    assert ("west.fwd.bike0.p1", "south.bwd.bike0") in rides
+    assert ("south.bwd.bike0.rev.p1", "west.fwd.bike0.rev") in rides
+
+
 def test_an_export_can_be_told_not_to_write_its_trace(tmp_path):
     m = clipgt_map()
     m.export_lanelet2(str(tmp_path / "lanelet2_map.osm"), trace=False)

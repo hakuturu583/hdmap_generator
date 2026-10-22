@@ -1465,17 +1465,26 @@ impl PyMap {
     /// `<edge>.p2`, … and the trace has every one — and netconvert is asked for the
     /// same on the internal lanes of junctions with `junctions.limit-turn-speed`.
     /// Left at `None`, every edge is written whole at its limit.
-    #[pyo3(signature = (directory, trace = true, curve_lateral_acceleration = None))]
+    ///
+    /// `cycle_on_sidewalks` lets bicycles ride the sidewalks both ways as well as the
+    /// carriageway: each sidewalk gets two edges laid along it, `<edge>.bike<index>`
+    /// the way its edge runs and `<edge>.bike<index>.rev` the other way (each cut in
+    /// two halfway, the second half `….p1`), open to bicycles and pedestrians, with
+    /// every footway connection of the map written as a connection each way between
+    /// them. Off, sidewalks are for pedestrians only.
+    #[pyo3(signature = (directory, trace = true, curve_lateral_acceleration = None, cycle_on_sidewalks = false))]
     fn export_sumo(
         &mut self,
         directory: PathBuf,
         trace: bool,
         curve_lateral_acceleration: Option<f64>,
+        cycle_on_sidewalks: bool,
     ) -> PyResult<String> {
         self.ensure_built()?;
         let map = self.built.as_ref().expect("just built");
         let options = roadgen_sumo::Options {
             curve_lateral_acceleration,
+            cycle_on_sidewalks,
         };
         let (prefix, written) =
             roadgen_sumo::write_traced_with(map, &directory, &options).map_err(runtime_error)?;
