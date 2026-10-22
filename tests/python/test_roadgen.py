@@ -1185,6 +1185,12 @@ def test_a_sumo_export_can_let_bicycles_ride_the_sidewalks_both_ways(tmp_path):
     }
     assert ("west.fwd.bike0.p1", "south.bwd.bike0") in rides
     assert ("south.bwd.bike0.rev.p1", "west.fwd.bike0.rev") in rides
+    # Off the sidewalk onto the carriageway it runs beside, and off the carriageway
+    # onto the sidewalk of the road it turns into.
+    assert ("west.fwd.bike0.p1", "south.bwd") in rides
+    assert ("west.fwd", "south.bwd.bike0") in rides
+    # And back the other way at the dead end the west arm's sidewalk runs out to.
+    assert ("west.fwd.bike0.rev.p1", "west.fwd.bike0") in rides
 
 
 def test_an_export_can_be_told_not_to_write_its_trace(tmp_path):
