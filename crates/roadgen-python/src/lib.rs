@@ -1468,11 +1468,12 @@ impl PyMap {
     ///
     /// `cycle_on_sidewalks` lets bicycles ride the sidewalks both ways as well as the
     /// carriageway: each sidewalk gets two edges laid along it, `<edge>.bike<index>`
-    /// the way its edge runs and `<edge>.bike<index>.rev` the other way (each cut in
-    /// two halfway, the second half `….p1`), open to bicycles and pedestrians, with
-    /// every footway connection of the map written as a connection each way between
-    /// them. A bicycle may also come off a sidewalk onto the carriageway beside it, or
-    /// off a carriageway onto a sidewalk, at any junction or joint; ride across the
+    /// the way its edge runs and `<edge>.bike<index>.rev` the other way (each written
+    /// in at least two pieces, the second `….p1`), open to bicycles and pedestrians,
+    /// with every footway connection of the map written as a connection each way
+    /// between them. A bicycle may also come off a sidewalk onto the carriageway beside
+    /// it, or off a carriageway onto a sidewalk, at any junction or joint, and between
+    /// junctions every 50 m at most, where the carriageway is cut; ride across the
     /// road wherever a crosswalk became a crossing; and turn back at a dead end. Off,
     /// sidewalks are for pedestrians only.
     #[pyo3(signature = (directory, trace = true, curve_lateral_acceleration = None, cycle_on_sidewalks = false))]
