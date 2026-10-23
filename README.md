@@ -1872,7 +1872,10 @@ crosswalk, and keeps off the rest. So the package carries the surface twice: the
 `.fbx` the level is built from, and a `<name>.obj` in CARLA's frame (y up, the
 roadgen y negated) whose materials are those labels. The tool that reads it is one the
 UE5 branch builds but does not put where `Import.py` looks, so the build script
-finds it under `Build/` and stages it, with the `.obj`, into `Util/DockerUtils/dist/`;
+finds it under `Build/` (CMake's `Build/_deps/recastnavigation-build/`, a build
+directory under `Build/`, or a packaged server's `Tools/`) and stages it, with the
+`.obj`, into `Util/DockerUtils/dist/`, and runs it itself when `Import.py` left no
+navigation behind (`--no-navmesh` builds none);
 the navigation comes out as `Content/<Package>/Maps/<name>/Nav/<name>.bin`, which the
 server hands to clients and `world.get_random_location_from_navigation()` draws on.
 
