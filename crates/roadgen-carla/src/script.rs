@@ -38,14 +38,15 @@ pub fn script(config: &PackageConfig, furniture: bool, water: bool) -> String {
 """Written by roadgen beside the package for {map}. Imports it into a CARLA UE5
 checkout and gives the level a sky.
 
-    python {package}.py [--carla ROOT] [--engine DIR] [--launch]
+    python {package}.py [--carla ROOT] [--engine DIR] [--no-navmesh] [--launch]
 
 `--carla` is the CARLA checkout (the one with Unreal/CarlaUnreal in it) and
 `--engine` the Unreal Engine it was built against. Each is taken from the option,
 else from the environment (CARLA_ROOT, CARLA_UNREAL_ENGINE_PATH), else from what
 the package was exported with. Run it with the interpreter that has `roadgen` and
 CARLA's own `carla` module: CARLA's Import.py needs the second, and is run with
-the same one.
+the same one. It also builds the pedestrians' navigation mesh, with the
+RecastBuilder CARLA's build left under Build/, unless told --no-navmesh.
 """
 
 import argparse
@@ -80,6 +81,7 @@ def main(argv=None):
     parser.add_argument("--no-sky", action="store_true", help="leave the level without a sky")
     parser.add_argument("--no-furniture", action="store_true", help="leave the lights and signs unplaced")
     parser.add_argument("--no-water", action="store_true", help="leave the water in its flat colours")
+    parser.add_argument("--no-navmesh", action="store_true", help="build no navigation mesh for pedestrians")
     parser.add_argument("--launch", action="store_true", help="start the CARLA server on the map afterwards")
     args = parser.parse_args(argv)
     if not args.carla or not args.engine:
@@ -132,14 +134,14 @@ def main(argv=None):
     # package brings its own .obj; the tool is found where CMake built it.
     dist = carla / "Util" / "DockerUtils" / "dist"
     recast = dist / "RecastBuilder"
-    if not recast.exists():
-        built = sorted(carla.glob("Build/*/_deps/recastnavigation-build/RecastBuilder/RecastBuilder*"))
-        built = [path for path in built if path.is_file() and os.access(str(path), os.X_OK)]
-        if built:
-            shutil.copy2(built[0], recast)
-            print("staged %s" % built[0])
-        else:
+    built = None
+    if not args.no_navmesh:
+        built = recast_builder(carla)
+        if built is None:
             print("warning: no RecastBuilder under %s/Build, so no pedestrian navigation will be built" % carla, file=sys.stderr)
+        elif not recast.exists():
+            shutil.copy2(built, recast)
+            print("staged %s" % built)
     shutil.copy2(import_dir / MAP / (MAP + ".obj"), dist / (MAP + ".obj"))
 
     # Import.py imports every .json it finds under Import/, other packages'
@@ -157,9 +159,17 @@ def main(argv=None):
             path.with_name(path.name + ".roadgen-aside").rename(path)
 
     nav = carla / "Unreal" / "CarlaUnreal" / "Content" / PACKAGE / "Maps" / MAP / "Nav" / (MAP + ".bin")
+    if built is not None and not nav.exists():
+        # Import.py's build of it left none (its build.sh found no tool to run,
+        # or could not run it): built here, the way that build.sh does.
+        print("building the pedestrian navigation with %s" % built)
+        subprocess.run([str(built), MAP + ".obj"], cwd=str(dist), check=False)
+        if (dist / (MAP + ".bin")).exists():
+            nav.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dist / (MAP + ".bin"), nav)
     if nav.exists():
         print("pedestrian navigation built: %s" % nav)
-    else:
+    elif not args.no_navmesh:
         print("warning: no pedestrian navigation was built (%s is missing)" % nav, file=sys.stderr)
 
     if not args.no_sky:
@@ -190,6 +200,22 @@ def main(argv=None):
     if args.launch:
         subprocess.run(command, cwd=str(uproject.parent), check=False)
     return 0
+
+
+def recast_builder(carla):
+    """The RecastBuilder CARLA's build left under Build/, or None: CMake's own
+    tree (Build/_deps/..., or a build directory under Build/), else the
+    packaged server's Tools/."""
+    patterns = (
+        "Build/_deps/recastnavigation-build/RecastBuilder/RecastBuilder*",
+        "Build/*/_deps/recastnavigation-build/RecastBuilder/RecastBuilder*",
+        "Build/Package/*/Tools/RecastBuilder*",
+    )
+    for pattern in patterns:
+        for path in sorted(carla.glob(pattern)):
+            if path.is_file() and os.access(str(path), os.X_OK):
+                return path
+    return None
 
 
 if __name__ == "__main__":
@@ -239,6 +265,22 @@ mod tests {
         assert!(text.contains("OWN_TEXTURES = False"));
         assert!(text.contains("FURNITURE = False") && text.contains("WATER = False"));
         assert!(text.contains("CARLA_ROOT = None") && text.contains("ENGINE = None"));
+    }
+
+    #[test]
+    fn the_navigation_builder_is_looked_for_where_carlas_build_leaves_it() {
+        let text = script(&PackageConfig::new("Town01"), false, false);
+        assert!(text.contains("--no-navmesh"));
+        // CMake's tree straight under Build/ (the UE5 branch's), one a level
+        // down, and the packaged server's Tools/.
+        assert!(
+            text.contains("\"Build/_deps/recastnavigation-build/RecastBuilder/RecastBuilder*\"")
+        );
+        assert!(
+            text.contains("\"Build/*/_deps/recastnavigation-build/RecastBuilder/RecastBuilder*\"")
+        );
+        assert!(text.contains("\"Build/Package/*/Tools/RecastBuilder*\""));
+        assert!(text.contains("subprocess.run([str(built), MAP + \".obj\"]"));
     }
 
     #[test]
