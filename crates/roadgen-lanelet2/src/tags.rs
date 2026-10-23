@@ -70,6 +70,19 @@ pub fn participant(subtype: &str) -> &'static str {
     }
 }
 
+/// The `one_way` tag a lanelet of this subtype carries.
+///
+/// A lane is one-way in the direction it is drawn, the way its traffic goes, and
+/// Lanelet2 reads a plain `one_way` for every participant. A walkway is walked
+/// both ways whichever side of the road it is on, so it says `no`: `yes` would
+/// keep a pedestrian routing graph to one direction along every pavement.
+pub fn one_way(subtype: &str) -> &'static str {
+    match subtype {
+        "walkway" => "no",
+        _ => "yes",
+    }
+}
+
 /// The `turn_direction` of a lanelet through a junction whose heading swings by
 /// `swing` radians, counter-clockwise positive: `straight` within 45 degrees either
 /// way, else `left` or `right`.
@@ -126,7 +139,7 @@ pub fn object_type(kind: &MapObjectKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{sign_subtype, turn_direction};
+    use super::{one_way, sign_subtype, turn_direction};
     use std::f64::consts::{FRAC_PI_2, PI};
 
     #[test]
@@ -137,6 +150,14 @@ mod tests {
         // Any other sign keeps the caller's code.
         for code in ["205", "de274-60", "R1-2", "1000001"] {
             assert_eq!(sign_subtype(code), code);
+        }
+    }
+
+    #[test]
+    fn a_walkway_is_walked_both_ways_and_every_other_lane_only_its_own() {
+        assert_eq!(one_way("walkway"), "no");
+        for subtype in ["road", "highway", "bicycle_lane"] {
+            assert_eq!(one_way(subtype), "yes", "{subtype}");
         }
     }
 

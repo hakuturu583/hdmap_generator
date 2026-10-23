@@ -742,7 +742,7 @@ impl<'a> Exporter<'a> {
                 ("type", "lanelet".to_owned()),
                 ("subtype", subtype.to_owned()),
                 ("location", self.location_of(&lane).to_owned()),
-                ("one_way", "yes".to_owned()),
+                ("one_way", tags::one_way(subtype).to_owned()),
                 (tags::participant(subtype), "yes".to_owned()),
             ];
             if let Some(limit) = lane.speed_limit {
