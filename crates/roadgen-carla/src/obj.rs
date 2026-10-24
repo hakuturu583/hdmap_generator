@@ -19,6 +19,14 @@
 //! road it crosses would become road, which a pedestrian that does not cross roads
 //! is never routed over: the road under each crossing is cut away instead, and
 //! there only the crossing is left.
+//!
+//! The kerb is `road`. CARLA gives each walker one of two filters: one that
+//! keeps to pavements and crossings (it excludes the road's flag) and one that
+//! may cross anywhere (it does not) -- `world.set_pedestrians_cross_factor`
+//! is the share drawn the second. A kerb that was a block walled every road
+//! off from its pavements, so no walker could step off one anywhere but at a
+//! crossing, whatever it was drawn; as road, the kerb is crossed by exactly
+//! the walkers that may cross the road, and closed to the rest.
 
 use std::fmt::Write;
 
@@ -270,9 +278,9 @@ impl Writer {
 /// pavement standing on it.
 fn precedence(role: Role) -> u8 {
     match role {
-        Role::Building | Role::Curb | Role::TrafficLight | Role::TrafficSign => 0,
+        Role::Building | Role::TrafficLight | Role::TrafficSign => 0,
         Role::Terrain => 1,
-        Role::Road | Role::Gutter => 2,
+        Role::Road | Role::Gutter | Role::Curb => 2,
         Role::Sidewalk => 3,
         Role::Marking => 4,
     }
@@ -283,10 +291,12 @@ fn precedence(role: Role) -> u8 {
 /// navigation mesh a second surface there.
 fn material_of(role: Role) -> Option<&'static str> {
     Some(match role {
-        Role::Road | Role::Gutter => "road",
+        // The kerb as the road it bounds: crossed by a walker that may cross
+        // roads, closed to one that may not (see the module's docs).
+        Role::Road | Role::Gutter | Role::Curb => "road",
         Role::Sidewalk => "sidewalk",
         Role::Terrain => "grass",
-        Role::Curb | Role::Building => "block",
+        Role::Building => "block",
         // Furniture is never in the map's meshes, and a post is not something a
         // pedestrian walks through in any case.
         Role::TrafficLight | Role::TrafficSign => "block",
@@ -417,5 +427,12 @@ mod tests {
         assert_eq!(material_of(Role::Marking), None);
         assert_eq!(material_of(Role::Building), Some("block"));
         assert_eq!(material_of(Role::Terrain), Some("grass"));
+    }
+
+    #[test]
+    fn the_kerb_is_road_that_only_a_walker_crossing_roads_steps_onto() {
+        // Not a block: that walled every road off from its pavements.
+        assert_eq!(material_of(Role::Curb), Some("road"));
+        assert_eq!(precedence(Role::Curb), precedence(Role::Road));
     }
 }
