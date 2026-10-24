@@ -1890,7 +1890,11 @@ per crossing, `crosswalk` from kerb to kerb and `CROSSWALK_OVERLAP` (0.3 m) onto
 each pavement, because the stripes are what a camera sees and the band is what a
 walker needs. Only that far onto the pavement: CARLA's walkers stop and look for a
 light wherever their route steps from a pavement onto a crossing, and a band over the
-whole width of the pavement would stop everyone walking along it.
+whole width of the pavement would stop everyone walking along it. The kerb is `road` in it, not
+a block: CARLA's walkers that may cross a road anywhere
+(`world.set_pedestrians_cross_factor`) step off a pavement over it, and the rest,
+whose filter excludes road, keep to the crossings; a kerb as a block walled every
+road off from its pavements for all of them.
 
 Crosswalks *are* painted, too — a bar and a gap of half a metre each, across the
 carriageway, from the crossing objects in the IR — and so are stop lines, as a bar
