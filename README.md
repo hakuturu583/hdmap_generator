@@ -274,7 +274,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
 | `gpudrive_warnings(scenario=None)` | what a GPUDrive export would lose, and what its scene runs up against |
 | `womd_warnings()` | what a Waymo Open Motion scenario would lose |
-| `commonroad_warnings(benchmark_id=, planning_problem=, elevation=)` | what a CommonRoad scenario would lose |
+| `commonroad_warnings(benchmark_id=, planning_problem=, elevation=, light_cycle=)` | what a CommonRoad scenario would lose |
 | `carla_warnings(name=, package=, buildings=, ...)` | what a CARLA package cannot carry, and what its import will get wrong quietly |
 | `osm_warnings()` | what a plain OpenStreetMap export would lose |
 | `sumo_warnings()` | what a SUMO export would lose |
@@ -285,7 +285,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
 | `export_womd(path, scenario_id=, steps=, time_step=, current_time_index=)` | write a TFRecord holding one Waymo Open Motion `Scenario` |
-| `export_commonroad(path, benchmark_id=, author=, affiliation=, source=, date=, time_step=, planning_problem=, goal_steps=, elevation=)` | write a CommonRoad 2020a XML scenario |
+| `export_commonroad(path, benchmark_id=, author=, affiliation=, source=, date=, time_step=, planning_problem=, goal_steps=, elevation=, light_cycle=)` | write a CommonRoad 2020a XML scenario |
 | `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=, furniture=, carla_root=, engine=, sun_altitude=, sun_azimuth=)` | write a CARLA UE5 package and the script that imports it; returns what was written and what each mesh will be tagged |
 | `export_pointcloud_map(directory, name=, buildings=, kerb_height=, verge_width=, ground_extent=, spacing=, cell_size=)` | write Autoware's point-cloud map of the surface a CARLA package is built of: `pointcloud_map/*.pcd` and `pointcloud_map_metadata.yaml`, in the Lanelet2 map's frame |
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
@@ -2475,13 +2475,16 @@ a planner, CommonRoad's route planner or its drivability checker.
 m.export_commonroad("scenario.xml")              # ZAM_<map name>-1_1_T-1, dated today
 xml = m.to_commonroad_xml(benchmark_id="ZAM_Town-1_1_T-1", date="2026-01-01",
                           time_step=0.1, goal_steps=300, elevation=True)
+m.export_commonroad("lit.xml", light_cycle="default")   # the lights run a cycle
+m.export_commonroad("own.xml", light_cycle=[("red", 30), ("redYellow", 2),
+                                            ("green", 25), ("yellow", 3)])
 ```
 
 | Element | What goes in it |
 | --- | --- |
 | `lanelet` | each driving lane, bicycle lane and footway: its left and right bound in travel order, as many points each, with the paint on them (`solid`, `dashed`, `solid_solid`, `solid_dashed`, `curb`, …); its predecessors and successors; the lanelet beside it on either side and whether it runs the same way; what it is (`urban`, `country`, `highway`, `mainCarriageWay`, `accessRamp`, `exitRamp`, `bicycleLane`, `sidewalk`, and `intersection` for a lane through a junction) and who uses it — vehicles or bicycles one way, pedestrians both ways. A crossing is a `crosswalk` lanelet too |
 | `trafficSign` | the map's signs CommonRoad's catalogue has, by their German number — a stop sign however its code is spelt is `206`, and `274-50` is a 50 km/h limit; a virtual `274` for each distinct speed limit, held in metres per second; a virtual `205` give-way for each right-of-way rule. Each is referred to by the lanelets it governs, and a stop or a give-way puts a `stopLine` across them, at the stop line the map draws when it draws one |
-| `trafficLight` | each light where it stands, referred to by the lanes that stop for it, which stop at its stop line |
+| `trafficLight` | each light where it stands, referred to by the lanes that stop for it, which stop at its stop line; dark — one `inactive` phase — unless `light_cycle` gives it a cycle |
 | `intersection` | each junction a street meets — the crossroad end of a slip road too — with an incoming per approach, the lanes of one road going one way, and the lanelets each turns into, sorted `successorsLeft`, `successorsStraight` and `successorsRight` by how far they swing; the crossings at its mouths |
 | `planningProblem` | the schema requires one: from rest at the start of the map's first lane to the end of the route the map's own policy drives from it, within the time it takes at 5 m/s, or `goal_steps` steps |
 
@@ -2502,8 +2505,17 @@ each is drawn. CommonRoad's successor runs from one lanelet's end to the next on
 start, so a pavement round a junction's corner is written the way that links it to the
 pavements either side, and a link that joins two ends that both lead out cannot be said.
 
-**What it cannot carry.** There is no other traffic, only the planning problem. The IR
-has no signal timing, so each light's cycle is one `inactive` phase. Right of way is a
+**Light timing is asked for, not read.** The IR has no signal timing, so a light is
+dark unless `light_cycle` gives it one: `"default"` for the Scenario Designer's own —
+red 6 s, red and amber 1 s, green 6 s, amber 1 s — or a list of `(colour, seconds)`.
+Every light runs the same cycle, but not in step: at each junction, the lights on the
+approaches across the first one run behind it by the time the cycle takes to reach
+green, so north–south and east–west take turns. That works when the time to green is
+half the cycle, as the default's is; `commonroad_warnings(light_cycle=...)` says when a
+cycle would put crossing directions on green together. A junction approached from more
+than two directions still has only two groups.
+
+**What it cannot carry.** There is no other traffic, only the planning problem. Right of way is a
 give-way sign on the lanes that yield, not a relation to the lanes they yield to. A
 speed-limit sign holds, in CommonRoad, along the lanelets after it until the next, so a
 lane with no limit of its own takes the one before it. Shoulders, borders, parking

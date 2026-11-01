@@ -1,6 +1,6 @@
 """Type stubs for the Rust extension module."""
 
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence, Union
 
 __version__: str
 
@@ -253,6 +253,7 @@ class Map:
         benchmark_id: Optional[str] = None,
         planning_problem: bool = True,
         elevation: bool = False,
+        light_cycle: Union[str, bool, Sequence[tuple[str, float]], None] = None,
     ) -> list[str]: ...
     def carla_warnings(
         self,
@@ -338,6 +339,7 @@ class Map:
         planning_problem: bool = True,
         goal_steps: Optional[int] = None,
         elevation: bool = False,
+        light_cycle: Union[str, bool, Sequence[tuple[str, float]], None] = None,
         trace: bool = True,
     ) -> None:
         """Writes a CommonRoad 2020a XML scenario: lanelets, signs, lights, intersections and a planning problem."""
@@ -397,6 +399,7 @@ class Map:
         planning_problem: bool = True,
         goal_steps: Optional[int] = None,
         elevation: bool = False,
+        light_cycle: Union[str, bool, Sequence[tuple[str, float]], None] = None,
     ) -> str: ...
     def to_opendrive_xml(self) -> str: ...
     def to_lanelet2_osm(self) -> str: ...

@@ -1342,17 +1342,20 @@ impl PyMap {
         benchmark_id = None,
         planning_problem = true,
         elevation = false,
+        light_cycle = None,
     ))]
     fn commonroad_warnings(
         &mut self,
         benchmark_id: Option<&str>,
         planning_problem: bool,
         elevation: bool,
+        light_cycle: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<String>> {
         let config = self.commonroad_config(CommonRoadArgs {
             benchmark_id,
             planning_problem,
             elevation,
+            light_cycle: light_cycle.map(light_cycle_arg).transpose()?,
             ..CommonRoadArgs::default()
         })?;
         let map = self.built.as_ref().expect("just built");
@@ -1736,6 +1739,13 @@ impl PyMap {
     /// drive it at 5 m/s). `planning_problem=False` leaves it out, which the schema
     /// does not allow. Points are in the plane unless `elevation` is true.
     ///
+    /// The map holds no signal timing, so a light is written dark unless
+    /// `light_cycle` gives it one: `"default"` for the Scenario Designer's own —
+    /// red 6 s, red and amber 1 s, green 6 s, amber 1 s — or a list of
+    /// `(colour, seconds)` with colours `red`, `redYellow`, `green`, `yellow` and
+    /// `inactive`. At each junction the lights across the first approach run half a
+    /// cycle behind, so that crossing directions take turns.
+    ///
     /// `benchmark_id` defaults to `ZAM_<map name>-1_1_T-1` and `date` to today.
     ///
     /// Also writes `<path>.trace.json` — which lanelet each lane became, and which
@@ -1752,6 +1762,7 @@ impl PyMap {
         planning_problem = true,
         goal_steps = None,
         elevation = false,
+        light_cycle = None,
         trace = true,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -1767,6 +1778,7 @@ impl PyMap {
         planning_problem: bool,
         goal_steps: Option<u64>,
         elevation: bool,
+        light_cycle: Option<&Bound<'_, PyAny>>,
         trace: bool,
     ) -> PyResult<()> {
         let config = self.commonroad_config(CommonRoadArgs {
@@ -1779,6 +1791,7 @@ impl PyMap {
             planning_problem,
             goal_steps,
             elevation,
+            light_cycle: light_cycle.map(light_cycle_arg).transpose()?,
         })?;
         let map = self.built.as_ref().expect("just built");
         let written =
@@ -2116,6 +2129,7 @@ impl PyMap {
         planning_problem = true,
         goal_steps = None,
         elevation = false,
+        light_cycle = None,
     ))]
     #[allow(clippy::wrong_self_convention, clippy::too_many_arguments)]
     fn to_commonroad_xml(
@@ -2129,6 +2143,7 @@ impl PyMap {
         planning_problem: bool,
         goal_steps: Option<u64>,
         elevation: bool,
+        light_cycle: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<String> {
         let config = self.commonroad_config(CommonRoadArgs {
             benchmark_id,
@@ -2140,6 +2155,7 @@ impl PyMap {
             planning_problem,
             goal_steps,
             elevation,
+            light_cycle: light_cycle.map(light_cycle_arg).transpose()?,
         })?;
         let map = self.built.as_ref().expect("just built");
         roadgen_commonroad::to_xml(map, &config).map_err(runtime_error)
@@ -3154,6 +3170,7 @@ impl PyMap {
         config.planning_problem = args.planning_problem;
         config.goal_steps = args.goal_steps;
         config.elevation = args.elevation;
+        config.light_cycle = args.light_cycle;
         Ok(config)
     }
 
@@ -3197,6 +3214,45 @@ struct CommonRoadArgs<'a> {
     planning_problem: bool,
     goal_steps: Option<u64>,
     elevation: bool,
+    light_cycle: Option<Vec<(roadgen_commonroad::LightPhase, f64)>>,
+}
+
+/// A `light_cycle` argument: `"default"` or `True` for the default cycle, or a
+/// sequence of `(colour, seconds)`.
+fn light_cycle_arg(
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Vec<(roadgen_commonroad::LightPhase, f64)>> {
+    if let Ok(flag) = value.extract::<bool>() {
+        if flag {
+            return Ok(roadgen_commonroad::DEFAULT_LIGHT_CYCLE.to_vec());
+        }
+        return Err(PyValueError::new_err(
+            "light_cycle=False is no cycle; leave it out for dark lights",
+        ));
+    }
+    if let Ok(name) = value.extract::<String>() {
+        if name == "default" {
+            return Ok(roadgen_commonroad::DEFAULT_LIGHT_CYCLE.to_vec());
+        }
+        return Err(PyValueError::new_err(format!(
+            "light_cycle is \"default\" or a list of (colour, seconds), not {name:?}"
+        )));
+    }
+    let phases: Vec<(String, f64)> = value.extract().map_err(|_| {
+        PyValueError::new_err("light_cycle is \"default\" or a list of (colour, seconds)")
+    })?;
+    phases
+        .into_iter()
+        .map(|(colour, seconds)| {
+            roadgen_commonroad::LightPhase::parse(&colour)
+                .map(|phase| (phase, seconds))
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "{colour:?} is no light colour: red, redYellow, green, yellow or inactive"
+                    ))
+                })
+        })
+        .collect()
 }
 
 impl Default for CommonRoadArgs<'_> {
@@ -3211,6 +3267,7 @@ impl Default for CommonRoadArgs<'_> {
             planning_problem: true,
             goal_steps: None,
             elevation: false,
+            light_cycle: None,
         }
     }
 }

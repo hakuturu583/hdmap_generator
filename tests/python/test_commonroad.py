@@ -158,3 +158,67 @@ def test_commonroad_io_reads_it(tmp_path):
     for lanelet in network.lanelets:
         for successor in lanelet.successor:
             assert lanelet.lanelet_id in network.find_lanelet_by_id(successor).predecessor
+
+
+def test_a_light_cycle_is_written_when_asked_for():
+    m = crossroads()
+    dark = ElementTree.fromstring(m.to_commonroad_xml())
+    assert [c.text for c in dark.iter("color")] == ["inactive"]
+
+    lit = ElementTree.fromstring(m.to_commonroad_xml(light_cycle="default"))
+    assert [c.text for c in lit.iter("color")] == ["red", "redYellow", "green", "yellow"]
+    assert [d.text for d in lit.iter("duration")] == ["60", "10", "60", "10"]
+
+    custom = ElementTree.fromstring(
+        m.to_commonroad_xml(light_cycle=[("red", 3.0), ("green", 2.5), ("yellow", 0.5)])
+    )
+    assert [d.text for d in custom.iter("duration")] == ["30", "25", "5"]
+    assert not any("inactive" in w for w in m.commonroad_warnings(light_cycle=True))
+
+    with pytest.raises(ValueError):
+        m.to_commonroad_xml(light_cycle=[("purple", 3.0)])
+    with pytest.raises(ValueError):
+        m.to_commonroad_xml(light_cycle="sometimes")
+
+
+def test_commonroad_io_sees_crossing_traffic_take_turns(tmp_path):
+    reader = pytest.importorskip("commonroad.common.file_reader")
+    # The demo's crossroads: north and west run into the junction, south and east
+    # out of it, so the approaches are the forward lanes of the first two and the
+    # backward lanes of the others.
+    two_way = lambda: [
+        roadgen.Lane(width=3.5, direction="forward"),
+        roadgen.Lane(width=3.5, direction="backward"),
+    ]
+    m = roadgen.Map(name="lights")
+    north = m.add_road(start=(0.0, 70.0, 0.0), end=(0.0, 14.0, 0.0), lanes=two_way())
+    south = m.add_road(start=(0.0, -14.0, 0.0), end=(0.0, -70.0, 0.0), lanes=two_way())
+    east = m.add_road(start=(14.0, 0.0, 0.0), end=(70.0, 0.0, 0.0), lanes=two_way())
+    west = m.add_road(start=(-70.0, 0.0, 0.0), end=(-14.0, 0.0, 0.0), lanes=two_way())
+    x = m.add_junction("x")
+    for a, b in ((north, south), (north, east), (west, east), (west, south)):
+        m.connect(a, b, junction=x)
+    for approach in (north.lane(0), west.lane(0), south.lane(1), east.lane(1)):
+        light = m.add_traffic_light(approach, end="end" if approach.index == 0 else "start")
+        m.add_traffic_light_rule([light], [approach])
+    path = tmp_path / "lights.xml"
+    m.export_commonroad(str(path), light_cycle="default")
+    scenario, _ = reader.CommonRoadFileReader(str(path)).open()
+    network = scenario.lanelet_network
+
+    def axis(light):
+        lanelet = next(l for l in network.lanelets if light.traffic_light_id in l.traffic_lights)
+        dx, dy = lanelet.center_vertices[-1] - lanelet.center_vertices[-2]
+        return "east-west" if abs(dx) > abs(dy) else "north-south"
+
+    turns = set()
+    for step in range(280):
+        green = {
+            axis(light)
+            for light in network.traffic_lights
+            if light.get_state_at_time_step(step).value == "green"
+        }
+        assert len(green) < 2, f"both ways green at step {step}"
+        turns |= green
+    assert turns == {"east-west", "north-south"}
+

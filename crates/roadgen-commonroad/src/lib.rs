@@ -32,7 +32,9 @@
 //!   right-of-way rule, each referred to by the lanelets it governs, with the stop
 //!   line a stop or give-way puts across them.
 //! - **Traffic lights**, referred to by the lanes that stop for them. The IR has no
-//!   signal timing, so each light's cycle is one `inactive` phase.
+//!   signal timing, so each light's cycle is one `inactive` phase unless
+//!   [`ScenarioConfig::light_cycle`] gives them one to run, crossing directions
+//!   half a cycle apart.
 //! - **Intersections**: one per at-grade junction, with its approaches and the
 //!   movements each one makes.
 //! - **A planning problem**, which the schema requires: from rest at the start of
@@ -67,6 +69,61 @@ pub const TIME_STEP: f64 = 0.1;
 /// are nowhere real, whose traffic signs are Germany's.
 pub const COUNTRY: &str = "ZAM";
 
+/// What a traffic light shows during one phase of its cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LightPhase {
+    Red,
+    /// Red and amber together, before green, as German lights show it.
+    RedYellow,
+    Green,
+    Yellow,
+    /// Dark, or flashing: the light governs nothing.
+    Inactive,
+}
+
+impl LightPhase {
+    /// The phase's name in the schema, which is also what [`LightPhase::parse`]
+    /// reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LightPhase::Red => "red",
+            LightPhase::RedYellow => "redYellow",
+            LightPhase::Green => "green",
+            LightPhase::Yellow => "yellow",
+            LightPhase::Inactive => "inactive",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<LightPhase> {
+        Some(
+            match value
+                .to_ascii_lowercase()
+                .replace(['_', '-', ' '], "")
+                .as_str()
+            {
+                "red" => LightPhase::Red,
+                "redyellow" | "redamber" => LightPhase::RedYellow,
+                "green" => LightPhase::Green,
+                "yellow" | "amber" => LightPhase::Yellow,
+                "inactive" | "off" => LightPhase::Inactive,
+                _ => return None,
+            },
+        )
+    }
+}
+
+/// The cycle a light runs when the caller asks for the default one: the Scenario
+/// Designer's own, 60, 10, 60 and 10 steps of 0.1 s, in seconds.
+///
+/// Red and red-and-amber together last as long as green and amber, so that two
+/// groups of lights half a cycle apart take turns and are never green together.
+pub const DEFAULT_LIGHT_CYCLE: [(LightPhase, f64); 4] = [
+    (LightPhase::Red, 6.0),
+    (LightPhase::RedYellow, 1.0),
+    (LightPhase::Green, 6.0),
+    (LightPhase::Yellow, 1.0),
+];
+
 /// How a map is turned into a scenario.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScenarioConfig {
@@ -87,6 +144,12 @@ pub struct ScenarioConfig {
     pub goal_steps: Option<u64>,
     /// Whether points carry their `z`.
     pub elevation: bool,
+    /// The cycle every traffic light runs, as phases and how many seconds each
+    /// lasts; `None` writes each light dark, as one `inactive` phase, since the map
+    /// holds no timing. At each junction the lights on the approaches across the
+    /// first ones run half a cycle behind them — by the time from the cycle's
+    /// start to its first green — so that crossing directions take turns.
+    pub light_cycle: Option<Vec<(LightPhase, f64)>>,
 }
 
 impl Default for ScenarioConfig {
@@ -101,6 +164,7 @@ impl Default for ScenarioConfig {
             planning_problem: true,
             goal_steps: None,
             elevation: false,
+            light_cycle: None,
         }
     }
 }
@@ -145,6 +209,44 @@ impl ScenarioConfig {
         self
     }
 
+    pub fn with_light_cycle(mut self, cycle: impl IntoIterator<Item = (LightPhase, f64)>) -> Self {
+        self.light_cycle = Some(cycle.into_iter().collect());
+        self
+    }
+
+    /// Every light runs [`DEFAULT_LIGHT_CYCLE`].
+    pub fn with_default_light_cycle(self) -> Self {
+        self.with_light_cycle(DEFAULT_LIGHT_CYCLE)
+    }
+
+    /// The light cycle in time steps, each phase at least one long.
+    fn light_steps(&self) -> Result<Option<Vec<(LightPhase, u64)>>, ExportError> {
+        let Some(cycle) = &self.light_cycle else {
+            return Ok(None);
+        };
+        if cycle.is_empty() {
+            return Err(ExportError::Config(
+                "a light cycle needs one phase at least".into(),
+            ));
+        }
+        cycle
+            .iter()
+            .map(|&(phase, seconds)| {
+                let steps = (seconds / self.time_step).round();
+                if !(seconds.is_finite() && steps >= 1.0) {
+                    return Err(ExportError::Config(format!(
+                        "the {} phase lasts {seconds} s, and has to last one time step \
+                         ({} s) at least",
+                        phase.as_str(),
+                        self.time_step
+                    )));
+                }
+                Ok((phase, steps as u64))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
     fn validate(&self) -> Result<(), ExportError> {
         if !(self.time_step.is_finite() && self.time_step > 0.0) {
             return Err(ExportError::Config(format!(
@@ -157,6 +259,7 @@ impl ScenarioConfig {
                 "the goal has to be reachable after one time step at least".into(),
             ));
         }
+        self.light_steps()?;
         if self.benchmark_id.is_empty() {
             return Err(ExportError::Config("the benchmark id is empty".into()));
         }
@@ -217,6 +320,7 @@ pub fn to_scenario_traced(
         enabled: config.planning_problem,
         time_step: config.time_step,
         goal_steps: config.goal_steps,
+        light_cycle: config.light_steps()?,
     };
     let network = network::build(map, &planning, &mut trace)?;
     let origin = map.metadata.origin;
@@ -373,11 +477,47 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
             .count()
     };
     if objects(MapObjectKind::is_traffic_light) > 0 {
-        problems.push(
-            "the map has no signal timing, so every traffic light's cycle is a single \
-             inactive phase: what it shows is the simulator's to decide"
-                .to_owned(),
-        );
+        match config.and_then(|config| config.light_cycle.as_ref()) {
+            None => problems.push(
+                "the map has no signal timing, so every traffic light's cycle is a \
+                 single inactive phase — a planner sees no signal; ask for a light \
+                 cycle to have them run one"
+                    .to_owned(),
+            ),
+            Some(cycle) => {
+                problems.push(
+                    "the map has no signal timing, so every traffic light runs the cycle \
+                     asked for, the lights across each junction's first approaches half \
+                     a cycle behind; a junction with more than two directions of approach \
+                     still has two groups"
+                        .to_owned(),
+                );
+                let lasting = |wanted: &[LightPhase]| -> f64 {
+                    cycle
+                        .iter()
+                        .take_while(|(phase, _)| *phase != LightPhase::Green)
+                        .filter(|(phase, _)| wanted.contains(phase))
+                        .map(|(_, seconds)| seconds)
+                        .sum()
+                };
+                let before = lasting(&[
+                    LightPhase::Red,
+                    LightPhase::RedYellow,
+                    LightPhase::Yellow,
+                    LightPhase::Inactive,
+                ]);
+                let total: f64 = cycle.iter().map(|(_, seconds)| seconds).sum();
+                if !cycle.iter().any(|(phase, _)| *phase == LightPhase::Green) {
+                    problems.push("the light cycle has no green phase".to_owned());
+                } else if before * 2.0 < total - 1e-9 {
+                    problems.push(format!(
+                        "the light cycle reaches green {before} s into its {total} s: \
+                         the two groups of lights at a junction take turns only when that \
+                         is half the cycle, so crossing directions are green together"
+                    ));
+                }
+            }
+        }
     }
     let unsigned = map
         .objects

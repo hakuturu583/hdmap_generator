@@ -518,3 +518,94 @@ fn a_corner_pavement_is_written_the_way_that_links_it() {
             .any(|problem| problem.contains("links between footways")));
     }
 }
+
+/// What a light shows at `step`, the way commonroad-io reads a cycle: it starts
+/// at the offset, and before that it is already running.
+fn light_at(light: &roadgen_commonroad::model::TrafficLight, step: u64) -> &'static str {
+    let total: u64 = light.cycle.iter().map(|phase| phase.duration).sum();
+    let mut into = (step + total - light.time_offset % total) % total;
+    for phase in &light.cycle {
+        if into < phase.duration {
+            return phase.color;
+        }
+        into -= phase.duration;
+    }
+    unreachable!("the steps add up to the cycle")
+}
+
+#[test]
+fn lights_are_dark_unless_given_a_cycle_and_then_cross_traffic_takes_turns() {
+    let (map, _) = scenarios::signalised_crosswalk_crossroads(TrafficHandedness::RightHand);
+    let dark = scenario(&map);
+    assert_eq!(dark.traffic_lights.len(), 4);
+    for light in &dark.traffic_lights {
+        assert_eq!(light.cycle.len(), 1);
+        assert_eq!(light.cycle[0].color, "inactive");
+        assert_eq!(light.time_offset, 0);
+    }
+
+    let lit =
+        roadgen_commonroad::to_scenario(&map, &config(&map).with_default_light_cycle()).unwrap();
+    // Which axis each light's approach arrives along, from the lanelet that
+    // refers to it.
+    let axis = |light: u64| {
+        let lanelet = lit
+            .lanelets
+            .iter()
+            .find(|lanelet| lanelet.traffic_lights.contains(&light))
+            .expect("a lanelet stops for every light");
+        let points = &lanelet.left.points;
+        let (a, b) = (points[points.len() - 2], points[points.len() - 1]);
+        if (b.x - a.x).abs() > (b.y - a.y).abs() {
+            "east-west"
+        } else {
+            "north-south"
+        }
+    };
+    let mut east_west = 0;
+    for light in &lit.traffic_lights {
+        let names: Vec<&str> = light.cycle.iter().map(|phase| phase.color).collect();
+        assert_eq!(names, ["red", "redYellow", "green", "yellow"]);
+        let steps: Vec<u64> = light.cycle.iter().map(|phase| phase.duration).collect();
+        assert_eq!(steps, [60, 10, 60, 10], "seconds in steps of 0.1 s");
+        east_west += usize::from(axis(light.id) == "east-west");
+    }
+    assert_eq!(east_west, 2);
+
+    let mut green = [false, false];
+    for step in 0..280 {
+        let mut shown: HashMap<&str, Vec<&str>> = HashMap::new();
+        for light in &lit.traffic_lights {
+            shown
+                .entry(axis(light.id))
+                .or_default()
+                .push(light_at(light, step));
+        }
+        let ew = shown["east-west"].contains(&"green");
+        let ns = shown["north-south"].contains(&"green");
+        assert!(!(ew && ns), "both ways green at step {step}");
+        // The two lights on one axis show the same.
+        for colours in shown.values() {
+            assert!(colours.windows(2).all(|pair| pair[0] == pair[1]), "{step}");
+        }
+        green[0] |= ew;
+        green[1] |= ns;
+    }
+    assert_eq!(green, [true, true], "each way gets its turn");
+}
+
+#[test]
+fn a_light_cycle_the_check_can_see_through() {
+    use roadgen_commonroad::LightPhase::{Green, Red, Yellow};
+    let (map, _) = scenarios::signalised_crosswalk_crossroads(TrafficHandedness::RightHand);
+    let lopsided = config(&map).with_light_cycle([(Red, 5.0), (Green, 20.0), (Yellow, 3.0)]);
+    assert!(roadgen_commonroad::check(&map, Some(&lopsided))
+        .iter()
+        .any(|problem| problem.contains("green together")));
+    let short = config(&map).with_light_cycle([(Red, 0.01), (Green, 5.0)]);
+    assert!(roadgen_commonroad::to_scenario(&map, &short).is_err());
+    let default = config(&map).with_default_light_cycle();
+    assert!(!roadgen_commonroad::check(&map, Some(&default))
+        .iter()
+        .any(|problem| problem.contains("green together") || problem.contains("inactive")));
+}

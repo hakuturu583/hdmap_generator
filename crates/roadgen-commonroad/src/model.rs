@@ -122,6 +122,9 @@ pub struct CycleElement {
 pub struct TrafficLight {
     pub id: u64,
     pub cycle: Vec<CycleElement>,
+    /// The time step the cycle starts at; before it, the cycle is already running,
+    /// as far through as it would have got.
+    pub time_offset: u64,
     pub position: Option<Point3>,
     pub direction: &'static str,
 }
@@ -333,6 +336,10 @@ impl Scenario {
             doc.text("duration", &element.duration.to_string());
             doc.text("color", element.color);
             doc.close("cycleElement");
+        }
+        // The schema's offset is a positive integer, so none is no offset.
+        if light.time_offset > 0 {
+            doc.text("timeOffset", &light.time_offset.to_string());
         }
         doc.close("cycle");
         if let Some(position) = light.position {

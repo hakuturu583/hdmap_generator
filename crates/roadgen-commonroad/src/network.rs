@@ -42,7 +42,7 @@ use roadgen_core::semantics::{
 };
 use roadgen_core::{
     Direction, FormOfWay, IrRef, JunctionId, LaneConnection, LaneId, LaneType, ObjectId, Relation,
-    RoadType, SpeedLimit, Trace, ValidatedMap,
+    RoadLinkTarget, RoadType, SpeedLimit, Trace, ValidatedMap,
 };
 
 use crate::error::ExportError;
@@ -67,6 +67,8 @@ pub(crate) struct Planning {
     pub enabled: bool,
     pub time_step: f64,
     pub goal_steps: Option<u64>,
+    /// The light cycle in time steps, or `None` for dark lights.
+    pub light_cycle: Option<Vec<(crate::LightPhase, u64)>>,
 }
 
 /// Whether a lane of this type becomes a lanelet.
@@ -92,7 +94,7 @@ pub(crate) fn build(
     builder.sign_objects(trace);
     builder.speed_limits(trace);
     builder.right_of_way(trace);
-    builder.lights(trace);
+    builder.lights(planning.light_cycle.as_deref(), trace)?;
     builder.light_rules(trace);
     builder.intersections(trace)?;
     builder.planning_problem(planning, trace)?;
@@ -579,8 +581,38 @@ impl<'a> Builder<'a> {
 
     /// Every traffic light, where it stands. The IR holds no timing, so each one's
     /// cycle is a single `inactive` phase: what it shows is the simulator's to decide.
-    fn lights(&mut self, trace: &mut Trace) {
+    fn lights(
+        &mut self,
+        cycle: Option<&[(crate::LightPhase, u64)]>,
+        trace: &mut Trace,
+    ) -> Result<(), ExportError> {
         let map = self.map;
+        let (elements, half) = match cycle {
+            None => (
+                vec![CycleElement {
+                    duration: 1,
+                    color: "inactive",
+                }],
+                0,
+            ),
+            Some(cycle) => (
+                cycle
+                    .iter()
+                    .map(|&(phase, duration)| CycleElement {
+                        duration,
+                        color: phase.as_str(),
+                    })
+                    .collect(),
+                // Half a cycle, as the second group needs it: the time from the
+                // start to the first green.
+                cycle
+                    .iter()
+                    .take_while(|(phase, _)| *phase != crate::LightPhase::Green)
+                    .map(|(_, duration)| duration)
+                    .sum(),
+            ),
+        };
+        let across = self.lights_across()?;
         for object in map.objects.iter() {
             if !object.kind.is_traffic_light() {
                 continue;
@@ -589,10 +621,8 @@ impl<'a> Builder<'a> {
             self.light_ids.insert(&object.id, id);
             self.traffic_lights.push(TrafficLight {
                 id,
-                cycle: vec![CycleElement {
-                    duration: 1,
-                    color: "inactive",
-                }],
+                cycle: elements.clone(),
+                time_offset: if across.contains(&object.id) { half } else { 0 },
                 position: Some(position(&object.geometry)),
                 direction: "all",
             });
@@ -603,6 +633,64 @@ impl<'a> Builder<'a> {
                 "traffic_light",
             );
         }
+        Ok(())
+    }
+
+    /// The lights that run half a cycle behind the rest: at each junction, those
+    /// that stop an approach across the first approach a light there stops.
+    ///
+    /// An approach's axis is the heading its lane arrives at, either way along it,
+    /// so the approaches from north and south are one axis and those from east and
+    /// west the other. A light short of no junction runs with no offset.
+    fn lights_across(&self) -> Result<HashSet<&'a ObjectId>, ExportError> {
+        use std::f64::consts::PI;
+        let map = self.map;
+        let mut axes: HashMap<&'a JunctionId, f64> = HashMap::new();
+        let mut placed: HashSet<&'a ObjectId> = HashSet::new();
+        let mut across = HashSet::new();
+        for rule in map.rules.iter() {
+            let TrafficRule::TrafficLight { lights, lanes, .. } = rule else {
+                continue;
+            };
+            let Some(lane) = lanes.iter().find_map(|lane| map.lane(lane)) else {
+                continue;
+            };
+            // The junction the approach's road runs into where traffic leaves it,
+            // or failing that the one its movements go through.
+            let linked = map
+                .road(&lane.road)
+                .and_then(|road| road.link.at(lane.direction.exit_end().as_road_end()))
+                .and_then(|target| match target {
+                    RoadLinkTarget::Junction(junction) => Some(junction),
+                    _ => None,
+                });
+            let junction = linked.or_else(|| {
+                map.successors(&lane.id).into_iter().find_map(|next| {
+                    map.lane(&next)
+                        .and_then(|next| map.road(&next.road))
+                        .and_then(|road| road.junction.as_ref())
+                })
+            });
+            let Some(junction) = junction else {
+                continue;
+            };
+            let heading = lane
+                .travel_geometry(self.config)?
+                .centerline
+                .end_tangent()?
+                .heading();
+            let axis = heading.rem_euclid(PI);
+            let first = *axes.entry(junction).or_insert(axis);
+            let apart = (axis - first).rem_euclid(PI);
+            let crossing = apart.min(PI - apart) > PI / 4.0;
+            for light in lights {
+                // A light two rules name runs as the first one placed it.
+                if placed.insert(light) && crossing {
+                    across.insert(light);
+                }
+            }
+        }
+        Ok(across)
     }
 
     /// The lights a traffic-light rule names, referred to by the lanes that stop
