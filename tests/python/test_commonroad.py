@@ -222,3 +222,41 @@ def test_commonroad_io_sees_crossing_traffic_take_turns(tmp_path):
         turns |= green
     assert turns == {"east-west", "north-south"}
 
+
+
+def test_the_map_alone_is_a_commonroad_2024_map(tmp_path):
+    m = crossroads()
+    path = tmp_path / "map.pb"
+    m.export_commonroad_map(str(path), date="2026-01-01")
+    assert path.read_bytes() == m.to_commonroad_map_bytes(date="2026-01-01")
+    assert (tmp_path / "map.pb.trace.json").exists()
+    assert any("no cycle" in w for w in m.commonroad_map_warnings())
+
+
+def test_commonroad_io_reads_the_map_as_the_scenarios_network(tmp_path):
+    reader = pytest.importorskip("commonroad.common.file_reader")
+    np = pytest.importorskip("numpy")
+    m = crossroads()
+    m.export_commonroad_map(str(tmp_path / "map.pb"))
+    m.export_commonroad(str(tmp_path / "scenario.xml"))
+    network, environment = reader.CommonRoadFileReader(
+        filename_map=str(tmp_path / "map.pb")
+    ).open_map()
+    scenario, _ = reader.CommonRoadFileReader(str(tmp_path / "scenario.xml")).open()
+    expected = scenario.lanelet_network
+
+    assert {l.lanelet_id for l in network.lanelets} == {l.lanelet_id for l in expected.lanelets}
+    for lanelet in expected.lanelets:
+        read = network.find_lanelet_by_id(lanelet.lanelet_id)
+        assert np.allclose(read.left_vertices, lanelet.left_vertices)
+        assert np.allclose(read.right_vertices, lanelet.right_vertices)
+        assert sorted(read.successor) == sorted(lanelet.successor)
+        assert read.adj_left == lanelet.adj_left
+        assert read.adj_left_same_direction == lanelet.adj_left_same_direction
+        assert read.traffic_lights == lanelet.traffic_lights
+    (limit,) = network.traffic_signs
+    assert limit.traffic_sign_elements[0].traffic_sign_element_id.name == "MAX_SPEED"
+    assert float(limit.traffic_sign_elements[0].additional_values[0]) == pytest.approx(10.0)
+    assert len(network.traffic_lights) == 1
+    assert len(network.intersections) == 1
+    assert environment == []

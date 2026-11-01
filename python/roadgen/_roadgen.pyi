@@ -248,6 +248,9 @@ class Map:
     def rdshq_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def gpudrive_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def womd_warnings(self) -> list[str]: ...
+    def commonroad_map_warnings(
+        self, benchmark_id: Optional[str] = None, elevation: bool = False
+    ) -> list[str]: ...
     def commonroad_warnings(
         self,
         benchmark_id: Optional[str] = None,
@@ -333,6 +336,18 @@ class Map:
         trace: bool = True,
     ) -> None:
         """Writes a TFRecord file holding one Waymo Open Motion `Scenario`."""
+    def export_commonroad_map(
+        self,
+        path: str,
+        benchmark_id: Optional[str] = None,
+        author: Optional[str] = None,
+        affiliation: Optional[str] = None,
+        source: Optional[str] = None,
+        date: Optional[str] = None,
+        elevation: bool = False,
+        trace: bool = True,
+    ) -> None:
+        """Writes the map alone as a CommonRoad 2024 `CommonRoadMap` protocol buffer."""
     def export_commonroad(
         self,
         path: str,
@@ -394,6 +409,16 @@ class Map:
         current_time_index: Optional[int] = None,
     ) -> bytes:
         """One serialized `waymo.open_dataset.Scenario`, not framed as a TFRecord."""
+    def to_commonroad_map_bytes(
+        self,
+        benchmark_id: Optional[str] = None,
+        author: Optional[str] = None,
+        affiliation: Optional[str] = None,
+        source: Optional[str] = None,
+        date: Optional[str] = None,
+        elevation: bool = False,
+    ) -> bytes:
+        """One serialized CommonRoad 2024 `CommonRoadMap` message."""
     def to_commonroad_xml(
         self,
         benchmark_id: Optional[str] = None,

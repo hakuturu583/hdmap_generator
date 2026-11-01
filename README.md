@@ -52,6 +52,7 @@ m.export_rdshq("rds_hq/")       # the layout Cosmos-Drive-Dreams renders from
 m.export_gpudrive("scene.json")
 m.export_womd("map.tfrecord")
 m.export_commonroad("scenario.xml")   # lanelets, signs, lights, a planning problem
+m.export_commonroad_map("map.pb")     # the map alone, CommonRoad's 2024 protobuf
 ```
 
 ## How it is put together
@@ -88,6 +89,7 @@ m.export_commonroad("scenario.xml")   # lanelets, signs, lights, a planning prob
                      ├──▶ GPUDrive       scene .json         `serde_json`
                      ├──▶ WOMD           .tfrecord Scenario  `prost`
                      ├──▶ CommonRoad     scenario .xml       `quick-xml`
+                     ├──▶ CommonRoad     map .pb (2024)      `prost`
                      └──▶ the IR itself  .roadgen.pb         `prost`
 
               the written files ──▶ roadgen-viewer ──▶ SVG
@@ -295,6 +297,8 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `to_womd_bytes(scenario_id=, steps=, time_step=, current_time_index=)` | one serialized `Scenario`, not framed as a TFRecord |
 | `to_commonroad_xml(...)` | the CommonRoad scenario as a string, with `export_commonroad`'s arguments |
+| `export_commonroad_map(path, benchmark_id=, author=, affiliation=, source=, date=, elevation=)` | write the map alone as a CommonRoad 2024 `CommonRoadMap` protocol buffer |
+| `to_commonroad_map_bytes(...)` / `commonroad_map_warnings(benchmark_id=, elevation=)` | the same, as bytes; and what it would lose |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 | `render_opendrive(path)` / `render_sumo(directory)` / `render_carla(path)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
 | `read_opendrive(path, sampling=, origin=, projection=)` | read an OpenDRIVE file as a `Map` — one that exports like any other and cannot be added to |
@@ -773,7 +777,8 @@ part/high_street/left/3/0/1        ← the one standing on it
 | **OpenStreetMap** | [Simple 3D Buildings](https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings): the outline as a closed `building=<kind>` way, a `building:part=yes` way per part where there is more than one, with `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and `roof:direction`. The solid survives; the frontage, a sloping base and the union of several parts' outlines do not, and `check` says so. |
 | **OpenDRIVE** | one `<object type="building">` carrying an `<outline>` per part, corners as `<cornerLocal>`. The massing survives; the roof shape does not, and `format_warnings()` says how many were flattened. |
 | **CARLA** | actual walls and roofs, from `Solid::shell()`. The whole solid survives — it is the only export that draws the roof rather than describing it — but CARLA's import will tag it `Terrain` unless the town is exported as [props](#where-the-town-goes-and-why-it-is-a-choice), in which case it is tagged and the package's script places it. |
-| Lanelet2, SUMO, ClipGT, GPUDrive, WOMD, CommonRoad | nothing; each one's warnings say how many were dropped. |
+| **CommonRoad map** | each part's outline in plan, as an environment obstacle of type `BUILDING`. Heights and roofs are not written. |
+| Lanelet2, SUMO, ClipGT, GPUDrive, WOMD, the CommonRoad scenario | nothing; each one's warnings say how many were dropped. |
 
 OSM measures a roof's direction clockwise from north, as a bearing; the IR measures it
 anticlockwise from east, as an angle. That conversion is the whole of the difference
@@ -2523,6 +2528,37 @@ strips and verges are not lanelets; buildings, barriers, structures and terrain 
 written; and a junction of motorways and slip roads alone is a merge, not an
 intersection. `Map.commonroad_warnings()` says all of that.
 
+### The map alone: CommonRoad 2024
+
+The 2020a XML above is a *scenario*, and its schema will not have one without a
+planning problem. CommonRoad's 2024 format splits a scenario into three files — the
+map, the dynamic part (traffic, light timing) and the scenario that ties them to
+planning problems — and `export_commonroad_map` writes the first: the map and nothing
+more, as one `CommonRoadMap` protocol buffer of CommonRoad's own schema, which
+`commonroad-io` opens with `CommonRoadFileReader(filename_map=path).open_map()`.
+
+```python
+m.export_commonroad_map("map.pb")              # ZAM_<map name>-1, in the plane
+data = m.to_commonroad_map_bytes(elevation=True)
+m.commonroad_map_warnings()
+```
+
+It is the scenario's lanelet network — the same lanelets, ids, signs, lights and
+intersections — cut into the 2024 format's elements:
+
+- **bounds and stop lines are elements of their own** that lanelets refer to by id.
+  Each lanelet has its own two bounds in its direction of travel: the format can share
+  one between neighbours with a "reversed" flag, but `commonroad-io`'s reader ignores
+  the flag, so a shared bound would read backwards on one side. A stop line has its
+  two ends — across the lanelet's end where the map draws none;
+- **signs are named** (`MAX_SPEED`, `STOP`, `YIELD`) rather than numbered, and every
+  one stands somewhere: a virtual speed limit beside the start of the first lanelet
+  it holds on, a virtual give-way beside the end;
+- **a light has no cycle**: timing belongs to the dynamic file, so `light_cycle` does
+  not apply;
+- **the buildings are in it**: every building part is an environment obstacle of type
+  `BUILDING`, its outline in plan.
+
 ## The demo page
 
 <https://hakuturu583.github.io/hdmap_generator/>
@@ -2886,6 +2922,7 @@ one more trace and changes none.
 | GPUDrive | `<file>.trace.json` | `road:42`, `agent:1` |
 | WOMD | `<file>.trace.json` | `feature:12`, `signal:12` (the lane state on feature 12) |
 | CommonRoad | `<file>.trace.json` | `lanelet:3`, `traffic_sign:40`, `traffic_light:41`, `intersection:42`, `incoming:43`, `planning_problem:48` |
+| CommonRoad map | `<file>.trace.json` | as CommonRoad, and `boundary:60`, `environment_obstacle:90` |
 | CARLA | `<dir>/<name>.carla.trace.json` | the package's `.xodr` as OpenDRIVE, and `actor:<name>` for each light and sign; the meshes are not traced |
 
 **A file read has a trace too.** `read_opendrive` records which element of the map
@@ -2984,7 +3021,8 @@ roadgen/
 │   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON
 │   ├── roadgen-womd/        lowering onto a Waymo Open Motion `Scenario`, with
 │   │                        Waymo's schema (`proto/`) and the TFRecord framing
-│   ├── roadgen-commonroad/  lowering onto a CommonRoad scenario's XML
+│   ├── roadgen-commonroad/  lowering onto a CommonRoad scenario's XML, and onto
+│   │                        a 2024 map with CommonRoad's schema (`proto/`)
 │   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
 │   ├── roadgen-sumo/        lowering onto SUMO's plain-XML network
 │   ├── roadgen-proto/       the IR as Protocol Buffers: the schema (`proto/`),
@@ -3109,5 +3147,6 @@ of `scenario.proto`.
 
 The CommonRoad element names, their order and the sign catalogue were read off the
 2020a XML schema and the reader that `commonroad-io` (BSD-3-Clause) ships; nothing of
-either is carried here.
+either is carried here. The 2024 map's schema is CommonRoad's own `.proto` files, carried
+unchanged in `crates/roadgen-commonroad/proto/` with their BSD-3-Clause licence.
 Check licence compatibility before adding a dependency.

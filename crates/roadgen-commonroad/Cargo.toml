@@ -14,6 +14,13 @@ roadgen-core.workspace = true
 # two files place the map in one spot rather than two that nearly agree.
 roadgen-opendrive.workspace = true
 quick-xml.workspace = true
+# The 2024 map is a protocol buffer of CommonRoad's own schema, compiled from
+# `proto/` the way the WOMD export compiles Waymo's.
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

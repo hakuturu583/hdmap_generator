@@ -1380,6 +1380,23 @@ impl PyMap {
         Ok(roadgen_commonroad::check(map, Some(&config)))
     }
 
+    /// What a CommonRoad 2024 map export loses, with the same arguments as
+    /// `export_commonroad_map`.
+    #[pyo3(signature = (benchmark_id = None, elevation = false))]
+    fn commonroad_map_warnings(
+        &mut self,
+        benchmark_id: Option<&str>,
+        elevation: bool,
+    ) -> PyResult<Vec<String>> {
+        let config = self.commonroad_config(CommonRoadArgs {
+            benchmark_id,
+            elevation,
+            ..CommonRoadArgs::default()
+        })?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(roadgen_commonroad::check_map(map, Some(&config)))
+    }
+
     /// Writes the IR dump: every road, lane, junction, connection, object, rule and
     /// building by its identifier, with what it belongs to and connects to, and
     /// none of its geometry.
@@ -1818,6 +1835,94 @@ impl PyMap {
             self.write_sidecar(&written, roadgen_trace::sidecar_path(&path))?;
         }
         Ok(())
+    }
+
+    /// Writes the map alone as a CommonRoad 2024 map: one `CommonRoadMap` protocol
+    /// buffer, which `commonroad-io` reads with
+    /// `CommonRoadFileReader(filename_map=path).open_map()`.
+    ///
+    /// The same lanelets, signs, lights and intersections as `export_commonroad`,
+    /// with no planning problem and no light timing (both belong to other files of
+    /// the 2024 format), and every building part as an environment obstacle of its
+    /// outline. `benchmark_id` names the map (`ZAM_<map name>-1`), and `date`,
+    /// `author`, `affiliation`, `source` and `elevation` are as for
+    /// `export_commonroad`.
+    ///
+    /// Also writes `<path>.trace.json` unless `trace` is false.
+    #[pyo3(signature = (
+        path,
+        benchmark_id = None,
+        author = None,
+        affiliation = None,
+        source = None,
+        date = None,
+        elevation = false,
+        trace = true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn export_commonroad_map(
+        &mut self,
+        path: PathBuf,
+        benchmark_id: Option<&str>,
+        author: Option<&str>,
+        affiliation: Option<&str>,
+        source: Option<&str>,
+        date: Option<&str>,
+        elevation: bool,
+        trace: bool,
+    ) -> PyResult<()> {
+        let config = self.commonroad_config(CommonRoadArgs {
+            benchmark_id,
+            author,
+            affiliation,
+            source,
+            date,
+            elevation,
+            ..CommonRoadArgs::default()
+        })?;
+        let map = self.built.as_ref().expect("just built");
+        let written = roadgen_commonroad::protobuf::write_map_traced(map, &path, &config)
+            .map_err(runtime_error)?;
+        if trace {
+            self.write_sidecar(&written, roadgen_trace::sidecar_path(&path))?;
+        }
+        Ok(())
+    }
+
+    /// The CommonRoad map as one serialized `CommonRoadMap` message, with the same
+    /// arguments as `export_commonroad_map`.
+    #[pyo3(signature = (
+        benchmark_id = None,
+        author = None,
+        affiliation = None,
+        source = None,
+        date = None,
+        elevation = false,
+    ))]
+    #[allow(clippy::wrong_self_convention, clippy::too_many_arguments)]
+    fn to_commonroad_map_bytes<'py>(
+        &mut self,
+        py: Python<'py>,
+        benchmark_id: Option<&str>,
+        author: Option<&str>,
+        affiliation: Option<&str>,
+        source: Option<&str>,
+        date: Option<&str>,
+        elevation: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let config = self.commonroad_config(CommonRoadArgs {
+            benchmark_id,
+            author,
+            affiliation,
+            source,
+            date,
+            elevation,
+            ..CommonRoadArgs::default()
+        })?;
+        let map = self.built.as_ref().expect("just built");
+        let bytes =
+            roadgen_commonroad::protobuf::to_map_bytes(map, &config).map_err(runtime_error)?;
+        Ok(PyBytes::new(py, &bytes))
     }
 
     /// Writes the map as a CARLA UE5 asset package.
@@ -3234,6 +3339,23 @@ struct CommonRoadArgs<'a, 'py> {
     elevation: bool,
     /// As Python passed it; [`light_cycle_arg`] reads it.
     light_cycle: Option<&'a Bound<'py, PyAny>>,
+}
+
+impl Default for CommonRoadArgs<'_, '_> {
+    fn default() -> Self {
+        CommonRoadArgs {
+            benchmark_id: None,
+            author: None,
+            affiliation: None,
+            source: None,
+            date: None,
+            time_step: None,
+            planning_problem: true,
+            goal_steps: None,
+            elevation: false,
+            light_cycle: None,
+        }
+    }
 }
 
 /// A `light_cycle` argument: `"default"` or `True` for the default cycle, or a

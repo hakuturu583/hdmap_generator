@@ -41,11 +41,18 @@
 //!   the first lane a vehicle can set off from to the last lane of the route the
 //!   map's own policy takes from there ([`Map::route_from`]).
 //!
+//!
+//! # The map alone
+//!
+//! The XML is a scenario. [`protobuf`] writes the map alone, as a CommonRoad 2024
+//! `CommonRoadMap` protocol buffer, built from the same network.
+//!
 //! [`Map::route_from`]: roadgen_core::map::Map::route_from
 
 pub mod error;
 pub mod model;
 mod network;
+pub mod protobuf;
 mod signs;
 mod xml;
 
@@ -406,16 +413,42 @@ pub fn write_traced(
 /// Most of these are properties of the format rather than faults in the map. Pass
 /// the configuration to have it checked as well.
 pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String> {
+    problems(map, config, Target::Scenario)
+}
+
+/// What this map loses on the way into a CommonRoad 2024 map ([`protobuf`]).
+///
+/// The same as [`check`] but for what only a scenario has — a planning problem,
+/// light timing — and for the buildings, which a map holds as environment
+/// obstacles.
+pub fn check_map(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String> {
+    problems(map, config, Target::Map)
+}
+
+/// Which CommonRoad file the problems are for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// The 2020a XML scenario.
+    Scenario,
+    /// The 2024 protobuf map.
+    Map,
+}
+
+fn problems(map: &ValidatedMap, config: Option<&ScenarioConfig>, target: Target) -> Vec<String> {
     let elevation = config.is_some_and(|config| config.elevation);
     let mut problems = vec![
         "CommonRoad ids are numbered as they are written, in one id space for \
-         lanelets, signs, lights, intersections and planning problems, so the map's \
-         own identifiers do not survive the crossing"
-            .to_owned(),
-        "a CommonRoad scenario written from a map has no obstacles: there is no other \
-         traffic, only the planning problem"
+         lanelets, signs, lights, intersections and the rest, so the map's own \
+         identifiers do not survive the crossing"
             .to_owned(),
     ];
+    if target == Target::Scenario {
+        problems.push(
+            "a CommonRoad scenario written from a map has no obstacles: there is no \
+             other traffic, only the planning problem"
+                .to_owned(),
+        );
+    }
     if !elevation {
         problems.push(
             "a CommonRoad lanelet lies in the plane, so heights are not written; ask for \
@@ -434,12 +467,19 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
         ));
     }
     if !map.buildings.is_empty() {
-        problems.push(format!(
-            "the map's {} buildings ({} parts) are not written: CommonRoad's environment \
-             obstacles are outlines, and a building is not what a planner drives among",
-            map.buildings.len(),
-            map.building_parts.len()
-        ));
+        problems.push(match target {
+            Target::Scenario => format!(
+                "the map's {} buildings ({} parts) are not written: the 2020a scenario \
+                 has no building, and the CommonRoad map does",
+                map.buildings.len(),
+                map.building_parts.len()
+            ),
+            Target::Map => format!(
+                "the map's {} building parts are environment obstacles of their outline \
+                 in plan: their heights and roofs are not written",
+                map.building_parts.len()
+            ),
+        });
     }
     if !map.structures.is_empty() {
         problems.push(format!(
@@ -496,7 +536,14 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
             .filter(|object| wanted(&object.kind))
             .count()
     };
-    if objects(MapObjectKind::is_traffic_light) > 0 {
+    if objects(MapObjectKind::is_traffic_light) > 0 && target == Target::Map {
+        problems.push(
+            "a CommonRoad map holds where a traffic light stands and which lanes stop for \
+             it, not its timing, which belongs to a dynamic file: the lights are written \
+             with no cycle, whatever light cycle is asked for"
+                .to_owned(),
+        );
+    } else if objects(MapObjectKind::is_traffic_light) > 0 {
         match config.and_then(|config| config.light_cycle.as_ref()) {
             None => problems.push(
                 "the map has no signal timing, so every traffic light's cycle is a \
@@ -590,7 +637,7 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
         ));
     }
     let drivable = map.lanes.iter().any(|lane| lane.lane_type.is_drivable());
-    if !drivable {
+    if !drivable && target == Target::Scenario {
         problems.push(
             "the map has no lane a vehicle drives, so there is no planning problem and \
              the scenario is not valid under the CommonRoad schema"
@@ -602,7 +649,7 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
         if let Err(error) = config.validate() {
             problems.push(error.to_string());
         }
-        if !config.planning_problem && drivable {
+        if !config.planning_problem && drivable && target == Target::Scenario {
             problems.push(
                 "no planning problem is posed, which the CommonRoad schema requires: \
                  commonroad-io reads the scenario, but a validator refuses it"
@@ -612,8 +659,13 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
         if !is_benchmark_id(&config.benchmark_id) {
             problems.push(format!(
                 "the benchmark id {:?} is not of the form COUNTRY_MapName-1_1_T-1, so \
-                 commonroad-io reads it as the name of the map and nothing else",
-                config.benchmark_id
+                 commonroad-io reads it as the name of the map and nothing else{}",
+                config.benchmark_id,
+                if target == Target::Map {
+                    ", and the map is filed under ZAM, that name and map 1"
+                } else {
+                    ""
+                }
             ));
         }
     }
