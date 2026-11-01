@@ -1,0 +1,16 @@
+[package]
+name = "roadgen-commonroad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto a CommonRoad scenario"
+
+[dependencies]
+roadgen-core.workspace = true
+quick-xml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

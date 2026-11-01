@@ -81,7 +81,9 @@ jobs:
           # which is how a Cosmos reader reads it. sumolib reads the SUMO network.
           # protobuf and grpcio-tools (which bundles protoc) compile the IR schema
           # for the importer that reads a document knowing nothing of roadgen.
-          pip install maturin pytest pandas pyarrow sumolib protobuf grpcio-tools
+          # commonroad-io is how a CommonRoad planner reads a scenario, and ships
+          # the schema lxml validates it against.
+          pip install maturin pytest pandas pyarrow sumolib protobuf grpcio-tools commonroad-io lxml
           maturin build --release --out dist
           pip install --find-links dist roadgen
       - name: Test

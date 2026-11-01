@@ -1332,6 +1332,33 @@ impl PyMap {
         Ok(roadgen_womd::check(map, None))
     }
 
+    /// What a CommonRoad export loses: the heights a lanelet in the plane has none
+    /// of, the light timing the map does not hold, the signs CommonRoad's catalogue
+    /// does not have and the rules it can only hold as signs.
+    ///
+    /// Kept apart from `format_warnings` for the same reason as the GPUDrive ones.
+    /// Pass the same arguments as `export_commonroad` to have them checked too.
+    #[pyo3(signature = (
+        benchmark_id = None,
+        planning_problem = true,
+        elevation = false,
+    ))]
+    fn commonroad_warnings(
+        &mut self,
+        benchmark_id: Option<&str>,
+        planning_problem: bool,
+        elevation: bool,
+    ) -> PyResult<Vec<String>> {
+        let config = self.commonroad_config(CommonRoadArgs {
+            benchmark_id,
+            planning_problem,
+            elevation,
+            ..CommonRoadArgs::default()
+        })?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(roadgen_commonroad::check(map, Some(&config)))
+    }
+
     /// Writes the IR dump: every road, lane, junction, connection, object, rule and
     /// building by its identifier, with what it belongs to and connects to, and
     /// none of its geometry.
@@ -1697,6 +1724,71 @@ impl PyMap {
         Ok(())
     }
 
+    /// Writes the map as a CommonRoad scenario: one XML document of the 2020a
+    /// schema, which `commonroad-io`'s `CommonRoadFileReader` reads as it is.
+    ///
+    /// The scenario is the lanelet network — every driving and bicycle lane and
+    /// footway, with its bounds, its predecessors and successors and the lanelets
+    /// beside it, and every crossing — the traffic signs and lights on it, an
+    /// intersection per junction, and one planning problem: from rest at the start
+    /// of the map's first lane to the end of the route from it, within
+    /// `goal_steps` time steps of `time_step` seconds (by default, long enough to
+    /// drive it at 5 m/s). `planning_problem=False` leaves it out, which the schema
+    /// does not allow. Points are in the plane unless `elevation` is true.
+    ///
+    /// `benchmark_id` defaults to `ZAM_<map name>-1_1_T-1` and `date` to today.
+    ///
+    /// Also writes `<path>.trace.json` — which lanelet each lane became, and which
+    /// sign, light and intersection each object, rule and junction — unless `trace`
+    /// is false.
+    #[pyo3(signature = (
+        path,
+        benchmark_id = None,
+        author = None,
+        affiliation = None,
+        source = None,
+        date = None,
+        time_step = None,
+        planning_problem = true,
+        goal_steps = None,
+        elevation = false,
+        trace = true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn export_commonroad(
+        &mut self,
+        path: PathBuf,
+        benchmark_id: Option<&str>,
+        author: Option<&str>,
+        affiliation: Option<&str>,
+        source: Option<&str>,
+        date: Option<&str>,
+        time_step: Option<f64>,
+        planning_problem: bool,
+        goal_steps: Option<u64>,
+        elevation: bool,
+        trace: bool,
+    ) -> PyResult<()> {
+        let config = self.commonroad_config(CommonRoadArgs {
+            benchmark_id,
+            author,
+            affiliation,
+            source,
+            date,
+            time_step,
+            planning_problem,
+            goal_steps,
+            elevation,
+        })?;
+        let map = self.built.as_ref().expect("just built");
+        let written =
+            roadgen_commonroad::write_traced(map, &path, &config).map_err(runtime_error)?;
+        if trace {
+            self.write_sidecar(&written, roadgen_trace::sidecar_path(&path))?;
+        }
+        Ok(())
+    }
+
     /// Writes the map as a CARLA UE5 asset package.
     ///
     /// A folder holding the descriptor CARLA's `Import.py` reads, and under it the
@@ -2010,6 +2102,47 @@ impl PyMap {
         let map = self.built.as_ref().expect("just built");
         let bytes = roadgen_womd::to_bytes(map, &config).map_err(runtime_error)?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// The CommonRoad scenario as an XML string, with the same arguments as
+    /// `export_commonroad`.
+    #[pyo3(signature = (
+        benchmark_id = None,
+        author = None,
+        affiliation = None,
+        source = None,
+        date = None,
+        time_step = None,
+        planning_problem = true,
+        goal_steps = None,
+        elevation = false,
+    ))]
+    #[allow(clippy::wrong_self_convention, clippy::too_many_arguments)]
+    fn to_commonroad_xml(
+        &mut self,
+        benchmark_id: Option<&str>,
+        author: Option<&str>,
+        affiliation: Option<&str>,
+        source: Option<&str>,
+        date: Option<&str>,
+        time_step: Option<f64>,
+        planning_problem: bool,
+        goal_steps: Option<u64>,
+        elevation: bool,
+    ) -> PyResult<String> {
+        let config = self.commonroad_config(CommonRoadArgs {
+            benchmark_id,
+            author,
+            affiliation,
+            source,
+            date,
+            time_step,
+            planning_problem,
+            goal_steps,
+            elevation,
+        })?;
+        let map = self.built.as_ref().expect("just built");
+        roadgen_commonroad::to_xml(map, &config).map_err(runtime_error)
     }
 
     // `&mut self` because the map builds itself on demand; the name is the one the
@@ -2991,6 +3124,39 @@ impl PyMap {
         Ok(config)
     }
 
+    /// The scenario configuration the CommonRoad methods share: the map's own
+    /// defaults and the arguments over them.
+    fn commonroad_config(
+        &mut self,
+        args: CommonRoadArgs<'_>,
+    ) -> PyResult<roadgen_commonroad::ScenarioConfig> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let mut config = roadgen_commonroad::ScenarioConfig::for_map(map);
+        if let Some(id) = args.benchmark_id {
+            config.benchmark_id = id.to_owned();
+        }
+        if let Some(author) = args.author {
+            config.author = author.to_owned();
+        }
+        if let Some(affiliation) = args.affiliation {
+            config.affiliation = affiliation.to_owned();
+        }
+        if let Some(source) = args.source {
+            config.source = source.to_owned();
+        }
+        if let Some(date) = args.date {
+            config.date = Some(date.to_owned());
+        }
+        if let Some(time_step) = args.time_step {
+            config.time_step = time_step;
+        }
+        config.planning_problem = args.planning_problem;
+        config.goal_steps = args.goal_steps;
+        config.elevation = args.elevation;
+        Ok(config)
+    }
+
     /// The scenario configuration the WOMD methods share: the map's own defaults and
     /// the arguments over them.
     fn womd_config(
@@ -3016,6 +3182,36 @@ impl PyMap {
             config.current_time_index = index;
         }
         Ok(config)
+    }
+}
+
+/// The arguments the CommonRoad methods take, gathered so that each method passes
+/// them on in one piece.
+struct CommonRoadArgs<'a> {
+    benchmark_id: Option<&'a str>,
+    author: Option<&'a str>,
+    affiliation: Option<&'a str>,
+    source: Option<&'a str>,
+    date: Option<&'a str>,
+    time_step: Option<f64>,
+    planning_problem: bool,
+    goal_steps: Option<u64>,
+    elevation: bool,
+}
+
+impl Default for CommonRoadArgs<'_> {
+    fn default() -> Self {
+        CommonRoadArgs {
+            benchmark_id: None,
+            author: None,
+            affiliation: None,
+            source: None,
+            date: None,
+            time_step: None,
+            planning_problem: true,
+            goal_steps: None,
+            elevation: false,
+        }
     }
 }
 

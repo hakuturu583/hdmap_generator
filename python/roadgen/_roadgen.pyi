@@ -248,6 +248,12 @@ class Map:
     def rdshq_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def gpudrive_warnings(self, scenario: Optional[str] = None) -> list[str]: ...
     def womd_warnings(self) -> list[str]: ...
+    def commonroad_warnings(
+        self,
+        benchmark_id: Optional[str] = None,
+        planning_problem: bool = True,
+        elevation: bool = False,
+    ) -> list[str]: ...
     def carla_warnings(
         self,
         name: Optional[str] = None,
@@ -320,6 +326,21 @@ class Map:
         trace: bool = True,
     ) -> None:
         """Writes a TFRecord file holding one Waymo Open Motion `Scenario`."""
+    def export_commonroad(
+        self,
+        path: str,
+        benchmark_id: Optional[str] = None,
+        author: Optional[str] = None,
+        affiliation: Optional[str] = None,
+        source: Optional[str] = None,
+        date: Optional[str] = None,
+        time_step: Optional[float] = None,
+        planning_problem: bool = True,
+        goal_steps: Optional[int] = None,
+        elevation: bool = False,
+        trace: bool = True,
+    ) -> None:
+        """Writes a CommonRoad 2020a XML scenario: lanelets, signs, lights, intersections and a planning problem."""
     def export_carla(
         self,
         directory: str,
@@ -365,6 +386,18 @@ class Map:
         current_time_index: Optional[int] = None,
     ) -> bytes:
         """One serialized `waymo.open_dataset.Scenario`, not framed as a TFRecord."""
+    def to_commonroad_xml(
+        self,
+        benchmark_id: Optional[str] = None,
+        author: Optional[str] = None,
+        affiliation: Optional[str] = None,
+        source: Optional[str] = None,
+        date: Optional[str] = None,
+        time_step: Optional[float] = None,
+        planning_problem: bool = True,
+        goal_steps: Optional[int] = None,
+        elevation: bool = False,
+    ) -> str: ...
     def to_opendrive_xml(self) -> str: ...
     def to_lanelet2_osm(self) -> str: ...
     def to_osm_xml(self) -> str: ...
