@@ -105,7 +105,7 @@ pub use structure::{
 pub use terrain::{Tin, TinBreakline, TinError, TinLocator, TinSurface};
 pub use topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
-    RoadLink, RoadLinkTarget,
+    RoadLink, RoadLinkTarget, Turn,
 };
 pub use trace::{IrRef, Relation, Trace, TraceLink};
 pub use units::{GeoOrigin, PositiveWidth, SpeedLimit};

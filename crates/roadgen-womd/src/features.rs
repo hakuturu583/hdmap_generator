@@ -76,7 +76,11 @@ pub(crate) fn all_traced(
         ids: &ids,
         polylines: &polylines,
         graph: graph(map, &ids),
-        speeds: rule_speeds(map),
+        speeds: map
+            .rule_speed_limits()
+            .into_iter()
+            .map(|(lane, (limit, _))| (lane, limit))
+            .collect(),
         sections: map
             .roads
             .iter()
@@ -178,29 +182,6 @@ fn graph<'a>(
         graph.entry(to).or_default().0.push(from_id);
     }
     graph
-}
-
-/// The limit each lane a speed-limit rule names is held to: where several rules
-/// name one lane, the lowest, which is the one a driver has to keep to — as the
-/// SUMO export reads it.
-fn rule_speeds(map: &ValidatedMap) -> HashMap<&LaneId, SpeedLimit> {
-    let mut speeds: HashMap<&LaneId, SpeedLimit> = HashMap::new();
-    for rule in &map.rules {
-        let TrafficRule::SpeedLimit { limit, lanes } = rule else {
-            continue;
-        };
-        for lane in lanes {
-            speeds
-                .entry(lane)
-                .and_modify(|held| {
-                    if limit.mps() < held.mps() {
-                        *held = *limit;
-                    }
-                })
-                .or_insert(*limit);
-        }
-    }
-    speeds
 }
 
 /// A boundary feature as the lanes beside it refer to it.

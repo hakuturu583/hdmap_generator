@@ -6,7 +6,7 @@
 //! junctions, the connections between them, 3D geometry and semantics — with each of
 //! those concerns kept in its own module.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::arena::Arena;
 use crate::buildings::{Building, BuildingPart};
@@ -714,6 +714,33 @@ impl Map {
             }
         }
         carriers
+    }
+
+    /// The limit each lane a speed-limit rule names is held to, with the index in
+    /// [`Map::rules`] of the rule that holds it: where several rules name one lane,
+    /// the lowest — the one a driver has to keep to — and the first of equals.
+    ///
+    /// A lane no rule names is held to its own [`Lane::speed_limit`], if any; this
+    /// is only the rules. It is the one reading of them the exports share, so that
+    /// SUMO, WOMD and CommonRoad hold a lane to the same limit.
+    pub fn rule_speed_limits(&self) -> HashMap<&LaneId, (SpeedLimit, usize)> {
+        let mut limits: HashMap<&LaneId, (SpeedLimit, usize)> = HashMap::new();
+        for (index, rule) in self.rules.iter().enumerate() {
+            let TrafficRule::SpeedLimit { limit, lanes } = rule else {
+                continue;
+            };
+            for lane in lanes {
+                limits
+                    .entry(lane)
+                    .and_modify(|held| {
+                        if limit.mps() < held.0.mps() {
+                            *held = (*limit, index);
+                        }
+                    })
+                    .or_insert((*limit, index));
+            }
+        }
+        limits
     }
 
     /// Lanes of a road, in cross-section order.

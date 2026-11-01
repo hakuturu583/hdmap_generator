@@ -1,4 +1,4 @@
-"""Generate 3D road networks and write them as OpenDRIVE, Lanelet2, OSM, SUMO, ClipGT, RDS-HQ, GPUDrive, WOMD or a CARLA package.
+"""Generate 3D road networks and write them as OpenDRIVE, Lanelet2, OSM, SUMO, ClipGT, RDS-HQ, GPUDrive, WOMD, CommonRoad or a CARLA package.
 
 The road network itself — topology, geometry, semantics, validation — lives in
 Rust. This package is the front end: every object here is a handle on something
@@ -31,6 +31,7 @@ the Rust core owns, so there is one model of the map and not two.
     m.export_rdshq("rds_hq/")
     m.export_gpudrive("scene.json")
     m.export_womd("map.tfrecord")
+    m.export_commonroad("scenario.xml")
     m.export_carla("Import/")                  # a CARLA UE5 asset package
 
 A town can be generated beside the roads, and the only two things to say about

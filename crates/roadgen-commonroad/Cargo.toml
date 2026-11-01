@@ -1,0 +1,26 @@
+[package]
+name = "roadgen-commonroad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto a CommonRoad scenario"
+
+[dependencies]
+roadgen-core.workspace = true
+# The PROJ string the OpenDRIVE export georeferences the same metres with, so the
+# two files place the map in one spot rather than two that nearly agree.
+roadgen-opendrive.workspace = true
+quick-xml.workspace = true
+# The 2024 map is a protocol buffer of CommonRoad's own schema, compiled from
+# `proto/` the way the WOMD export compiles Waymo's.
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

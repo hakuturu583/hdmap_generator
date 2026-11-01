@@ -61,6 +61,13 @@ under its own terms.
   are removed, as the file itself says. Only the schema is included, not the dataset;
   the dataset is under its own terms, which this project does not touch.
 
+* CommonRoad 2024 map protocol buffer schema
+  (https://github.com/CommonRoad/commonroad-io, `scenario_definition/protobuf_format/`)
+  `crates/roadgen-commonroad/proto/map/*.proto` and `proto/common/*.proto`,
+  Copyright 2021 Technical University of Munich, Professorship of Cyber-Physical
+  Systems, BSD 3-Clause; the licence is carried beside them as `proto/LICENSE.txt`.
+  The files are unmodified; only the map and the common messages it uses are included.
+
 --------------------------------------------------------------------------------
 Assets a CARLA package fetches
 --------------------------------------------------------------------------------

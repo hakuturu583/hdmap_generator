@@ -84,22 +84,10 @@ pub fn one_way(subtype: &str) -> &'static str {
 }
 
 /// The `turn_direction` of a lanelet through a junction whose heading swings by
-/// `swing` radians, counter-clockwise positive: `straight` within 45 degrees either
-/// way, else `left` or `right`.
-///
-/// 45 degrees is half a right angle, so a turn at an ordinary crossroads (90) and
-/// a straight on that bends to meet a skewed arm (CARLA's run to about 15) fall
-/// clearly to either side.
+/// `swing` radians, counter-clockwise positive: [`Turn::from_swing`]'s reading,
+/// spelt `straight`, `left` or `right`.
 pub fn turn_direction(swing: f64) -> &'static str {
-    use std::f64::consts::{PI, TAU};
-    let swing = (swing + PI).rem_euclid(TAU) - PI;
-    if swing.abs() <= PI / 4.0 {
-        "straight"
-    } else if swing > 0.0 {
-        "left"
-    } else {
-        "right"
-    }
+    roadgen_core::Turn::from_swing(swing).as_str()
 }
 
 /// Is a traffic sign of this catalogue code a stop sign?

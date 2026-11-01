@@ -4,8 +4,8 @@ Generate 3D road networks — with a town beside them, or an open-pit mine round
 if you want one — and write the
 same network out as **OpenDRIVE**, as an **Autoware-ready Lanelet2** map, as plain
 **OpenStreetMap**, as a **SUMO** network, as a **CARLA UE5 asset package**, as a
-**ClipGT** clip and an **RDS-HQ** clip for NVIDIA Cosmos, as a **GPUDrive** scene, and
-as the map of a **Waymo Open Motion Dataset** scenario.
+**ClipGT** clip and an **RDS-HQ** clip for NVIDIA Cosmos, as a **GPUDrive** scene, as
+the map of a **Waymo Open Motion Dataset** scenario, and as a **CommonRoad** scenario.
 
 This is a generator, not a converter. You describe roads, lanes, junctions and the
 movements between them, and the library builds the geometry and writes the files.
@@ -51,6 +51,8 @@ m.export_clipgt("clip/")
 m.export_rdshq("rds_hq/")       # the layout Cosmos-Drive-Dreams renders from
 m.export_gpudrive("scene.json")
 m.export_womd("map.tfrecord")
+m.export_commonroad("scenario.xml")   # lanelets, signs, lights, a planning problem
+m.export_commonroad_map("map.pb")     # the map alone, CommonRoad's 2024 protobuf
 ```
 
 ## How it is put together
@@ -86,6 +88,8 @@ m.export_womd("map.tfrecord")
                      ├──▶ RDS-HQ         WebDataset .tar     `tar`
                      ├──▶ GPUDrive       scene .json         `serde_json`
                      ├──▶ WOMD           .tfrecord Scenario  `prost`
+                     ├──▶ CommonRoad     scenario .xml       `quick-xml`
+                     ├──▶ CommonRoad     map .pb (2024)      `prost`
                      └──▶ the IR itself  .roadgen.pb         `prost`
 
               the written files ──▶ roadgen-viewer ──▶ SVG
@@ -272,6 +276,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
 | `gpudrive_warnings(scenario=None)` | what a GPUDrive export would lose, and what its scene runs up against |
 | `womd_warnings()` | what a Waymo Open Motion scenario would lose |
+| `commonroad_warnings(benchmark_id=, planning_problem=, elevation=, light_cycle=)` | what a CommonRoad scenario would lose |
 | `carla_warnings(name=, package=, buildings=, ...)` | what a CARLA package cannot carry, and what its import will get wrong quietly |
 | `osm_warnings()` | what a plain OpenStreetMap export would lose |
 | `sumo_warnings()` | what a SUMO export would lose |
@@ -282,6 +287,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
 | `export_womd(path, scenario_id=, steps=, time_step=, current_time_index=)` | write a TFRecord holding one Waymo Open Motion `Scenario` |
+| `export_commonroad(path, benchmark_id=, author=, affiliation=, source=, date=, time_step=, planning_problem=, goal_steps=, elevation=, light_cycle=)` | write a CommonRoad 2020a XML scenario |
 | `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=, furniture=, carla_root=, engine=, sun_altitude=, sun_azimuth=)` | write a CARLA UE5 package and the script that imports it; returns what was written and what each mesh will be tagged |
 | `export_pointcloud_map(directory, name=, buildings=, kerb_height=, verge_width=, ground_extent=, spacing=, cell_size=)` | write Autoware's point-cloud map of the surface a CARLA package is built of: `pointcloud_map/*.pcd` and `pointcloud_map_metadata.yaml`, in the Lanelet2 map's frame |
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
@@ -290,6 +296,9 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `carla_water(carla_root, package, map_name, engine=, descriptor=, flowing=, still=)` | after `Import.py`: put the Unreal materials the descriptor names in the water's slots — `M_Water_Flowing` on rivers, whose UVs run downstream for a panning normal map, and `M_Water_Still` on lakes and ponds |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `to_womd_bytes(scenario_id=, steps=, time_step=, current_time_index=)` | one serialized `Scenario`, not framed as a TFRecord |
+| `to_commonroad_xml(...)` | the CommonRoad scenario as a string, with `export_commonroad`'s arguments |
+| `export_commonroad_map(path, benchmark_id=, author=, affiliation=, source=, date=, elevation=)` | write the map alone as a CommonRoad 2024 `CommonRoadMap` protocol buffer |
+| `to_commonroad_map_bytes(...)` / `commonroad_map_warnings(benchmark_id=, elevation=)` | the same, as bytes; and what it would lose |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 | `render_opendrive(path)` / `render_sumo(directory)` / `render_carla(path)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
 | `read_opendrive(path, sampling=, origin=, projection=)` | read an OpenDRIVE file as a `Map` — one that exports like any other and cannot be added to |
@@ -768,7 +777,8 @@ part/high_street/left/3/0/1        ← the one standing on it
 | **OpenStreetMap** | [Simple 3D Buildings](https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings): the outline as a closed `building=<kind>` way, a `building:part=yes` way per part where there is more than one, with `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and `roof:direction`. The solid survives; the frontage, a sloping base and the union of several parts' outlines do not, and `check` says so. |
 | **OpenDRIVE** | one `<object type="building">` carrying an `<outline>` per part, corners as `<cornerLocal>`. The massing survives; the roof shape does not, and `format_warnings()` says how many were flattened. |
 | **CARLA** | actual walls and roofs, from `Solid::shell()`. The whole solid survives — it is the only export that draws the roof rather than describing it — but CARLA's import will tag it `Terrain` unless the town is exported as [props](#where-the-town-goes-and-why-it-is-a-choice), in which case it is tagged and the package's script places it. |
-| Lanelet2, SUMO, ClipGT, GPUDrive, WOMD | nothing; each one's warnings say how many were dropped. |
+| **CommonRoad map** | each part's outline in plan, as an environment obstacle of type `BUILDING`. Heights and roofs are not written. |
+| Lanelet2, SUMO, ClipGT, GPUDrive, WOMD, the CommonRoad scenario | nothing; each one's warnings say how many were dropped. |
 
 OSM measures a roof's direction clockwise from north, as a bearing; the IR measures it
 anticlockwise from east, as an angle. That conversion is the whole of the difference
@@ -2456,6 +2466,99 @@ survives as its outline of road edges, a verge not at all — and the lane width
 with them. Feature ids are numbered as they are written. `Map.womd_warnings()` says all of
 that.
 
+## CommonRoad
+
+[CommonRoad](https://commonroad.in.tum.de/) is the benchmark format of TU Munich's
+motion-planning suite: one XML document holding a lanelet network, the traffic signs
+and lights on it, its intersections, any other traffic, and the planning problems posed
+on it. `export_commonroad` writes the 2020a schema that
+[`commonroad-io`](https://pypi.org/project/commonroad-io/) ships and validates against,
+so its `CommonRoadFileReader` opens the file as it is, and the scenario goes straight to
+a planner, CommonRoad's route planner or its drivability checker.
+
+```python
+m.export_commonroad("scenario.xml")              # ZAM_<map name>-1_1_T-1, dated today
+xml = m.to_commonroad_xml(benchmark_id="ZAM_Town-1_1_T-1", date="2026-01-01",
+                          time_step=0.1, goal_steps=300, elevation=True)
+m.export_commonroad("lit.xml", light_cycle="default")   # the lights run a cycle
+m.export_commonroad("own.xml", light_cycle=[("red", 30), ("redYellow", 2),
+                                            ("green", 25), ("yellow", 3)])
+```
+
+| Element | What goes in it |
+| --- | --- |
+| `lanelet` | each driving lane, bicycle lane and footway: its left and right bound in travel order, as many points each, with the paint on them (`solid`, `dashed`, `solid_solid`, `solid_dashed`, `curb`, …); its predecessors and successors; the lanelet beside it on either side and whether it runs the same way; what it is (`urban`, `country`, `highway`, `mainCarriageWay`, `accessRamp`, `exitRamp`, `bicycleLane`, `sidewalk`, and `intersection` for a lane through a junction) and who uses it — vehicles or bicycles one way, pedestrians both ways. A crossing is a `crosswalk` lanelet too |
+| `trafficSign` | the map's signs CommonRoad's catalogue has, by their German number — a stop sign however its code is spelt is `206`, and `274-50` is a 50 km/h limit; a virtual `274` for each distinct speed limit, held in metres per second; a virtual `205` give-way for each right-of-way rule. Each is referred to by the lanelets it governs, and a stop or a give-way puts a `stopLine` across them, at the stop line the map draws when it draws one |
+| `trafficLight` | each light where it stands, referred to by the lanes that stop for it, which stop at its stop line; dark — one `inactive` phase — unless `light_cycle` gives it a cycle |
+| `intersection` | each junction a street meets — the crossroad end of a slip road too — with an incoming per approach, the lanes of one road going one way, and the lanelets each turns into, sorted `successorsLeft`, `successorsStraight` and `successorsRight` by how far they swing; the crossings at its mouths |
+| `planningProblem` | the schema requires one: from rest at the start of the map's first lane to the end of the route the map's own policy drives from it, within the time it takes at 5 m/s, or `goal_steps` steps |
+
+**Ids are one space.** Lanelets, signs, lights, intersections, their incomings and the
+planning problem are numbered from 1 in that order, as the schema keys them. The scenario
+is set in Zamunda (`ZAM`), the country CommonRoad keeps for scenarios that are nowhere
+real, whose signs are Germany's; the origin's latitude and longitude go in `location`,
+with the same PROJ string the OpenDRIVE export writes as its `geoReference`, so that a
+tool which reprojects a scenario — the Scenario Designer, say — puts both files in one
+place.
+
+**A lanelet lies in the plane** unless `elevation=True`. The schema allows a `z`, but
+CommonRoad's tools work in two dimensions, so where one road passes over another the two
+lanelets cross, unconnected.
+
+**Footways are walked both ways**, and the IR joins pavements end to end whichever way
+each is drawn. CommonRoad's successor runs from one lanelet's end to the next one's
+start, so a pavement round a junction's corner is written the way that links it to the
+pavements either side, and a link that joins two ends that both lead out cannot be said.
+
+**Light timing is asked for, not read.** The IR has no signal timing, so a light is
+dark unless `light_cycle` gives it one: `"default"` for the Scenario Designer's own —
+red 6 s, red and amber 1 s, green 6 s, amber 1 s — or a list of `(colour, seconds)`.
+Every light runs the same cycle, but not in step: at each junction, the lights on the
+approaches across the first one run behind it by the time the cycle takes to reach
+green, so north–south and east–west take turns. That works when the time to green is
+half the cycle, as the default's is; `commonroad_warnings(light_cycle=...)` says when a
+cycle would put crossing directions on green together. A junction approached from more
+than two directions still has only two groups.
+
+**What it cannot carry.** There is no other traffic, only the planning problem. Right of way is a
+give-way sign on the lanes that yield, not a relation to the lanes they yield to. A
+speed-limit sign holds, in CommonRoad, along the lanelets after it until the next, so a
+lane with no limit of its own takes the one before it. Shoulders, borders, parking
+strips and verges are not lanelets; buildings, barriers, structures and terrain are not
+written; and a junction of motorways and slip roads alone is a merge, not an
+intersection. `Map.commonroad_warnings()` says all of that.
+
+### The map alone: CommonRoad 2024
+
+The 2020a XML above is a *scenario*, and its schema will not have one without a
+planning problem. CommonRoad's 2024 format splits a scenario into three files — the
+map, the dynamic part (traffic, light timing) and the scenario that ties them to
+planning problems — and `export_commonroad_map` writes the first: the map and nothing
+more, as one `CommonRoadMap` protocol buffer of CommonRoad's own schema, which
+`commonroad-io` opens with `CommonRoadFileReader(filename_map=path).open_map()`.
+
+```python
+m.export_commonroad_map("map.pb")              # ZAM_<map name>-1, in the plane
+data = m.to_commonroad_map_bytes(elevation=True)
+m.commonroad_map_warnings()
+```
+
+It is the scenario's lanelet network — the same lanelets, ids, signs, lights and
+intersections — cut into the 2024 format's elements:
+
+- **bounds and stop lines are elements of their own** that lanelets refer to by id.
+  Each lanelet has its own two bounds in its direction of travel: the format can share
+  one between neighbours with a "reversed" flag, but `commonroad-io`'s reader ignores
+  the flag, so a shared bound would read backwards on one side. A stop line has its
+  two ends — across the lanelet's end where the map draws none;
+- **signs are named** (`MAX_SPEED`, `STOP`, `YIELD`) rather than numbered, and every
+  one stands somewhere: a virtual speed limit beside the start of the first lanelet
+  it holds on, a virtual give-way beside the end;
+- **a light has no cycle**: timing belongs to the dynamic file, so `light_cycle` does
+  not apply;
+- **the buildings are in it**: every building part is an environment obstacle of type
+  `BUILDING`, its outline in plan.
+
 ## The demo page
 
 <https://hakuturu583.github.io/hdmap_generator/>
@@ -2818,6 +2921,8 @@ one more trace and changes none.
 | ClipGT | `<dir>/<clip id>.clipgt.trace.json` | `<layer>:<row>` — `lane:17`, `lane_line:3`, `wait_line:0` |
 | GPUDrive | `<file>.trace.json` | `road:42`, `agent:1` |
 | WOMD | `<file>.trace.json` | `feature:12`, `signal:12` (the lane state on feature 12) |
+| CommonRoad | `<file>.trace.json` | `lanelet:3`, `traffic_sign:40`, `traffic_light:41`, `intersection:42`, `incoming:43`, `planning_problem:48` |
+| CommonRoad map | `<file>.trace.json` | as CommonRoad, and `boundary:60`, `environment_obstacle:90` |
 | CARLA | `<dir>/<name>.carla.trace.json` | the package's `.xodr` as OpenDRIVE, and `actor:<name>` for each light and sign; the meshes are not traced |
 
 **A file read has a trace too.** `read_opendrive` records which element of the map
@@ -2916,6 +3021,8 @@ roadgen/
 │   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON
 │   ├── roadgen-womd/        lowering onto a Waymo Open Motion `Scenario`, with
 │   │                        Waymo's schema (`proto/`) and the TFRecord framing
+│   ├── roadgen-commonroad/  lowering onto a CommonRoad scenario's XML, and onto
+│   │                        a 2024 map with CommonRoad's schema (`proto/`)
 │   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
 │   ├── roadgen-sumo/        lowering onto SUMO's plain-XML network
 │   ├── roadgen-proto/       the IR as Protocol Buffers: the schema (`proto/`),
@@ -3037,4 +3144,9 @@ The WOMD schema is Waymo's own `map.proto` and `scenario.proto`, from
 [waymo-open-dataset](https://github.com/waymo-research/waymo-open-dataset), under
 Apache-2.0 and carried with their copyright headers; the one change is said at the top
 of `scenario.proto`.
+
+The CommonRoad element names, their order and the sign catalogue were read off the
+2020a XML schema and the reader that `commonroad-io` (BSD-3-Clause) ships; nothing of
+either is carried here. The 2024 map's schema is CommonRoad's own `.proto` files, carried
+unchanged in `crates/roadgen-commonroad/proto/` with their BSD-3-Clause licence.
 Check licence compatibility before adding a dependency.

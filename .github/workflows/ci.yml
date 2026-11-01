@@ -88,3 +88,12 @@ jobs:
         run: python -m pytest tests/python -q
         env:
           ROADGEN_REQUIRE_SUMO: "1"
+      # commonroad-io is how a CommonRoad planner reads a scenario, and ships the
+      # schema lxml validates it against. It pins protobuf 3, which the WOMD and IR
+      # tests' grpcio-tools cannot share, so it gets an environment of its own.
+      - name: CommonRoad
+        run: |
+          python -m venv /tmp/commonroad
+          /tmp/commonroad/bin/pip install pytest lxml commonroad-io
+          /tmp/commonroad/bin/pip install --find-links dist roadgen
+          /tmp/commonroad/bin/python -m pytest tests/python/test_commonroad.py -q

@@ -1566,6 +1566,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "roadgen-commonroad"
+version = "0.41.2"
+dependencies = [
+ "prost",
+ "prost-build",
+ "protox",
+ "quick-xml",
+ "roadgen-core",
+ "roadgen-opendrive",
+ "tempfile",
+]
+
+[[package]]
 name = "roadgen-core"
 version = "0.41.2"
 
@@ -1595,6 +1608,7 @@ dependencies = [
  "roadgen-buildings",
  "roadgen-carla",
  "roadgen-clipgt",
+ "roadgen-commonroad",
  "roadgen-core",
  "roadgen-gpudrive",
  "roadgen-lanelet2",
@@ -1667,6 +1681,7 @@ dependencies = [
  "roadgen-buildings",
  "roadgen-carla",
  "roadgen-clipgt",
+ "roadgen-commonroad",
  "roadgen-core",
  "roadgen-gpudrive",
  "roadgen-lanelet2",
