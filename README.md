@@ -2488,7 +2488,10 @@ xml = m.to_commonroad_xml(benchmark_id="ZAM_Town-1_1_T-1", date="2026-01-01",
 **Ids are one space.** Lanelets, signs, lights, intersections, their incomings and the
 planning problem are numbered from 1 in that order, as the schema keys them. The scenario
 is set in Zamunda (`ZAM`), the country CommonRoad keeps for scenarios that are nowhere
-real, whose signs are Germany's; the origin's latitude and longitude go in `location`.
+real, whose signs are Germany's; the origin's latitude and longitude go in `location`,
+with the same PROJ string the OpenDRIVE export writes as its `geoReference`, so that a
+tool which reprojects a scenario — the Scenario Designer, say — puts both files in one
+place.
 
 **A lanelet lies in the plane** unless `elevation=True`. The schema allows a `z`, but
 CommonRoad's tools work in two dimensions, so where one road passes over another the two

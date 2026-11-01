@@ -16,7 +16,8 @@
 //!
 //! A CommonRoad point is metres in a plane, and the IR's own metres about the map
 //! origin are written as they are; the origin's latitude and longitude go in the
-//! scenario's `location`. The schema allows a `z` but CommonRoad's tools work in
+//! scenario's `location`, with the PROJ string those metres are in — the OpenDRIVE
+//! export's `<geoReference>` — as its `geoReference`. The schema allows a `z` but CommonRoad's tools work in
 //! the plane, so heights are left out unless [`ScenarioConfig::elevation`] asks
 //! for them.
 //!
@@ -230,6 +231,10 @@ pub fn to_scenario_traced(
             geo_name_id: -999,
             latitude: origin.latitude(),
             longitude: origin.longitude(),
+            geo_reference: Some(
+                roadgen_opendrive::geo_reference(map)
+                    .map_err(|error| ExportError::Projection(error.to_string()))?,
+            ),
         },
         tags: network.tags,
         lanelets: network.lanelets,
@@ -640,6 +645,14 @@ mod tests {
         assert!(to_xml(&map, &config.with_elevation(true))
             .unwrap()
             .contains("<z>"));
+    }
+
+    #[test]
+    fn the_scenario_is_georeferenced_as_the_opendrive_export_is() {
+        let map = straight_map();
+        let xml = to_xml(&map, &ScenarioConfig::default()).unwrap();
+        let reference = roadgen_opendrive::geo_reference(&map).unwrap();
+        assert!(xml.contains(&format!("<geoReference>{reference}</geoReference>")));
     }
 
     #[test]

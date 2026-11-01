@@ -10,6 +10,9 @@ description = "Lowers the roadgen canonical IR onto a CommonRoad scenario"
 
 [dependencies]
 roadgen-core.workspace = true
+# The PROJ string the OpenDRIVE export georeferences the same metres with, so the
+# two files place the map in one spot rather than two that nearly agree.
+roadgen-opendrive.workspace = true
 quick-xml.workspace = true
 
 [dev-dependencies]

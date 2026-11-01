@@ -382,6 +382,44 @@ pub fn origin_proj_string(map: &ValidatedMap) -> String {
     proj_string_about(map.metadata.origin)
 }
 
+/// The PROJ string that describes the map's metres: the `<geoReference>` the
+/// OpenDRIVE export writes unless [`Options::geo_reference`] names another, and the
+/// one any other export that georeferences the same coordinates should carry.
+///
+/// PROJ has no exact local east/north/up projection, so a local-Cartesian map is
+/// described as a transverse Mercator at the same origin with unit scale — which
+/// agrees with it to well under a millimetre over the size of a generated map,
+/// and is what consumers of OpenDRIVE expect to find here. A UTM map's metres are
+/// UTM eastings and northings less the origin's, so it is the zone's transverse
+/// Mercator with the origin's easting and northing folded into the false origin:
+/// a bare `+proj=utm` would place the file's `(0, 0)` on the equator.
+pub fn geo_reference(map: &Map) -> Result<String, ExportError> {
+    let origin = map.metadata.origin;
+    Ok(match map.metadata.projection {
+        // MGRS changes how the *Lanelet2* export reports a node's metric
+        // position; the map's own coordinates are still metres about its origin,
+        // so this file describes them the same way either way.
+        Projection::LocalCartesian | Projection::Mgrs => proj_string_about(origin),
+        Projection::Utm => {
+            let (zone, northern, easting, northing) =
+                utmups::forward(origin.latitude(), origin.longitude())
+                    .map_err(|error| ExportError::Projection(error.message().to_owned()))?;
+            // UTM is a transverse Mercator on the zone's central meridian at
+            // scale 0.9996 with a false easting of 500 km and, south of the
+            // equator, a false northing of 10 000 km. Subtracting the origin's
+            // easting and northing from those false values makes the projection
+            // hand back the file's own metres.
+            let false_northing = if northern { 0.0 } else { 10_000_000.0 };
+            format!(
+                "+proj=tmerc +lat_0=0 +lon_0={} +k=0.9996 +x_0={} +y_0={} +datum=WGS84 +units=m +no_defs",
+                utmups::central_meridian(zone),
+                500_000.0 - easting,
+                false_northing - northing
+            )
+        }
+    })
+}
+
 fn proj_string_about(origin: GeoOrigin) -> String {
     format!(
         "+proj=tmerc +lat_0={} +lon_0={} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
@@ -731,43 +769,13 @@ impl<'a> Exporter<'a> {
     /// The coordinates in the file are always the map's own metres about its origin,
     /// whatever the projection — that is what keeps this file in the same frame as
     /// the SUMO, ClipGT, GPUDrive and CARLA exports — so the string here has to
-    /// describe *those* metres, not the frame they were derived from.
-    ///
-    /// PROJ has no exact local east/north/up projection, so a local-Cartesian map is
-    /// described as a transverse Mercator at the same origin with unit scale — which
-    /// agrees with it to well under a millimetre over the size of a generated map,
-    /// and is what consumers of OpenDRIVE expect to find here. A UTM map's metres are
-    /// UTM eastings and northings less the origin's, so it is the zone's transverse
-    /// Mercator with the origin's easting and northing folded into the false origin:
-    /// a bare `+proj=utm` would place the file's `(0, 0)` on the equator.
+    /// describe *those* metres, not the frame they were derived from: the caller's
+    /// own string, or [`geo_reference`]'s.
     fn proj_string(&self) -> Result<String, ExportError> {
-        if let Some(reference) = &self.options.geo_reference {
-            return Ok(reference.clone());
+        match &self.options.geo_reference {
+            Some(reference) => Ok(reference.clone()),
+            None => geo_reference(self.map),
         }
-        let origin = self.map.metadata.origin;
-        Ok(match self.map.metadata.projection {
-            // MGRS changes how the *Lanelet2* export reports a node's metric
-            // position; the map's own coordinates are still metres about its origin,
-            // so this file describes them the same way either way.
-            Projection::LocalCartesian | Projection::Mgrs => proj_string_about(origin),
-            Projection::Utm => {
-                let (zone, northern, easting, northing) =
-                    utmups::forward(origin.latitude(), origin.longitude())
-                        .map_err(|error| ExportError::Projection(error.message().to_owned()))?;
-                // UTM is a transverse Mercator on the zone's central meridian at
-                // scale 0.9996 with a false easting of 500 km and, south of the
-                // equator, a false northing of 10 000 km. Subtracting the origin's
-                // easting and northing from those false values makes the projection
-                // hand back the file's own metres.
-                let false_northing = if northern { 0.0 } else { 10_000_000.0 };
-                format!(
-                    "+proj=tmerc +lat_0=0 +lon_0={} +k=0.9996 +x_0={} +y_0={} +datum=WGS84 +units=m +no_defs",
-                    utmups::central_meridian(zone),
-                    500_000.0 - easting,
-                    false_northing - northing
-                )
-            }
-        })
     }
 
     fn samples(&self, road: &Road) -> Result<Vec<Sample>, GeometryError> {

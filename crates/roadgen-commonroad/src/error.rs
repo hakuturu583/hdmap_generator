@@ -9,6 +9,8 @@ pub enum ExportError {
     Geometry(GeometryError),
     /// The configuration asks for a scenario CommonRoad cannot describe.
     Config(String),
+    /// The map's origin cannot be described in its projection.
+    Projection(String),
     Io(String),
 }
 
@@ -23,6 +25,7 @@ impl fmt::Display for ExportError {
         match self {
             ExportError::Geometry(error) => write!(f, "{error}"),
             ExportError::Config(detail) => write!(f, "the scenario is unusable: {detail}"),
+            ExportError::Projection(detail) => write!(f, "cannot georeference the map: {detail}"),
             ExportError::Io(detail) => write!(f, "{detail}"),
         }
     }

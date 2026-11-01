@@ -44,6 +44,9 @@ pub struct Location {
     pub geo_name_id: i64,
     pub latitude: f64,
     pub longitude: f64,
+    /// The PROJ string the scenario's metres are in, which CommonRoad's tools use
+    /// to put it on the globe.
+    pub geo_reference: Option<String>,
 }
 
 /// A lane boundary as one lanelet sees it.
@@ -184,6 +187,19 @@ impl Scenario {
         doc.text("geoNameId", &self.location.geo_name_id.to_string());
         doc.text("gpsLatitude", &number(self.location.latitude));
         doc.text("gpsLongitude", &number(self.location.longitude));
+        if let Some(reference) = &self.location.geo_reference {
+            // The schema has the transformation after the reference as part of one
+            // sequence, so a scenario that has a reference has the identity too.
+            doc.open("geoTransformation", &[]);
+            doc.text("geoReference", reference);
+            doc.open("additionalTransformation", &[]);
+            doc.text("xTranslation", "0.0");
+            doc.text("yTranslation", "0.0");
+            doc.text("zRotation", "0.0");
+            doc.text("scaling", "1.0");
+            doc.close("additionalTransformation");
+            doc.close("geoTransformation");
+        }
         doc.close("location");
 
         if self.tags.is_empty() {
