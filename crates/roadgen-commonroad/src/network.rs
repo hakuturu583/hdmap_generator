@@ -390,7 +390,9 @@ impl<'a> Builder<'a> {
                 continue;
             };
             let id = self.take_id();
-            let stop = object.kind.is_stop_sign();
+            // Read off the element written, so every spelling the catalogue takes
+            // for a stop — `DE206` as well as `stop` — stops the lanes too.
+            let stop = element.sign_id == signs::STOP;
             for lane in lanes {
                 let line = stop.then(|| self.index.stop_line(lane)).flatten();
                 let lanelet = self.lanelet_mut(lane).expect("written");
@@ -682,19 +684,39 @@ impl<'a> Builder<'a> {
             else {
                 continue;
             };
-            let ids: Vec<u64> = lights
+            let written: Vec<(&ObjectId, u64)> = lights
                 .iter()
-                .filter_map(|light| self.light_ids.get(light).copied())
+                .filter_map(|light| Some((light, *self.light_ids.get(light)?)))
                 .collect();
-            if ids.is_empty() {
+            if written.is_empty() {
                 continue;
             }
+            // The lights a lane stops for: those that govern it themselves, when
+            // any does — a rule over several mouths has a light at each, and they
+            // run in different groups — else every light of the rule.
+            let lights_of = |lane: &LaneId| -> Vec<u64> {
+                let own: Vec<u64> = written
+                    .iter()
+                    .filter(|(light, _)| {
+                        map.objects
+                            .get(light)
+                            .is_some_and(|object| object.lanes.contains(lane))
+                    })
+                    .map(|&(_, id)| id)
+                    .collect();
+                if own.is_empty() {
+                    written.iter().map(|&(_, id)| id).collect()
+                } else {
+                    own
+                }
+            };
             for (line, group) in map.traffic_light_stops(stop_lines, lanes) {
                 let ends = line
                     .as_ref()
                     .and_then(|line| map.objects.get(line))
                     .and_then(line_ends);
                 for lane in &group {
+                    let ids = lights_of(lane);
                     let Some(lanelet) = self.lanelet_mut(lane) else {
                         continue;
                     };
@@ -707,7 +729,7 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
-            for id in ids {
+            for (_, id) in written {
                 trace.link_as(
                     IrRef::Rule(index),
                     format!("traffic_light:{id}"),

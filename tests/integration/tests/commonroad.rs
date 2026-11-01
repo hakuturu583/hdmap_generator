@@ -642,4 +642,49 @@ fn one_rule_over_two_mouths_still_puts_their_lights_in_turn() {
         [0, 70],
         "a light at each mouth, half a cycle apart"
     );
+    // Each approach stops for its own light only, never for the one across it.
+    let approaches: Vec<&roadgen_commonroad::model::Lanelet> = lit
+        .lanelets
+        .iter()
+        .filter(|lanelet| !lanelet.traffic_lights.is_empty())
+        .collect();
+    assert_eq!(approaches.len(), 2);
+    for lanelet in approaches {
+        assert_eq!(lanelet.traffic_lights.len(), 1, "lanelet {}", lanelet.id);
+        let stop = lanelet.stop_line.as_ref().unwrap();
+        assert_eq!(stop.traffic_lights, lanelet.traffic_lights);
+    }
+}
+
+#[test]
+fn a_stop_sign_in_any_spelling_the_catalogue_takes_stops_its_lane() {
+    let mut builder = MapBuilder::new(scenarios::metadata("de_stop"));
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(80.0, 0.0, 0.0),
+                scenarios::two_way(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let forward = LaneRef::new(road, 0);
+    let line = builder.add_stop_line(&forward, LaneEnd::End).unwrap();
+    builder
+        .add_traffic_sign(&forward, LaneEnd::End, "DE206", 2.5)
+        .unwrap();
+    builder.add_right_of_way(vec![], vec![forward], Some(line));
+    let map = builder.finish().unwrap().validate().unwrap();
+    let scenario = scenario(&map);
+
+    let codes: Vec<&str> = scenario
+        .traffic_signs
+        .iter()
+        .map(|sign| sign.elements[0].sign_id)
+        .collect();
+    assert_eq!(codes, ["206"], "the stop sign, and no give-way beside it");
+    let stop = lanelet(&scenario, 1).stop_line.as_ref().expect("it stops");
+    assert!(stop.points.is_some(), "at the line the map draws");
+    assert_eq!(stop.traffic_signs, vec![scenario.traffic_signs[0].id]);
 }

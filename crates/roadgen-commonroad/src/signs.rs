@@ -18,7 +18,7 @@ pub const MAX_SPEED: &str = "274";
 /// Give way.
 pub const YIELD: &str = "205";
 /// Stop.
-const STOP: &str = "206";
+pub const STOP: &str = "206";
 
 /// The sign ids both CommonRoad's 2020a schema and its reader's Zamunda catalogue
 /// know.
