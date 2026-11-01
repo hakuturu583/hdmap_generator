@@ -33,16 +33,20 @@ fn lanelet(scenario: &Scenario, id: u64) -> &Lanelet {
         .unwrap_or_else(|| panic!("no lanelet {id}"))
 }
 
-/// The lanelet a lane became, by the trace.
-fn lanelet_of(map: &ValidatedMap, lane: &LaneId) -> u64 {
+/// The lanelet every written lane became, read off one export's trace.
+fn lanelets_of(map: &ValidatedMap) -> HashMap<LaneId, u64> {
     let (_, trace) = roadgen_commonroad::to_scenario_traced(map, &config(map)).unwrap();
-    let local = trace
-        .links_of(&IrRef::Lane(lane.clone()))
-        .find(|link| link.local.starts_with("lanelet:"))
-        .unwrap_or_else(|| panic!("{lane} became no lanelet"))
-        .local
-        .clone();
-    local["lanelet:".len()..].parse().unwrap()
+    trace
+        .links
+        .iter()
+        .filter_map(|link| match &link.ir {
+            IrRef::Lane(lane) if link.role.as_deref() == Some("lanelet") => Some((
+                lane.clone(),
+                link.local["lanelet:".len()..].parse().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Every id the document declares and every reference it makes, read off the
@@ -134,11 +138,12 @@ fn every_lanelet_has_bounds_of_one_length_that_meet_its_successors() {
 fn the_lanelet_graph_is_the_maps() {
     let map = scenarios::controlled_crossroads();
     let scenario = scenario(&map);
+    let all = lanelets_of(&map);
     let ids: HashMap<&LaneId, u64> = map
         .lanes
         .iter()
         .filter(|lane| lane.lane_type.is_drivable())
-        .map(|lane| (&lane.id, lanelet_of(&map, &lane.id)))
+        .map(|lane| (&lane.id, all[&lane.id]))
         .collect();
     let mut connections = 0;
     for connection in map.connections.iter() {
@@ -211,7 +216,7 @@ fn a_traffic_light_and_a_give_way_stop_the_approach_at_its_line() {
                 && lane.direction == Direction::Forward
         })
         .unwrap();
-    let approach = lanelet(&scenario, lanelet_of(&map, &north.id));
+    let approach = lanelet(&scenario, lanelets_of(&map)[&north.id]);
 
     assert_eq!(scenario.traffic_lights.len(), 1);
     let light = &scenario.traffic_lights[0];
@@ -388,7 +393,8 @@ fn the_planning_problem_drives_the_maps_own_route() {
     };
     let start = map.default_start().unwrap();
     let route = map.route_from(&start);
-    let first = lanelet(&scenario, lanelet_of(&map, &start));
+    let ids = lanelets_of(&map);
+    let first = lanelet(&scenario, ids[&start]);
     // At the middle of the lane where it begins, at rest.
     let middle = first.left.points[0].lerp(first.right.points[0], 0.5);
     assert!(
@@ -401,7 +407,7 @@ fn the_planning_problem_drives_the_maps_own_route() {
     assert_eq!(problem.initial_state.velocity, 0.0);
     assert_eq!(
         problem.goal_states[0].lanelets,
-        vec![lanelet_of(&map, route.last().unwrap())]
+        vec![ids[route.last().unwrap()]]
     );
     assert!(problem.goal_states[0].time.1 > 0);
 

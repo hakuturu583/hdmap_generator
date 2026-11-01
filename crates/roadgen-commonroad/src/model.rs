@@ -46,14 +46,14 @@ pub struct Location {
     pub longitude: f64,
     /// The PROJ string the scenario's metres are in, which CommonRoad's tools use
     /// to put it on the globe.
-    pub geo_reference: Option<String>,
+    pub geo_reference: String,
 }
 
 /// A lane boundary as one lanelet sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bound {
     pub points: Vec<Point3>,
-    pub line_marking: Option<&'static str>,
+    pub line_marking: &'static str,
 }
 
 /// Another lanelet beside this one, and whether it runs the same way.
@@ -65,9 +65,9 @@ pub struct Adjacent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StopLine {
-    /// The line's two ends, or none for a line across the lanelet's end.
+    /// The line's two ends, or none for a line across the lanelet's end. It is
+    /// written as a solid line.
     pub points: Option<[Point3; 2]>,
-    pub line_marking: &'static str,
     pub traffic_signs: Vec<u64>,
     pub traffic_lights: Vec<u64>,
 }
@@ -90,6 +90,35 @@ pub struct Lanelet {
     pub user_bidirectional: Vec<&'static str>,
     pub traffic_signs: Vec<u64>,
     pub traffic_lights: Vec<u64>,
+}
+
+impl Lanelet {
+    /// A lanelet with its bounds and what it is, and nothing yet beside, before
+    /// or after it or governing it.
+    pub fn new(
+        id: u64,
+        left: Bound,
+        right: Bound,
+        lanelet_types: Vec<&'static str>,
+        user_one_way: Vec<&'static str>,
+        user_bidirectional: Vec<&'static str>,
+    ) -> Self {
+        Lanelet {
+            id,
+            left,
+            right,
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+            adjacent_left: None,
+            adjacent_right: None,
+            stop_line: None,
+            lanelet_types,
+            user_one_way,
+            user_bidirectional,
+            traffic_signs: Vec::new(),
+            traffic_lights: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,8 +154,9 @@ pub struct TrafficLight {
     /// The time step the cycle starts at; before it, the cycle is already running,
     /// as far through as it would have got.
     pub time_offset: u64,
-    pub position: Option<Point3>,
-    pub direction: &'static str,
+    /// Where it stands. It governs every movement from the lanes that stop for it:
+    /// its direction is written as `all`.
+    pub position: Point3,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -190,11 +220,11 @@ impl Scenario {
         doc.text("geoNameId", &self.location.geo_name_id.to_string());
         doc.text("gpsLatitude", &number(self.location.latitude));
         doc.text("gpsLongitude", &number(self.location.longitude));
-        if let Some(reference) = &self.location.geo_reference {
+        {
             // The schema has the transformation after the reference as part of one
             // sequence, so a scenario that has a reference has the identity too.
             doc.open("geoTransformation", &[]);
-            doc.text("geoReference", reference);
+            doc.text("geoReference", &self.location.geo_reference);
             doc.open("additionalTransformation", &[]);
             doc.text("xTranslation", "0.0");
             doc.text("yTranslation", "0.0");
@@ -250,9 +280,7 @@ impl Scenario {
         for point in &bound.points {
             self.point(doc, "point", *point);
         }
-        if let Some(marking) = bound.line_marking {
-            doc.text("lineMarking", marking);
-        }
+        doc.text("lineMarking", bound.line_marking);
         doc.close(name);
     }
 
@@ -288,7 +316,7 @@ impl Scenario {
                     self.point(doc, "point", point);
                 }
             }
-            doc.text("lineMarking", stop.line_marking);
+            doc.text("lineMarking", "solid");
             refs(doc, "trafficSignRef", &stop.traffic_signs);
             refs(doc, "trafficLightRef", &stop.traffic_lights);
             doc.close("stopLine");
@@ -342,12 +370,10 @@ impl Scenario {
             doc.text("timeOffset", &light.time_offset.to_string());
         }
         doc.close("cycle");
-        if let Some(position) = light.position {
-            doc.open("position", &[]);
-            self.point(doc, "point", position);
-            doc.close("position");
-        }
-        doc.text("direction", light.direction);
+        doc.open("position", &[]);
+        self.point(doc, "point", light.position);
+        doc.close("position");
+        doc.text("direction", "all");
         doc.text("active", "true");
         doc.close("trafficLight");
     }

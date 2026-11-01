@@ -124,6 +124,18 @@ pub const DEFAULT_LIGHT_CYCLE: [(LightPhase, f64); 4] = [
     (LightPhase::Yellow, 1.0),
 ];
 
+/// How long a cycle runs before its first green — red and red-and-amber, in a
+/// German cycle — in whatever unit its phases are given. The lights across a
+/// junction's first approach run this far behind, which is half the cycle when the
+/// cycle is laid out for two directions to take turns.
+pub(crate) fn before_green<T: Copy + std::iter::Sum<T>>(cycle: &[(LightPhase, T)]) -> T {
+    cycle
+        .iter()
+        .take_while(|(phase, _)| *phase != LightPhase::Green)
+        .map(|&(_, duration)| duration)
+        .sum()
+}
+
 /// How a map is turned into a scenario.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScenarioConfig {
@@ -247,7 +259,9 @@ impl ScenarioConfig {
             .map(Some)
     }
 
-    fn validate(&self) -> Result<(), ExportError> {
+    /// Refuses a configuration CommonRoad cannot describe, and hands back the light
+    /// cycle in time steps, which checking it has worked out.
+    fn validate(&self) -> Result<Option<Vec<(LightPhase, u64)>>, ExportError> {
         if !(self.time_step.is_finite() && self.time_step > 0.0) {
             return Err(ExportError::Config(format!(
                 "the time step is {} s, and has to be a positive number of seconds",
@@ -259,7 +273,7 @@ impl ScenarioConfig {
                 "the goal has to be reachable after one time step at least".into(),
             ));
         }
-        self.light_steps()?;
+        let light_steps = self.light_steps()?;
         if self.benchmark_id.is_empty() {
             return Err(ExportError::Config("the benchmark id is empty".into()));
         }
@@ -270,7 +284,7 @@ impl ScenarioConfig {
                 )));
             }
         }
-        Ok(())
+        Ok(light_steps)
     }
 }
 
@@ -314,13 +328,13 @@ pub fn to_scenario_traced(
     map: &ValidatedMap,
     config: &ScenarioConfig,
 ) -> Result<(Scenario, Trace), ExportError> {
-    config.validate()?;
+    let light_cycle = config.validate()?;
     let mut trace = Trace::new(TRACE_FORMAT);
     let planning = network::Planning {
         enabled: config.planning_problem,
         time_step: config.time_step,
         goal_steps: config.goal_steps,
-        light_cycle: config.light_steps()?,
+        light_cycle,
     };
     let network = network::build(map, &planning, &mut trace)?;
     let origin = map.metadata.origin;
@@ -335,10 +349,8 @@ pub fn to_scenario_traced(
             geo_name_id: -999,
             latitude: origin.latitude(),
             longitude: origin.longitude(),
-            geo_reference: Some(
-                roadgen_opendrive::geo_reference(map)
-                    .map_err(|error| ExportError::Projection(error.to_string()))?,
-            ),
+            geo_reference: roadgen_opendrive::geo_reference(map)
+                .map_err(|error| ExportError::Projection(error.to_string()))?,
         },
         tags: network.tags,
         lanelets: network.lanelets,
@@ -500,20 +512,7 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
                      still has two groups"
                         .to_owned(),
                 );
-                let lasting = |wanted: &[LightPhase]| -> f64 {
-                    cycle
-                        .iter()
-                        .take_while(|(phase, _)| *phase != LightPhase::Green)
-                        .filter(|(phase, _)| wanted.contains(phase))
-                        .map(|(_, seconds)| seconds)
-                        .sum()
-                };
-                let before = lasting(&[
-                    LightPhase::Red,
-                    LightPhase::RedYellow,
-                    LightPhase::Yellow,
-                    LightPhase::Inactive,
-                ]);
+                let before = before_green(cycle);
                 let total: f64 = cycle.iter().map(|(_, seconds)| seconds).sum();
                 if !cycle.iter().any(|(phase, _)| *phase == LightPhase::Green) {
                     problems.push("the light cycle has no green phase".to_owned());
@@ -530,16 +529,8 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
     let unsigned = map
         .objects
         .iter()
-        .filter(|object| match &object.kind {
-            MapObjectKind::TrafficSign { code } => {
-                signs::element(code).is_none()
-                    || !object.lanes.iter().any(|lane| {
-                        map.lane(lane)
-                            .is_some_and(|l| network::is_written(l.lane_type))
-                    })
-            }
-            _ => false,
-        })
+        .filter(|object| matches!(object.kind, MapObjectKind::TrafficSign { .. }))
+        .filter(|object| network::writable_sign(map, object).is_none())
         .count();
     if unsigned > 0 {
         problems.push(format!(

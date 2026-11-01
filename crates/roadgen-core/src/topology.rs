@@ -45,6 +45,44 @@ impl Direction {
     }
 }
 
+/// Which way a movement through a junction turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Turn {
+    Left,
+    Straight,
+    Right,
+}
+
+impl Turn {
+    /// The turn of a movement whose heading swings by `swing` radians between its
+    /// ends, counter-clockwise positive: straight within 45 degrees either way, else
+    /// left or right.
+    ///
+    /// 45 degrees is half a right angle, so a turn at an ordinary crossroads (90) and
+    /// a straight on that bends to meet a skewed arm (CARLA's run to about 15) fall
+    /// clearly to either side. Every export that sorts movements by turn reads them
+    /// this way, so the formats agree on which way a connector goes.
+    pub fn from_swing(swing: f64) -> Turn {
+        use std::f64::consts::{PI, TAU};
+        let swing = (swing + PI).rem_euclid(TAU) - PI;
+        if swing.abs() <= PI / 4.0 {
+            Turn::Straight
+        } else if swing > 0.0 {
+            Turn::Left
+        } else {
+            Turn::Right
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Turn::Left => "left",
+            Turn::Straight => "straight",
+            Turn::Right => "right",
+        }
+    }
+}
+
 /// Which side of the reference line a lane sits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LateralSide {

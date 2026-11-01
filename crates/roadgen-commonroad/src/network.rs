@@ -33,16 +33,16 @@
 //! `traffic_sign:<id>`, `traffic_light:<id>`, `intersection:<id>`,
 //! `incoming:<id>` and `planning_problem:<id>`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use roadgen_core::geometry::{Curve3, Point3, SamplingConfig};
-use roadgen_core::map::Lane;
+use roadgen_core::geometry::{Curve3, Point3, SamplingConfig, UnitVector3};
+use roadgen_core::map::{Lane, SectionEdge};
 use roadgen_core::semantics::{
     BoundaryMarking, MapObject, MapObjectKind, ObjectGeometry, RoadMarking, TrafficRule,
 };
 use roadgen_core::{
     Direction, FormOfWay, IrRef, JunctionId, LaneConnection, LaneId, LaneType, ObjectId, Relation,
-    RoadLinkTarget, RoadType, SpeedLimit, Trace, ValidatedMap,
+    RoadId, RoadLinkTarget, RoadType, SpeedLimit, Trace, Turn, ValidatedMap,
 };
 
 use crate::error::ExportError;
@@ -130,6 +130,7 @@ struct Builder<'a> {
     /// give-way sign beside it.
     stopped: HashSet<&'a LaneId>,
     orientation: Orientation<'a>,
+    index: Index<'a>,
     lanelets: Vec<Lanelet>,
     traffic_signs: Vec<TrafficSign>,
     traffic_lights: Vec<TrafficLight>,
@@ -148,6 +149,7 @@ impl<'a> Builder<'a> {
             light_ids: HashMap::new(),
             stopped: HashSet::new(),
             orientation: Orientation::of(map),
+            index: Index::of(map),
             lanelets: Vec::new(),
             traffic_signs: Vec::new(),
             traffic_lights: Vec::new(),
@@ -206,18 +208,23 @@ impl<'a> Builder<'a> {
             // that runs against it — the way it is written, which for a footway
             // need not be the way it is drawn.
             let reversed = self.orientation.direction(lane) == Direction::Backward;
-            let (left, right) = if reversed {
-                (
-                    lane.right_boundary.reversed(self.config)?,
-                    lane.left_boundary.reversed(self.config)?,
-                )
-            } else {
-                (lane.left_boundary.clone(), lane.right_boundary.clone())
+            // Sampled as drawn and then reversed, as `Lane::travel_polyline` does:
+            // a polyline's vertices are the same either way along it.
+            let sample = |curve: &Curve3| -> Result<Vec<Point3>, ExportError> {
+                let polyline = curve.to_polyline(self.config)?;
+                let polyline = if reversed {
+                    polyline.reversed()
+                } else {
+                    polyline
+                };
+                Ok(polyline.points().to_vec())
             };
-            let (left, right) = matched(
-                left.to_polyline(self.config)?.points(),
-                right.to_polyline(self.config)?.points(),
-            );
+            let (left, right) = if reversed {
+                (sample(&lane.right_boundary)?, sample(&lane.left_boundary)?)
+            } else {
+                (sample(&lane.left_boundary)?, sample(&lane.right_boundary)?)
+            };
+            let (left, right) = matched(left, right);
             let ((left_edge, left_marking), (right_edge, right_marking)) = if reversed {
                 (
                     (lane.right_edge, lane.right_marking),
@@ -230,27 +237,24 @@ impl<'a> Builder<'a> {
                 )
             };
             let (one_way, bidirectional) = users(lane.lane_type);
-            let lanelet = Lanelet {
+            let mut lanelet = Lanelet::new(
                 id,
-                left: Bound {
+                Bound {
                     points: left,
-                    line_marking: Some(line_marking(left_marking, reversed)),
+                    line_marking: line_marking(left_marking, reversed),
                 },
-                right: Bound {
+                Bound {
                     points: right,
-                    line_marking: Some(line_marking(right_marking, reversed)),
+                    line_marking: line_marking(right_marking, reversed),
                 },
-                predecessors: predecessors.remove(&lane.id).unwrap_or_default(),
-                successors: successors.remove(&lane.id).unwrap_or_default(),
-                adjacent_left: self.across(lane, left_edge),
-                adjacent_right: self.across(lane, right_edge),
-                stop_line: None,
-                lanelet_types: self.lanelet_types(lane),
-                user_one_way: one_way,
-                user_bidirectional: bidirectional,
-                traffic_signs: Vec::new(),
-                traffic_lights: Vec::new(),
-            };
+                self.lanelet_types(lane),
+                one_way,
+                bidirectional,
+            );
+            lanelet.predecessors = predecessors.remove(&lane.id).unwrap_or_default();
+            lanelet.successors = successors.remove(&lane.id).unwrap_or_default();
+            lanelet.adjacent_left = self.across(lane, left_edge);
+            lanelet.adjacent_right = self.across(lane, right_edge);
             trace.link_as(
                 lane.id.clone(),
                 format!("lanelet:{id}"),
@@ -265,8 +269,10 @@ impl<'a> Builder<'a> {
     /// The lanelet on the other side of `edge` from `lane`, when it is written and
     /// of the same kind: two lanes a vehicle drives, or two footways.
     fn across(&self, lane: &Lane, edge: i32) -> Option<Adjacent> {
-        let edges = self.map.section_edges(&lane.road, lane.section);
-        let other = edges
+        let other = self
+            .index
+            .sections
+            .get(&(&lane.road, lane.section))?
             .get(&edge)?
             .lanes()
             .find(|other| other.id != lane.id)?;
@@ -311,17 +317,16 @@ impl<'a> Builder<'a> {
 
     /// Whether a slip road's lane leads onto a motorway or off one.
     fn ramp(&self, lane: &Lane) -> Option<&'static str> {
-        let on_motorway = |lanes: Vec<LaneId>| {
+        let on_motorway = |lanes: &[&Lane]| {
             lanes.iter().any(|next| {
                 self.map
-                    .lane(next)
-                    .and_then(|next| self.map.road(&next.road))
+                    .road(&next.road)
                     .is_some_and(|road| road.form == FormOfWay::Motorway)
             })
         };
-        if on_motorway(self.map.successors(&lane.id)) {
+        if on_motorway(self.index.successors(&lane.id)) {
             Some("accessRamp")
-        } else if on_motorway(self.map.predecessors(&lane.id)) {
+        } else if on_motorway(self.index.predecessors(&lane.id)) {
             Some("exitRamp")
         } else {
             None
@@ -348,31 +353,22 @@ impl<'a> Builder<'a> {
                 continue;
             };
             let (left, right) = matched(
-                left.to_polyline(self.config)?.points(),
-                right.to_polyline(self.config)?.points(),
+                left.to_polyline(self.config)?.points().to_vec(),
+                right.to_polyline(self.config)?.points().to_vec(),
             );
             let id = self.take_id();
-            self.lanelets.push(Lanelet {
+            let bound = |points| Bound {
+                points,
+                line_marking: "dashed",
+            };
+            self.lanelets.push(Lanelet::new(
                 id,
-                left: Bound {
-                    points: left,
-                    line_marking: Some("dashed"),
-                },
-                right: Bound {
-                    points: right,
-                    line_marking: Some("dashed"),
-                },
-                predecessors: Vec::new(),
-                successors: Vec::new(),
-                adjacent_left: None,
-                adjacent_right: None,
-                stop_line: None,
-                lanelet_types: vec!["crosswalk"],
-                user_one_way: Vec::new(),
-                user_bidirectional: vec!["pedestrian"],
-                traffic_signs: Vec::new(),
-                traffic_lights: Vec::new(),
-            });
+                bound(left),
+                bound(right),
+                vec!["crosswalk"],
+                Vec::new(),
+                vec!["pedestrian"],
+            ));
             self.crosswalk_ids.insert(&object.id, id);
             trace.link_as(
                 object.id.clone(),
@@ -390,25 +386,13 @@ impl<'a> Builder<'a> {
     fn sign_objects(&mut self, trace: &mut Trace) {
         let map = self.map;
         for object in map.objects.iter() {
-            let MapObjectKind::TrafficSign { code } = &object.kind else {
+            let Some((element, lanes)) = writable_sign(map, object) else {
                 continue;
             };
-            let Some(element) = signs::element(code) else {
-                continue;
-            };
-            let lanes: Vec<&'a LaneId> = object
-                .lanes
-                .iter()
-                .filter(|lane| self.lane_ids.contains_key(lane))
-                .collect();
-            // CommonRoad's reader refuses a sign no lanelet refers to.
-            if lanes.is_empty() {
-                continue;
-            }
             let id = self.take_id();
             let stop = object.kind.is_stop_sign();
             for lane in lanes {
-                let line = stop.then(|| self.stop_line_across(lane)).flatten();
+                let line = stop.then(|| self.index.stop_line(lane)).flatten();
                 let lanelet = self.lanelet_mut(lane).expect("written");
                 push_unique(&mut lanelet.traffic_signs, id);
                 if stop {
@@ -432,48 +416,26 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// The two ends of the first stop line the map draws across `lane`.
-    fn stop_line_across(&self, lane: &LaneId) -> Option<[Point3; 2]> {
-        self.map
-            .objects
-            .iter()
-            .filter(|object| object.kind == MapObjectKind::StopLine)
-            .find(|object| object.lanes.contains(lane))
-            .and_then(line_ends)
-    }
-
     /// One virtual speed-limit sign per distinct limit, referred to by every
     /// lanelet held to it. A lane's limit is the lowest rule over it, or its own
     /// when no rule names it — the reading the SUMO and WOMD exports make.
     fn speed_limits(&mut self, trace: &mut Trace) {
         let map = self.map;
-        let mut ruled: HashMap<&LaneId, (SpeedLimit, usize)> = HashMap::new();
-        for (index, rule) in map.rules.iter().enumerate() {
-            let TrafficRule::SpeedLimit { limit, lanes } = rule else {
-                continue;
-            };
-            for lane in lanes {
-                ruled
-                    .entry(lane)
-                    .and_modify(|held| {
-                        if limit.mps() < held.0.mps() {
-                            *held = (*limit, index);
-                        }
-                    })
-                    .or_insert((*limit, index));
-            }
-        }
+        let ruled = map.rule_speed_limits();
 
         // Keyed by the limit in micrometres per second, so that two limits written
         // the same way share a sign, in the order they are first met.
-        let mut groups: Vec<(i64, SpeedLimit, Vec<u64>, Vec<IrRef>)> = Vec::new();
+        struct Group<'l> {
+            key: i64,
+            limit: SpeedLimit,
+            lanes: Vec<&'l LaneId>,
+            sources: Vec<IrRef>,
+        }
+        let mut groups: Vec<Group> = Vec::new();
         for lane in map.lanes.iter() {
-            if !lane.lane_type.is_drivable() {
+            if !lane.lane_type.is_drivable() || !self.lane_ids.contains_key(&lane.id) {
                 continue;
             }
-            let Some(lanelet) = self.lanelet_of(&lane.id) else {
-                continue;
-            };
             let (limit, source) = match ruled.get(&lane.id) {
                 Some(&(limit, rule)) => (limit, IrRef::Rule(rule)),
                 None => match lane.speed_limit {
@@ -482,37 +444,38 @@ impl<'a> Builder<'a> {
                 },
             };
             let key = (limit.mps() * 1e6).round() as i64;
-            let at = match groups.iter().position(|group| group.0 == key) {
-                Some(at) => at,
-                None => {
-                    groups.push((key, limit, Vec::new(), Vec::new()));
-                    groups.len() - 1
-                }
-            };
-            groups[at].2.push(lanelet);
-            if !groups[at].3.contains(&source) {
-                groups[at].3.push(source);
-            }
+            let at = position_or_push(
+                &mut groups,
+                |group| group.key == key,
+                || Group {
+                    key,
+                    limit,
+                    lanes: Vec::new(),
+                    sources: Vec::new(),
+                },
+            );
+            groups[at].lanes.push(&lane.id);
+            push_unique(&mut groups[at].sources, source);
         }
 
-        for (_, limit, lanelets, sources) in groups {
+        for group in groups {
             let id = self.take_id();
-            for lanelet in &lanelets {
-                let index = self.index_of_lanelet(*lanelet);
-                push_unique(&mut self.lanelets[index].traffic_signs, id);
+            for lane in group.lanes {
+                let lanelet = self.lanelet_mut(lane).expect("written");
+                push_unique(&mut lanelet.traffic_signs, id);
             }
             self.traffic_signs.push(TrafficSign {
                 id,
                 elements: vec![TrafficSignElement {
                     sign_id: signs::MAX_SPEED,
                     // CommonRoad's speed limits are in metres per second.
-                    additional_values: vec![number(limit.mps())],
+                    additional_values: vec![number(group.limit.mps())],
                 }],
                 position: None,
                 virtual_sign: true,
             });
-            let relation = Relation::shared_by(sources.len());
-            for source in sources {
+            let relation = Relation::shared_by(group.sources.len());
+            for source in group.sources {
                 trace.link_as(
                     source,
                     format!("traffic_sign:{id}"),
@@ -521,11 +484,6 @@ impl<'a> Builder<'a> {
                 );
             }
         }
-    }
-
-    fn index_of_lanelet(&self, id: u64) -> usize {
-        // Lane lanelets are numbered from 1 in the order they are stored.
-        (id - 1) as usize
     }
 
     /// One virtual give-way sign per right-of-way rule, referred to by the lanes
@@ -603,13 +561,8 @@ impl<'a> Builder<'a> {
                         color: phase.as_str(),
                     })
                     .collect(),
-                // Half a cycle, as the second group needs it: the time from the
-                // start to the first green.
-                cycle
-                    .iter()
-                    .take_while(|(phase, _)| *phase != crate::LightPhase::Green)
-                    .map(|(_, duration)| duration)
-                    .sum(),
+                // Half a cycle, as the second group needs it.
+                crate::before_green(cycle),
             ),
         };
         let across = self.lights_across()?;
@@ -623,8 +576,7 @@ impl<'a> Builder<'a> {
                 id,
                 cycle: elements.clone(),
                 time_offset: if across.contains(&object.id) { half } else { 0 },
-                position: Some(position(&object.geometry)),
-                direction: "all",
+                position: position(&object.geometry),
             });
             trace.link_as(
                 object.id.clone(),
@@ -703,20 +655,15 @@ impl<'a> Builder<'a> {
                 _ => None,
             });
         let junction = linked.or_else(|| {
-            map.successors(&lane.id).into_iter().find_map(|next| {
-                map.lane(&next)
-                    .and_then(|next| map.road(&next.road))
-                    .and_then(|road| road.junction.as_ref())
-            })
+            self.index
+                .successors(&lane.id)
+                .iter()
+                .find_map(|next| map.road(&next.road).and_then(|road| road.junction.as_ref()))
         });
         let Some(junction) = junction else {
             return Ok(None);
         };
-        let heading = lane
-            .travel_geometry(self.config)?
-            .centerline
-            .end_tangent()?
-            .heading();
+        let heading = travel_tangents(lane)?.1.heading();
         Ok(Some((junction, heading.rem_euclid(std::f64::consts::PI))))
     }
 
@@ -800,27 +747,25 @@ impl<'a> Builder<'a> {
         trace: &mut Trace,
     ) -> Result<Option<Intersection>, ExportError> {
         let map = self.map;
-        let connectors: Vec<&'a Lane> = map
-            .lanes
-            .iter()
+        let connectors: Vec<&'a Lane> = self
+            .index
+            .connectors
+            .get(junction)
+            .into_iter()
+            .flatten()
+            .copied()
             .filter(|lane| lane.lane_type.is_drivable() && self.lane_ids.contains_key(&lane.id))
-            .filter(|lane| {
-                map.road(&lane.road)
-                    .is_some_and(|road| road.junction.as_ref() == Some(junction))
-            })
             .collect();
         // An approach is the lanes of one road going one way, in the order first
         // reached.
-        let mut approaches: Vec<((&'a roadgen_core::RoadId, Direction), Incoming)> = Vec::new();
+        let mut approaches: Vec<((&'a RoadId, Direction), Incoming)> = Vec::new();
         let mut involved: HashSet<&LaneId> = HashSet::new();
         for connector in &connectors {
             involved.insert(&connector.id);
-            let turn = self.turn(connector)?;
+            let (start, end) = travel_tangents(connector)?;
+            let turn = Turn::from_swing(end.heading() - start.heading());
             let connector_id = self.lanelet_of(&connector.id).expect("written");
-            for from in map.predecessors(&connector.id) {
-                let Some(from) = map.lane(&from) else {
-                    continue;
-                };
+            for &from in self.index.predecessors(&connector.id) {
                 if map.is_connector_lane(&from.id) {
                     continue;
                 }
@@ -829,13 +774,11 @@ impl<'a> Builder<'a> {
                 };
                 involved.insert(&from.id);
                 let key = (&from.road, from.direction);
-                let at = match approaches.iter().position(|(k, _)| *k == key) {
-                    Some(at) => at,
-                    None => {
-                        approaches.push((key, Incoming::default()));
-                        approaches.len() - 1
-                    }
-                };
+                let at = position_or_push(
+                    &mut approaches,
+                    |(k, _)| *k == key,
+                    || (key, Incoming::default()),
+                );
                 let incoming = &mut approaches[at].1;
                 push_unique(&mut incoming.incoming_lanelets, from_id);
                 let successors = match turn {
@@ -864,30 +807,15 @@ impl<'a> Builder<'a> {
         let crossing = map
             .objects
             .iter()
-            .filter(|object| object.lanes.iter().any(|lane| involved.contains(lane)))
-            .filter_map(|object| self.crosswalk_ids.get(&object.id).copied())
+            .filter_map(|object| Some((object, *self.crosswalk_ids.get(&object.id)?)))
+            .filter(|(object, _)| object.lanes.iter().any(|lane| involved.contains(lane)))
+            .map(|(_, id)| id)
             .collect();
         Ok(Some(Intersection {
             id,
             incomings,
             crossing,
         }))
-    }
-
-    /// Which way a lane through a junction turns, by how far its heading swings
-    /// between its ends — the reading the Lanelet2 export's `turn_direction` makes.
-    fn turn(&self, lane: &Lane) -> Result<Turn, ExportError> {
-        use std::f64::consts::{PI, TAU};
-        let centreline = lane.travel_geometry(self.config)?.centerline;
-        let swing = centreline.end_tangent()?.heading() - centreline.start_tangent()?.heading();
-        let swing = (swing + PI).rem_euclid(TAU) - PI;
-        Ok(if swing.abs() <= PI / 4.0 {
-            Turn::Straight
-        } else if swing > 0.0 {
-            Turn::Left
-        } else {
-            Turn::Right
-        })
     }
 
     /// A drive from the first lane a vehicle can set off from to the end of the
@@ -922,7 +850,6 @@ impl<'a> Builder<'a> {
             return Ok(());
         };
         let lane = map.lane(first).expect("routed");
-        let centreline: Curve3 = lane.travel_geometry(self.config)?.centerline;
         let mut length = 0.0;
         for lane in &route {
             if let Some(lane) = map.lane(lane) {
@@ -937,8 +864,8 @@ impl<'a> Builder<'a> {
         self.planning_problems.push(PlanningProblem {
             id,
             initial_state: InitialState {
-                position: centreline.start_point(),
-                orientation: centreline.start_tangent()?.heading(),
+                position: lane.entry_point(),
+                orientation: travel_tangents(lane)?.0.heading(),
                 velocity: 0.0,
             },
             goal_states: vec![GoalState {
@@ -955,7 +882,7 @@ impl<'a> Builder<'a> {
     /// The scenario's tags: what kind of roads it has, and that it is made up.
     fn tags(&self) -> Vec<&'static str> {
         let map = self.map;
-        let mut tags = BTreeMap::new();
+        let mut tags = BTreeSet::new();
         for road in map.roads.iter() {
             let tag = if road.form.is_controlled_access() || road.road_type == RoadType::Motorway {
                 "highway"
@@ -964,10 +891,10 @@ impl<'a> Builder<'a> {
             } else {
                 "urban"
             };
-            tags.insert(tag, ());
+            tags.insert(tag);
         }
         if !self.intersections.is_empty() {
-            tags.insert("intersection", ());
+            tags.insert("intersection");
         }
         if self.lanelets.iter().any(|lanelet| {
             lanelet
@@ -976,17 +903,17 @@ impl<'a> Builder<'a> {
                 .chain(lanelet.adjacent_right)
                 .any(|adjacent| adjacent.same_direction)
         }) {
-            tags.insert("multi_lane", ());
+            tags.insert("multi_lane");
         }
         if self.lanelets.iter().any(|lanelet| {
             lanelet
                 .adjacent_left
                 .is_some_and(|adjacent| !adjacent.same_direction)
         }) {
-            tags.insert("oncoming_traffic", ());
+            tags.insert("oncoming_traffic");
         }
-        tags.insert("simulated", ());
-        tags.into_keys().collect()
+        tags.insert("simulated");
+        tags.into_iter().collect()
     }
 }
 
@@ -1004,27 +931,37 @@ pub(crate) struct Orientation<'m> {
 
 impl<'m> Orientation<'m> {
     pub fn of(map: &'m ValidatedMap) -> Self {
-        let mut flipped = HashSet::new();
-        for lane in map.lanes.iter() {
-            if lane.lane_type != LaneType::Sidewalk || !map.is_connector_lane(&lane.id) {
-                continue;
-            }
-            let linked = |reversed: bool| {
-                let mut trial = HashSet::new();
-                if reversed {
-                    trial.insert(&lane.id);
+        let corner = |id: &LaneId| {
+            map.lane(id)
+                .is_some_and(|lane| lane.lane_type == LaneType::Sidewalk)
+                && map.is_connector_lane(id)
+        };
+        // Each corner's own connections, from one pass over them all.
+        let mut touching: HashMap<&LaneId, Vec<&LaneConnection>> = HashMap::new();
+        for connection in map.connections.iter() {
+            for lane in [&connection.from.lane, &connection.to.lane] {
+                if corner(lane) {
+                    touching.entry(lane).or_default().push(connection);
                 }
-                let trial = Orientation { flipped: trial };
-                map.connections
+            }
+        }
+        let mut flipped = HashSet::new();
+        for (lane, connections) in touching {
+            let linked = |reversed: bool| {
+                let trial = Orientation {
+                    flipped: if reversed {
+                        HashSet::from([lane])
+                    } else {
+                        HashSet::new()
+                    },
+                };
+                connections
                     .iter()
-                    .filter(|connection| {
-                        connection.from.lane == lane.id || connection.to.lane == lane.id
-                    })
                     .filter(|connection| trial.link(map, connection).is_some())
                     .count()
             };
             if linked(true) > linked(false) {
-                flipped.insert(&lane.id);
+                flipped.insert(lane);
             }
         }
         Orientation { flipped }
@@ -1078,19 +1015,11 @@ pub(crate) fn is_intersection(map: &ValidatedMap, junction: &JunctionId) -> bool
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Turn {
-    Left,
-    Straight,
-    Right,
-}
-
 /// The lanelet's stop line, made with `ends` the first time it is asked for. A
 /// later rule's line is the same line or none: a lanelet stops once.
 fn stop_line(lanelet: &mut Lanelet, ends: Option<[Point3; 2]>) -> &mut StopLine {
     let line = lanelet.stop_line.get_or_insert_with(|| StopLine {
         points: None,
-        line_marking: "solid",
         traffic_signs: Vec::new(),
         traffic_lights: Vec::new(),
     });
@@ -1148,12 +1077,12 @@ fn line_marking(marking: BoundaryMarking, reversed: bool) -> &'static str {
 /// Two bounds with as many points as each other, which CommonRoad requires: as
 /// they are when they already have, else both resampled to the longer one's count
 /// at even fractions of their own length.
-fn matched(left: &[Point3], right: &[Point3]) -> (Vec<Point3>, Vec<Point3>) {
+fn matched(left: Vec<Point3>, right: Vec<Point3>) -> (Vec<Point3>, Vec<Point3>) {
     if left.len() == right.len() {
-        return (left.to_vec(), right.to_vec());
+        return (left, right);
     }
     let count = left.len().max(right.len()).max(2);
-    (resample(left, count), resample(right, count))
+    (resample(&left, count), resample(&right, count))
 }
 
 fn resample(points: &[Point3], count: usize) -> Vec<Point3> {
@@ -1191,9 +1120,135 @@ fn resample(points: &[Point3], count: usize) -> Vec<Point3> {
     out
 }
 
-fn push_unique(ids: &mut Vec<u64>, id: u64) {
-    if !ids.contains(&id) {
-        ids.push(id);
+fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
+    if !items.contains(&item) {
+        items.push(item);
+    }
+}
+
+/// The index of the first item `matches`, pushing `make()` when there is none.
+fn position_or_push<T>(
+    items: &mut Vec<T>,
+    matches: impl Fn(&T) -> bool,
+    make: impl FnOnce() -> T,
+) -> usize {
+    match items.iter().position(matches) {
+        Some(at) => at,
+        None => {
+            items.push(make());
+            items.len() - 1
+        }
+    }
+}
+
+/// The directions a lane is travelled in where traffic enters it and where it
+/// leaves, read off its centreline as drawn rather than a reversed copy of it.
+fn travel_tangents(lane: &Lane) -> Result<(UnitVector3, UnitVector3), ExportError> {
+    let (start, end) = (
+        lane.centerline.start_tangent()?,
+        lane.centerline.end_tangent()?,
+    );
+    Ok(match lane.direction {
+        Direction::Forward => (start, end),
+        Direction::Backward => (end.reversed(), start.reversed()),
+    })
+}
+
+/// A sign object CommonRoad can hold — one whose code its catalogue has — with
+/// the written lanes it governs, or `None`: CommonRoad's reader refuses a sign no
+/// lanelet refers to.
+pub(crate) fn writable_sign<'m>(
+    map: &'m ValidatedMap,
+    object: &'m MapObject,
+) -> Option<(TrafficSignElement, Vec<&'m LaneId>)> {
+    let MapObjectKind::TrafficSign { code } = &object.kind else {
+        return None;
+    };
+    let element = signs::element(code)?;
+    let lanes: Vec<&LaneId> = object
+        .lanes
+        .iter()
+        .filter(|lane| {
+            map.lane(lane)
+                .is_some_and(|lane| is_written(lane.lane_type))
+        })
+        .collect();
+    (!lanes.is_empty()).then_some((element, lanes))
+}
+
+/// Lookups the builder makes over and over, worked out in one pass each: the IR
+/// keeps connections as one list, and asking it for a lane's successors scans it.
+struct Index<'a> {
+    successors: HashMap<&'a LaneId, Vec<&'a Lane>>,
+    predecessors: HashMap<&'a LaneId, Vec<&'a Lane>>,
+    /// The lanes on each junction's connecting roads, in the map's order.
+    connectors: HashMap<&'a JunctionId, Vec<&'a Lane>>,
+    /// The first stop line the map draws across each lane.
+    stop_lines: HashMap<&'a LaneId, &'a MapObject>,
+    sections: HashMap<(&'a RoadId, usize), BTreeMap<i32, SectionEdge<'a>>>,
+}
+
+impl<'a> Index<'a> {
+    fn of(map: &'a ValidatedMap) -> Self {
+        let mut successors: HashMap<&LaneId, Vec<&Lane>> = HashMap::new();
+        let mut predecessors: HashMap<&LaneId, Vec<&Lane>> = HashMap::new();
+        for connection in map.connections.iter() {
+            let (from, to) = (&connection.from.lane, &connection.to.lane);
+            if let (Some(from_lane), Some(to_lane)) = (map.lane(from), map.lane(to)) {
+                successors.entry(from).or_default().push(to_lane);
+                predecessors.entry(to).or_default().push(from_lane);
+            }
+        }
+        let mut connectors: HashMap<&JunctionId, Vec<&Lane>> = HashMap::new();
+        for lane in map.lanes.iter() {
+            if let Some(junction) = map.road(&lane.road).and_then(|road| road.junction.as_ref()) {
+                connectors.entry(junction).or_default().push(lane);
+            }
+        }
+        let mut stop_lines: HashMap<&LaneId, &MapObject> = HashMap::new();
+        for object in map.objects.iter() {
+            if object.kind == MapObjectKind::StopLine {
+                for lane in &object.lanes {
+                    stop_lines.entry(lane).or_insert(object);
+                }
+            }
+        }
+        let sections = map
+            .roads
+            .iter()
+            .flat_map(|road| {
+                (0..road.sections.len())
+                    .map(move |section| ((&road.id, section), map.section_edges(&road.id, section)))
+            })
+            .collect();
+        Index {
+            successors,
+            predecessors,
+            connectors,
+            stop_lines,
+            sections,
+        }
+    }
+
+    fn successors(&self, lane: &LaneId) -> &[&'a Lane] {
+        self.successors
+            .get(lane)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn predecessors(&self, lane: &LaneId) -> &[&'a Lane] {
+        self.predecessors
+            .get(lane)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// The two ends of the first stop line the map draws across `lane`.
+    fn stop_line(&self, lane: &LaneId) -> Option<[Point3; 2]> {
+        self.stop_lines
+            .get(lane)
+            .and_then(|object| line_ends(object))
     }
 }
 
@@ -1210,7 +1265,7 @@ mod tests {
             Point3::new(4.0, -1.0, 0.0),
             Point3::new(10.0, -1.0, 0.0),
         ];
-        let (left, right) = matched(&left, &right);
+        let (left, right) = matched(left.to_vec(), right.to_vec());
         assert_eq!(left.len(), 3);
         assert_eq!(right.len(), 3);
         assert!((left[1].x - 5.0).abs() < 1e-9);

@@ -1374,7 +1374,7 @@ impl PyMap {
             planning_problem,
             goal_steps,
             elevation,
-            light_cycle: light_cycle.map(light_cycle_arg).transpose()?,
+            light_cycle,
         })?;
         let map = self.built.as_ref().expect("just built");
         Ok(roadgen_commonroad::check(map, Some(&config)))
@@ -1809,7 +1809,7 @@ impl PyMap {
             planning_problem,
             goal_steps,
             elevation,
-            light_cycle: light_cycle.map(light_cycle_arg).transpose()?,
+            light_cycle,
         })?;
         let map = self.built.as_ref().expect("just built");
         let written =
@@ -2173,7 +2173,7 @@ impl PyMap {
             planning_problem,
             goal_steps,
             elevation,
-            light_cycle: light_cycle.map(light_cycle_arg).transpose()?,
+            light_cycle,
         })?;
         let map = self.built.as_ref().expect("just built");
         roadgen_commonroad::to_xml(map, &config).map_err(runtime_error)
@@ -3162,7 +3162,7 @@ impl PyMap {
     /// defaults and the arguments over them.
     fn commonroad_config(
         &mut self,
-        args: CommonRoadArgs<'_>,
+        args: CommonRoadArgs<'_, '_>,
     ) -> PyResult<roadgen_commonroad::ScenarioConfig> {
         self.ensure_built()?;
         let map = self.built.as_ref().expect("just built");
@@ -3188,7 +3188,7 @@ impl PyMap {
         config.planning_problem = args.planning_problem;
         config.goal_steps = args.goal_steps;
         config.elevation = args.elevation;
-        config.light_cycle = args.light_cycle;
+        config.light_cycle = args.light_cycle.map(light_cycle_arg).transpose()?;
         Ok(config)
     }
 
@@ -3222,7 +3222,7 @@ impl PyMap {
 
 /// The arguments the CommonRoad methods take, gathered so that each method passes
 /// them on in one piece.
-struct CommonRoadArgs<'a> {
+struct CommonRoadArgs<'a, 'py> {
     benchmark_id: Option<&'a str>,
     author: Option<&'a str>,
     affiliation: Option<&'a str>,
@@ -3232,7 +3232,8 @@ struct CommonRoadArgs<'a> {
     planning_problem: bool,
     goal_steps: Option<u64>,
     elevation: bool,
-    light_cycle: Option<Vec<(roadgen_commonroad::LightPhase, f64)>>,
+    /// As Python passed it; [`light_cycle_arg`] reads it.
+    light_cycle: Option<&'a Bound<'py, PyAny>>,
 }
 
 /// A `light_cycle` argument: `"default"` or `True` for the default cycle, or a
@@ -3240,20 +3241,15 @@ struct CommonRoadArgs<'a> {
 fn light_cycle_arg(
     value: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<(roadgen_commonroad::LightPhase, f64)>> {
-    if let Ok(flag) = value.extract::<bool>() {
-        if flag {
-            return Ok(roadgen_commonroad::DEFAULT_LIGHT_CYCLE.to_vec());
-        }
-        return Err(PyValueError::new_err(
-            "light_cycle=False is no cycle; leave it out for dark lights",
-        ));
+    let default = value.extract::<bool>().ok() == Some(true)
+        || value.extract::<String>().ok().as_deref() == Some("default");
+    if default {
+        return Ok(roadgen_commonroad::DEFAULT_LIGHT_CYCLE.to_vec());
     }
-    if let Ok(name) = value.extract::<String>() {
-        if name == "default" {
-            return Ok(roadgen_commonroad::DEFAULT_LIGHT_CYCLE.to_vec());
-        }
+    if value.extract::<bool>().is_ok() || value.extract::<String>().is_ok() {
         return Err(PyValueError::new_err(format!(
-            "light_cycle is \"default\" or a list of (colour, seconds), not {name:?}"
+            "light_cycle is \"default\" or a list of (colour, seconds), not {value}; \
+             leave it out for dark lights"
         )));
     }
     let phases: Vec<(String, f64)> = value.extract().map_err(|_| {
