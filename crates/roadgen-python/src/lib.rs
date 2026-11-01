@@ -1340,23 +1340,41 @@ impl PyMap {
     /// Pass the same arguments as `export_commonroad` to have them checked too.
     #[pyo3(signature = (
         benchmark_id = None,
+        author = None,
+        affiliation = None,
+        source = None,
+        date = None,
+        time_step = None,
         planning_problem = true,
+        goal_steps = None,
         elevation = false,
         light_cycle = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn commonroad_warnings(
         &mut self,
         benchmark_id: Option<&str>,
+        author: Option<&str>,
+        affiliation: Option<&str>,
+        source: Option<&str>,
+        date: Option<&str>,
+        time_step: Option<f64>,
         planning_problem: bool,
+        goal_steps: Option<u64>,
         elevation: bool,
         light_cycle: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<String>> {
         let config = self.commonroad_config(CommonRoadArgs {
             benchmark_id,
+            author,
+            affiliation,
+            source,
+            date,
+            time_step,
             planning_problem,
+            goal_steps,
             elevation,
             light_cycle: light_cycle.map(light_cycle_arg).transpose()?,
-            ..CommonRoadArgs::default()
         })?;
         let map = self.built.as_ref().expect("just built");
         Ok(roadgen_commonroad::check(map, Some(&config)))
@@ -3253,23 +3271,6 @@ fn light_cycle_arg(
                 })
         })
         .collect()
-}
-
-impl Default for CommonRoadArgs<'_> {
-    fn default() -> Self {
-        CommonRoadArgs {
-            benchmark_id: None,
-            author: None,
-            affiliation: None,
-            source: None,
-            date: None,
-            time_step: None,
-            planning_problem: true,
-            goal_steps: None,
-            elevation: false,
-            light_cycle: None,
-        }
-    }
 }
 
 // --------------------------------------------------------------------------- //

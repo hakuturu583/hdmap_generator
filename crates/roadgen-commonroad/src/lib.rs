@@ -54,7 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use roadgen_core::map::Map;
 use roadgen_core::semantics::{MapObjectKind, TrafficRule};
-use roadgen_core::{Trace, TrafficHandedness, ValidatedMap};
+use roadgen_core::{LaneType, Trace, TrafficHandedness, ValidatedMap};
 
 pub use error::ExportError;
 pub use model::{Scenario, COMMONROAD_VERSION};
@@ -460,6 +460,14 @@ pub fn check(map: &ValidatedMap, config: Option<&ScenarioConfig>) -> Vec<String>
     let unlinked = map
         .connections
         .iter()
+        .filter(|connection| {
+            [&connection.from.lane, &connection.to.lane]
+                .into_iter()
+                .any(|lane| {
+                    map.lane(lane)
+                        .is_some_and(|lane| lane.lane_type == LaneType::Sidewalk)
+                })
+        })
         .filter(|connection| orientation.link(map, connection).is_none())
         .count();
     if unlinked > 0 {
@@ -662,15 +670,33 @@ fn is_benchmark_id(id: &str) -> bool {
 
 fn is_date(date: &str) -> bool {
     let bytes = date.as_bytes();
-    bytes.len() == 10
+    if !(bytes.len() == 10
         && bytes[4] == b'-'
         && bytes[7] == b'-'
         && bytes
             .iter()
             .enumerate()
-            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
-        && matches!(date[5..7].parse::<u32>(), Ok(1..=12))
-        && matches!(date[8..10].parse::<u32>(), Ok(1..=31))
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        date[..4].parse::<u32>(),
+        date[5..7].parse::<u32>(),
+        date[8..10].parse::<u32>(),
+    ) else {
+        return false;
+    };
+    // A reader parses the date as a calendar day, so 31 February is no date.
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day)
 }
 
 /// Today's date in UTC, `YYYY-MM-DD`.
@@ -743,6 +769,9 @@ mod tests {
         assert_eq!(civil_from_days(20_758), (2026, 11, 1));
         assert!(is_date(&today()));
         assert!(!is_date("2026-13-01"));
+        assert!(!is_date("2026-02-31"));
+        assert!(is_date("2024-02-29"));
+        assert!(!is_date("2100-02-29"));
     }
 
     #[test]

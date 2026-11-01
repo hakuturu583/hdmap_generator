@@ -251,7 +251,13 @@ class Map:
     def commonroad_warnings(
         self,
         benchmark_id: Optional[str] = None,
+        author: Optional[str] = None,
+        affiliation: Optional[str] = None,
+        source: Optional[str] = None,
+        date: Optional[str] = None,
+        time_step: Optional[float] = None,
         planning_problem: bool = True,
+        goal_steps: Optional[int] = None,
         elevation: bool = False,
         light_cycle: Union[str, bool, Sequence[tuple[str, float]], None] = None,
     ) -> list[str]: ...

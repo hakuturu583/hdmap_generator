@@ -652,45 +652,72 @@ impl<'a> Builder<'a> {
             let TrafficRule::TrafficLight { lights, lanes, .. } = rule else {
                 continue;
             };
-            let Some(lane) = lanes.iter().find_map(|lane| map.lane(lane)) else {
-                continue;
-            };
-            // The junction the approach's road runs into where traffic leaves it,
-            // or failing that the one its movements go through.
-            let linked = map
-                .road(&lane.road)
-                .and_then(|road| road.link.at(lane.direction.exit_end().as_road_end()))
-                .and_then(|target| match target {
-                    RoadLinkTarget::Junction(junction) => Some(junction),
-                    _ => None,
-                });
-            let junction = linked.or_else(|| {
-                map.successors(&lane.id).into_iter().find_map(|next| {
-                    map.lane(&next)
-                        .and_then(|next| map.road(&next.road))
-                        .and_then(|road| road.junction.as_ref())
-                })
-            });
-            let Some(junction) = junction else {
-                continue;
-            };
-            let heading = lane
-                .travel_geometry(self.config)?
-                .centerline
-                .end_tangent()?
-                .heading();
-            let axis = heading.rem_euclid(PI);
-            let first = *axes.entry(junction).or_insert(axis);
-            let apart = (axis - first).rem_euclid(PI);
-            let crossing = apart.min(PI - apart) > PI / 4.0;
             for light in lights {
                 // A light two rules name runs as the first one placed it.
-                if placed.insert(light) && crossing {
+                if placed.contains(light) {
+                    continue;
+                }
+                // The approach the light itself stands at: the first lane it governs
+                // that the rule names too, as a rule over several junction mouths
+                // has lights at each; else the rule's own first lane.
+                let own = map
+                    .objects
+                    .get(light)
+                    .map(|object| object.lanes.as_slice())
+                    .unwrap_or_default();
+                let approach = own
+                    .iter()
+                    .find(|lane| lanes.contains(lane))
+                    .or_else(|| own.first())
+                    .or_else(|| lanes.first())
+                    .and_then(|lane| map.lane(lane));
+                let Some(lane) = approach else {
+                    continue;
+                };
+                let Some((junction, axis)) = self.approach_axis(lane)? else {
+                    continue;
+                };
+                placed.insert(light);
+                let first = *axes.entry(junction).or_insert(axis);
+                let apart = (axis - first).rem_euclid(PI);
+                if apart.min(PI - apart) > PI / 4.0 {
                     across.insert(light);
                 }
             }
         }
         Ok(across)
+    }
+
+    /// The junction an approach runs into, and the axis it arrives along: its
+    /// heading at the junction, either way along it. `None` for a lane that runs
+    /// into no junction.
+    fn approach_axis(&self, lane: &'a Lane) -> Result<Option<(&'a JunctionId, f64)>, ExportError> {
+        let map = self.map;
+        // The junction the approach's road runs into where traffic leaves it, or
+        // failing that the one its movements go through.
+        let linked = map
+            .road(&lane.road)
+            .and_then(|road| road.link.at(lane.direction.exit_end().as_road_end()))
+            .and_then(|target| match target {
+                RoadLinkTarget::Junction(junction) => Some(junction),
+                _ => None,
+            });
+        let junction = linked.or_else(|| {
+            map.successors(&lane.id).into_iter().find_map(|next| {
+                map.lane(&next)
+                    .and_then(|next| map.road(&next.road))
+                    .and_then(|road| road.junction.as_ref())
+            })
+        });
+        let Some(junction) = junction else {
+            return Ok(None);
+        };
+        let heading = lane
+            .travel_geometry(self.config)?
+            .centerline
+            .end_tangent()?
+            .heading();
+        Ok(Some((junction, heading.rem_euclid(std::f64::consts::PI))))
     }
 
     /// The lights a traffic-light rule names, referred to by the lanes that stop
@@ -874,7 +901,16 @@ impl<'a> Builder<'a> {
             return Ok(());
         }
         let map = self.map;
-        let Some(start) = map.default_start() else {
+        // The map's default start is any drivable lane, a bicycle lane among them;
+        // a CommonRoad planning problem is posed to a vehicle, so a lane cars drive
+        // comes first when the map has one.
+        let start = map
+            .lanes
+            .iter()
+            .find(|lane| lane.lane_type == LaneType::Driving && !map.is_connector_lane(&lane.id))
+            .map(|lane| lane.id.clone())
+            .or_else(|| map.default_start());
+        let Some(start) = start else {
             return Ok(());
         };
         let route: Vec<LaneId> = map

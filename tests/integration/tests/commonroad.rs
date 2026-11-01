@@ -609,3 +609,31 @@ fn a_light_cycle_the_check_can_see_through() {
         .iter()
         .any(|problem| problem.contains("green together") || problem.contains("inactive")));
 }
+
+#[test]
+fn one_rule_over_two_mouths_still_puts_their_lights_in_turn() {
+    let mut builder = scenarios::crossroads_builder("one_rule", 70.0);
+    // Every arm points at the centre, so each forward lane is an approach at its end.
+    let north = LaneRef::new(RoadId::new("north"), 0);
+    let east = LaneRef::new(RoadId::new("east"), 0);
+    let north_light = builder
+        .add_traffic_light(&north, LaneEnd::End, 5.0)
+        .unwrap();
+    let east_light = builder.add_traffic_light(&east, LaneEnd::End, 5.0).unwrap();
+    builder.add_traffic_light_rule(vec![north_light, east_light], None, vec![north, east]);
+    let map = builder.finish().unwrap().validate().unwrap();
+
+    let lit =
+        roadgen_commonroad::to_scenario(&map, &config(&map).with_default_light_cycle()).unwrap();
+    let mut offsets: Vec<u64> = lit
+        .traffic_lights
+        .iter()
+        .map(|light| light.time_offset)
+        .collect();
+    offsets.sort();
+    assert_eq!(
+        offsets,
+        [0, 70],
+        "a light at each mouth, half a cycle apart"
+    );
+}
