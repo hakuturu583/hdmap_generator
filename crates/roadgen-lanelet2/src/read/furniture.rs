@@ -98,6 +98,7 @@ pub(crate) fn build(
             .unwrap_or("");
         match subtype {
             "traffic_light" => {
+                let lanes = approaches(map, &lanes);
                 let refers = ways("refers");
                 let bulbs = ways("light_bulbs");
                 let lights: Vec<ObjectId> = refers
@@ -342,4 +343,42 @@ fn light_head(
         }
     }
     head
+}
+
+/// The lanes a traffic light's rule is over, from the lanes whose lanelets refer
+/// to it: the IR's rule is about the approaches, the lanes that stop for the
+/// light, and Autoware hangs the element on the lanelets through the
+/// intersection — the ones `turn_direction` marks — as the Lanelet2 writer does.
+/// So a junction connector stands for the lanes that run into it from outside the
+/// junction; any other lane, and a connector nothing runs into, stands for itself.
+fn approaches(map: &Map, lanes: &[LaneId]) -> Vec<LaneId> {
+    let is_connector = |lane: &LaneId| {
+        map.lanes
+            .get(lane)
+            .and_then(|lane| map.road(&lane.road))
+            .is_some_and(|road| road.is_connector())
+    };
+    let mut approaches: Vec<LaneId> = Vec::new();
+    for lane in lanes {
+        let feeding: Vec<LaneId> = if is_connector(lane) {
+            map.connections_to(lane)
+                .into_iter()
+                .map(|connection| connection.from.lane.clone())
+                .filter(|from| !is_connector(from))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let stands_for = if feeding.is_empty() {
+            vec![lane.clone()]
+        } else {
+            feeding
+        };
+        for lane in stands_for {
+            if !approaches.contains(&lane) {
+                approaches.push(lane);
+            }
+        }
+    }
+    approaches
 }
