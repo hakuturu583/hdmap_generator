@@ -1,0 +1,151 @@
+// Bridges, tunnels, grade separations and interchanges.
+
+syntax = "proto3";
+
+package roadgen_ir.v1;
+
+import "roadgen_ir/v1/geometry.proto";
+
+// A stretch of one road, by horizontal station along its reference line.
+message RoadSpan {
+  // A `Road.id`.
+  string road = 1;
+  double from = 2;
+  double to = 3;
+}
+
+// What a bridge is, by what it spans.
+enum BridgeForm {
+  BRIDGE_FORM_UNSPECIFIED = 0;
+  // Over a river, a valley, a railway.
+  BRIDGE_FORM_BRIDGE = 1;
+  // A long elevated road on a row of piers.
+  BRIDGE_FORM_VIADUCT = 2;
+  // A short bridge that only carries one road over another.
+  BRIDGE_FORM_OVERPASS = 3;
+}
+
+// How a tunnel was made.
+enum TunnelForm {
+  TUNNEL_FORM_UNSPECIFIED = 0;
+  TUNNEL_FORM_BORED = 1;
+  TUNNEL_FORM_CUT_AND_COVER = 2;
+  TUNNEL_FORM_UNDERPASS = 3;
+}
+
+enum StructureMaterial {
+  STRUCTURE_MATERIAL_UNSPECIFIED = 0;
+  STRUCTURE_MATERIAL_CONCRETE = 1;
+  STRUCTURE_MATERIAL_STEEL = 2;
+  STRUCTURE_MATERIAL_MASONRY = 3;
+  STRUCTURE_MATERIAL_TIMBER = 4;
+}
+
+enum SupportKind {
+  SUPPORT_KIND_UNSPECIFIED = 0;
+  // Where the deck meets the ground, at each end.
+  SUPPORT_KIND_ABUTMENT = 1;
+  // A column between them.
+  SUPPORT_KIND_PIER = 2;
+}
+
+// One abutment or pier column.
+message Support {
+  SupportKind kind = 1;
+  // The column's plan, at the height of its top: the deck's underside.
+  Footprint footprint = 2;
+  // The height its foot stands at, where the map states land.
+  optional double base = 3;
+}
+
+// A deck on supports.
+message Bridge {
+  BridgeForm form = 1;
+  StructureMaterial material = 2;
+  // From the road surface to the underside of the deck, metres.
+  double deck_depth = 3;
+  // How far the deck reaches past the road's outer edge, metres.
+  double curb = 4;
+  repeated Support supports = 5;
+}
+
+// One mouth of a tunnel.
+message Portal {
+  // A `Road.id`.
+  string road = 1;
+  double station = 2;
+  // The opening's two sides at road level, left and right of the road.
+  Point3 left = 3;
+  Point3 right = 4;
+}
+
+// A bore with a portal at each end.
+message Tunnel {
+  TunnelForm form = 1;
+  // From the road surface to the ceiling, metres.
+  double clear_height = 2;
+  // Thickness of the lining round the bore, metres.
+  double lining = 3;
+  bool lighting = 4;
+  // The inspection walkway each side of the road, inside the bore, metres.
+  double walkway = 5;
+  // Exactly two.
+  repeated Portal portals = 6;
+}
+
+// A bridge or a tunnel, and the stretches of road it carries.
+message Structure {
+  // e.g. `structure/arakawa_bridge`.
+  string id = 1;
+  optional string name = 2;
+  oneof kind {
+    Bridge bridge = 3;
+    Tunnel tunnel = 4;
+  }
+  repeated RoadSpan carries = 5;
+  // Its plan: a bridge's deck, a tunnel's bore seen from above, at the height of
+  // the road it carries.
+  Footprint outline = 6;
+  // A `Site.id`.
+  optional string site = 7;
+}
+
+// A stretch of a road that is on, or in, a structure. Stations no span covers are
+// at grade.
+message StructureSpan {
+  double from = 1;
+  double to = 2;
+  // A `Structure.id`.
+  string structure = 3;
+}
+
+// What a road passes over.
+message Underneath {
+  oneof kind {
+    RoadSpan road = 1;
+    // A `LandCover.id`: a river, a canal.
+    string land_cover = 2;
+  }
+}
+
+// `over` passes over `under` by way of `via`: a crossing that is not a junction.
+message GradeSeparation {
+  // e.g. `separation/e1_north/avenue/0`.
+  string id = 1;
+  RoadSpan over = 2;
+  Underneath under = 3;
+  // A `Structure.id`: the bridge `over` is on, or the tunnel `under` is in.
+  string via = 4;
+}
+
+// A grade-separated junction as one feature.
+message Interchange {
+  // e.g. `interchange/kita_ic`.
+  string id = 1;
+  optional string name = 2;
+  // What it is, in its generator's words: `diamond`, `trumpet`, `parclo`.
+  string kind = 3;
+  repeated string junctions = 4;
+  repeated string roads = 5;
+  repeated string structures = 6;
+}

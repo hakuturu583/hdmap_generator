@@ -1,0 +1,227 @@
+// What the road means, as opposed to where it is or what it connects to.
+//
+// These are IR concepts: there is no OpenDRIVE `<signal>` and no Lanelet2
+// regulatory element here. A traffic light is an object; which lanes it controls
+// and where they stop is a `TrafficRule`.
+
+syntax = "proto3";
+
+package roadgen_ir.v1;
+
+import "roadgen_ir/v1/geometry.proto";
+
+// What a lane is for.
+enum LaneType {
+  LANE_TYPE_UNSPECIFIED = 0;
+  LANE_TYPE_DRIVING = 1;
+  LANE_TYPE_SHOULDER = 2;
+  LANE_TYPE_BORDER = 3;
+  LANE_TYPE_SIDEWALK = 4;
+  LANE_TYPE_BIKING = 5;
+  LANE_TYPE_PARKING = 6;
+  LANE_TYPE_RESTRICTED = 7;
+  // Carries no traffic: the strip beyond the outermost boundary.
+  LANE_TYPE_NONE = 8;
+}
+
+// What kind of place a road is in (OpenDRIVE's `<type>`).
+enum RoadType {
+  ROAD_TYPE_UNSPECIFIED = 0;
+  ROAD_TYPE_TOWN = 1;
+  ROAD_TYPE_RURAL = 2;
+  ROAD_TYPE_MOTORWAY = 3;
+  ROAD_TYPE_LOW_SPEED = 4;
+  ROAD_TYPE_PEDESTRIAN = 5;
+}
+
+// What part a road plays in the network (GDF's Form of Way), kept apart from
+// `RoadType`: a slip road in a town is both.
+enum FormOfWay {
+  // Nothing said; what every road is unless its generator said otherwise.
+  FORM_OF_WAY_UNSPECIFIED = 0;
+  FORM_OF_WAY_MOTORWAY = 1;
+  FORM_OF_WAY_MULTIPLE_CARRIAGEWAY = 2;
+  FORM_OF_WAY_SINGLE_CARRIAGEWAY = 3;
+  FORM_OF_WAY_SLIP_ROAD = 4;
+  FORM_OF_WAY_PARALLEL_ROAD = 5;
+  FORM_OF_WAY_SERVICE_ROAD = 6;
+  FORM_OF_WAY_ROUNDABOUT = 7;
+}
+
+// What a road is surfaced with. Whether it is paved follows from the surface:
+// asphalt, concrete and cobblestone are paved; the rest are not.
+enum Surface {
+  SURFACE_UNSPECIFIED = 0;
+  SURFACE_ASPHALT = 1;
+  SURFACE_CONCRETE = 2;
+  SURFACE_COBBLESTONE = 3;
+  SURFACE_GRAVEL = 4;
+  SURFACE_DIRT = 5;
+  SURFACE_SAND = 6;
+  SURFACE_ROCK = 7;
+}
+
+// A surface that takes over at `station` and holds until the next span's.
+message PavementSpan {
+  double station = 1;
+  Surface surface = 2;
+}
+
+// The paint on a lane boundary.
+enum RoadMarking {
+  ROAD_MARKING_UNSPECIFIED = 0;
+  // Nothing painted, though the boundary exists as a line.
+  ROAD_MARKING_NONE = 1;
+  ROAD_MARKING_SOLID = 2;
+  ROAD_MARKING_BROKEN = 3;
+  ROAD_MARKING_SOLID_SOLID = 4;
+  ROAD_MARKING_BROKEN_SOLID = 5;
+  ROAD_MARKING_SOLID_BROKEN = 6;
+  // A physical edge such as a kerb.
+  ROAD_MARKING_CURBSTONE = 7;
+}
+
+enum MarkingColor {
+  MARKING_COLOR_UNSPECIFIED = 0;
+  MARKING_COLOR_WHITE = 1;
+  MARKING_COLOR_YELLOW = 2;
+}
+
+// A lane boundary's paint.
+message BoundaryMarking {
+  RoadMarking marking = 1;
+  MarkingColor color = 2;
+}
+
+// Where a map object sits.
+message ObjectGeometry {
+  oneof kind {
+    // A single position, such as the base of a sign post.
+    Point3 point = 1;
+    // A line across or along the road: a stop line, the bar of a traffic light.
+    Curve line = 2;
+    // A strip with two edges, such as a crosswalk.
+    Band band = 3;
+  }
+}
+
+message Band {
+  Curve left = 1;
+  Curve right = 2;
+}
+
+enum LightColor {
+  LIGHT_COLOR_UNSPECIFIED = 0;
+  LIGHT_COLOR_RED = 1;
+  LIGHT_COLOR_YELLOW = 2;
+  LIGHT_COLOR_GREEN = 3;
+}
+
+// The way an arrow lamp points, as seen by the driver facing it: up is straight
+// on.
+enum LightArrow {
+  // A round lamp.
+  LIGHT_ARROW_NONE = 0;
+  LIGHT_ARROW_UP = 1;
+  LIGHT_ARROW_DOWN = 2;
+  LIGHT_ARROW_LEFT = 3;
+  LIGHT_ARROW_RIGHT = 4;
+  LIGHT_ARROW_UP_LEFT = 5;
+  LIGHT_ARROW_UP_RIGHT = 6;
+  LIGHT_ARROW_DOWN_LEFT = 7;
+  LIGHT_ARROW_DOWN_RIGHT = 8;
+}
+
+// One lamp of a traffic light.
+message LightBulb {
+  Point3 position = 1;
+  LightColor color = 2;
+  LightArrow arrow = 3;
+}
+
+// A traffic light's housing and lamps. A light whose generator knew neither has
+// no height and no bulbs; a consumer falls back on its own defaults.
+message LightHead {
+  // How far the housing reaches up from the object's geometry, which is its
+  // bottom edge, metres.
+  optional double height = 1;
+  repeated LightBulb bulbs = 2;
+}
+
+message TrafficLight {
+  LightHead head = 1;
+}
+
+message TrafficSign {
+  // The sign's identifier in whatever catalogue its generator used; the IR
+  // defines none.
+  string code = 1;
+}
+
+message StopLine {}
+
+message Crosswalk {}
+
+// Something that stands along the road to keep traffic on it: a berm, a guard
+// rail, a wall, a bridge's parapet. Its geometry is a band along the ground it
+// occupies.
+message Barrier {
+  // Which, in its generator's words.
+  string kind = 1;
+  // How far its top stands above its base, metres.
+  double height = 2;
+  // A `Structure.id`, for a barrier that is part of a bridge or a tunnel.
+  optional string structure = 3;
+}
+
+// A piece of road furniture, and the lanes it applies to.
+message MapObject {
+  // e.g. `object/light/j0/north`.
+  string id = 1;
+  oneof kind {
+    TrafficLight traffic_light = 2;
+    TrafficSign traffic_sign = 3;
+    StopLine stop_line = 4;
+    Crosswalk crosswalk = 5;
+    Barrier barrier = 6;
+  }
+  ObjectGeometry geometry = 7;
+  // `Lane.id`s governed by the object, in the order they were listed.
+  repeated string lanes = 8;
+}
+
+// Lanes controlled by traffic lights, with the stop lines they stop at: none,
+// one, or one per junction mouth. With several, each lane stops at the first of
+// them whose `MapObject.lanes` names it, and at none if none does.
+message TrafficLightRule {
+  // `MapObject.id`s of the lights.
+  repeated string lights = 1;
+  // `MapObject.id`s of the stop lines.
+  repeated string stop_lines = 2;
+  // `Lane.id`s.
+  repeated string lanes = 3;
+}
+
+// `yielding` gives way to `right_of_way`.
+message RightOfWayRule {
+  repeated string right_of_way = 1;
+  repeated string yielding = 2;
+  // A `MapObject.id`.
+  optional string stop_line = 3;
+}
+
+// A limit that applies to a set of lanes rather than to a whole road.
+message SpeedLimitRule {
+  // Metres per second, greater than zero.
+  double limit_mps = 1;
+  repeated string lanes = 2;
+}
+
+// A rule that governs movement, said over objects and lanes.
+message TrafficRule {
+  oneof kind {
+    TrafficLightRule traffic_light = 1;
+    RightOfWayRule right_of_way = 2;
+    SpeedLimitRule speed_limit = 3;
+  }
+}

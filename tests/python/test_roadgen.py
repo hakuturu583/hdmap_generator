@@ -1003,10 +1003,10 @@ def sumo_tools():
     return netconvert, sumolib
 
 
-def build_with_netconvert(m, directory):
+def build_with_netconvert(m, directory, **options):
     """Exports, builds with netconvert, and hands back the network SUMO read."""
     netconvert, sumolib = sumo_tools()
-    prefix = m.export_sumo(str(directory))
+    prefix = m.export_sumo(str(directory), **options)
     result = subprocess.run(
         [netconvert, "-c", f"{prefix}.netccfg"],
         cwd=directory,
@@ -1070,12 +1070,277 @@ def test_a_sumo_lane_is_where_the_export_says_it_is(tmp_path):
             assert found == pytest.approx(wanted, abs=0.02)
 
 
+def test_every_export_writes_a_trace_and_they_join_through_the_ir(tmp_path):
+    m = clipgt_map()
+    m.export_ir(str(tmp_path / "map.ir.json"))
+    m.export_opendrive(str(tmp_path / "map.xodr"))
+    m.export_lanelet2(str(tmp_path / "lanelet2_map.osm"))
+    m.export_osm(str(tmp_path / "openstreetmap.osm"))
+    prefix = m.export_sumo(str(tmp_path / "sumo"))
+    clip = m.export_clipgt(str(tmp_path / "clip"))
+    m.export_gpudrive(str(tmp_path / "scene.json"))
+    traces = [
+        "map.xodr.trace.json",
+        "lanelet2_map.osm.trace.json",
+        "openstreetmap.osm.trace.json",
+        f"sumo/{prefix}.sumo.trace.json",
+        f"clip/{clip}.clipgt.trace.json",
+        "scene.json.trace.json",
+    ]
+    for name in traces:
+        written = json.loads((tmp_path / name).read_text())
+        assert written["schema"] == "roadgen-trace/1"
+        assert written["links"], name
+
+    t = roadgen.Trace.load(
+        str(tmp_path / "map.ir.json"), *(str(tmp_path / name) for name in traces)
+    )
+    assert t.formats() == ["clipgt", "gpudrive", "lanelet2", "opendrive", "osm", "sumo"]
+
+    # A lanelet, by its bare id, to the SUMO lane the export already reports for the
+    # same IR lane.
+    sumo_lanes = dict(m.sumo_lane_ids())
+    checked = 0
+    for lane in m.lane_ids():
+        lanelets = [link for link in t.from_ir(lane, "lanelet2") if link["role"] == "lanelet"]
+        if not lanelets or lane not in sumo_lanes:
+            continue
+        lanelet = int(lanelets[0]["ref"].split(":")[1])
+        assert [link["ir"] for link in t.to_ir("lanelet2", lanelet) if link["role"] == "lanelet"] == [lane]
+        answers = t.translate("lanelet2", lanelet, to="sumo")
+        assert [answer["ref"] for answer in answers] == [f"lane:{sumo_lanes[lane]}"]
+        assert answers[0]["via"] is None
+        checked += 1
+    assert checked >= 8
+
+
+def test_a_sumo_export_can_hold_bends_to_their_curve_speed(tmp_path):
+    m = roadgen.Map(name="bend")
+    radius = 120.0
+    al = roadgen.Alignment(start=(0.0, 0.0, 0.0), heading=0.0)
+    al.line(80.0)
+    al.spiral(60.0, curvature_end=1 / radius)
+    al.arc(140.0, curvature=1 / radius)
+    al.spiral(60.0, curvature_end=0.0)
+    al.line(80.0)
+    m.add_road(lanes=two_way(), alignment=al, name="sweep", speed_limit_kph=80.0)
+
+    prefix, net = build_with_netconvert(m, tmp_path, curve_lateral_acceleration=2.0)
+    roads = sorted(edge.getID() for edge in net.getEdges() if edge.getFunction() != "internal")
+    assert roads == [
+        "sweep.bwd", "sweep.bwd.p1", "sweep.bwd.p2",
+        "sweep.fwd", "sweep.fwd.p1", "sweep.fwd.p2",
+    ]
+    bend = net.getEdge("sweep.fwd.p1").getSpeed()
+    assert bend < (2.0 * (radius + 3.5)) ** 0.5
+    assert net.getEdge("sweep.fwd").getSpeed() == pytest.approx(80.0 / 3.6, abs=0.01)
+
+    # Every piece of a lane is traced back to it.
+    written = json.loads((tmp_path / f"{prefix}.sumo.trace.json").read_text())
+    pieces = {link["ref"] for link in written["links"] if link["ref"].startswith("lane:sweep.fwd")}
+    assert {piece.split("_")[0] for piece in pieces} == {
+        "lane:sweep.fwd", "lane:sweep.fwd.p1", "lane:sweep.fwd.p2",
+    }
+
+    with pytest.raises(RuntimeError, match="positive"):
+        m.export_sumo(str(tmp_path / "bad"), curve_lateral_acceleration=0.0)
+
+
+def test_a_sumo_export_can_let_bicycles_ride_the_sidewalks_both_ways(tmp_path):
+    def street():
+        return [
+            roadgen.Lane(width=3.5, direction="backward"),
+            roadgen.Lane(width=2.0, direction="backward", type_="sidewalk"),
+            roadgen.Lane(width=3.5, direction="forward"),
+            roadgen.Lane(width=2.0, direction="forward", type_="sidewalk"),
+        ]
+
+    m = roadgen.Map(name="cycling")
+    west = m.add_road(start=(-70.0, 0.0, 0.0), end=(-14.0, 0.0, 0.0), lanes=street(), name="west")
+    south = m.add_road(start=(0.0, -70.0, 0.0), end=(0.0, -14.0, 0.0), lanes=street(), name="south")
+    m.connect(west, south, junction=m.add_junction("x"), ends=("end", "end"))
+
+    # Off by default: the sidewalks are the pedestrians' alone.
+    _, plain = build_with_netconvert(m, tmp_path / "plain")
+    assert not any(".bike" in edge.getID() for edge in plain.getEdges())
+
+    prefix, net = build_with_netconvert(m, tmp_path / "cycling", cycle_on_sidewalks=True)
+    # Lane 0 of each carriageway is its kerb lane: the sidewalk.
+    sidewalks = ["west.fwd_0", "west.bwd_0"]
+    assert set(sidewalks) <= set(dict(m.sumo_lane_ids()).values())
+    for sidewalk in sidewalks:
+        edge, index = sidewalk.rsplit("_", 1)
+        for way in ("", ".rev"):
+            for piece in ("", ".p1"):
+                cycleway = net.getEdge(f"{edge}.bike{index}{way}{piece}")
+                assert cycleway.allows("bicycle") and cycleway.allows("pedestrian")
+                assert not cycleway.allows("passenger")
+        # The sidewalk lane itself still admits pedestrians only.
+        assert not net.getLane(sidewalk).allows("bicycle")
+
+    # The corner pavement is ridden both ways: west's forward sidewalk arrives at the
+    # junction and south's backward one leaves it.
+    rides = {
+        (edge.getID(), to.getID()) for edge in net.getEdges() for to in edge.getOutgoing()
+    }
+    assert ("west.fwd.bike0.p1", "south.bwd.bike0") in rides
+    assert ("south.bwd.bike0.rev.p1", "west.fwd.bike0.rev") in rides
+    # Off the sidewalk onto the carriageway it runs beside, and off the carriageway
+    # onto the sidewalk of the road it turns into. The 56 m carriageway is cut
+    # halfway, where a bicycle changes between it and its sidewalk, so it reaches the
+    # junction on its second piece.
+    assert ("west.fwd.bike0.p1", "south.bwd") in rides
+    assert ("west.fwd.p1", "south.bwd.bike0") in rides
+    # And between junctions: on and off the road where it and its sidewalk are cut.
+    assert ("west.fwd.bike0", "west.fwd.p1") in rides
+    assert ("west.fwd", "west.fwd.bike0.p1") in rides
+    # And back the other way at the dead end the west arm's sidewalk runs out to.
+    assert ("west.fwd.bike0.rev.p1", "west.fwd.bike0") in rides
+
+
+def test_an_export_can_be_told_not_to_write_its_trace(tmp_path):
+    m = clipgt_map()
+    m.export_lanelet2(str(tmp_path / "lanelet2_map.osm"), trace=False)
+    m.export_sumo(str(tmp_path / "sumo"), trace=False)
+    assert not (tmp_path / "lanelet2_map.osm.trace.json").exists()
+    assert not list((tmp_path / "sumo").glob("*.trace.json"))
+
+
+def test_two_networks_in_one_directory_keep_a_trace_each(tmp_path):
+    first = clipgt_map()
+    second = roadgen.Map(name="other town")
+    second.add_road(start=(0.0, 0.0, 0.0), end=(50.0, 0.0, 0.0), lanes=two_way())
+    prefixes = [m.export_sumo(str(tmp_path)) for m in (first, second)]
+    assert prefixes[0] != prefixes[1]
+    for prefix in prefixes:
+        # Each still loads: the second export wrote beside the first, not over it.
+        roadgen.Trace.load(str(tmp_path / f"{prefix}.sumo.trace.json"))
+
+
+def test_a_trace_refuses_a_file_written_again_from_another_map(tmp_path):
+    m = clipgt_map()
+    m.export_lanelet2(str(tmp_path / "lanelet2_map.osm"))
+    other = roadgen.Map()
+    other.add_road(start=(0.0, 0.0, 0.0), end=(50.0, 0.0, 0.0), lanes=two_way())
+    other.export_lanelet2(str(tmp_path / "lanelet2_map.osm"), trace=False)
+    with pytest.raises(ValueError, match="has changed"):
+        roadgen.Trace.load(str(tmp_path / "lanelet2_map.osm.trace.json"))
+    # Still readable on purpose, for a trace whose files are elsewhere.
+    roadgen.Trace.load(str(tmp_path / "lanelet2_map.osm.trace.json"), check_files=False)
+
+
+def test_netconverts_internal_lanes_trace_back_to_the_junction_connectors(tmp_path):
+    m = clipgt_map()
+    prefix, net = build_with_netconvert(m, tmp_path)
+    t = roadgen.Trace.load(str(tmp_path / f"{prefix}.sumo.trace.json"))
+    traced, untraced = t.add_sumo_net(str(tmp_path / f"{prefix}.net.xml"))
+    assert traced > 0
+
+    connectors = {lane for lane in m.lane_ids() if lane.startswith("lane/x/")}
+    internal = [
+        lane.getID()
+        for edge in net.getEdges()
+        if edge.getFunction() == "internal" and edge.getID().startswith(":j_")
+        for lane in edge.getLanes()
+    ]
+    reached = set()
+    for lane in internal:
+        irs = {link["ir"] for link in t.to_ir("sumo", lane) if link["ir"].startswith("lane/")}
+        assert len(irs) == 1, (lane, irs)
+        assert irs <= connectors
+        reached |= irs
+    assert reached == connectors
+
+
 def test_sumo_says_what_it_cannot_carry():
     warnings = clipgt_map().sumo_warnings()
     assert any("markings" in warning for warning in warnings)
-    assert any("netconvert generates the phases" in warning for warning in warnings)
+    assert any("fixed-time program of the export's own" in warning for warning in warnings)
     # And, as with the OpenStreetMap export, it stays out of the general warnings.
     assert clipgt_map().format_warnings() == []
+
+
+# --------------------------------------------------------------------------- #
+# RDS-HQ
+#
+# These open the tars with the standard library the way a WebDataset reader does —
+# a member is `{clip}.{entry}`, decoded by its extension — so that a test failing
+# here means the Cosmos-Drive-Dreams toolkit would have failed too.
+# --------------------------------------------------------------------------- #
+
+
+def read_rdshq(root, folder, clip_id):
+    import tarfile
+
+    entries = {}
+    with tarfile.open(root / folder / f"{clip_id}.tar") as archive:
+        for member in archive.getmembers():
+            key, entry = member.name.split(".", 1)
+            assert key == clip_id, member.name
+            entries[entry] = archive.extractfile(member).read()
+    return entries
+
+
+def test_an_rdshq_clip_has_every_folder_the_renderer_opens(tmp_path):
+    clip_id = clipgt_map().export_rdshq(tmp_path)
+    assert clip_id == "demo_town"
+    for layer in (
+        "lanelines", "road_boundaries", "crosswalks", "road_markings",
+        "wait_lines", "poles", "traffic_signs", "traffic_lights", "lanes",
+    ):
+        document = json.loads(read_rdshq(tmp_path, f"3d_{layer}", clip_id)[f"{layer}.json"])
+        assert isinstance(document["labels"], list), layer
+    for folder in ("pose", "vehicle_pose", "timestamp", "all_object_info",
+                   "ftheta_intrinsic", "pinhole_intrinsic"):
+        assert read_rdshq(tmp_path, folder, clip_id), folder
+    assert (tmp_path / f"{clip_id}.rdshq.trace.json").is_file()
+
+
+def test_rdshq_poses_and_intrinsics_load_as_numpy_arrays(tmp_path):
+    np = pytest.importorskip("numpy")
+    import io
+
+    clip_id = clipgt_map().export_rdshq(tmp_path, speed=8.0)
+    camera = "camera_front_wide_120fov"
+    poses = read_rdshq(tmp_path, "pose", clip_id)
+    names = sorted(name for name in poses if name.endswith(f".pose.{camera}.npy"))
+    assert len(names) > 121, "long enough for one of the toolkit's videos"
+    first = np.load(io.BytesIO(poses[names[0]]))
+    assert first.shape == (4, 4)
+    rotation = first[:3, :3]
+    assert np.allclose(rotation.T @ rotation, np.eye(3))
+    # OpenCV axes: y is down, so it points against the world's up.
+    assert first[2, 1] < -0.9
+
+    ftheta = np.load(io.BytesIO(read_rdshq(tmp_path, "ftheta_intrinsic", clip_id)[f"ftheta_intrinsic.{camera}.npy"]))
+    assert ftheta.shape == (14,)
+    assert list(ftheta[:4]) == [960.0, 540.0, 1920.0, 1080.0]
+
+
+def test_rdshq_lines_and_lights_carry_what_the_renderer_reads(tmp_path):
+    clip_id = clipgt_map().export_rdshq(tmp_path)
+
+    def labels(layer):
+        return json.loads(read_rdshq(tmp_path, f"3d_{layer}", clip_id)[f"{layer}.json"])["labels"]
+
+    line = labels("lanelines")[0]["labelData"]["shape3d"]
+    names = {attribute["name"]: attribute["enumsList"]["enumsList"][0] for attribute in line["attributes"]}
+    assert names["colors"] in ("WHITE", "YELLOW")
+    assert all(len(point) == 3 for point in line["polyline3d"]["vertices"])
+
+    (light,) = labels("traffic_lights")
+    corners = light["labelData"]["shape3d"]["cuboid3d"]["vertices"]
+    assert len(corners) == 8
+    assert sum(corner[2] for corner in corners) / 8 > 4.9, "a light hangs above the road"
+
+
+def test_rdshq_says_what_the_toolkit_will_do(tmp_path):
+    m = clipgt_map()
+    warnings = m.rdshq_warnings()
+    assert any("topology" in warning for warning in warnings)
+    assert any("traffic_lights" in warning for warning in warnings), "one light reads as none"
+    with pytest.raises(RuntimeError, match="clip id"):
+        m.export_rdshq(tmp_path, clip_id="a.b")
 
 
 # --------------------------------------------------------------------------- #
@@ -1314,6 +1579,48 @@ def test_a_map_read_from_a_file_cannot_be_added_to(joined, tmp_path):
         back.add_road(start=(0.0, 0.0, 0.0), end=(10.0, 0.0, 0.0), lanes=two_way())
     with pytest.raises(ValueError, match="read from a file"):
         back.add_junction()
+
+
+def test_a_signal_of_a_file_read_is_followed_into_the_sumo_export(tmp_path):
+    """What a simulator running both needs: a light of the file, by the file's id,
+    to the SUMO movements it switches."""
+    m = roadgen.Map()
+    north = m.add_road(
+        start=(0.0, 70.0, 0.0), end=(0.0, 14.0, 0.0), lanes=two_way(), name="north",
+    )
+    east = m.add_road(
+        start=(70.0, 0.0, 0.0), end=(14.0, 0.0, 0.0), lanes=two_way(), name="east",
+    )
+    junction = m.add_junction("x")
+    m.connect_lanes(north.lane(0), east.lane(1), junction=junction)
+    m.connect_lanes(east.lane(0), north.lane(1), junction=junction)
+    light = m.add_traffic_light(north.lane(0), height=5.0)
+    m.add_traffic_light_rule([light], [north.lane(0)])
+    m.export_opendrive(tmp_path / "town.xodr", trace=False)
+    signal = ET.parse(tmp_path / "town.xodr").getroot().find("road/signals/signal")
+
+    back = roadgen.read_opendrive(str(tmp_path / "town.xodr"))
+    back.export_ir(tmp_path / "town.ir.json")
+    assert back.write_read_trace() == tmp_path / "town.xodr.read.trace.json"
+    prefix = back.export_sumo(tmp_path / "sumo")
+    trace = roadgen.Trace.load(
+        tmp_path / "town.ir.json",
+        tmp_path / "town.xodr.read.trace.json",
+        tmp_path / "sumo" / f"{prefix}.sumo.trace.json",
+    )
+    switched = {
+        answer["ref"]
+        for answer in trace.translate("opendrive", f"signal:{signal.get('id')}", to="sumo")
+        if answer["role"] == "link"
+    }
+    assert switched and all(ref.startswith("tls:") for ref in switched)
+    # The roads too, by the file's own ids.
+    assert trace.to_ir("opendrive", "road:0")
+
+
+def test_only_a_map_read_from_a_file_has_a_read_trace(joined, tmp_path):
+    with pytest.raises(ValueError, match="not read from a file"):
+        joined.write_read_trace(tmp_path / "trace.json")
 
 
 def test_a_built_map_has_nothing_to_warn_about_reading(joined):
@@ -1759,6 +2066,85 @@ def test_a_carla_package_is_a_descriptor_a_mesh_and_a_road_network(tmp_path):
     assert descriptor["maps"][0]["xodr"].endswith("Town01.xodr")
     # `GetArrayField("props")` is called without checking whether it is there.
     assert descriptor["props"] == []
+    # Running and standing water in slots of their own, each with the Unreal
+    # material the package's script puts in it.
+    water = descriptor["maps"][0]["water"]
+    assert water["flowing"]["slot"] == "M_Water_Flowing"
+    assert water["still"]["slot"] == "M_Water_Still"
+    assert water["flowing"]["material"] != water["still"]["material"]
+
+
+def read_pointcloud_map(directory):
+    """Every cell of an Autoware divided point-cloud map, checked against its metadata."""
+    import struct
+
+    metadata = {}
+    for line in (directory / "pointcloud_map_metadata.yaml").read_text().splitlines():
+        key, _, value = line.partition(": ")
+        metadata[key] = value
+    resolution = float(metadata.pop("x_resolution"))
+    assert float(metadata.pop("y_resolution")) == resolution
+    cells = sorted((directory / "pointcloud_map").glob("*.pcd"))
+    assert sorted(metadata) == [cell.name for cell in cells]
+    points = []
+    for cell in cells:
+        corner = metadata[cell.name].strip("[]").split(",")
+        # Autoware's loader reads a corner `as<int>`: 0.0 would sink the whole map.
+        assert all(re.fullmatch(r"\s*-?\d+", v) for v in corner), metadata[cell.name]
+        x0, y0 = (float(v) for v in corner)
+        data = cell.read_bytes()
+        header, body = data.split(b"DATA binary\n", 1)
+        assert b"FIELDS x y z\n" in header and b"TYPE F F F\n" in header
+        count = len(body) // 12
+        assert f"POINTS {count}\n".encode() in header
+        for i in range(count):
+            x, y, z = struct.unpack_from("<fff", body, 12 * i)
+            # Each point in the cell the metadata says the file covers.
+            assert x0 - 1e-3 <= x < x0 + resolution + 1e-3
+            assert y0 - 1e-3 <= y < y0 + resolution + 1e-3
+            points.append((x, y, z))
+    return points
+
+
+@pytest.mark.parametrize("projection", ["local_cartesian", "mgrs"])
+def test_the_pointcloud_map_lies_where_the_lanelet2_map_does(tmp_path, projection):
+    """Autoware reads both in one frame: the nodes' local_x, local_y and ele."""
+    m = roadgen.Map(name="Town01", origin=(35.6586, 139.7454, 0.0), projection=projection)
+    m.add_road(
+        start=(0.0, 0.0, 0.0),
+        end=(60.0, 0.0, 3.0),
+        lanes=[roadgen.Lane(width=3.5, direction="backward"),
+               roadgen.Lane(width=3.5, direction="forward")],
+    )
+    report = m.export_pointcloud_map(tmp_path, ground_extent=5.0, spacing=0.5)
+    points = read_pointcloud_map(tmp_path)
+    assert report["points"] == len(points) and report["cells"] >= 1
+
+    m.export_lanelet2(tmp_path / "lanelet2_map.osm")
+    osm = ET.parse(tmp_path / "lanelet2_map.osm").getroot()
+    nodes = []
+    for node in osm.iter("node"):
+        tags = {t.get("k"): t.get("v") for t in node.iter("tag")}
+        nodes.append((float(tags["local_x"]), float(tags["local_y"]),
+                      float(tags.get("ele", 0.0))))  # 0 is written as no tag at all
+    # Every lane-boundary node stands on the sampled surface.
+    grid = {}
+    for p in points:
+        grid.setdefault((round(p[0]), round(p[1])), []).append(p)
+    for x, y, z in nodes:
+        near = [p for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                for p in grid.get((round(x) + dx, round(y) + dy), [])]
+        closest = min(((p[0] - x) ** 2 + (p[1] - y) ** 2, p) for p in near)
+        assert closest[0] ** 0.5 < 0.6, (x, y, closest)
+        assert abs(closest[1][2] - z) < 0.3, (z, closest)
+
+
+def test_a_pointcloud_map_refuses_a_spacing_that_is_not_a_length(tmp_path):
+    with pytest.raises(ValueError, match="spacing"):
+        carla_street().export_pointcloud_map(tmp_path, spacing=0.0)
+    # A cell's corner Autoware's loader could not read as an integer.
+    with pytest.raises(ValueError, match="whole number"):
+        carla_street().export_pointcloud_map(tmp_path, cell_size=12.5)
 
 
 def test_the_report_says_what_carla_will_call_each_mesh(tmp_path):
@@ -1980,6 +2366,59 @@ def test_carla_sky_checks_the_checkout_before_running_anything(tmp_path):
         roadgen.carla_sky(str(tmp_path / "not-carla"), "Pkg", "Town", engine=str(engine))
 
 
+def test_carla_water_reads_the_descriptors_slots_and_takes_overrides(tmp_path):
+    import roadgen.water
+
+    descriptor = tmp_path / "Pkg.json"
+    descriptor.write_text(json.dumps({"maps": [{"name": "Town", "water": {
+        "flowing": {"slot": "M_Water_Flowing", "material": "/Water/River"},
+        "still": {"slot": "M_Water_Still", "material": "/Water/Lake"},
+    }}], "props": []}))
+    assert roadgen.water.water_slots(str(descriptor), "Town") == {
+        "M_Water_Flowing": "/Water/River",
+        "M_Water_Still": "/Water/Lake",
+    }
+    assert roadgen.water.water_slots(str(descriptor), "Town", flowing="/Game/M_Pan") == {
+        "M_Water_Flowing": "/Game/M_Pan",
+        "M_Water_Still": "/Water/Lake",
+    }
+    with pytest.raises(roadgen.CarlaWaterError, match="names no water"):
+        roadgen.water.water_slots(str(descriptor), "Elsewhere")
+    assert os.path.exists(roadgen.water.EDITOR_SCRIPT)
+
+
+def test_carla_water_dresses_the_levels_actors_as_well_as_the_meshes(tmp_path, monkeypatch):
+    # With CARLA's materials, cooking gives every land actor's component the
+    # land's material, which wins over the mesh's: the editor script has to set
+    # the components' slots in the map's level too, and be told which level.
+    import roadgen.water
+
+    descriptor = tmp_path / "Pkg.json"
+    descriptor.write_text(json.dumps({"maps": [{"name": "Town", "water": {
+        "flowing": {"slot": "M_Water_Flowing", "material": "/Water/River"},
+    }}], "props": []}))
+    seen = {}
+
+    def run(editor, uproject, script, environment, log=None):
+        seen.update(environment)
+        return ["roadgen-water: dressed 2 meshes of Town"], 0, True
+
+    monkeypatch.setattr(roadgen.water, "editor_paths", lambda *args: ("ed", "proj"))
+    monkeypatch.setattr(roadgen.water, "run_editor_script", run)
+    assert roadgen.water.carla_water(str(tmp_path), "Pkg", "Town", descriptor=str(descriptor)) == 2
+    assert seen["ROADGEN_LEVEL"] == "/Game/Pkg/Maps/Town/Town"
+    with open(roadgen.water.EDITOR_SCRIPT, encoding="utf-8") as file:
+        text = file.read()
+    for needed in ("ROADGEN_LEVEL", "load_map", "StaticMeshComponent", "save_current_level"):
+        assert needed in text
+
+
+def test_carla_water_refuses_to_run_without_an_engine(tmp_path, monkeypatch):
+    monkeypatch.delenv("CARLA_UNREAL_ENGINE_PATH", raising=False)
+    with pytest.raises(roadgen.CarlaWaterError, match="CARLA_UNREAL_ENGINE_PATH"):
+        roadgen.carla_water(str(tmp_path), "Pkg", "Town")
+
+
 def test_the_editor_side_sky_script_ships_with_the_package():
     import roadgen.sky
 
@@ -2025,3 +2464,169 @@ def test_a_package_comes_with_the_script_that_imports_it(tmp_path):
         [sys.executable, str(script), "--carla", str(tmp_path / "nowhere")], capture_output=True, text=True
     )
     assert result.returncode != 0 and "CarlaUnreal.uproject" in result.stderr
+
+
+def haul_lanes():
+    lane = lambda width, direction, type_: roadgen.Lane(
+        width=width, direction=direction, type_=type_, left_marking="none", right_marking="none"
+    )
+    return [
+        lane(7.5, "forward", "driving"),
+        lane(3.0, "forward", "shoulder"),
+        lane(7.5, "backward", "driving"),
+        lane(3.0, "backward", "shoulder"),
+    ]
+
+
+def quarry(m, name="North Pit", centre=(0.0, 0.0, 0.0), buildings="industrial"):
+    """A pit, the ramp down it and a haul road out to a waste dump, from parts."""
+    pit = m.add_pit(name=name, centre=centre)
+    ramp = m.add_road(
+        points=pit.ramp(start=-90, grade=0.1, clockwise=True, width=21.0),
+        lanes=haul_lanes(),
+        name=f"{name} ramp",
+        type_="low_speed",
+        pavement=[(0.0, "gravel")],
+        site=name,
+    )
+    m.add_barrier(ramp.lane(1), kind="berm", height=1.5)
+    x, y, z = centre
+    haul = m.add_road(
+        start=(x + 100.0, y - 260.0, z),
+        end=(x + 300.0, y - 260.0, z),
+        lanes=haul_lanes(),
+        name=f"{name} haul",
+        type_="low_speed",
+        pavement=[(0.0, "gravel")],
+        site=name,
+    )
+    m.add_heap("waste_dump", centre=(x + 440.0, y - 260.0, z), radius=110.0, height=30.0,
+               name=f"{name} dump", site=name)
+    m.add_pad(
+        [(x + 140.0, y - 320.0, z), (x + 260.0, y - 320.0, z),
+         (x + 260.0, y - 272.5, z), (x + 140.0, y - 272.5, z)],
+        buildings=buildings, name=f"{name} yard", site=name,
+    )
+    return pit, ramp, haul
+
+
+def test_a_mine_is_put_together_from_parts_and_its_roads_lie_on_the_land(tmp_path):
+    m = roadgen.Map(name="quarry")
+    pit, ramp, haul = quarry(m)
+    assert pit.floor_height == -72.0  # six benches of twelve metres
+    assert pit.land_cover == "landcover/land/north_pit"
+
+    site = m.site("site/north_pit")
+    assert site["kind"] == "open_pit_mine"
+    kinds = [m.land_cover(cover)["kind"] for cover in site["land_covers"]]
+    assert kinds == ["pit", "waste_dump", "pad"]
+    assert set(site["roads"]) == {ramp.id, haul.id}
+    assert m.road_pavement(ramp.id) == [(0.0, "gravel")]
+
+    surface = site["surfaces"][0]
+    nodes, triangles = m.tin_mesh(surface)
+    assert len(triangles) > 1000
+    assert min(z for _, _, z in nodes) == -72.0
+    kinds = {kind for _, kind, _ in m.tin_breaklines(surface)}
+    assert kinds == {"crest", "toe", "edge", "road_edge"}
+    # The floor of the pit is where the land is lowest.
+    assert m.terrain_height(0.0, 0.0) == -72.0
+    # And the ramp's own points are on the land, all the way down.
+    for x, y, z in pit.ramp()[::10]:
+        assert abs(m.terrain_height(x, y) - z) < 0.3
+
+    package = m.export_carla(str(tmp_path / "carla"), use_carla_materials=False)
+    assert package["meshes"] > 0
+
+
+def test_a_ramp_too_gentle_for_its_pit_is_refused():
+    m = roadgen.Map()
+    pit = m.add_pit(benches=10)
+    with pytest.raises(ValueError, match="cannot reach"):
+        pit.ramp(grade=0.01)
+    with pytest.raises(ValueError):
+        m.add_pit(benches=0)
+
+
+def test_a_ramp_into_a_long_narrow_pit_is_a_road_that_builds():
+    m = roadgen.Map()
+    pit = m.add_pit(floor=(200.0, 20.0))
+    m.add_road(points=pit.ramp(), lanes=haul_lanes(), site="pit")
+    m.validate()
+    with pytest.raises(ValueError):
+        pit.ramp(approach=float("inf"))
+
+
+def test_a_part_needs_a_name_to_name_its_features_after():
+    m = roadgen.Map()
+    for add in (
+        lambda: m.add_pit(name="!!!"),
+        lambda: m.add_heap("stockpile", centre=(0.0, 0.0, 0.0), radius=20.0, height=5.0, name="  "),
+        lambda: m.add_pad([(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 10.0, 0.0)], name="--"),
+    ):
+        with pytest.raises(ValueError, match="nothing to name"):
+            add()
+
+
+def test_no_town_building_stands_on_a_heap_smaller_than_its_lot():
+    m = street(length=400.0)
+    m.generate_buildings()
+    lots = len(m.building_ids())
+    assert lots > 0
+    # A small heap in among the lots on one side: every lot it touches goes.
+    m.add_heap("stockpile", centre=(200.0, -16.0, 0.0), radius=4.0, height=1.0, repose=30.0)
+    heap = [(200.0 + 4.0 * math.cos(a / 8 * math.tau), -16.0 + 4.0 * math.sin(a / 8 * math.tau)) for a in range(8)]
+    for building in m.building_ids():
+        for part in m.building_parts(building):
+            ring = [(x, y) for x, y, _ in m.building_footprint(part)]
+            xs, ys = [p[0] for p in ring], [p[1] for p in ring]
+            assert not any(min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys) for x, y in heap), building
+
+
+def test_two_mines_lie_on_one_land():
+    m = roadgen.Map(name="quarries")
+    quarry(m, "North Pit")
+    quarry(m, "South Pit", centre=(0.0, -1200.0, 0.0))
+    assert m.site_ids() == ["site/north_pit", "site/south_pit"]
+    assert len(m.tin_surface_ids()) == 1
+    assert m.terrain_height(0.0, -1200.0) == -72.0
+    # Two parts in one place are refused when the map is built.
+    m.add_pit(name="Too Close", centre=(50.0, 0.0, 0.0))
+    with pytest.raises(ValueError, match="overlap"):
+        m.validate()
+
+
+def test_a_road_can_say_what_it_is_surfaced_with():
+    m = roadgen.Map()
+    lanes = [roadgen.Lane(width=3.5, direction="forward")]
+    road = m.add_road(
+        start=(0.0, 0.0, 0.0),
+        end=(100.0, 0.0, 0.0),
+        lanes=lanes,
+        pavement=[(0.0, "asphalt"), (60.0, "gravel")],
+    )
+    assert m.road_pavement(road.id) == [(0.0, "asphalt"), (60.0, "gravel")]
+    with pytest.raises(ValueError):
+        m.add_road(start=(0.0, 10.0, 0.0), end=(50.0, 10.0, 0.0), lanes=lanes, pavement=[(0.0, "lava")])
+
+
+def test_a_mine_and_a_town_share_their_buildings_and_their_land():
+    # The mine's yard gets buildings from the same grammar a town's streets do.
+    m = roadgen.Map(name="quarry")
+    quarry(m)
+    assert m.building_ids()
+    assert all("haul" in m.building_frontage(b)[0] for b in m.building_ids())
+    bare = roadgen.Map(name="quarry")
+    quarry(bare, buildings=None)
+    assert bare.building_ids() == []
+
+    # A town's land is built the way a mine's is: a TIN with the roads' edges in it.
+    t = street()
+    t.generate_buildings()
+    t.generate_land(relief=4.0, seed=1)
+    surfaces = t.tin_surface_ids()
+    assert len(surfaces) == 1
+    kinds = {kind for _, kind, _ in t.tin_breaklines(surfaces[0])}
+    assert kinds == {"road_edge"}
+    t.generate_land(False)
+    assert t.tin_surface_ids() == []

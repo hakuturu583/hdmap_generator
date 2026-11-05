@@ -4,6 +4,11 @@
 //! rows is still written: a reader that finds no `crosswalk.parquet` and one that
 //! finds an empty one learn the same thing, and an empty file is the less surprising
 //! of the two.
+//!
+//! Every map layer also records, as it pushes each row, which IR element that row
+//! came from. A row's index is its only identifier, so the moment it is pushed is the
+//! one place the correspondence is known; the [`Trace`] names a row
+//! `<layer>:<row>`, with the layer as its file is named.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -14,7 +19,7 @@ use arrow::datatypes::{DataType, Field, Fields, Schema};
 use roadgen_core::geometry::{Curve3, Frame3, Point3, SamplingConfig, UnitVector3};
 use roadgen_core::map::{Lane, Map};
 use roadgen_core::semantics::{MapObject, MapObjectKind, ObjectGeometry, RoadMarking};
-use roadgen_core::{RoadId, ValidatedMap};
+use roadgen_core::{IrRef, Relation, RoadId, Trace, ValidatedMap};
 
 use crate::columns;
 use crate::ego;
@@ -34,23 +39,38 @@ pub struct Layer {
 /// are ClipGT's own defaults for a device whose dimensions are missing, which makes
 /// them the one size a reader is already prepared to see, and keeps this exporter
 /// from inventing a measurement the IR never made.
-const LIGHT_DIMENSIONS: Point3 = Point3::new(0.6, 0.6, 1.0);
+pub const LIGHT_DIMENSIONS: Point3 = Point3::new(0.6, 0.6, 1.0);
 /// The same for a sign's plate.
-const SIGN_DIMENSIONS: Point3 = Point3::new(0.8, 0.3, 0.8);
+pub const SIGN_DIMENSIONS: Point3 = Point3::new(0.8, 0.3, 0.8);
+
+/// The format name a ClipGT [`Trace`] is recorded under.
+pub const TRACE_FORMAT: &str = "clipgt";
 
 /// Every layer of the clip, in the order they are written.
 pub fn all(map: &ValidatedMap, config: &ClipConfig) -> Result<Vec<Layer>, ExportError> {
+    all_traced(map, config, &mut Trace::new(TRACE_FORMAT))
+}
+
+/// The same, recording in `trace` which IR element each map row came from.
+///
+/// The scene layers — calibration and egomotion — describe the rig and the drive
+/// rather than the map, so they leave nothing in the trace.
+pub fn all_traced(
+    map: &ValidatedMap,
+    config: &ClipConfig,
+    trace: &mut Trace,
+) -> Result<Vec<Layer>, ExportError> {
     Ok(vec![
         calibration(config)?,
         egomotion(map, config)?,
-        lanes(map)?,
-        lane_lines(map)?,
-        road_boundaries(map)?,
-        crosswalks(map)?,
-        wait_lines(map)?,
-        traffic_lights(map)?,
-        traffic_signs(map)?,
-        intersection_areas(map)?,
+        lanes(map, trace)?,
+        lane_lines(map, trace)?,
+        road_boundaries(map, trace)?,
+        crosswalks(map, trace)?,
+        wait_lines(map, trace)?,
+        traffic_lights(map, trace)?,
+        traffic_signs(map, trace)?,
+        intersection_areas(map, trace)?,
     ])
 }
 
@@ -120,12 +140,17 @@ pub fn poses(map: &ValidatedMap, config: &ClipConfig) -> Result<Vec<ego::Pose>, 
 // --------------------------------------------------------------------------- //
 
 /// A lane is its two rails, in travel order: `left_rail` is the driver's left.
-fn lanes(map: &ValidatedMap) -> Result<Layer, ExportError> {
+fn lanes(map: &ValidatedMap, trace: &mut Trace) -> Result<Layer, ExportError> {
     let config = map.metadata.sampling;
     let mut left = Vec::new();
     let mut right = Vec::new();
     for lane in map.lanes.iter().filter(|lane| lane.lane_type.is_drivable()) {
         let travel = lane.travel_geometry(config)?;
+        trace.link(
+            lane.id.clone(),
+            row_ref("lane", left.len()),
+            Relation::Exact,
+        );
         left.push(vertices(&travel.left, config)?);
         right.push(vertices(&travel.right, config)?);
     }
@@ -137,7 +162,7 @@ fn lanes(map: &ValidatedMap) -> Result<Layer, ExportError> {
 
 /// Painted boundaries, one row per cross-section edge rather than per lane: two lanes
 /// that meet at an edge are separated by one line, not two stacked on each other.
-fn lane_lines(map: &ValidatedMap) -> Result<Layer, ExportError> {
+fn lane_lines(map: &ValidatedMap, trace: &mut Trace) -> Result<Layer, ExportError> {
     let config = map.metadata.sampling;
     let mut seen: HashSet<(RoadId, usize, i32)> = HashSet::new();
     let mut rails = Vec::new();
@@ -157,6 +182,8 @@ fn lane_lines(map: &ValidatedMap) -> Result<Layer, ExportError> {
             if !seen.insert((lane.road.clone(), lane.section, edge)) {
                 continue;
             }
+            let section = map.lanes_of_section(&lane.road, lane.section);
+            link_edge(trace, &section, edge, &row_ref("lane_line", rails.len()));
             rails.push(vertices(boundary, config)?);
             colors.push(vec![clipgt_color(marking.color).to_owned()]);
             styles.push(vec![clipgt_style(marking.marking).to_owned()]);
@@ -172,13 +199,14 @@ fn lane_lines(map: &ValidatedMap) -> Result<Layer, ExportError> {
 
 /// The outer edge of the carriageway: for each cross-section, the boundary beyond the
 /// outermost lane on each side, whether or not anything is painted on it.
-fn road_boundaries(map: &ValidatedMap) -> Result<Layer, ExportError> {
+fn road_boundaries(map: &ValidatedMap, trace: &mut Trace) -> Result<Layer, ExportError> {
     let config = map.metadata.sampling;
     let mut rows = Vec::new();
     for road in map.roads.iter() {
         for section in 0..road.sections.len() {
             let lanes = map.lanes_of_section(&road.id, section);
-            for boundary in outer_boundaries(&lanes) {
+            for (edge, boundary) in outer_boundaries(&lanes) {
+                link_edge(trace, &lanes, edge, &row_ref("road_boundary", rows.len()));
                 rows.push(vertices(boundary, config)?);
             }
         }
@@ -187,11 +215,13 @@ fn road_boundaries(map: &ValidatedMap) -> Result<Layer, ExportError> {
     layer("road_boundary", vec![("road_boundary", record)])
 }
 
-fn crosswalks(map: &ValidatedMap) -> Result<Layer, ExportError> {
+fn crosswalks(map: &ValidatedMap, trace: &mut Trace) -> Result<Layer, ExportError> {
     let config = map.metadata.sampling;
     let mut rows = Vec::new();
     for object in objects_of(map, |kind| matches!(kind, MapObjectKind::Crosswalk)) {
         if let ObjectGeometry::Band { left, right } = &object.geometry {
+            let local = row_ref("crosswalk", rows.len());
+            trace.link(object.id.clone(), local, Relation::Exact);
             rows.push(band_polygon(left, right, config)?);
         }
     }
@@ -199,11 +229,13 @@ fn crosswalks(map: &ValidatedMap) -> Result<Layer, ExportError> {
     layer("crosswalk", vec![("crosswalk", record)])
 }
 
-fn wait_lines(map: &ValidatedMap) -> Result<Layer, ExportError> {
+fn wait_lines(map: &ValidatedMap, trace: &mut Trace) -> Result<Layer, ExportError> {
     let config = map.metadata.sampling;
     let mut rows = Vec::new();
     for object in objects_of(map, |kind| matches!(kind, MapObjectKind::StopLine)) {
         if let ObjectGeometry::Line(line) = &object.geometry {
+            let local = row_ref("wait_line", rows.len());
+            trace.link(object.id.clone(), local, Relation::Exact);
             rows.push(vertices(line, config)?);
         }
     }
@@ -211,8 +243,14 @@ fn wait_lines(map: &ValidatedMap) -> Result<Layer, ExportError> {
     layer("wait_line", vec![("wait_line", record)])
 }
 
-fn traffic_lights(map: &ValidatedMap) -> Result<Layer, ExportError> {
-    let devices = devices(map, |kind| kind.is_traffic_light(), LIGHT_DIMENSIONS)?;
+fn traffic_lights(map: &ValidatedMap, trace: &mut Trace) -> Result<Layer, ExportError> {
+    let devices = devices(
+        map,
+        "traffic_light",
+        trace,
+        |kind| kind.is_traffic_light(),
+        LIGHT_DIMENSIONS,
+    )?;
     let record = Record::new()
         .add("center", Arc::new(columns::points(&devices.centers)))
         .add("dimensions", Arc::new(columns::points(&devices.dimensions)))
@@ -223,9 +261,11 @@ fn traffic_lights(map: &ValidatedMap) -> Result<Layer, ExportError> {
     layer("traffic_light", vec![("traffic_light", record)])
 }
 
-fn traffic_signs(map: &ValidatedMap) -> Result<Layer, ExportError> {
+fn traffic_signs(map: &ValidatedMap, trace: &mut Trace) -> Result<Layer, ExportError> {
     let devices = devices(
         map,
+        "traffic_sign",
+        trace,
         |kind| matches!(kind, MapObjectKind::TrafficSign { .. }),
         SIGN_DIMENSIONS,
     )?;
@@ -241,7 +281,7 @@ fn traffic_signs(map: &ValidatedMap) -> Result<Layer, ExportError> {
 }
 
 /// A junction as an outline: the hull of everything its connectors cover.
-fn intersection_areas(map: &ValidatedMap) -> Result<Layer, ExportError> {
+fn intersection_areas(map: &ValidatedMap, trace: &mut Trace) -> Result<Layer, ExportError> {
     let config = map.metadata.sampling;
     let mut rows = Vec::new();
     for junction in map.junctions.iter() {
@@ -254,6 +294,8 @@ fn intersection_areas(map: &ValidatedMap) -> Result<Layer, ExportError> {
         }
         let hull = convex_hull(&points);
         if hull.len() >= 3 {
+            let local = row_ref("intersection_area", rows.len());
+            trace.link(junction.id.clone(), local, Relation::Exact);
             rows.push(hull);
         }
     }
@@ -275,35 +317,69 @@ struct Devices {
 
 fn devices(
     map: &ValidatedMap,
+    layer: &str,
+    trace: &mut Trace,
     wanted: impl Fn(&MapObjectKind) -> bool,
     dimensions: Point3,
 ) -> Result<Devices, ExportError> {
-    let config = map.metadata.sampling;
     let mut devices = Devices {
         centers: Vec::new(),
         dimensions: Vec::new(),
         orientations: Vec::new(),
         categories: Vec::new(),
     };
-    for object in objects_of(map, &wanted) {
-        let ObjectGeometry::Line(bar) = &object.geometry else {
-            continue;
-        };
-        let (from, to) = (bar.start_point(), bar.end_point());
-        let center = from.lerp(to, 0.5);
-        let facing = facing_of(map, object, center, config)?;
-
-        devices.centers.push(center);
+    for (object, frame) in device_boxes(map, wanted, dimensions)? {
+        let local = row_ref(layer, devices.centers.len());
+        trace.link(object.id.clone(), local, Relation::Exact);
+        devices.centers.push(frame.origin);
         devices.dimensions.push(dimensions);
-        devices
-            .orientations
-            .push(ego::orientation_of(&Frame3::from_tangent(center, facing)?));
+        devices.orientations.push(ego::orientation_of(&frame));
         devices.categories.push(match &object.kind {
             MapObjectKind::TrafficSign { code } => code.clone(),
             other => other.as_str().to_owned(),
         });
     }
     Ok(devices)
+}
+
+/// Where each wanted light or sign stands and which way it faces: on the middle
+/// of the bar the IR draws across the lanes — the device's bottom edge — looking
+/// back at the traffic it governs. Every format that boxes a device boxes it from
+/// here ([`device_boxes`]), so they all agree.
+pub fn device_frames<'a>(
+    map: &'a ValidatedMap,
+    wanted: impl Fn(&MapObjectKind) -> bool + 'a,
+) -> Result<Vec<(&'a MapObject, Frame3)>, ExportError> {
+    let config = map.metadata.sampling;
+    let mut frames = Vec::new();
+    for object in objects_of(map, wanted) {
+        let ObjectGeometry::Line(bar) = &object.geometry else {
+            continue;
+        };
+        let center = bar.start_point().lerp(bar.end_point(), 0.5);
+        let facing = facing_of(map, object, center, config)?;
+        frames.push((object, Frame3::from_tangent(center, facing)?));
+    }
+    Ok(frames)
+}
+
+/// The box each wanted light or sign is drawn as, `dimensions` along its forward,
+/// left and up axes: the frame of [`device_frames`], raised by half the box's
+/// height. The IR's bar is a device's bottom edge — a light's housing rises from
+/// it, and OpenDRIVE's `zOffset` stands it there — so the box stands on the bar
+/// rather than straddling it.
+pub fn device_boxes<'a>(
+    map: &'a ValidatedMap,
+    wanted: impl Fn(&MapObjectKind) -> bool + 'a,
+    dimensions: Point3,
+) -> Result<Vec<(&'a MapObject, Frame3)>, ExportError> {
+    Ok(device_frames(map, wanted)?
+        .into_iter()
+        .map(|(object, frame)| {
+            let origin = frame.origin + frame.up.scaled(dimensions.z / 2.0);
+            (object, Frame3 { origin, ..frame })
+        })
+        .collect())
 }
 
 /// Which way a device faces: back along the traffic it governs, so it looks at the
@@ -346,7 +422,7 @@ fn object_bar_direction(object: &MapObject) -> Result<UnitVector3, ExportError> 
     }
 }
 
-fn objects_of<'a>(
+pub fn objects_of<'a>(
     map: &'a ValidatedMap,
     wanted: impl Fn(&MapObjectKind) -> bool + 'a,
 ) -> impl Iterator<Item = &'a MapObject> {
@@ -355,29 +431,59 @@ fn objects_of<'a>(
         .filter(move |object| wanted(&object.kind))
 }
 
-/// The two edges of a cross-section: the leftmost and the rightmost.
+/// The two edges of a cross-section: the leftmost and the rightmost, each with its
+/// edge index.
 ///
 /// Found through the edge indices rather than by looking at each side's lanes,
 /// because a cross-section need not have lanes on both sides — a junction connector
 /// has one lane, and both of its boundaries are edges of the carriageway.
-fn outer_boundaries<'a>(lanes: &[&'a Lane]) -> Vec<&'a Curve3> {
+pub fn outer_boundaries<'a>(lanes: &[&'a Lane]) -> Vec<(i32, &'a Curve3)> {
     let leftmost = lanes
         .iter()
         .max_by_key(|lane| lane.left_edge)
-        .map(|lane| &lane.left_boundary);
+        .map(|lane| (lane.left_edge, &lane.left_boundary));
     let rightmost = lanes
         .iter()
         .min_by_key(|lane| lane.right_edge)
-        .map(|lane| &lane.right_boundary);
+        .map(|lane| (lane.right_edge, &lane.right_boundary));
     leftmost.into_iter().chain(rightmost).collect()
 }
 
-fn vertices(curve: &Curve3, config: SamplingConfig) -> Result<Vec<Point3>, ExportError> {
+/// A row's name in the trace: `<layer>:<row>`.
+pub fn row_ref(layer: &str, row: usize) -> String {
+    format!("{layer}:{row}")
+}
+
+/// Links a row drawn along one cross-section edge to every lane of the section that
+/// the edge bounds, as that lane's left or right boundary.
+///
+/// An edge between two lanes is one row for both, so each of them is `Merged` into
+/// it; an edge only one lane touches is that lane's own.
+pub fn link_edge(trace: &mut Trace, section: &[&Lane], edge: i32, local: &str) {
+    let bordering: Vec<(&Lane, &str)> = section
+        .iter()
+        .filter_map(|lane| {
+            if lane.left_edge == edge {
+                Some((*lane, "left_boundary"))
+            } else if lane.right_edge == edge {
+                Some((*lane, "right_boundary"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let relation = Relation::shared_by(bordering.len());
+    for (lane, role) in bordering {
+        trace.link_as(IrRef::Lane(lane.id.clone()), local, relation, role);
+    }
+}
+
+pub fn vertices(curve: &Curve3, config: SamplingConfig) -> Result<Vec<Point3>, ExportError> {
     Ok(curve.to_polyline(config)?.points().to_vec())
 }
 
 /// A strip's outline: up one edge and back down the other.
-fn band_polygon(
+pub fn band_polygon(
     left: &Curve3,
     right: &Curve3,
     config: SamplingConfig,
@@ -431,7 +537,7 @@ fn convex_hull(points: &[Point3]) -> Vec<Point3> {
     hull
 }
 
-fn clipgt_color(color: roadgen_core::semantics::MarkingColor) -> &'static str {
+pub fn clipgt_color(color: roadgen_core::semantics::MarkingColor) -> &'static str {
     match color {
         roadgen_core::semantics::MarkingColor::White => "WHITE",
         roadgen_core::semantics::MarkingColor::Yellow => "YELLOW",

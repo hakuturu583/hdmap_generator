@@ -122,7 +122,7 @@ pub(crate) fn build(
                 );
                 map.rules.push(TrafficRule::TrafficLight {
                     lights,
-                    stop_line,
+                    stop_lines: stop_line.into_iter().collect(),
                     lanes,
                 });
             }

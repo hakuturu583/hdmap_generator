@@ -610,6 +610,273 @@ fn a_light_stands_on_the_pavement_with_an_arm_that_reaches_its_lane() {
 }
 
 #[test]
+fn a_lights_housing_and_lamps_are_where_the_ir_and_so_lanelet2_put_them() {
+    use roadgen_core::semantics::{LightColor, MapObjectKind, ObjectGeometry};
+
+    let map = signalised("Town01");
+    let config = PackageConfig::for_map(&map);
+    let furniture = roadgen_carla::furniture::build(
+        &map,
+        &config.map,
+        &config.surfaces,
+        &config.furniture.unwrap(),
+    );
+    for light in &furniture.lights {
+        let object = map
+            .objects
+            .iter()
+            .find(|object| object.id == light.object)
+            .unwrap();
+        let (MapObjectKind::TrafficLight { head }, ObjectGeometry::Line(bar)) =
+            (&object.kind, &object.geometry)
+        else {
+            panic!("{} is not a light with a bar", object.id);
+        };
+        // The builder gave it a standard head: a bar as wide as the housing, over
+        // the middle of the lane, and three lamps standing on it.
+        let (from, to) = (bar.start_point(), bar.end_point());
+        assert!((from.distance_to(to) - 0.38).abs() < 1e-6, "{}", object.id);
+        assert_eq!(head.height.map(|h| (h * 100.0).round()), Some(105.0));
+        assert_eq!(
+            head.bulbs.iter().map(|bulb| bulb.color).collect::<Vec<_>>(),
+            [LightColor::Green, LightColor::Yellow, LightColor::Red]
+        );
+
+        // The lamps CARLA switches, in the world: each bulb has a lamp round it,
+        // on the face of the housing towards the traffic.
+        let world = lamps_in_the_world(light);
+        for bulb in &head.bulbs {
+            let near = world
+                .iter()
+                .filter(|p| {
+                    (p.z - bulb.position.z).abs() <= 0.15 + 1e-6
+                        && p.horizontal_distance_to(bulb.position) <= 0.15 + 0.2
+                })
+                .count();
+            assert!(
+                near >= 12,
+                "no lamp at {:?} for {}",
+                bulb.position,
+                object.id
+            );
+        }
+        // And the housing stands on the bar: nothing of the head hangs below it.
+        let bottom = from.z.min(to.z);
+        let lowest_lamp = world.iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        assert!(
+            lowest_lamp > bottom,
+            "a lamp at {lowest_lamp} below the bar at {bottom}"
+        );
+    }
+}
+
+/// The lamps CARLA switches, in the world.
+fn lamps_in_the_world(light: &roadgen_carla::furniture::Placed) -> Vec<Point3> {
+    let (sin, cos) = light.heading.sin_cos();
+    light
+        .lamps
+        .as_ref()
+        .unwrap()
+        .positions
+        .iter()
+        .map(|p| {
+            Point3::new(
+                light.position.x + p.x * cos - p.y * sin,
+                light.position.y + p.x * sin + p.y * cos,
+                light.position.z + p.z,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_pole_moved_back_to_keep_clear_still_hangs_its_head_over_the_bar() {
+    // Two lanes into the junction, a light over each: their poles cannot both
+    // stand abeam of the bars, so one moves back -- and its head must not.
+    let mut builder = MapBuilder::new(MapMetadata {
+        name: Some("Town01".to_owned()),
+        ..MapMetadata::default()
+    });
+    let width = |metres: f64| PositiveWidth::new(metres).expect("a positive width");
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 80.0, 0.0),
+                Point3::new(0.0, 14.0, 0.0),
+                vec![
+                    LaneSpec::new(width(3.5), Direction::Backward),
+                    LaneSpec::new(width(2.0), Direction::Backward).with_type(LaneType::Sidewalk),
+                    LaneSpec::new(width(3.5), Direction::Forward),
+                    LaneSpec::new(width(3.5), Direction::Forward),
+                    LaneSpec::new(width(2.0), Direction::Forward).with_type(LaneType::Sidewalk),
+                ],
+            )
+            .expect("a road")
+            .with_name("north"),
+        )
+        .expect("a road");
+    for index in [2, 3] {
+        let lane = LaneRef::new(road.clone(), index);
+        let light = builder
+            .add_traffic_light_at(&lane, LaneEnd::End, 5.0, 6.0)
+            .expect("a light");
+        builder.add_traffic_light_rule(vec![light], None, vec![lane]);
+    }
+
+    // The second light also governs the first lane, as a light read from
+    // OpenDRIVE may: two heads on one arm, from the pole that stood back.
+    let mut map = builder.finish().expect("a map").into_map();
+    let lanes: Vec<_> = map
+        .objects
+        .iter()
+        .filter(|o| o.kind.is_traffic_light())
+        .flat_map(|o| o.lanes.clone())
+        .collect();
+    let second = map
+        .objects
+        .iter_mut()
+        .filter(|o| o.kind.is_traffic_light())
+        .nth(1)
+        .unwrap();
+    second.lanes = lanes;
+    let map = roadgen_core::validation::UnvalidatedMap::from_map(map)
+        .validate()
+        .expect("a valid map");
+    let config = PackageConfig::for_map(&map);
+    let furniture = roadgen_carla::furniture::build(
+        &map,
+        &config.map,
+        &config.surfaces,
+        &config.furniture.unwrap(),
+    );
+    assert_eq!(furniture.lights.len(), 2);
+    assert_eq!(
+        furniture.lights.iter().map(|l| l.lanes.len()).max(),
+        Some(2)
+    );
+    let feet: Vec<_> = furniture.lights.iter().map(|l| l.position).collect();
+    assert!(
+        (feet[0].y - feet[1].y).abs() > 0.5,
+        "the poles should not stand side by side: {feet:?}"
+    );
+    for light in &furniture.lights {
+        let object = map.objects.iter().find(|o| o.id == light.object).unwrap();
+        let head = object.kind.light_head().unwrap();
+        let world = lamps_in_the_world(light);
+        for bulb in &head.bulbs {
+            assert!(
+                world.iter().any(|p| (p.z - bulb.position.z).abs() < 0.16
+                    && p.horizontal_distance_to(bulb.position) < 0.35),
+                "no lamp at {:?} for {}",
+                bulb.position,
+                object.id
+            );
+        }
+        // Every head hangs from the arm: between the outermost heads the arm runs
+        // straight across at their station, not off on a slant from the pole.
+        if light.lanes.len() > 1 {
+            let lamps = &light.lamps.as_ref().unwrap().positions;
+            let (lo, hi) = lamps.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+                (lo.min(p.y), hi.max(p.y))
+            });
+            let head_x = lamps.iter().map(|p| p.x).sum::<f64>() / lamps.len() as f64;
+            let top = light
+                .mesh
+                .positions
+                .iter()
+                .map(|p| p.z)
+                .fold(f64::MIN, f64::max);
+            // A cylinder is its two end rings: the cross arm starts abeam of the
+            // pole and ends past the farthest head, both at the heads' station.
+            let far = if lo.abs() > hi.abs() { lo } else { hi };
+            let near_arm = |p: &&Point3| (p.x - head_x).abs() < 0.35 && p.z > top - 1.0;
+            assert!(
+                light
+                    .mesh
+                    .positions
+                    .iter()
+                    .filter(near_arm)
+                    .any(|p| p.y.abs() < 0.3),
+                "the arm does not start at the heads' station for {}",
+                object.id
+            );
+            assert!(
+                light
+                    .mesh
+                    .positions
+                    .iter()
+                    .filter(near_arm)
+                    .any(|p| p.y.abs() > far.abs()),
+                "the arm does not end at the heads' station for {}",
+                object.id
+            );
+        }
+        // Above each lamp there is part of the post (bracket or arm).
+        let post = &light.mesh.positions;
+        let lamps = &light.lamps.as_ref().unwrap().positions;
+        let (min_y, max_y) = lamps.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+            (lo.min(p.y), hi.max(p.y))
+        });
+        let top = post.iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        for y in [min_y, max_y] {
+            let x = lamps.iter().find(|p| (p.y - y).abs() < 1e-9).unwrap().x;
+            assert!(
+                post.iter()
+                    .any(|p| (p.y - y).abs() < 0.3 && (p.x - x).abs() < 0.5 && p.z > top - 1.0),
+                "nothing holds the head at y = {y} up for {}",
+                object.id
+            );
+        }
+    }
+}
+
+#[test]
+fn a_signal_read_as_a_point_at_its_post_keeps_its_lamps_where_its_bulbs_are() {
+    use roadgen_core::semantics::{MapObjectKind, ObjectGeometry};
+    use roadgen_core::validation::UnvalidatedMap;
+
+    // As CARLA's own `.xodr` reads back: each light a point at the foot of its
+    // post, on the pavement, its bulbs where the lamps are.
+    let mut map = signalised("Town01").into_map();
+    for object in map.objects.iter_mut() {
+        if let (MapObjectKind::TrafficLight { .. }, ObjectGeometry::Line(bar)) =
+            (&object.kind, &object.geometry)
+        {
+            let middle = bar.start_point().lerp(bar.end_point(), 0.5);
+            let foot = if middle.x.abs() < middle.y.abs() {
+                Point3::new(-4.1, middle.y, 0.15)
+            } else {
+                Point3::new(middle.x, 4.1, 0.15)
+            };
+            object.geometry = ObjectGeometry::Point(foot);
+        }
+    }
+    let map = UnvalidatedMap::from_map(map).validate().unwrap();
+    let config = PackageConfig::for_map(&map);
+    let furniture = roadgen_carla::furniture::build(
+        &map,
+        &config.map,
+        &config.surfaces,
+        &config.furniture.unwrap(),
+    );
+    assert_eq!(furniture.lights.len(), 2);
+    for light in &furniture.lights {
+        let object = map.objects.iter().find(|o| o.id == light.object).unwrap();
+        let head = object.kind.light_head().unwrap();
+        let world = lamps_in_the_world(light);
+        for bulb in &head.bulbs {
+            assert!(
+                world.iter().any(|p| (p.z - bulb.position.z).abs() < 0.16
+                    && p.horizontal_distance_to(bulb.position) < 0.35),
+                "no lamp at {:?} for {}",
+                bulb.position,
+                object.id
+            );
+        }
+    }
+}
+
+#[test]
 fn the_furniture_is_props_the_xodr_agrees_with_and_map_logic_ties_together() {
     let map = signalised("Town01");
     let directory = tempfile::tempdir().expect("a temporary directory");
@@ -791,4 +1058,146 @@ fn a_package_without_furniture_leaves_the_signals_where_the_ir_put_them() {
     assert!(warnings
         .iter()
         .any(|warning| warning.contains("CARLA spawns its own")));
+}
+
+/// Every element a written `.xodr` holds, named the way the OpenDRIVE trace names
+/// them.
+fn xodr_elements(path: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let drive = opendrive::core::OpenDrive::from_xml_str(&fs::read_to_string(path).unwrap())
+        .expect("the .xodr parses");
+    let mut found = std::collections::BTreeSet::new();
+    for road in &drive.road {
+        found.insert(format!("road:{}", road.id));
+        for (index, section) in road.lanes.lane_section.iter().enumerate() {
+            let left = section.left.iter().flat_map(|left| left.lane.iter());
+            let right = section.right.iter().flat_map(|right| right.lane.iter());
+            for id in left.map(|lane| lane.id).chain(right.map(|lane| lane.id)) {
+                found.insert(format!("lane:{}/{index}/{id}", road.id));
+            }
+        }
+        for signal in road.signals.iter().flat_map(|signals| &signals.signal) {
+            found.insert(format!("signal:{}", signal.id));
+        }
+        for object in road.objects.iter().flat_map(|objects| &objects.object) {
+            found.insert(format!("object:{}", object.id));
+            for outline in object
+                .outlines
+                .iter()
+                .flat_map(|outlines| &outlines.outline)
+            {
+                found.insert(format!("outline:{}/{}", object.id, outline.id.unwrap()));
+            }
+        }
+    }
+    for junction in &drive.junction {
+        found.insert(format!("junction:{}", junction.id));
+        for connection in junction.connection.iter() {
+            found.insert(format!("connection:{}/{}", junction.id, connection.id));
+        }
+    }
+    for controller in &drive.controller {
+        found.insert(format!("controller:{}", controller.id));
+    }
+    found
+}
+
+#[test]
+fn the_trace_names_what_the_package_holds() {
+    use roadgen_core::trace::{IrRef, Relation};
+
+    let map = signalised("Town01");
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let config = PackageConfig::for_map(&map);
+    let (package, trace) =
+        roadgen_carla::write_traced(&map, directory.path(), &config).expect("a package");
+    assert_eq!(trace.format, "carla");
+    for file in [&package.descriptor, &package.xodr, &package.script] {
+        assert!(
+            trace.files.contains(file),
+            "{} is not listed",
+            file.display()
+        );
+    }
+    // The meshes are not: no link points into them.
+    assert!(!trace.files.contains(&package.fbx));
+    assert!(trace.files.contains(package.furniture.as_ref().unwrap()));
+    for file in &trace.files {
+        assert!(file.is_file(), "{} was not written", file.display());
+    }
+
+    // Everything but the actors is in the `.xodr`, under the name the OpenDRIVE
+    // trace gives it.
+    let xodr = xodr_elements(&package.xodr);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(package.furniture.as_ref().unwrap()).unwrap())
+            .unwrap();
+    let placed: Vec<(String, String)> = ["lights", "signs"]
+        .iter()
+        .flat_map(|kind| manifest[kind].as_array().unwrap().iter())
+        .map(|entry| {
+            (
+                entry["object"].as_str().unwrap().to_owned(),
+                entry["name"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let mut actors = 0;
+    for link in &trace.links {
+        match link.local.strip_prefix("actor:") {
+            Some(name) => {
+                actors += 1;
+                assert_eq!(link.relation, Relation::Exact);
+                assert!(
+                    placed.contains(&(link.ir.to_string(), name.to_owned())),
+                    "{} is traced to actor {name}, which the manifest does not place",
+                    link.ir
+                );
+            }
+            None => assert!(
+                xodr.contains(&link.local),
+                "{} is traced to {}, which the .xodr does not hold",
+                link.ir,
+                link.local
+            ),
+        }
+    }
+    assert_eq!(actors, placed.len());
+    assert_eq!(actors, package.lights + package.signs);
+
+    for road in map.roads.iter() {
+        let ir = IrRef::Road(road.id.clone());
+        let exact = trace
+            .links_of(&ir)
+            .filter(|link| link.relation == Relation::Exact)
+            .count();
+        assert_eq!(exact, 1, "{}", road.id);
+    }
+    for lane in map.lanes.iter() {
+        let ir = IrRef::Lane(lane.id.clone());
+        let exact = trace
+            .links_of(&ir)
+            .filter(|link| link.relation == Relation::Exact)
+            .count();
+        assert_eq!(exact, 1, "{}", lane.id);
+    }
+}
+
+#[test]
+fn the_same_map_is_traced_the_same_twice() {
+    let map = signalised("Town01");
+    let config = PackageConfig::for_map(&map);
+    let trace = || {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let (_, trace) =
+            roadgen_carla::write_traced(&map, directory.path(), &config).expect("a package");
+        let files: Vec<_> = trace
+            .files
+            .iter()
+            .map(|file| file.strip_prefix(directory.path()).unwrap().to_path_buf())
+            .collect();
+        (trace.links, files)
+    };
+    let one = trace();
+    assert!(!one.0.is_empty());
+    assert_eq!(one, trace());
 }

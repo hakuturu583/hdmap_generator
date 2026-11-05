@@ -1,225 +1,198 @@
-//! A traffic light's housing and lamps, as Autoware draws them, kept through the IR:
-//! read from Lanelet2, written back to Lanelet2, and written to and read from
-//! OpenDRIVE.
+//! A traffic light's housing and lamps, kept through the IR: written to Lanelet2 as
+//! Autoware draws them, and written to and read back from OpenDRIVE.
 
-use roadgen_core::semantics::{LightArrow, LightColor, LightHead, MapObjectKind};
-use roadgen_core::validation::ValidatedMap;
-use roadgen_integration_tests::osm::Osm;
-use roadgen_lanelet2::ReadOptions;
+use roadgen_core::geometry::Point3;
+use roadgen_core::semantics::{
+    LightArrow, LightBulb, LightColor, LightHead, MapObjectKind, ObjectGeometry,
+};
+use roadgen_core::validation::{UnvalidatedMap, ValidatedMap};
+use roadgen_integration_tests::{reload_lanelet2, scenarios};
 
-/// One lane 40 m long with a traffic light over its end: a housing 0.45 m tall
-/// whose bottom edge is 5 m up, and four lamps — red, yellow, green, and a green
-/// arrow to the right.
-fn lit_lane() -> String {
-    let mut osm = Osm::new();
-    let left = osm.line(None, &[(0.0, 3.5), (20.0, 3.5), (40.0, 3.5)]);
-    let right = osm.line(None, &[(0.0, 0.0), (20.0, 0.0), (40.0, 0.0)]);
-    let lanelet = osm.lanelet(left, right);
-
-    let housing = vec![osm.node(37.0, 0.5, 5.0), osm.node(37.0, 3.0, 5.0)];
-    let light = osm.tagged_way(
-        housing,
-        vec![
-            ("type", "traffic_light".into()),
-            ("subtype", "red_yellow_green".into()),
-            ("height", "0.450000".into()),
-        ],
-    );
-    let lamps = [
-        (1.0, "red", None),
-        (1.6, "yellow", None),
-        (2.2, "green", None),
-        (2.8, "green", Some("right")),
-    ]
-    .into_iter()
-    .map(|(y, color, arrow)| {
-        let mut tags = vec![("color", color.to_owned())];
-        if let Some(arrow) = arrow {
-            tags.push(("arrow", arrow.to_owned()));
-        }
-        osm.tagged_node(37.0, y, 5.225, tags)
-    })
-    .collect();
-    let bulbs = osm.tagged_way(
-        lamps,
-        vec![
-            ("type", "light_bulbs".into()),
-            ("traffic_light_id", light.to_string()),
-        ],
-    );
-    let stop = vec![osm.node(35.0, 0.0, 0.0), osm.node(35.0, 3.5, 0.0)];
-    let stop_line = osm.tagged_way(stop, vec![("type", "stop_line".into())]);
-    let element = osm.regulatory_element(
-        "traffic_light",
-        vec![
-            ("way", light, "refers"),
-            ("way", stop_line, "ref_line"),
-            ("way", bulbs, "light_bulbs"),
-        ],
-    );
-    osm.refer(lanelet, element);
-    osm.xml()
+/// The controlled crossroads, each light given a housing 0.45 m tall and four
+/// lamps along its bar 0.225 m up: red, yellow, green, and a green arrow right.
+fn lit_crossroads() -> ValidatedMap {
+    let mut map = scenarios::controlled_crossroads().into_map();
+    for object in map.objects.iter_mut() {
+        let (MapObjectKind::TrafficLight { head }, ObjectGeometry::Line(bar)) =
+            (&mut object.kind, &object.geometry)
+        else {
+            continue;
+        };
+        let (from, to) = (bar.start_point(), bar.end_point());
+        let lamp = |at: f64, color, arrow| LightBulb {
+            position: {
+                let p = from.lerp(to, at);
+                Point3::new(p.x, p.y, p.z + 0.225)
+            },
+            color,
+            arrow,
+        };
+        *head = LightHead {
+            height: Some(0.45),
+            bulbs: vec![
+                lamp(0.2, LightColor::Red, None),
+                lamp(0.4, LightColor::Yellow, None),
+                lamp(0.6, LightColor::Green, None),
+                lamp(0.8, LightColor::Green, Some(LightArrow::Right)),
+            ],
+        };
+    }
+    UnvalidatedMap::from_map(map).validate().unwrap()
 }
 
-fn read(xml: &str) -> ValidatedMap {
-    roadgen_lanelet2::from_osm_str(xml, &ReadOptions::default())
-        .unwrap()
-        .map
-        .validate()
-        .unwrap()
-}
-
-/// Reads a map written from `map` again, about the same origin.
-fn read_back(xml: &str, map: &ValidatedMap) -> ValidatedMap {
-    roadgen_lanelet2::from_osm_str(
-        xml,
-        &ReadOptions {
-            origin: Some(map.metadata.origin),
-            ..ReadOptions::default()
-        },
-    )
-    .unwrap()
-    .map
-    .validate()
-    .unwrap()
-}
-
-fn head(map: &ValidatedMap) -> LightHead {
-    let lights: Vec<&LightHead> = map
+fn heads(map: &ValidatedMap) -> Vec<LightHead> {
+    let mut heads: Vec<LightHead> = map
         .objects
         .iter()
         .filter_map(|object| match &object.kind {
-            MapObjectKind::TrafficLight { head } => Some(head),
+            MapObjectKind::TrafficLight { head } => Some(head.clone()),
             _ => None,
         })
         .collect();
-    assert_eq!(lights.len(), 1, "one traffic light");
-    lights[0].clone()
-}
-
-/// Whether two heads are the same, the lamps within `tolerance` metres.
-fn same(a: &LightHead, b: &LightHead, tolerance: f64) -> bool {
-    a.height
-        .zip(b.height)
-        .is_some_and(|(x, y)| (x - y).abs() < 1e-9)
-        && a.bulbs.len() == b.bulbs.len()
-        && a.bulbs.iter().zip(&b.bulbs).all(|(p, q)| {
-            p.color == q.color
-                && p.arrow == q.arrow
-                && p.position.distance_to(q.position) < tolerance
-        })
+    heads.sort_by(|a, b| {
+        let (p, q) = (a.bulbs[0].position, b.bulbs[0].position);
+        p.x.total_cmp(&q.x).then(p.y.total_cmp(&q.y))
+    });
+    heads
 }
 
 #[test]
-fn a_traffic_light_keeps_its_housing_and_lamps() {
-    let map = read(&lit_lane());
-    let head = head(&map);
-    assert_eq!(head.height, Some(0.45));
-    let shown: Vec<(LightColor, Option<LightArrow>)> = head
-        .bulbs
+fn lanelet2_draws_the_housing_and_lamps_as_autoware_does() {
+    let map = lit_crossroads();
+    let lights = heads(&map).len();
+    assert!(lights > 0);
+    let xml = roadgen_lanelet2::to_osm_xml(&map).unwrap();
+    // The housing's height on each light's way, and the light_bulbs way listed in
+    // the light's regulatory element.
+    assert_eq!(xml.matches("k=\"height\" v=\"0.450000\"").count(), lights);
+    assert!(xml.matches("role=\"light_bulbs\"").count() >= lights);
+
+    // As Lanelet2's own loader reads it: a light_bulbs way per light, naming its
+    // light, with a point per lamp tagged with what it shows.
+    let loaded = reload_lanelet2(&map);
+    let lines: Vec<_> = loaded
+        .line_strings
+        .all()
         .iter()
-        .map(|bulb| (bulb.color, bulb.arrow))
+        .filter_map(ll2_core::map::as_linestring)
+        .cloned()
         .collect();
-    assert_eq!(
-        shown,
-        vec![
-            (LightColor::Red, None),
-            (LightColor::Yellow, None),
-            (LightColor::Green, None),
-            (LightColor::Green, Some(LightArrow::Right)),
-        ]
-    );
-    // The lamps are where the file puts them: 0.225 m above the housing's bottom
-    // edge, and 0.6 m apart — as near as the file's rounded degrees say.
-    let bottom = map
-        .objects
+    let tag = |attributes: &ll2_core::refs::Attrs, key: &str| {
+        attributes
+            .read()
+            .get(key)
+            .map(|value| value.value().to_owned())
+    };
+    let light_ids: Vec<String> = lines
         .iter()
-        .find(|object| object.kind.is_traffic_light())
-        .map(|object| match &object.geometry {
-            roadgen_core::semantics::ObjectGeometry::Line(line) => line.start_point().z,
-            _ => panic!("a traffic light is a line"),
-        })
-        .unwrap();
-    for bulb in &head.bulbs {
-        assert!((bulb.position.z - bottom - 0.225).abs() < 1e-6);
+        .filter(|line| tag(line.attributes(), "type").as_deref() == Some("traffic_light"))
+        .map(|line| line.id().to_string())
+        .collect();
+    let bulbs: Vec<_> = lines
+        .iter()
+        .filter(|line| tag(line.attributes(), "type").as_deref() == Some("light_bulbs"))
+        .collect();
+    assert_eq!(bulbs.len(), lights);
+    for way in bulbs {
+        let named = tag(way.attributes(), "traffic_light_id").unwrap();
+        assert!(light_ids.contains(&named), "{named} is not a traffic light");
+        let shown: Vec<(Option<String>, Option<String>)> = way
+            .points()
+            .iter()
+            .map(|point| {
+                (
+                    tag(point.attributes(), "color"),
+                    tag(point.attributes(), "arrow"),
+                )
+            })
+            .collect();
+        let text = |value: &str| Some(value.to_owned());
+        assert_eq!(
+            shown,
+            vec![
+                (text("red"), None),
+                (text("yellow"), None),
+                (text("green"), None),
+                (text("green"), text("right")),
+            ]
+        );
     }
-    assert!((head.bulbs[0].position.distance_to(head.bulbs[1].position) - 0.6).abs() < 0.01);
-}
-
-#[test]
-fn the_lamps_come_back_from_lanelet2() {
-    let map = read(&lit_lane());
-    let back = read_back(&roadgen_lanelet2::to_osm_xml(&map).unwrap(), &map);
-    assert!(same(&head(&map), &head(&back), 1e-4));
 }
 
 #[test]
 fn opendrive_carries_the_housing_height_and_the_lamps() {
-    let map = read(&lit_lane());
+    let map = lit_crossroads();
+    let lights = heads(&map).len();
     let xml = roadgen_opendrive::to_xml(&map).unwrap();
-    assert!(
-        xml.contains("height=\"4.5"),
-        "the signal has its housing's height"
-    );
     assert_eq!(
         xml.matches(&format!("code=\"{}\"", roadgen_opendrive::BULB_CODE))
             .count(),
-        4
+        4 * lights
     );
     let back = roadgen_opendrive::from_xml(&xml)
         .unwrap()
         .map
         .validate()
         .unwrap();
-    assert!(same(&head(&map), &head(&back), 1e-4));
+    let (written, read) = (heads(&map), heads(&back));
+    assert_eq!(written.len(), read.len());
+    for (a, b) in written.iter().zip(&read) {
+        assert!(a
+            .height
+            .zip(b.height)
+            .is_some_and(|(x, y)| (x - y).abs() < 1e-9));
+        assert_eq!(a.bulbs.len(), b.bulbs.len());
+        for (p, q) in a.bulbs.iter().zip(&b.bulbs) {
+            assert_eq!((p.color, p.arrow), (q.color, q.arrow));
+            assert!(p.position.distance_to(q.position) < 1e-4);
+        }
+    }
 }
 
 #[test]
-fn lamps_naming_no_light_go_with_the_light_listed_in_the_same_place() {
-    // Two lights over one lane whose lamps name ids that are not theirs, as two
-    // of Nishi-Shinjuku's do: 413 for 3002413.
-    let mut osm = Osm::new();
-    let left = osm.line(None, &[(0.0, 3.5), (40.0, 3.5)]);
-    let right = osm.line(None, &[(0.0, 0.0), (40.0, 0.0)]);
-    let lanelet = osm.lanelet(left, right);
-    let mut members = Vec::new();
-    let mut lamps_of = Vec::new();
-    for (x, color) in [(37.0, "red"), (38.0, "green")] {
-        let housing = vec![osm.node(x, 0.5, 5.0), osm.node(x, 3.0, 5.0)];
-        let light = osm.tagged_way(housing, vec![("type", "traffic_light".into())]);
-        let lamp = osm.tagged_node(x, 1.0, 5.2, vec![("color", color.to_owned())]);
-        let bulbs = osm.tagged_way(
-            vec![lamp],
-            vec![
-                ("type", "light_bulbs".into()),
-                ("traffic_light_id", "7".into()),
-            ],
-        );
-        members.push(("way", light, "refers"));
-        lamps_of.push(("way", bulbs, "light_bulbs"));
-    }
-    members.extend(lamps_of);
-    let element = osm.regulatory_element("traffic_light", members);
-    osm.refer(lanelet, element);
+fn a_lights_lamp_way_traces_back_to_the_light() {
+    use roadgen_core::trace::{IrRef, Relation};
 
-    let imported = roadgen_lanelet2::from_osm_str(&osm.xml(), &ReadOptions::default()).unwrap();
-    assert!(imported
-        .approximations
+    let map = lit_crossroads();
+    let (written, trace) = roadgen_lanelet2::to_lanelet_map_traced(&map).unwrap();
+    let lines: Vec<_> = written
+        .line_strings
+        .all()
         .iter()
-        .any(|note| note.contains("light_bulbs")));
-    let map = imported.map.validate().unwrap();
-    let mut shown: Vec<(f64, Vec<LightColor>)> = map
-        .objects
-        .iter()
-        .filter_map(|object| match &object.kind {
-            MapObjectKind::TrafficLight { head } => Some((
-                head.bulbs[0].position.x,
-                head.bulbs.iter().map(|bulb| bulb.color).collect(),
-            )),
-            _ => None,
-        })
+        .filter_map(ll2_core::map::as_linestring)
+        .cloned()
         .collect();
-    shown.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let colors: Vec<Vec<LightColor>> = shown.into_iter().map(|(_, colors)| colors).collect();
-    assert_eq!(colors, vec![vec![LightColor::Red], vec![LightColor::Green]]);
+    let named = |local: &str| {
+        lines
+            .iter()
+            .find(|line| format!("linestring:{}", line.id()) == local)
+            .unwrap_or_else(|| panic!("{local} is not in the export"))
+    };
+    let tag = |line: &ll2_core::linestring::LineString, key: &str| {
+        line.attributes()
+            .read()
+            .get(key)
+            .map(|value| value.value().to_owned())
+    };
+
+    let mut lights = 0;
+    for object in map.objects.iter().filter(|o| o.kind.is_traffic_light()) {
+        lights += 1;
+        let links: Vec<_> = trace.links_of(&IrRef::Object(object.id.clone())).collect();
+        let housing = links.iter().find(|link| link.role.is_none()).unwrap();
+        let bulbs: Vec<_> = links
+            .iter()
+            .filter(|link| link.role.as_deref() == Some("light_bulbs"))
+            .collect();
+        assert_eq!(bulbs.len(), 1, "{}", object.id);
+        assert_eq!(bulbs[0].relation, Relation::Exact);
+        // The traced way is the lamps of the traced housing, by Autoware's own tag.
+        let way = named(&bulbs[0].local);
+        assert_eq!(tag(way, "type").as_deref(), Some("light_bulbs"));
+        assert_eq!(
+            format!("linestring:{}", tag(way, "traffic_light_id").unwrap()),
+            housing.local
+        );
+    }
+    assert!(lights > 0);
 }

@@ -7,16 +7,21 @@ members = [
     "crates/roadgen-opendrive",
     "crates/roadgen-lanelet2",
     "crates/roadgen-clipgt",
+    "crates/roadgen-rdshq",
     "crates/roadgen-gpudrive",
+    "crates/roadgen-womd",
+    "crates/roadgen-commonroad",
     "crates/roadgen-osm",
+    "crates/roadgen-proto",
     "crates/roadgen-sumo",
+    "crates/roadgen-trace",
     "crates/roadgen-viewer",
     "crates/roadgen-python",
     "tests/integration",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.42.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -30,9 +35,14 @@ roadgen-carla = { path = "crates/roadgen-carla" }
 roadgen-opendrive = { path = "crates/roadgen-opendrive" }
 roadgen-lanelet2 = { path = "crates/roadgen-lanelet2" }
 roadgen-clipgt = { path = "crates/roadgen-clipgt" }
+roadgen-rdshq = { path = "crates/roadgen-rdshq" }
 roadgen-gpudrive = { path = "crates/roadgen-gpudrive" }
+roadgen-womd = { path = "crates/roadgen-womd" }
+roadgen-commonroad = { path = "crates/roadgen-commonroad" }
 roadgen-osm = { path = "crates/roadgen-osm" }
+roadgen-proto = { path = "crates/roadgen-proto" }
 roadgen-sumo = { path = "crates/roadgen-sumo" }
+roadgen-trace = { path = "crates/roadgen-trace" }
 roadgen-viewer = { path = "crates/roadgen-viewer" }
 
 # OpenDRIVE 1.7 data model, parser and writer. MIT, which an Apache-2.0 project may
@@ -72,6 +82,11 @@ parquet = { version = "59", default-features = false, features = ["arrow", "snap
 # that is not a file on disk, and the viewer has no disk to put one on.
 bytes = { version = "1", default-features = false }
 
+# tar, for RDS-HQ: every file of that dataset is a one-sample WebDataset shard,
+# which is a plain tar archive. MIT/Apache-2.0. Default features off, because the
+# one they bring is reading extended attributes off disk, and nothing here reads.
+tar = { version = "0.4", default-features = false }
+
 # The ClipGT scenario file, and the rig JSON a clip's calibration table carries.
 # serde and serde_json are MIT/Apache-2.0; serde_norway is the maintained fork of
 # serde_yaml, under the same licences.
@@ -79,11 +94,25 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
 
+# sha2, for the digests a trace file keeps of the files it describes and of the IR
+# it came from. MIT/Apache-2.0. A trace whose file was rewritten gives wrong answers
+# without complaint, so the digest is what lets a reader refuse it instead.
+sha2 = "0.10"
+
 # symbios-shape: a derivation engine for CGA shape grammars, the CityEngine
 # formalism. MIT, which an Apache-2.0 project may redistribute. Used so that the
 # architecture in `roadgen-buildings` is a grammar a caller can edit rather than a
 # hard-coded box generator; this project supplies the lots and keeps the footprints.
 symbios-shape = "0.4"
+
+# Protocol Buffers, for the IR as a document other programs can read. prost is
+# Apache-2.0 and protox MIT/Apache-2.0, so an Apache-2.0 project may redistribute
+# both. protox is a protobuf compiler written in Rust: the build reads the `.proto`
+# files itself, so nobody building roadgen has to install `protoc`.
+prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
+protox = "0.10"
 
 pyo3 = "0.29"
 

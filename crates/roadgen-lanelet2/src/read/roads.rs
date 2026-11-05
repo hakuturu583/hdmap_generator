@@ -404,6 +404,10 @@ fn road_along(
         road_type: road_type(group[0].location.as_deref()),
         speed_limit: None,
         superelevation: Poly3Profile::default(),
+        // Lanelet2 says nothing of a road's surface, part or structure.
+        pavement: roadgen_core::semantics::PavementProfile::unknown(),
+        form: roadgen_core::semantics::FormOfWay::Unspecified,
+        structure: roadgen_core::structure::StructureProfile::at_grade(),
     };
 
     // The road's cross-fall. Lanelet2 boundaries carry their own heights, and a

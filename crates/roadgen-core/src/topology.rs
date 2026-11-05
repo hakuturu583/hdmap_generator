@@ -5,7 +5,7 @@
 //! from these — OpenDRIVE's `<link>`/`<laneLink>` and Lanelet2's shared boundary
 //! points are *lowerings* of this, never the other way round.
 
-use crate::id::{ConnectionId, JunctionId, LaneId, RoadId};
+use crate::id::{ConnectionId, InterchangeId, JunctionId, LaneId, RoadId};
 
 /// Which way traffic runs along a lane, relative to its road's reference line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,6 +41,44 @@ impl Direction {
         match self {
             Direction::Forward => "forward",
             Direction::Backward => "backward",
+        }
+    }
+}
+
+/// Which way a movement through a junction turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Turn {
+    Left,
+    Straight,
+    Right,
+}
+
+impl Turn {
+    /// The turn of a movement whose heading swings by `swing` radians between its
+    /// ends, counter-clockwise positive: straight within 45 degrees either way, else
+    /// left or right.
+    ///
+    /// 45 degrees is half a right angle, so a turn at an ordinary crossroads (90) and
+    /// a straight on that bends to meet a skewed arm (CARLA's run to about 15) fall
+    /// clearly to either side. Every export that sorts movements by turn reads them
+    /// this way, so the formats agree on which way a connector goes.
+    pub fn from_swing(swing: f64) -> Turn {
+        use std::f64::consts::{PI, TAU};
+        let swing = (swing + PI).rem_euclid(TAU) - PI;
+        if swing.abs() <= PI / 4.0 {
+            Turn::Straight
+        } else if swing > 0.0 {
+            Turn::Left
+        } else {
+            Turn::Right
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Turn::Left => "left",
+            Turn::Straight => "straight",
+            Turn::Right => "right",
         }
     }
 }
@@ -92,6 +130,14 @@ impl LaneEnd {
         match self {
             LaneEnd::Start => LaneEnd::End,
             LaneEnd::End => LaneEnd::Start,
+        }
+    }
+
+    /// The road's end this lane end lies at; the inverse of [`RoadEnd::as_lane_end`].
+    pub fn as_road_end(self) -> RoadEnd {
+        match self {
+            LaneEnd::Start => RoadEnd::Start,
+            LaneEnd::End => RoadEnd::End,
         }
     }
 
@@ -214,6 +260,8 @@ pub struct Junction {
     pub incoming_roads: Vec<RoadId>,
     /// Generated roads that carry traffic through the junction.
     pub connecting_roads: Vec<RoadId>,
+    /// The interchange the junction is part of, when it is part of one.
+    pub interchange: Option<InterchangeId>,
 }
 
 impl Junction {
@@ -223,6 +271,7 @@ impl Junction {
             name,
             incoming_roads: Vec::new(),
             connecting_roads: Vec::new(),
+            interchange: None,
         }
     }
 }

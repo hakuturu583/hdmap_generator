@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, RoadId};
+use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
 
 /// Something that cannot be expressed as geometry.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +23,10 @@ pub enum GeometryError {
     InvalidSampling { max_segment_length: f64 },
     /// A closed ring encloses no area, so it is a line rather than a polygon.
     ZeroArea,
+    /// A curve was asked to be realised in no segments at all.
+    NoSegments,
+    /// A curve was asked to be realised in more segments than can be afforded.
+    TooManySegments { got: usize, max: usize },
 }
 
 impl fmt::Display for GeometryError {
@@ -52,6 +56,13 @@ impl fmt::Display for GeometryError {
             ),
             GeometryError::ZeroArea => {
                 f.write_str("the ring encloses no area, so it is a line and not a polygon")
+            }
+            GeometryError::NoSegments => f.write_str("a curve needs at least one segment"),
+            GeometryError::TooManySegments { got, max } => {
+                write!(
+                    f,
+                    "a curve of {got} segments is more than the {max} allowed"
+                )
             }
         }
     }
@@ -110,6 +121,8 @@ pub enum BuildError {
         angle_degrees: f64,
         detail: String,
     },
+    /// A bridge, tunnel or interchange could not be laid out.
+    Structure(String),
 }
 
 impl From<GeometryError> for BuildError {
@@ -175,6 +188,7 @@ impl fmt::Display for BuildError {
                  cannot be rounded: {detail}. Give the bend an arc or spiral alignment, or \
                  more room"
             ),
+            BuildError::Structure(detail) => f.write_str(detail),
         }
     }
 }
@@ -293,6 +307,41 @@ pub enum ValidationIssue {
         part: BuildingPartId,
         detail: String,
     },
+    /// A traffic light's housing or lamps are not ones a light could have.
+    ImplausibleTrafficLight {
+        object: ObjectId,
+        detail: String,
+    },
+    /// A feature names another feature that is not on the map. The two are named
+    /// by their printed identifiers, since they may be of any kind.
+    DanglingFeatureReference {
+        referrer: String,
+        feature: String,
+    },
+    /// A terrain surface, breakline, land cover, site, barrier or pavement is not
+    /// one the world could hold.
+    ImplausibleFeature {
+        feature: String,
+        detail: String,
+    },
+    /// A motorway, a slip road or a road on a structure crosses another road on
+    /// the level, or close enough that nothing could carry one over the other.
+    UnseparatedCrossing {
+        over: RoadId,
+        under: RoadId,
+        detail: String,
+    },
+    /// A road carried over another leaves too little room between them: the
+    /// underside of the upper road's deck comes down within [`CLEARANCE`] of the
+    /// lower road, or the upper road dips into the roof of the tunnel the lower
+    /// is in.
+    ///
+    /// [`CLEARANCE`]: crate::structure::CLEARANCE
+    InsufficientClearance {
+        over: RoadId,
+        under: RoadId,
+        detail: String,
+    },
     Geometry {
         detail: String,
     },
@@ -353,6 +402,25 @@ impl fmt::Display for ValidationIssue {
             ValidationIssue::ImplausibleBuildingPart { part, detail } => {
                 write!(f, "building part {part}: {detail}")
             }
+            ValidationIssue::ImplausibleTrafficLight { object, detail } => {
+                write!(f, "traffic light {object}: {detail}")
+            }
+            ValidationIssue::DanglingFeatureReference { referrer, feature } => {
+                write!(f, "{referrer} refers to missing feature {feature}")
+            }
+            ValidationIssue::ImplausibleFeature { feature, detail } => {
+                write!(f, "{feature}: {detail}")
+            }
+            ValidationIssue::UnseparatedCrossing { detail, .. } => write!(
+                f,
+                "{detail}: a motorway, a slip road or a road on a structure crosses nothing \
+                 on the level — carry one over the other with a bridge or a tunnel"
+            ),
+            ValidationIssue::InsufficientClearance { detail, .. } => write!(
+                f,
+                "{detail}: a road carried over another has to leave the lower one its \
+                 clear height"
+            ),
             ValidationIssue::Geometry { detail } => write!(f, "geometry error: {detail}"),
         }
     }

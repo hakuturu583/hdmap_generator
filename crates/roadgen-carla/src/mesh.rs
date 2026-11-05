@@ -174,11 +174,26 @@ impl Mesh {
     /// scale: a surface that is not a ribbon has no along and across to follow, and
     /// the ground reads the same wherever two of its triangles meet.
     pub fn sheet(&mut self, positions: &[Point3], triangles: &[[u32; 3]], slot: usize) {
+        let plan: Vec<[f64; 2]> = positions.iter().map(|p| [p.x, p.y]).collect();
+        self.sheet_mapped(positions, triangles, &plan, slot);
+    }
+
+    /// Adds a surface already triangulated, as [`Mesh::sheet`] does, with each
+    /// position's texture coordinates given — in metres, which the texture's
+    /// scale turns into repeats — rather than taken from the plan.
+    pub fn sheet_mapped(
+        &mut self,
+        positions: &[Point3],
+        triangles: &[[u32; 3]],
+        metres: &[[f64; 2]],
+        slot: usize,
+    ) {
+        debug_assert_eq!(positions.len(), metres.len());
         let base = self.positions.len() as u32;
         let scale = self.texture_scale(slot);
-        for point in positions {
+        for (point, uv) in positions.iter().zip(metres) {
             self.positions.push(*point);
-            self.uvs.push([point.x / scale, point.y / scale]);
+            self.uvs.push([uv[0] / scale, uv[1] / scale]);
         }
         for triangle in triangles {
             self.push_triangle(triangle.map(|index| base + index), slot);

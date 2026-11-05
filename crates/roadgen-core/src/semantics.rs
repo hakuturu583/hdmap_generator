@@ -4,8 +4,8 @@
 //! `RegulatoryElement` appears here; each exporter maps these onto its own format's
 //! vocabulary, and a format that cannot express one simply drops it.
 
-use crate::geometry::{Curve3, Point3};
-use crate::id::{LaneId, ObjectId};
+use crate::geometry::{Curve3, Point3, UnitVector3};
+use crate::id::{LaneId, ObjectId, StructureId};
 use crate::units::SpeedLimit;
 
 /// What a lane is for.
@@ -95,6 +95,195 @@ impl RoadType {
             "pedestrian" => RoadType::Pedestrian,
             _ => return None,
         })
+    }
+}
+
+/// What part a road plays in the network, kept apart from [`RoadType`].
+///
+/// GDF's Form of Way. A road type says what kind of place the road is in — a town,
+/// the country, a motorway — which is what OpenDRIVE's `<type>` holds; the form says
+/// what the road *is* to the network: a carriageway of a motorway, the slip road
+/// onto it, a parallel collector. The two are different questions, and a slip road
+/// in a town is both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FormOfWay {
+    /// Nothing said; what every road is unless the caller says otherwise.
+    #[default]
+    Unspecified,
+    /// One carriageway of a road for motor vehicles only, entered and left only by
+    /// slip roads and crossing nothing on the level.
+    Motorway,
+    /// A road with physically separated carriageways that is not a motorway.
+    MultipleCarriageway,
+    SingleCarriageway,
+    /// A road built to enter or leave another: a ramp, a link between motorways.
+    SlipRoad,
+    /// A collector-distributor beside a carriageway, or a frontage road.
+    ParallelRoad,
+    ServiceRoad,
+    Roundabout,
+}
+
+impl FormOfWay {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FormOfWay::Unspecified => "unspecified",
+            FormOfWay::Motorway => "motorway",
+            FormOfWay::MultipleCarriageway => "multiple_carriageway",
+            FormOfWay::SingleCarriageway => "single_carriageway",
+            FormOfWay::SlipRoad => "slip_road",
+            FormOfWay::ParallelRoad => "parallel_road",
+            FormOfWay::ServiceRoad => "service_road",
+            FormOfWay::Roundabout => "roundabout",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<FormOfWay> {
+        Some(match value.to_ascii_lowercase().as_str() {
+            "unspecified" | "" => FormOfWay::Unspecified,
+            "motorway" => FormOfWay::Motorway,
+            "multiple_carriageway" | "dual_carriageway" => FormOfWay::MultipleCarriageway,
+            "single_carriageway" => FormOfWay::SingleCarriageway,
+            "slip_road" | "ramp" => FormOfWay::SlipRoad,
+            "parallel_road" => FormOfWay::ParallelRoad,
+            "service_road" => FormOfWay::ServiceRoad,
+            "roundabout" => FormOfWay::Roundabout,
+            _ => return None,
+        })
+    }
+
+    /// A motorway or a slip road: entered only where a slip road joins, crossing
+    /// nothing on the level, and with no frontage for a building to face.
+    pub fn is_controlled_access(self) -> bool {
+        matches!(self, FormOfWay::Motorway | FormOfWay::SlipRoad)
+    }
+}
+
+/// What a road is surfaced with: whether it is paved, and with what.
+///
+/// Two levels, the way GDF puts it — a pavement status, then a surface type that
+/// only means anything under it — so that a road that is unpaved and asphalt is a
+/// value this type cannot hold rather than one validation has to catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Pavement {
+    Paved(PavedSurface),
+    Unpaved(UnpavedSurface),
+}
+
+/// The surface of a paved road.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PavedSurface {
+    Asphalt,
+    Concrete,
+    Cobblestone,
+}
+
+/// The surface of an unpaved road.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnpavedSurface {
+    Gravel,
+    Dirt,
+    Sand,
+    Rock,
+}
+
+impl Pavement {
+    pub fn is_paved(self) -> bool {
+        matches!(self, Pavement::Paved(_))
+    }
+
+    /// The surface type on its own, which is the word every consumer that has one
+    /// field for it wants.
+    pub fn surface_str(self) -> &'static str {
+        match self {
+            Pavement::Paved(PavedSurface::Asphalt) => "asphalt",
+            Pavement::Paved(PavedSurface::Concrete) => "concrete",
+            Pavement::Paved(PavedSurface::Cobblestone) => "cobblestone",
+            Pavement::Unpaved(UnpavedSurface::Gravel) => "gravel",
+            Pavement::Unpaved(UnpavedSurface::Dirt) => "dirt",
+            Pavement::Unpaved(UnpavedSurface::Sand) => "sand",
+            Pavement::Unpaved(UnpavedSurface::Rock) => "rock",
+        }
+    }
+
+    /// Reads a surface type; its pavement status follows from it.
+    pub fn parse(value: &str) -> Option<Pavement> {
+        Some(match value.to_ascii_lowercase().as_str() {
+            "asphalt" => Pavement::Paved(PavedSurface::Asphalt),
+            "concrete" => Pavement::Paved(PavedSurface::Concrete),
+            "cobblestone" | "sett" => Pavement::Paved(PavedSurface::Cobblestone),
+            "gravel" => Pavement::Unpaved(UnpavedSurface::Gravel),
+            "dirt" | "earth" | "ground" => Pavement::Unpaved(UnpavedSurface::Dirt),
+            "sand" => Pavement::Unpaved(UnpavedSurface::Sand),
+            "rock" => Pavement::Unpaved(UnpavedSurface::Rock),
+            _ => return None,
+        })
+    }
+}
+
+/// A road's pavement along its length: each value holds from its station to the
+/// next one's. Empty when nobody said, which is every road the IR held before
+/// pavement existed, and which a consumer reads as "whatever it assumes".
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PavementProfile {
+    /// `(station, pavement)`, ascending by station.
+    spans: Vec<(f64, Pavement)>,
+}
+
+impl PavementProfile {
+    /// Unknown everywhere.
+    pub fn unknown() -> Self {
+        PavementProfile::default()
+    }
+
+    /// The same pavement along the whole road.
+    pub fn constant(pavement: Pavement) -> Self {
+        PavementProfile {
+            spans: vec![(0.0, pavement)],
+        }
+    }
+
+    /// Pavements taking over at each station in turn. Fails unless the stations are
+    /// finite and strictly ascending; a span that repeats the one before it is
+    /// merged into it.
+    pub fn new(spans: impl IntoIterator<Item = (f64, Pavement)>) -> Result<Self, String> {
+        let mut kept: Vec<(f64, Pavement)> = Vec::new();
+        for (station, pavement) in spans {
+            if !station.is_finite() {
+                return Err(format!("a pavement starts at station {station}"));
+            }
+            if let Some(&(previous, last)) = kept.last() {
+                if station <= previous {
+                    return Err(format!(
+                        "pavement stations must ascend, and {station} follows {previous}"
+                    ));
+                }
+                if last == pavement {
+                    continue;
+                }
+            }
+            kept.push((station, pavement));
+        }
+        Ok(PavementProfile { spans: kept })
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn spans(&self) -> &[(f64, Pavement)] {
+        &self.spans
+    }
+
+    /// The pavement at `station`: the last span that starts at or before it, or the
+    /// first before the first span begins.
+    pub fn at(&self, station: f64) -> Option<Pavement> {
+        self.spans
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= station + 1e-9)
+            .or_else(|| self.spans.first())
+            .map(|&(_, pavement)| pavement)
     }
 }
 
@@ -196,6 +385,8 @@ pub enum LightColor {
 }
 
 impl LightColor {
+    pub const ALL: [LightColor; 3] = [LightColor::Red, LightColor::Yellow, LightColor::Green];
+
     pub fn as_str(self) -> &'static str {
         match self {
             LightColor::Red => "red",
@@ -205,12 +396,13 @@ impl LightColor {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        Some(match value.trim().to_ascii_lowercase().as_str() {
-            "red" => LightColor::Red,
-            "yellow" | "amber" => LightColor::Yellow,
-            "green" => LightColor::Green,
-            _ => return None,
-        })
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("amber") {
+            return Some(LightColor::Yellow);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|color| color.as_str().eq_ignore_ascii_case(value))
     }
 }
 
@@ -229,6 +421,17 @@ pub enum LightArrow {
 }
 
 impl LightArrow {
+    pub const ALL: [LightArrow; 8] = [
+        LightArrow::Up,
+        LightArrow::Down,
+        LightArrow::Left,
+        LightArrow::Right,
+        LightArrow::UpLeft,
+        LightArrow::UpRight,
+        LightArrow::DownLeft,
+        LightArrow::DownRight,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             LightArrow::Up => "up",
@@ -243,17 +446,10 @@ impl LightArrow {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        Some(match value.trim().to_ascii_lowercase().as_str() {
-            "up" => LightArrow::Up,
-            "down" => LightArrow::Down,
-            "left" => LightArrow::Left,
-            "right" => LightArrow::Right,
-            "up_left" => LightArrow::UpLeft,
-            "up_right" => LightArrow::UpRight,
-            "down_left" => LightArrow::DownLeft,
-            "down_right" => LightArrow::DownRight,
-            _ => return None,
-        })
+        let value = value.trim();
+        Self::ALL
+            .into_iter()
+            .find(|arrow| arrow.as_str().eq_ignore_ascii_case(value))
     }
 }
 
@@ -279,6 +475,36 @@ pub struct LightHead {
     pub bulbs: Vec<LightBulb>,
 }
 
+impl LightHead {
+    /// The width of a standard head: a vertical housing with three round lamps.
+    pub const STANDARD_WIDTH: f64 = 0.38;
+    /// The diameter of each of a standard head's lamps.
+    pub const STANDARD_LAMP: f64 = 0.30;
+    /// How much taller a standard housing is than its column of lamps.
+    pub const STANDARD_MARGIN: f64 = 0.15;
+
+    /// A standard head whose housing's bottom edge is centred on `bottom`: three
+    /// lamps one above the other, green at the bottom and red at the top, as a
+    /// builder-placed light is built in every export that draws one.
+    pub fn standard(bottom: Point3, up: UnitVector3) -> LightHead {
+        let lamp = Self::STANDARD_LAMP;
+        let margin = Self::STANDARD_MARGIN / 2.0;
+        let bulbs = [LightColor::Green, LightColor::Yellow, LightColor::Red]
+            .into_iter()
+            .enumerate()
+            .map(|(row, color)| LightBulb {
+                position: bottom + up.scaled(margin + lamp / 2.0 + row as f64 * lamp),
+                color,
+                arrow: None,
+            })
+            .collect();
+        LightHead {
+            height: Some(3.0 * lamp + Self::STANDARD_MARGIN),
+            bulbs,
+        }
+    }
+}
+
 /// Kinds of physical furniture the IR knows about.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MapObjectKind {
@@ -292,6 +518,20 @@ pub enum MapObjectKind {
     },
     StopLine,
     Crosswalk,
+    /// Something that stands along the road to keep traffic on it: a safety berm
+    /// beside a haul road, a guard rail, a wall, a bridge's parapet. `kind` says
+    /// which, in the caller's words; `height` is how far its top stands above its
+    /// base, metres. The geometry is a band along the ground it occupies.
+    ///
+    /// GDF holds a safety barrier as road furniture related to the road it lines,
+    /// and one that is part of a structure — a parapet along a bridge's deck — as
+    /// belonging to that structure too: `structure` says which, and is `None` for a
+    /// barrier that stands on the ground.
+    Barrier {
+        kind: String,
+        height: f64,
+        structure: Option<StructureId>,
+    },
 }
 
 impl MapObjectKind {
@@ -306,14 +546,39 @@ impl MapObjectKind {
         matches!(self, MapObjectKind::TrafficLight { .. })
     }
 
+    /// A traffic sign whose code [`is_stop_sign`] recognises.
+    pub fn is_stop_sign(&self) -> bool {
+        matches!(self, MapObjectKind::TrafficSign { code } if is_stop_sign(code))
+    }
+
+    /// A traffic light's housing and lamps; `None` for anything else.
+    pub fn light_head(&self) -> Option<&LightHead> {
+        match self {
+            MapObjectKind::TrafficLight { head } => Some(head),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
             MapObjectKind::TrafficLight { .. } => "traffic_light",
             MapObjectKind::TrafficSign { .. } => "traffic_sign",
             MapObjectKind::StopLine => "stop_line",
             MapObjectKind::Crosswalk => "crosswalk",
+            MapObjectKind::Barrier { .. } => "barrier",
         }
     }
+}
+
+/// Whether a sign's catalogue code names a stop sign.
+///
+/// The IR does not define a sign catalogue — `code` is whatever the caller uses — so
+/// this recognises the spellings a caller is likely to have written, and nothing
+/// else: "stop" and "stop-sign" in any case and with any separator, R1-1 (MUTCD) and
+/// 206 (the Vienna Convention).
+pub fn is_stop_sign(code: &str) -> bool {
+    let code = code.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+    code.starts_with("stop") || code == "r1-1" || code == "206"
 }
 
 /// A piece of road furniture, and the lanes it applies to.
@@ -329,10 +594,12 @@ pub struct MapObject {
 /// A rule that governs movement, expressed over IR objects and lanes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrafficRule {
-    /// Lanes controlled by one or more traffic lights, optionally with a stop line.
+    /// Lanes controlled by one or more traffic lights, with the stop lines they
+    /// stop at: none, one, or — when the lanes reach their junction by more than
+    /// one mouth — one per mouth, each across the rule's lanes it crosses.
     TrafficLight {
         lights: Vec<ObjectId>,
-        stop_line: Option<ObjectId>,
+        stop_lines: Vec<ObjectId>,
         lanes: Vec<LaneId>,
     },
     /// `yielding` gives way to `right_of_way`.

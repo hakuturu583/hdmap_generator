@@ -1,0 +1,980 @@
+//! Bridges, tunnels, grade separations and interchanges in the IR.
+
+use roadgen_core::prelude::*;
+use roadgen_core::structure::{
+    BridgeForm, BridgeSpec, RoadSpan, StructureKind, SupportKind, TunnelForm, TunnelSpec,
+    Underneath, CLEARANCE, PARAPET, PARAPET_KIND,
+};
+use roadgen_core::{
+    FormOfWay, MapObject, StructureId, ValidatedMap, ValidationConfig, ValidationError,
+    ValidationIssue, VerticalProfile,
+};
+
+fn two_way() -> Vec<LaneSpec> {
+    vec![
+        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+    ]
+}
+
+/// A motorway along x at `height`, over a street along y at grade.
+fn crossing(height: f64) -> (MapBuilder, RoadId, RoadId) {
+    let mut builder = MapBuilder::default();
+    let motorway = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, height),
+                Point3::new(300.0, 0.0, height),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    let street = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -200.0, 0.0),
+                Point3::new(0.0, 200.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    (builder, motorway, street)
+}
+
+#[test]
+fn a_motorway_on_a_bridge_over_a_street_is_a_grade_separation() {
+    let (mut builder, motorway, street) = crossing(9.0);
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway.clone(), 200.0, 400.0)],
+            BridgeSpec {
+                name: Some("Street Viaduct".into()),
+                form: BridgeForm::Viaduct,
+                ..BridgeSpec::default()
+            },
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+
+    let structure = map.structures.iter().next().unwrap();
+    assert_eq!(structure.id.as_str(), "structure/street_viaduct");
+    assert_eq!(structure.kind.form(), "viaduct");
+    let road = map.road(&motorway).unwrap();
+    assert_eq!(road.structure.at(300.0), Some(&structure.id));
+    assert_eq!(road.structure.at(100.0), None);
+
+    let separation = map.grade_separations.iter().next().unwrap();
+    assert_eq!(separation.over.road, motorway);
+    assert!(matches!(&separation.under, Underneath::Road(span) if span.road == street));
+    assert_eq!(separation.via, structure.id);
+
+    // Abutments at both ends, piers between, none on the street.
+    let StructureKind::Bridge(bridge) = &structure.kind else {
+        panic!("a bridge")
+    };
+    let abutments = bridge
+        .supports
+        .iter()
+        .filter(|s| s.kind == SupportKind::Abutment)
+        .count();
+    assert_eq!(abutments, 2);
+    let piers: Vec<_> = bridge
+        .supports
+        .iter()
+        .filter(|s| s.kind == SupportKind::Pier)
+        .collect();
+    assert!(piers.len() >= 3, "{} piers", piers.len());
+    for pier in piers {
+        for p in pier.footprint.points() {
+            assert!(
+                p.x.abs() > 3.5,
+                "a pier stands on the street at x = {}",
+                p.x
+            );
+            assert!(
+                (p.z - (9.0 - 2.5)).abs() < 1e-6,
+                "a pier's top is the deck's underside"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_motorway_crossing_a_street_on_the_level_is_refused() {
+    let (builder, _, _) = crossing(0.0);
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    assert!(error
+        .issues
+        .iter()
+        .any(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. })));
+}
+
+#[test]
+fn a_motorway_above_a_street_with_nothing_under_it_is_refused() {
+    let (builder, _, _) = crossing(9.0);
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    assert!(error.issues.iter().any(|issue| matches!(
+        issue,
+        ValidationIssue::UnseparatedCrossing { detail, .. } if detail.contains("nothing")
+    )));
+}
+
+/// The motorway of [`crossing`] at `height` on a viaduct over the street, validated.
+fn on_a_viaduct(height: f64) -> Result<ValidatedMap, ValidationError> {
+    on_a_viaduct_with(height, ValidationConfig::default())
+}
+
+fn on_a_viaduct_with(
+    height: f64,
+    config: ValidationConfig,
+) -> Result<ValidatedMap, ValidationError> {
+    let (mut builder, motorway, _) = crossing(height);
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway, 200.0, 400.0)],
+            BridgeSpec::for_form(BridgeForm::Viaduct),
+        )
+        .unwrap();
+    builder.finish().unwrap().validate_with(config)
+}
+
+#[test]
+fn a_deck_that_comes_down_within_the_clearance_of_the_road_under_it_is_refused() {
+    let deck = BridgeSpec::for_form(BridgeForm::Viaduct).deck_depth;
+    // Clear of the street by more than its deck, but not by its deck and the
+    // clearance.
+    let error = on_a_viaduct(deck + CLEARANCE - 0.5).unwrap_err();
+    assert!(
+        error.issues.iter().any(|issue| matches!(
+            issue,
+            ValidationIssue::InsufficientClearance { over, under, detail }
+                if over.local_name() == "motorway"
+                    && under.local_name() == "street"
+                    && detail.contains("4.00 m")
+        )),
+        "{error}"
+    );
+    on_a_viaduct(deck + CLEARANCE).unwrap();
+    // A map drawn to a lower standard says so, or asks for none.
+    for clearance in [Some(CLEARANCE - 0.5), None] {
+        on_a_viaduct_with(
+            deck + CLEARANCE - 0.5,
+            ValidationConfig {
+                clearance,
+                ..ValidationConfig::default()
+            },
+        )
+        .unwrap();
+    }
+    // But no standard lets a deck down on to the road under it.
+    assert!(on_a_viaduct_with(
+        deck - 0.5,
+        ValidationConfig {
+            clearance: None,
+            ..ValidationConfig::default()
+        },
+    )
+    .is_err());
+}
+
+/// The street of [`crossing`] in a cut-and-cover tunnel under the motorway at
+/// `height`, validated.
+fn over_a_tunnel(height: f64) -> Result<ValidatedMap, ValidationError> {
+    let (mut builder, _, street) = crossing(height);
+    builder
+        .add_tunnel(
+            vec![RoadSpan::new(street, 150.0, 250.0)],
+            TunnelSpec {
+                form: TunnelForm::CutAndCover,
+                ..TunnelSpec::default()
+            },
+        )
+        .unwrap();
+    builder.finish().unwrap().validate()
+}
+
+#[test]
+fn a_road_that_dips_into_the_roof_of_a_tunnel_under_it_is_refused() {
+    let tunnel = TunnelSpec::default();
+    let roof = tunnel.clear_height + tunnel.lining;
+    let error = over_a_tunnel(roof - 0.5).unwrap_err();
+    assert!(
+        error.issues.iter().any(|issue| matches!(
+            issue,
+            ValidationIssue::InsufficientClearance { detail, .. } if detail.contains("roof")
+        )),
+        "{error}"
+    );
+    over_a_tunnel(roof).unwrap();
+}
+
+#[test]
+fn two_streets_crossing_on_the_level_are_still_a_map() {
+    let mut builder = MapBuilder::default();
+    for (name, start, end) in [
+        (
+            "a",
+            Point3::new(-100.0, 0.0, 0.0),
+            Point3::new(100.0, 0.0, 0.0),
+        ),
+        (
+            "b",
+            Point3::new(0.0, -100.0, 0.0),
+            Point3::new(0.0, 100.0, 0.0),
+        ),
+    ] {
+        builder
+            .add_road(
+                RoadSpec::line(start, end, two_way())
+                    .unwrap()
+                    .with_name(name),
+            )
+            .unwrap();
+    }
+    builder.finish().unwrap().validate().unwrap();
+}
+
+#[test]
+fn a_tunnel_has_a_portal_at_each_end_of_what_it_carries() {
+    let mut builder = MapBuilder::default();
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1000.0, 0.0, 10.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("through"),
+        )
+        .unwrap();
+    builder
+        .add_tunnel(
+            vec![RoadSpan::new(road.clone(), 300.0, 700.0)],
+            TunnelSpec {
+                form: TunnelForm::Bored,
+                ..TunnelSpec::default()
+            },
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let structure = map.structures.iter().next().unwrap();
+    assert_eq!(structure.id.as_str(), "structure/through/tunnel/0");
+    let tunnel = structure.kind.tunnel().unwrap();
+    assert!((tunnel.portals[0].station - 300.0).abs() < 1e-9);
+    assert!((tunnel.portals[1].station - 700.0).abs() < 1e-9);
+    assert!((tunnel.portals[0].left.y - 3.5).abs() < 1e-6);
+    assert!((tunnel.portals[0].right.y + 3.5).abs() < 1e-6);
+    // The bore is wider than the road by its walkway and lining.
+    let widest = structure
+        .outline
+        .points()
+        .iter()
+        .map(|p| p.y)
+        .fold(0.0_f64, f64::max);
+    assert!((widest - (3.5 + 0.75 + 0.6)).abs() < 1e-6);
+    assert!(parapets(&map).is_empty(), "a tunnel has no parapets");
+}
+
+#[test]
+fn one_deck_carries_both_carriageways() {
+    let mut builder = MapBuilder::default();
+    let one_way = || {
+        vec![
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+        ]
+    };
+    let left = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 9.0, 10.0),
+                Point3::new(400.0, 9.0, 10.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("left"),
+        )
+        .unwrap();
+    let right = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(400.0, -9.0, 10.0),
+                Point3::new(0.0, -9.0, 10.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("right"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(left, 100.0, 300.0),
+                RoadSpan::new(right, 100.0, 300.0),
+            ],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let structure = map.structures.iter().next().unwrap();
+    let (low, high) = structure
+        .outline
+        .points()
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), p| {
+            (l.min(p.y), h.max(p.y))
+        });
+    // Each carriageway's lanes lie to its right: from one outer edge to the other,
+    // the median between, and the curbs.
+    assert!((high - (9.0 + 0.6)).abs() < 1e-6, "{high}");
+    assert!((low - (-9.0 - 0.6)).abs() < 1e-6, "{low}");
+    // A deck that wide stands on pairs of columns.
+    let bridge = structure.kind.bridge().unwrap();
+    let piers = bridge
+        .supports
+        .iter()
+        .filter(|s| s.kind == SupportKind::Pier)
+        .count();
+    assert_eq!(piers % 2, 0);
+}
+
+#[test]
+fn a_vertical_profile_rounds_the_crest_of_a_road() {
+    let profile =
+        VerticalProfile::new(vec![(0.0, 0.0), (300.0, 12.0), (600.0, 0.0)], 4000.0).unwrap();
+    let spec = RoadSpec::line(
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(600.0, 0.0, 0.0),
+        two_way(),
+    )
+    .unwrap()
+    .with_vertical(&profile)
+    .unwrap();
+    let mut builder = MapBuilder::default();
+    let road = builder.add_road(spec.with_name("crest")).unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let line = &map.road(&road).unwrap().reference_line;
+    let top = line
+        .sample_at(300.0, map.metadata.sampling)
+        .unwrap()
+        .point
+        .z;
+    assert!((top - profile.height(300.0)).abs() < 1e-3);
+    assert!(top < 12.0 - 1.0, "the crest is rounded: {top}");
+    assert!((line.horizontal_length().unwrap() - 600.0).abs() < 1e-6);
+}
+
+#[test]
+fn an_interchange_points_its_junctions_back_at_it() {
+    let mut builder = MapBuilder::default();
+    let a = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(100.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("a"),
+        )
+        .unwrap();
+    let b = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(130.0, 0.0, 0.0),
+                Point3::new(230.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("b"),
+        )
+        .unwrap();
+    let junction = builder.add_junction(Some("j"));
+    builder.connect_via(&junction, &a, &b).unwrap();
+    builder
+        .add_interchange(
+            "Kita IC",
+            "diamond",
+            vec![junction.clone()],
+            vec![a.clone()],
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let interchange = map.interchanges.iter().next().unwrap();
+    assert_eq!(interchange.id.as_str(), "interchange/kita_ic");
+    assert_eq!(
+        map.junction(&junction).unwrap().interchange.as_ref(),
+        Some(&interchange.id)
+    );
+    // The movements through its junction are its roads too.
+    assert!(interchange.roads.len() > 1);
+}
+
+#[test]
+fn a_deck_over_two_carriageways_running_opposite_ways_sits_on_its_supports() {
+    // Two one-way carriageways side by side, climbing east, drawn opposite ways.
+    let one_way = || {
+        vec![LaneSpec::new(
+            PositiveWidth::new(3.5).unwrap(),
+            Direction::Forward,
+        )]
+    };
+    let mut builder = MapBuilder::default();
+    let east = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -6.0, 0.0),
+                Point3::new(300.0, -6.0, 15.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("east"),
+        )
+        .unwrap();
+    let west = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(300.0, 6.0, 15.0),
+                Point3::new(0.0, 6.0, 0.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("west"),
+        )
+        .unwrap();
+    let spec = BridgeSpec::default();
+    let depth = spec.deck_depth;
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(east, 50.0, 250.0),
+                RoadSpan::new(west, 50.0, 250.0),
+            ],
+            spec,
+        )
+        .unwrap();
+    let map = builder.finish().unwrap();
+    let map = map.as_map();
+    let bridge = map.structures.iter().next().unwrap();
+    let abutments: Vec<_> = bridge
+        .kind
+        .bridge()
+        .unwrap()
+        .supports
+        .iter()
+        .filter(|s| s.kind == SupportKind::Abutment)
+        .collect();
+    assert_eq!(abutments.len(), 2);
+    for abutment in abutments {
+        // The deck is 0.05 up per metre east; its underside over the abutment is
+        // there, not at the far end of the other carriageway.
+        let x = abutment.footprint.centroid().x;
+        let top = abutment.footprint.highest();
+        let deck = 0.05 * x;
+        assert!(
+            (top - (deck - depth)).abs() < 0.6,
+            "an abutment at x {x:.0} topped at {top:.2}, under a deck at {deck:.2}"
+        );
+    }
+}
+
+/// A motorway along x at grade, and a street at grade alongside it from x = -100
+/// to 100 whose centre lies `apart` metres to the right of the motorway's.
+fn alongside(apart: f64) -> MapBuilder {
+    let mut builder = MapBuilder::default();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 0.0),
+                Point3::new(300.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-100.0, -apart, 0.0),
+                Point3::new(100.0, -apart, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    builder
+}
+
+#[test]
+fn a_street_that_runs_into_the_edge_of_a_motorway_is_refused() {
+    // The reference lines are 6 m apart and never cross, but each road is 3.5 m
+    // wide to each side: the street's outer lane runs a metre into the motorway.
+    let error = alongside(6.0).finish().unwrap().validate().unwrap_err();
+    let unseparated: Vec<_> = error
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. }))
+        .collect();
+    assert_eq!(unseparated.len(), 1, "{unseparated:?}");
+}
+
+#[test]
+fn a_street_alongside_a_motorway_with_room_between_is_still_a_map() {
+    alongside(7.5).finish().unwrap().validate().unwrap();
+}
+
+#[test]
+fn a_bridge_over_a_street_that_ends_beneath_its_edge_is_a_grade_separation() {
+    let mut builder = MapBuilder::default();
+    let motorway = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 9.0),
+                Point3::new(300.0, 0.0, 9.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    // The street stops 2 m short of the motorway's centre: its reference line
+    // never reaches the motorway's, but its lanes run under the motorway's.
+    let street = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -200.0, 0.0),
+                Point3::new(0.0, -2.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway.clone(), 200.0, 400.0)],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let separation = map.grade_separations.iter().next().unwrap();
+    assert_eq!(separation.over.road, motorway);
+    assert!(matches!(&separation.under, Underneath::Road(span) if span.road == street));
+}
+
+#[test]
+fn two_motorways_that_meet_at_a_junction_do_not_cross_where_they_meet() {
+    let mut builder = MapBuilder::default();
+    let motorway = |name: &str, start: Point3, end: Point3| {
+        RoadSpec::line(start, end, two_way())
+            .unwrap()
+            .with_name(name)
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway)
+    };
+    let a = builder
+        .add_road(motorway(
+            "a",
+            Point3::new(-200.0, 0.0, 0.0),
+            Point3::new(0.0, 0.0, 0.0),
+        ))
+        .unwrap();
+    // Leaving at a narrow angle from right beside the first one's end, the second
+    // starts with its outline over the first's.
+    let b = builder
+        .add_road(motorway(
+            "b",
+            Point3::new(-2.0, 5.0, 0.0),
+            Point3::new(200.0, 45.0, 0.0),
+        ))
+        .unwrap();
+    let junction = builder.add_junction(Some("fork"));
+    builder.connect_via(&junction, &a, &b).unwrap();
+    builder.finish().unwrap().validate().unwrap();
+}
+
+#[test]
+fn a_street_that_runs_into_where_a_motorway_widens_is_refused() {
+    let mut builder = MapBuilder::default();
+    let lane = |direction| LaneSpec::new(PositiveWidth::new(3.5).unwrap(), direction);
+    // A straight motorway that gains a third lane, on its right, from x = -50 to
+    // 50: its right edge is 3.5 m out at either end and 7 m out there.
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 0.0),
+                Point3::new(300.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_cross_section(
+                250.0,
+                vec![
+                    lane(Direction::Forward),
+                    lane(Direction::Forward),
+                    lane(Direction::Backward),
+                ],
+            )
+            .with_cross_section(350.0, two_way())
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    // A street 9 m off it reaches 5.5 m towards it: into the third lane only.
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-40.0, -9.0, 0.0),
+                Point3::new(40.0, -9.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    let unseparated: Vec<_> = error
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. }))
+        .collect();
+    assert_eq!(unseparated.len(), 1, "{unseparated:?}");
+}
+
+#[test]
+fn a_street_drawn_over_the_length_of_a_motorway_is_refused() {
+    let mut builder = MapBuilder::default();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 0.0),
+                Point3::new(300.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    // End to end with the motorway and 3 m to its side: no edge of the one crosses
+    // an edge of the other, but the two share 4 m of their width all along.
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, -3.0, 0.0),
+                Point3::new(300.0, -3.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    let unseparated: Vec<_> = error
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. }))
+        .collect();
+    assert_eq!(unseparated.len(), 1, "{unseparated:?}");
+}
+
+#[test]
+fn a_street_drawn_wholly_inside_a_motorway_is_refused() {
+    let mut builder = MapBuilder::default();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, 0.0),
+                Point3::new(300.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    // Narrow, short and alongside the motorway's centre line: every edge of it is
+    // inside the motorway's, so none crosses one.
+    let narrow = || {
+        vec![
+            LaneSpec::new(PositiveWidth::new(1.5).unwrap(), Direction::Forward),
+            LaneSpec::new(PositiveWidth::new(1.5).unwrap(), Direction::Backward),
+        ]
+    };
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-100.0, -1.0, 0.0),
+                Point3::new(100.0, -1.0, 0.0),
+                narrow(),
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    let unseparated: Vec<_> = error
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue, ValidationIssue::UnseparatedCrossing { .. }))
+        .collect();
+    assert_eq!(unseparated.len(), 1, "{unseparated:?}");
+}
+
+/// The bridges' parapets on a map: its barriers of that kind.
+fn parapets(map: &Map) -> Vec<&MapObject> {
+    map.objects
+        .iter()
+        .filter(|object| {
+            matches!(&object.kind, MapObjectKind::Barrier { kind, .. } if kind == PARAPET_KIND)
+        })
+        .collect()
+}
+
+/// How far across a parapet's band reaches, its lowest y and its highest, and
+/// where along x it begins and ends.
+fn reach(parapet: &MapObject) -> ((f64, f64), (f64, f64)) {
+    let ObjectGeometry::Band { left, right } = &parapet.geometry else {
+        panic!("{} is a band", parapet.id)
+    };
+    let ends = [
+        left.start_point(),
+        left.end_point(),
+        right.start_point(),
+        right.end_point(),
+    ];
+    let span = |f: fn(&Point3) -> f64| {
+        ends.iter()
+            .map(f)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| {
+                (l.min(v), h.max(v))
+            })
+    };
+    (span(|p| p.y), span(|p| p.x))
+}
+
+#[test]
+fn a_bridge_over_two_stretches_of_one_road_stands_parapets_along_each() {
+    let (mut builder, motorway, _) = crossing(9.0);
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(motorway.clone(), 50.0, 150.0),
+                RoadSpan::new(motorway.clone(), 250.0, 400.0),
+            ],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let parapets = parapets(&map);
+    assert_eq!(parapets.len(), 4, "one each side of each stretch");
+    let mut ids: Vec<_> = parapets.iter().map(|p| p.id.as_str().to_owned()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 4, "{ids:?}");
+}
+
+#[test]
+fn a_bridge_stands_a_parapet_on_the_curb_along_each_side_of_its_deck() {
+    let (mut builder, motorway, _) = crossing(9.0);
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway.clone(), 200.0, 400.0)],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let structure = map.structures.iter().next().unwrap();
+    let parapets = parapets(&map);
+    assert_eq!(parapets.len(), 2, "one each side");
+    let mut sides = Vec::new();
+    for parapet in &parapets {
+        let MapObjectKind::Barrier {
+            height,
+            structure: of,
+            ..
+        } = &parapet.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(of.as_ref(), Some(&structure.id), "it is the bridge's");
+        assert_eq!(*height, PARAPET);
+        assert!(!parapet.lanes.is_empty());
+        assert!(parapet
+            .lanes
+            .iter()
+            .all(|lane| map.lanes.get(lane).unwrap().road == motorway));
+        // On the curb, from the road's edge out to the deck's, the length of it.
+        let ((low, high), (start, end)) = reach(parapet);
+        assert!((start + 100.0).abs() < 1e-6 && (end - 100.0).abs() < 1e-6);
+        assert!((high - low - 0.6).abs() < 1e-6, "{low}..{high}");
+        assert!(
+            (low.abs().min(high.abs()) - 3.5).abs() < 1e-6,
+            "{low}..{high}"
+        );
+        assert!(
+            (parapet_z(parapet) - 9.0).abs() < 1e-6,
+            "it stands on the deck"
+        );
+        sides.push(low.signum());
+    }
+    sides.sort_by(f64::total_cmp);
+    assert_eq!(sides, [-1.0, 1.0]);
+}
+
+fn parapet_z(parapet: &MapObject) -> f64 {
+    let ObjectGeometry::Band { left, .. } = &parapet.geometry else {
+        panic!("{} is a band", parapet.id)
+    };
+    left.start_point().z
+}
+
+#[test]
+fn a_deck_over_both_carriageways_has_parapets_down_its_outer_edges_and_none_down_the_median() {
+    let mut builder = MapBuilder::default();
+    let one_way = || {
+        vec![
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+        ]
+    };
+    // Each carriageway's lanes lie to its right, so the two face each other across
+    // a 4 m median.
+    let left = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 9.0, 10.0),
+                Point3::new(400.0, 9.0, 10.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("left"),
+        )
+        .unwrap();
+    let right = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(400.0, -9.0, 10.0),
+                Point3::new(0.0, -9.0, 10.0),
+                one_way(),
+            )
+            .unwrap()
+            .with_name("right"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![
+                RoadSpan::new(left, 100.0, 300.0),
+                RoadSpan::new(right, 100.0, 300.0),
+            ],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let parapets = parapets(&map);
+    assert_eq!(parapets.len(), 2, "{parapets:#?}");
+    for parapet in parapets {
+        let ((low, high), _) = reach(parapet);
+        assert!(
+            low.abs().min(high.abs()) >= 9.0 - 1e-6,
+            "{} stands at {low}..{high}, in the median",
+            parapet.id
+        );
+        assert!((low.abs().max(high.abs()) - 9.6).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn a_parapet_of_a_bridge_the_map_does_not_have_is_refused() {
+    let (mut builder, motorway, _) = crossing(9.0);
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway, 200.0, 400.0)],
+            BridgeSpec::default(),
+        )
+        .unwrap();
+    let mut map = builder.finish().unwrap();
+    let id = parapets(map.as_map_mut())[0].id.clone();
+    if let MapObjectKind::Barrier { structure, .. } =
+        &mut map.as_map_mut().objects.get_mut(&id).unwrap().kind
+    {
+        *structure = Some(StructureId::new("nowhere"));
+    }
+    let error = map.validate().unwrap_err();
+    assert!(error.issues.iter().any(|issue| matches!(
+        issue,
+        ValidationIssue::DanglingFeatureReference { referrer, feature }
+            if *referrer == id.to_string() && feature == "structure/nowhere"
+    )));
+}
+
+#[test]
+fn a_graded_deck_over_a_wide_road_keeps_the_clearance_at_its_low_edge_too() {
+    // A motorway climbing at 6 % on a viaduct over an eight-lane avenue: where the
+    // two centre lines cross it clears the avenue, but the avenue is 28 m wide,
+    // and at its edge downhill the deck is 0.84 m lower.
+    let deck = BridgeSpec::for_form(BridgeForm::Viaduct).deck_depth;
+    let middle = deck + CLEARANCE + 0.3;
+    let lane = |direction| LaneSpec::new(PositiveWidth::new(3.5).unwrap(), direction);
+    let mut builder = MapBuilder::default();
+    let motorway = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(-300.0, 0.0, middle - 18.0),
+                Point3::new(300.0, 0.0, middle + 18.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("motorway")
+            .with_type(RoadType::Motorway)
+            .with_form(FormOfWay::Motorway),
+        )
+        .unwrap();
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, -200.0, 0.0),
+                Point3::new(0.0, 200.0, 0.0),
+                [Direction::Forward; 4]
+                    .into_iter()
+                    .chain([Direction::Backward; 4])
+                    .map(lane)
+                    .collect(),
+            )
+            .unwrap()
+            .with_name("avenue"),
+        )
+        .unwrap();
+    builder
+        .add_bridge(
+            vec![RoadSpan::new(motorway, 200.0, 400.0)],
+            BridgeSpec::for_form(BridgeForm::Viaduct),
+        )
+        .unwrap();
+    let error = builder.finish().unwrap().validate().unwrap_err();
+    assert!(
+        error.issues.iter().any(|issue| matches!(
+            issue,
+            ValidationIssue::InsufficientClearance { under, .. }
+                if under.local_name() == "avenue"
+        )),
+        "{error}"
+    );
+}

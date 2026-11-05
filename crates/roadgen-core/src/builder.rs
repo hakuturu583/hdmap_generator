@@ -11,14 +11,17 @@ use std::collections::{HashMap, HashSet};
 use crate::error::{BuildError, GeometryError};
 use crate::geometry::{
     Arc3, Bezier3, Curve3, LaneHeight, Point3, Poly3Piece, Poly3Profile, Polyline3, SamplingConfig,
-    Taper, UnitVector3, Vector3, WidthProfile,
+    Taper, UnitVector3, Vector3, VerticalProfile, WidthProfile,
 };
-use crate::id::{ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
+use crate::id::{ConnectionId, InterchangeId, JunctionId, LaneId, ObjectId, RoadId};
 use crate::layout::{self, RoadGeometry, SectionLayout};
 use crate::map::{CrossSection, Lane, Map, MapMetadata, Road};
 use crate::semantics::{
-    BoundaryMarking, LaneType, MapObject, MapObjectKind, ObjectGeometry, RoadMarking, RoadType,
-    TrafficRule,
+    BoundaryMarking, FormOfWay, LaneType, LightHead, MapObject, MapObjectKind, ObjectGeometry,
+    PavementProfile, RoadMarking, RoadType, TrafficRule,
+};
+use crate::structure::{
+    self, BridgeSpec, Interchange, RoadSpan, StructureProfile, StructureSpec, TunnelSpec,
 };
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
@@ -26,6 +29,10 @@ use crate::topology::{
 };
 use crate::units::{PositiveWidth, SpeedLimit};
 use crate::validation::UnvalidatedMap;
+
+/// How far a crossing reaches onto the pavement each side of the carriageway, so
+/// that it meets the walkways rather than stopping short of them.
+pub const CROSSWALK_OVERLAP: f64 = 0.3;
 
 /// One lane of a road's cross-section, as the caller describes it.
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +126,10 @@ pub struct RoadSpec {
     /// Roll of the road surface about its reference line, radians, as a function of
     /// horizontal station. Zero everywhere is a road that is flat across.
     pub superelevation: Poly3Profile,
+    /// What the road is surfaced with along its length; unknown unless said.
+    pub pavement: PavementProfile,
+    /// What part the road plays in the network.
+    pub form: FormOfWay,
 }
 
 impl RoadSpec {
@@ -133,6 +144,8 @@ impl RoadSpec {
             road_type: RoadType::Town,
             speed_limit: None,
             superelevation: Poly3Profile::default(),
+            pavement: PavementProfile::unknown(),
+            form: FormOfWay::Unspecified,
         }
     }
 
@@ -161,6 +174,30 @@ impl RoadSpec {
     pub fn with_superelevation(mut self, superelevation: Poly3Profile) -> Self {
         self.superelevation = superelevation;
         self
+    }
+
+    /// Surfaces the road: what it is paved with, or that it is not, along its
+    /// length.
+    pub fn with_pavement(mut self, pavement: PavementProfile) -> Self {
+        self.pavement = pavement;
+        self
+    }
+
+    /// Says what part the road plays in the network: a motorway carriageway, a
+    /// slip road.
+    pub fn with_form(mut self, form: FormOfWay) -> Self {
+        self.form = form;
+        self
+    }
+
+    /// Gives the road a vertical alignment: its plan stays, and its heights are
+    /// read from `profile` against horizontal station, the reference line cut
+    /// every five metres so the vertical curves are followed.
+    pub fn with_vertical(mut self, profile: &VerticalProfile) -> Result<Self, GeometryError> {
+        self.reference_line = self
+            .reference_line
+            .draped(&|station| profile.height(station), 5.0)?;
+        Ok(self)
     }
 
     /// Adds a cross-section that takes over at `station`.
@@ -220,6 +257,16 @@ impl LaneRef {
     }
 }
 
+/// An interchange as the caller named it.
+#[derive(Debug, Clone)]
+struct InterchangeSpec {
+    id: InterchangeId,
+    name: String,
+    kind: String,
+    junctions: Vec<JunctionId>,
+    roads: Vec<RoadId>,
+}
+
 #[derive(Debug, Clone)]
 struct RoadDraft {
     id: RoadId,
@@ -261,6 +308,8 @@ enum ObjectSpec {
         setback: f64,
         lanes: Vec<LaneRef>,
     },
+    /// A band over the whole of one lane, end to end: a berm on a shoulder.
+    AlongLane { kind: MapObjectKind, lane: LaneRef },
     /// A band across a whole road at a station along it.
     AcrossRoad {
         kind: MapObjectKind,
@@ -301,6 +350,8 @@ pub struct MapBuilder {
     objects: Vec<(ObjectId, ObjectSpec)>,
     object_index: HashMap<ObjectId, usize>,
     rules: Vec<RuleSpec>,
+    structures: Vec<(Vec<RoadSpan>, StructureSpec)>,
+    interchanges: Vec<InterchangeSpec>,
     auto_road: usize,
     auto_junction: usize,
     auto_object: usize,
@@ -324,6 +375,8 @@ impl MapBuilder {
             objects: Vec::new(),
             object_index: HashMap::new(),
             rules: Vec::new(),
+            structures: Vec::new(),
+            interchanges: Vec::new(),
             auto_road: 0,
             auto_junction: 0,
             auto_object: 0,
@@ -336,6 +389,11 @@ impl MapBuilder {
 
     pub fn metadata_mut(&mut self) -> &mut MapMetadata {
         &mut self.metadata
+    }
+
+    /// The roads added so far, in the order they were added.
+    pub fn roads(&self) -> impl Iterator<Item = (&RoadId, &RoadSpec)> {
+        self.roads.iter().map(|draft| (&draft.id, &draft.spec))
     }
 
     /// Adds a road. Its identifier comes from `spec.name`, or from the road's
@@ -621,14 +679,8 @@ impl MapBuilder {
     ) -> Result<ConnectionId, BuildError> {
         let from_direction = self.lane_spec(from)?.direction;
         let to_direction = self.lane_spec(to)?.direction;
-        let from_end = match from_direction.exit_end() {
-            LaneEnd::Start => RoadEnd::Start,
-            LaneEnd::End => RoadEnd::End,
-        };
-        let to_end = match to_direction.entry_end() {
-            LaneEnd::Start => RoadEnd::Start,
-            LaneEnd::End => RoadEnd::End,
-        };
+        let from_end = from_direction.exit_end().as_road_end();
+        let to_end = to_direction.entry_end().as_road_end();
         self.set_link(&from.road, from_end, &to.road, to_end, junction)?;
         self.push_operation(from.clone(), to.clone(), junction)?;
         Ok(ConnectionId::between(
@@ -749,8 +801,9 @@ impl MapBuilder {
         self.add_traffic_light_at(lane, end, height, 0.0)
     }
 
-    /// Adds a traffic light bar above `lane`, `setback` metres back from one of its
-    /// ends.
+    /// Adds a traffic light over the middle of `lane`, `setback` metres back from
+    /// one of its ends: a standard head ([`LightHead::standard`]) whose bar -- the
+    /// housing's bottom edge -- is `height` above the road.
     pub fn add_traffic_light_at(
         &mut self,
         lane: &LaneRef,
@@ -844,6 +897,29 @@ impl MapBuilder {
         )
     }
 
+    /// Stands a barrier along the whole of `lane`: a berm of broken rock on a haul
+    /// road's shoulder, a wall, a guard rail. `kind` says which, in the caller's
+    /// words; `height` is how far its top stands above the lane, metres.
+    pub fn add_barrier(
+        &mut self,
+        lane: &LaneRef,
+        kind: impl Into<String>,
+        height: f64,
+    ) -> Result<ObjectId, BuildError> {
+        self.lane_spec(lane)?;
+        self.push_object(
+            format!("barrier/{}/{}", lane.road.local_name(), lane.index),
+            ObjectSpec::AlongLane {
+                kind: MapObjectKind::Barrier {
+                    kind: kind.into(),
+                    height,
+                    structure: None,
+                },
+                lane: lane.clone(),
+            },
+        )
+    }
+
     fn push_object(&mut self, key: String, spec: ObjectSpec) -> Result<ObjectId, BuildError> {
         let id = ObjectId::new(key);
         if self.object_index.contains_key(&id) {
@@ -886,6 +962,78 @@ impl MapBuilder {
     /// Records a speed limit that applies to a set of lanes.
     pub fn add_speed_limit_rule(&mut self, limit: SpeedLimit, lanes: Vec<LaneRef>) {
         self.rules.push(RuleSpec::SpeedLimit { limit, lanes });
+    }
+
+    /// Puts a bridge under `spans`: one stretch of road, or several side by side
+    /// that share a deck — both carriageways of a motorway. Its outline, abutments
+    /// and piers are laid out once the roads are built.
+    pub fn add_bridge(&mut self, spans: Vec<RoadSpan>, spec: BridgeSpec) -> Result<(), BuildError> {
+        self.add_structure(spans, StructureSpec::Bridge(spec))
+    }
+
+    /// Puts a tunnel round `spans`. Twin bores are two tunnels.
+    pub fn add_tunnel(&mut self, spans: Vec<RoadSpan>, spec: TunnelSpec) -> Result<(), BuildError> {
+        self.add_structure(spans, StructureSpec::Tunnel(spec))
+    }
+
+    fn add_structure(
+        &mut self,
+        spans: Vec<RoadSpan>,
+        spec: StructureSpec,
+    ) -> Result<(), BuildError> {
+        for span in &spans {
+            if !self.road_index.contains_key(&span.road) {
+                return Err(BuildError::UnknownRoad(span.road.clone()));
+            }
+        }
+        if spans.is_empty() {
+            return Err(BuildError::Structure(
+                "a structure has to carry some road".into(),
+            ));
+        }
+        self.structures.push((spans, spec));
+        Ok(())
+    }
+
+    /// Gathers junctions and roads into one interchange. The movements through
+    /// its junctions are its roads too, and the structures any of its roads are on
+    /// are its structures; both are filled in when the map is built.
+    pub fn add_interchange(
+        &mut self,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        junctions: Vec<JunctionId>,
+        roads: Vec<RoadId>,
+    ) -> Result<InterchangeId, BuildError> {
+        let name = name.into();
+        let key = structure::slug(&name);
+        if key.is_empty() {
+            return Err(BuildError::Structure(format!(
+                "an interchange named {name:?} has nothing to name it after"
+            )));
+        }
+        let id = InterchangeId::new(key);
+        if self.interchanges.iter().any(|spec| spec.id == id) {
+            return Err(BuildError::DuplicateId(id.to_string()));
+        }
+        for junction in &junctions {
+            if !self.junction_index.contains_key(junction) {
+                return Err(BuildError::UnknownJunction(junction.clone()));
+            }
+        }
+        for road in &roads {
+            if !self.road_index.contains_key(road) {
+                return Err(BuildError::UnknownRoad(road.clone()));
+            }
+        }
+        self.interchanges.push(InterchangeSpec {
+            id: id.clone(),
+            name,
+            kind: kind.into(),
+            junctions,
+            roads,
+        });
+        Ok(id)
     }
 
     /// Generates geometry and produces the map, ready for validation.
@@ -939,18 +1087,58 @@ impl Generator {
         self.build_connections()?;
         self.build_objects()?;
         self.build_rules()?;
+        self.place_structures()?;
+        self.build_interchanges()?;
+        structure::derive_separations(&mut self.map);
         Ok(UnvalidatedMap::from_map(self.map))
+    }
+
+    fn place_structures(&mut self) -> Result<(), BuildError> {
+        for (spans, spec) in &self.builder.structures {
+            structure::place_built(&mut self.map, spans, spec)
+                .map_err(|error| BuildError::Structure(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn build_interchanges(&mut self) -> Result<(), BuildError> {
+        for spec in &self.builder.interchanges {
+            let interchange = Interchange {
+                id: spec.id.clone(),
+                name: Some(spec.name.clone()),
+                kind: spec.kind.clone(),
+                junctions: spec.junctions.clone(),
+                roads: spec.roads.clone(),
+                structures: Vec::new(),
+            };
+            self.map
+                .interchanges
+                .insert(spec.id.clone(), interchange)
+                .map_err(|duplicate| BuildError::DuplicateId(duplicate.0.to_string()))?;
+        }
+        structure::refresh_interchanges(&mut self.map);
+        Ok(())
     }
 
     fn build_reference_geometry(&mut self) -> Result<(), BuildError> {
         let config = self.config();
         for draft in &self.builder.roads {
+            // The ends of every bridge and tunnel the caller put on the road are
+            // vertices of it, the way a section boundary is.
+            let structure_ends = self
+                .builder
+                .structures
+                .iter()
+                .flat_map(|(spans, _)| spans.iter())
+                .filter(|span| span.road == draft.id)
+                .flat_map(|span| [span.from, span.to]);
             let stations = crate::map::required_stations(
                 draft
                     .spec
                     .cross_sections
                     .iter()
-                    .map(|section| section.station),
+                    .map(|section| section.station)
+                    .chain(structure_ends),
                 draft.spec.all_lanes().map(|lane| &lane.width),
                 draft.spec.all_lanes().map(|lane| &lane.height),
                 config,
@@ -1134,19 +1322,7 @@ impl Generator {
                 half_arc,
                 reference_line.horizontal_length()?,
             );
-            let draft = self.builder.draft_mut(&road.0)?;
-            draft.spec.reference_line = reference_line;
-            draft.spec.map_stations(&moved);
-            for (_, object) in &mut self.builder.objects {
-                if let ObjectSpec::AcrossRoad {
-                    road: at, station, ..
-                } = object
-                {
-                    if at == &road.0 {
-                        *station = moved(*station);
-                    }
-                }
-            }
+            self.reshape(&road.0, reference_line, &moved)?;
         }
         Ok(())
     }
@@ -1163,6 +1339,37 @@ impl Generator {
     /// lines and arcs that every format draws the same way. A vertex the road has no
     /// room to round shrinks its arc to fit, down to a corner as tight as the road is
     /// wide, and past that the build fails and says which vertex.
+    /// Gives a road a new reference line, and moves everything that was put on it
+    /// by station — its cross-sections, the bridges and tunnels on it, the
+    /// crosswalks across it — to where `moved` says those stations went.
+    fn reshape(
+        &mut self,
+        road: &RoadId,
+        reference_line: Curve3,
+        moved: &impl Fn(f64) -> f64,
+    ) -> Result<(), BuildError> {
+        let draft = self.builder.draft_mut(road)?;
+        draft.spec.reference_line = reference_line;
+        draft.spec.map_stations(moved);
+        for (spans, _) in &mut self.builder.structures {
+            for span in spans.iter_mut().filter(|span| &span.road == road) {
+                span.from = moved(span.from);
+                span.to = moved(span.to);
+            }
+        }
+        for (_, object) in &mut self.builder.objects {
+            if let ObjectSpec::AcrossRoad {
+                road: at, station, ..
+            } = object
+            {
+                if at == road {
+                    *station = moved(*station);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn round_vertices(&mut self) -> Result<(), BuildError> {
         let roads: Vec<RoadId> = self
             .builder
@@ -1182,19 +1389,7 @@ impl Generator {
             let Some((reference_line, moved)) = self.round_polyline(&road, &points)? else {
                 continue;
             };
-            let draft = self.builder.draft_mut(&road)?;
-            draft.spec.reference_line = reference_line;
-            draft.spec.map_stations(&moved);
-            for (_, object) in &mut self.builder.objects {
-                if let ObjectSpec::AcrossRoad {
-                    road: at, station, ..
-                } = object
-                {
-                    if at == &road {
-                        *station = moved(*station);
-                    }
-                }
-            }
+            self.reshape(&road, reference_line, &moved)?;
         }
         Ok(())
     }
@@ -1590,6 +1785,9 @@ impl Generator {
                 road_type: spec.road_type,
                 speed_limit: spec.speed_limit,
                 superelevation: spec.superelevation.clone(),
+                pavement: spec.pavement.clone(),
+                form: spec.form,
+                structure: StructureProfile::at_grade(),
             },
             lanes,
         ))
@@ -1844,8 +2042,8 @@ impl Generator {
     ) -> Result<(), BuildError> {
         let from_lane = self.lane(from)?.clone();
         let to_lane = self.lane(to)?.clone();
-        let from_end = road_end_of(from_lane.direction.exit_end());
-        let to_end = road_end_of(to_lane.direction.entry_end());
+        let from_end = from_lane.direction.exit_end().as_road_end();
+        let to_end = to_lane.direction.entry_end().as_road_end();
         self.build_junction_road(junction, &from_lane, from_end, &to_lane, to_end)
     }
 
@@ -1870,16 +2068,33 @@ impl Generator {
         // own terms: a road's start is left against its direction and entered
         // along it. The sign says whether the new road runs with the lane's
         // reference line there (`+1`) or against it.
-        // Along each lane's own direction there, climb and all: the connector is
-        // banked as the road it meets, and a roll turns the cross-section about the
-        // direction of travel, so only a connector that leaves at the road's grade
-        // tilts its cross-section onto the road's.
+        // Where the road it meets is banked, along the lane's own direction there,
+        // climb and all: the connector is banked as that road, and a roll turns the
+        // cross-section about the direction of travel, so only a connector that
+        // leaves at the road's grade tilts its cross-section onto the road's. Where
+        // the road is level across, horizontally, as a junction's surface is level:
+        // leaving at the grade would carry an approach's climb on past the junction
+        // and crest above both roads.
+        let roll_at = |road: &RoadId, end: RoadEnd| {
+            let geometry = &self.geometry[road];
+            geometry.rolls[geometry.index_at(end)]
+        };
+        let along = |lane: &Lane, end: RoadEnd, banked: bool| -> Result<UnitVector3, BuildError> {
+            let joint = into_joint(&lane.centerline, end)?;
+            Ok(if banked {
+                joint.normalize()?
+            } else {
+                horizontal(joint)?
+            })
+        };
         let start = from_lane.endpoint(from_end.as_lane_end());
-        let start_tangent = into_joint(&from_lane.centerline, from_end)?.normalize()?;
+        let start_tangent = along(
+            from_lane,
+            from_end,
+            roll_at(&from_lane.road, from_end) != 0.0,
+        )?;
         let end = to_lane.endpoint(to_end.as_lane_end());
-        let end_tangent = into_joint(&to_lane.centerline, to_end)?
-            .normalize()?
-            .reversed();
+        let end_tangent = along(to_lane, to_end, roll_at(&to_lane.road, to_end) != 0.0)?.reversed();
         let sign = |end: RoadEnd| match end {
             RoadEnd::End => 1.0,
             RoadEnd::Start => -1.0,
@@ -1912,10 +2127,6 @@ impl Generator {
         // is about the reference line's own direction: where the connector runs
         // against the road it meets, the road's left side is its right, and the roll
         // changes sign.
-        let roll_at = |road: &RoadId, end: RoadEnd| {
-            let geometry = &self.geometry[road];
-            geometry.rolls[geometry.index_at(end)]
-        };
         let start_roll = start_sign * roll_at(&from_lane.road, from_end);
         let end_roll = end_sign * roll_at(&to_lane.road, to_end);
         let length = reference_line.horizontal_length()?;
@@ -2032,6 +2243,26 @@ impl Generator {
                 .unwrap_or(RoadType::Town),
             speed_limit: from_lane.speed_limit,
             superelevation,
+            // A movement through a junction is surfaced like the road it leaves.
+            pavement: self
+                .map
+                .road(&from_lane.road)
+                .and_then(|road| {
+                    let station = match from_end {
+                        RoadEnd::Start => 0.0,
+                        RoadEnd::End => road.horizontal_length().ok()?,
+                    };
+                    road.pavement.at(station)
+                })
+                .map(PavementProfile::constant)
+                .unwrap_or_default(),
+            // And plays the part the road it leaves plays: a movement off a slip road
+            // is a slip road.
+            form: self
+                .map
+                .road(&from_lane.road)
+                .map(|road| road.form)
+                .unwrap_or_default(),
         };
         let (road, lanes) = self.build_road(
             &road_id,
@@ -2102,20 +2333,44 @@ impl Generator {
                         LaneEnd::End => (finish - setback).max(start),
                         LaneEnd::Start => (start + setback).min(finish),
                     };
-                    let up = self
+                    let normal = self
                         .map
                         .road(&lane.road)
                         .ok_or_else(|| BuildError::UnknownRoad(lane.road.clone()))
-                        .and_then(|road| Ok(road.frame_at(station, config)?.up.scaled(height)))?;
+                        .and_then(|road| Ok(road.frame_at(station, config)?.up))?;
+                    let up = normal.scaled(height);
                     let raise = |point: Point3| point + up;
+                    let (mut left, mut right) = (raise(left), raise(right));
+                    let mut kind = kind;
+                    if let MapObjectKind::TrafficLight { head } = &mut kind {
+                        if *head == LightHead::default() {
+                            // A light is a head hung over the middle of its lane,
+                            // and its bar is that head's bottom edge -- the
+                            // housing every export draws, not the lane's width.
+                            let middle = left.lerp(right, 0.5);
+                            let across = (right - left).normalize()?;
+                            let half = across.scaled(LightHead::STANDARD_WIDTH / 2.0);
+                            (left, right) = (middle - half, middle + half);
+                            *head = LightHead::standard(middle, normal);
+                        }
+                    }
                     MapObject {
                         id: id.clone(),
                         kind,
-                        geometry: ObjectGeometry::Line(Curve3::polyline([
-                            raise(left),
-                            raise(right),
-                        ])?),
+                        geometry: ObjectGeometry::Line(Curve3::polyline([left, right])?),
                         lanes: self.lane_ids(&lanes)?,
+                    }
+                }
+                ObjectSpec::AlongLane { kind, lane } => {
+                    let entry = self.lane(&lane)?.clone();
+                    MapObject {
+                        id: id.clone(),
+                        kind,
+                        geometry: ObjectGeometry::Band {
+                            left: entry.left_boundary.clone(),
+                            right: entry.right_boundary.clone(),
+                        },
+                        lanes: vec![entry.id.clone()],
                     }
                 }
                 ObjectSpec::AcrossRoad {
@@ -2137,19 +2392,16 @@ impl Generator {
                     let station = station.clamp(half, length - half);
                     let frame = entry.frame_at(station, config)?;
                     let lateral = frame.left.get();
-                    // How far the road reaches at *this* station, which a tapering
-                    // cross-section makes a different question at every one.
-                    let extent = self.layouts[&road]
-                        .iter()
-                        .filter(|layout| {
-                            station >= layout.station_range.0 && station <= layout.station_range.1
-                        })
-                        .map(|layout| layout.extent(station))
-                        .fold(0.0_f64, f64::max);
+                    // Kerb to kerb at *this* station -- a tapering cross-section
+                    // makes it a different question at every one -- and
+                    // CROSSWALK_OVERLAP onto the pavement each side, so that a
+                    // crossing meets the walkways without lying along them. (A
+                    // road with no pavement is crossed edge to edge.)
+                    let (lo, hi) = self.crossing_span(&road, station);
                     let along = frame.tangent.scaled(width / 2.0);
                     let edge = |sign: f64| -> Result<Curve3, GeometryError> {
                         let center = frame.origin + along * sign;
-                        Curve3::polyline([center + lateral * extent, center - lateral * extent])
+                        Curve3::polyline([center + lateral * hi, center + lateral * lo])
                     };
                     MapObject {
                         id: id.clone(),
@@ -2170,6 +2422,47 @@ impl Generator {
         Ok(())
     }
 
+    /// The lateral span a crossing at `station` covers: the carriageway (every
+    /// lane but the pavements) and [`CROSSWALK_OVERLAP`] past it on a side with a
+    /// pavement, never beyond the road's edge.
+    fn crossing_span(&self, road: &RoadId, station: f64) -> (f64, f64) {
+        let layouts = &self.layouts[road];
+        let in_section = |range: (f64, f64)| station >= range.0 && station <= range.1;
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        let (mut road_lo, mut road_hi) = (f64::MAX, f64::MIN);
+        for lane in self.map.lanes_of(road) {
+            if !in_section(lane.station_range) {
+                continue;
+            }
+            let Some(layout) = layouts.get(lane.section) else {
+                continue;
+            };
+            let edges = [
+                layout.edge_offset(lane.left_edge, station),
+                layout.edge_offset(lane.right_edge, station),
+            ];
+            for offset in edges {
+                road_lo = road_lo.min(offset);
+                road_hi = road_hi.max(offset);
+                // Pavements are walked, and a `None` lane is not surfaced at all.
+                if !matches!(lane.lane_type, LaneType::Sidewalk | LaneType::None) {
+                    lo = lo.min(offset);
+                    hi = hi.max(offset);
+                }
+            }
+        }
+        if road_lo > road_hi {
+            return (0.0, 0.0);
+        }
+        if lo > hi {
+            return (road_lo, road_hi);
+        }
+        (
+            (lo - CROSSWALK_OVERLAP).max(road_lo),
+            (hi + CROSSWALK_OVERLAP).min(road_hi),
+        )
+    }
+
     fn lane_ids(&self, lanes: &[LaneRef]) -> Result<Vec<LaneId>, BuildError> {
         lanes
             .iter()
@@ -2186,7 +2479,7 @@ impl Generator {
                     lanes,
                 } => TrafficRule::TrafficLight {
                     lights,
-                    stop_line,
+                    stop_lines: stop_line.into_iter().collect(),
                     lanes: self.lane_ids(&lanes)?,
                 },
                 RuleSpec::RightOfWay {
@@ -2206,13 +2499,6 @@ impl Generator {
             self.map.rules.push(rule);
         }
         Ok(())
-    }
-}
-
-fn road_end_of(end: LaneEnd) -> RoadEnd {
-    match end {
-        LaneEnd::Start => RoadEnd::Start,
-        LaneEnd::End => RoadEnd::End,
     }
 }
 
@@ -2370,6 +2656,19 @@ impl RoadSpec {
                 if let Ok(width) = WidthProfile::new(knots, taper) {
                     lane.width = width;
                 }
+                // A lift is by station too: where it ramps or peaks has to stay
+                // where it was on the ground, not at a number the arc has moved.
+                if !lane.height.is_flat() {
+                    let knots: Vec<(f64, f64, f64)> = lane
+                        .height
+                        .knots()
+                        .iter()
+                        .map(|(station, inner, outer)| (map(*station), *inner, *outer))
+                        .collect();
+                    if let Ok(height) = LaneHeight::new(knots) {
+                        lane.height = height;
+                    }
+                }
             }
         }
         let pieces: Vec<Poly3Piece> = self
@@ -2449,6 +2748,76 @@ mod tests {
         builder
             .add_road(RoadSpec::line(from, to, two_way()).unwrap().with_name(name))
             .unwrap()
+    }
+
+    #[test]
+    fn a_crossing_spans_the_carriageway_and_just_reaches_the_pavements() {
+        // Two 3.5 m lanes and a 2.5 m pavement each side: the carriageway is 7 m,
+        // the road 12 m. The crossing covers the 7 m and 0.3 m of each pavement.
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    vec![
+                        LaneSpec::new(width(3.5), Direction::Backward),
+                        LaneSpec::new(width(2.5), Direction::Backward)
+                            .with_type(LaneType::Sidewalk),
+                        LaneSpec::new(width(3.5), Direction::Forward),
+                        LaneSpec::new(width(2.5), Direction::Forward).with_type(LaneType::Sidewalk),
+                    ],
+                )
+                .unwrap()
+                .with_name("main"),
+            )
+            .unwrap();
+        let crossing = builder.add_crosswalk(&road, 0.5, 4.0).unwrap();
+        let map = builder.finish().unwrap().into_map();
+        let object = map.objects.iter().find(|o| o.id == crossing).unwrap();
+        let ObjectGeometry::Band { left, .. } = &object.geometry else {
+            panic!("a crossing is a band");
+        };
+        let (a, b) = (left.start_point(), left.end_point());
+        let (lo, hi) = (a.y.min(b.y), a.y.max(b.y));
+        let reach = 3.5 + CROSSWALK_OVERLAP;
+        assert!(
+            (lo + reach).abs() < 1e-9 && (hi - reach).abs() < 1e-9,
+            "{lo}..{hi}"
+        );
+    }
+
+    #[test]
+    fn a_light_is_a_standard_head_over_the_middle_of_its_lane_at_any_height() {
+        for height in [5.0, 0.0] {
+            let mut builder = MapBuilder::default();
+            let road = straight(
+                &mut builder,
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(100.0, 0.0, 0.0),
+                "main",
+            );
+            let light = builder
+                .add_traffic_light(&LaneRef::new(road, 0), LaneEnd::End, height)
+                .unwrap();
+            let map = builder.finish().unwrap().into_map();
+            let object = map.objects.iter().find(|o| o.id == light).unwrap();
+            let (MapObjectKind::TrafficLight { head }, ObjectGeometry::Line(bar)) =
+                (&object.kind, &object.geometry)
+            else {
+                panic!("not a light bar");
+            };
+            // 0.38 m across the forward lane's middle (y = -1.75), at the height asked.
+            let (from, to) = (bar.start_point(), bar.end_point());
+            assert!((from.distance_to(to) - LightHead::STANDARD_WIDTH).abs() < 1e-9);
+            assert!((from.lerp(to, 0.5).y + 1.75).abs() < 1e-9);
+            assert!((from.z - height).abs() < 1e-9 && (to.z - height).abs() < 1e-9);
+            // Three lamps standing on the bar, red at the top.
+            assert_eq!(head.bulbs.len(), 3);
+            assert!(head.bulbs.iter().all(|bulb| bulb.position.z > height));
+            assert_eq!(head.bulbs[2].color, crate::semantics::LightColor::Red);
+            assert!(head.bulbs[2].position.z < height + head.height.unwrap());
+        }
     }
 
     #[test]
@@ -2587,6 +2956,51 @@ mod tests {
             "{:?}",
             there.point
         );
+    }
+
+    #[test]
+    fn a_lift_moves_with_the_rounded_corner_too() {
+        let mut builder = MapBuilder::default();
+        let a = straight(
+            &mut builder,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(100.0, 0.0, 0.0),
+            "a",
+        );
+        // Road b's first lane ramps up to a kerb's height 30 m in from the joint.
+        let ramp = LaneHeight::new([(0.0, 0.0, 0.0), (30.0, 0.15, 0.15)]).unwrap();
+        let mut lanes = two_way();
+        lanes[0] = lanes[0].clone().with_height(ramp);
+        let b = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(100.0, 0.0, 0.0),
+                    Point3::new(100.0, 100.0, 0.0),
+                    lanes,
+                )
+                .unwrap()
+                .with_name("b"),
+            )
+            .unwrap();
+        builder.connect(&a, &b).unwrap();
+        let map = builder.finish().unwrap().into_map();
+
+        let radius = 3.5 + CORNER_INNER_RADIUS;
+        let (setback, half_arc) = (radius, radius * std::f64::consts::FRAC_PI_4);
+        let lifted: Vec<&Lane> = map
+            .lanes_of(&b)
+            .into_iter()
+            .filter(|lane| !lane.height.is_flat())
+            .collect();
+        assert_eq!(lifted.len(), 1);
+        // The top of the ramp is where it was on the ground -- 30 m along the
+        // straight part -- which is a different station now the joint is an arc.
+        let top = lifted[0].height.knots().last().copied().unwrap();
+        assert!(
+            (top.0 - (30.0 - setback + half_arc)).abs() < 1e-9,
+            "{top:?}"
+        );
+        assert_eq!((top.1, top.2), (0.15, 0.15));
     }
 
     #[test]

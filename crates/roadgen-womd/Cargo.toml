@@ -1,0 +1,20 @@
+[package]
+name = "roadgen-womd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lowers the roadgen canonical IR onto a Waymo Open Motion Dataset scenario's map"
+
+[dependencies]
+roadgen-core.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

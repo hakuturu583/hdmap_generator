@@ -28,9 +28,19 @@ impl SamplingConfig {
         Ok(SamplingConfig { max_segment_length })
     }
 
-    /// Number of segments needed to cover `length` without exceeding the bound.
+    /// The most segments one curve is ever realised as, whatever its length and
+    /// the bound: a vertex every centimetre along ten kilometres of curve.
+    ///
+    /// Every sampling allocates a vertex per segment, so a curve far longer than
+    /// any road, or a bound far finer than any map, has to cost a bounded amount
+    /// rather than all the memory there is — which is what a document from
+    /// outside could otherwise ask for.
+    pub const MAX_SEGMENTS: usize = 1 << 20;
+
+    /// Number of segments needed to cover `length` without exceeding the bound,
+    /// up to [`SamplingConfig::MAX_SEGMENTS`].
     fn segments_for(&self, length: f64) -> usize {
-        ((length / self.max_segment_length).ceil() as usize).max(1)
+        ((length / self.max_segment_length).ceil() as usize).clamp(1, Self::MAX_SEGMENTS)
     }
 
     /// Stations from `from` to `to`, both included, evenly spaced and no further
@@ -358,11 +368,6 @@ pub struct Bezier3 {
 impl Bezier3 {
     /// The curve through these control points, realised at `config`'s resolution.
     pub fn new(control: [Point3; 4], config: SamplingConfig) -> Result<Self, GeometryError> {
-        for point in control {
-            if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
-                return Err(GeometryError::NonFiniteCoordinate);
-            }
-        }
         let polygon: f64 = control
             .windows(2)
             .map(|pair| pair[0].distance_to(pair[1]))
@@ -383,10 +388,41 @@ impl Bezier3 {
             }
         };
         let per_five_degrees = (turn / (5.0_f64).to_radians()).ceil() as usize;
-        Ok(Bezier3 {
+        Bezier3::checked(
             control,
-            segments: config.segments_for(polygon).max(8).max(per_five_degrees),
-        })
+            config.segments_for(polygon).max(8).max(per_five_degrees),
+        )
+    }
+
+    /// The curve through these control points, realised as exactly `segments`
+    /// straight pieces.
+    ///
+    /// For a reader putting back a curve that was written out: the resolution is
+    /// part of the curve, and [`Bezier3::new`] would derive it again from whatever
+    /// sampling the reader happens to have.
+    ///
+    /// Fails for no segments, and for more than [`SamplingConfig::MAX_SEGMENTS`],
+    /// which [`Bezier3::new`] never exceeds: every sampling of the curve allocates
+    /// one vertex per segment, so a count that came from outside is a count the
+    /// program has to be able to afford.
+    pub fn with_segments(control: [Point3; 4], segments: usize) -> Result<Self, GeometryError> {
+        if segments == 0 {
+            return Err(GeometryError::NoSegments);
+        }
+        if segments > SamplingConfig::MAX_SEGMENTS {
+            return Err(GeometryError::TooManySegments {
+                got: segments,
+                max: SamplingConfig::MAX_SEGMENTS,
+            });
+        }
+        Bezier3::checked(control, segments)
+    }
+
+    fn checked(control: [Point3; 4], segments: usize) -> Result<Self, GeometryError> {
+        if !control.iter().all(|point| point.is_finite()) {
+            return Err(GeometryError::NonFiniteCoordinate);
+        }
+        Ok(Bezier3 { control, segments })
     }
 
     /// How many straight segments the curve is realised as.
@@ -558,13 +594,19 @@ impl Curve3 {
             1 => return Ok(segments.into_iter().next().expect("length checked")),
             _ => {}
         }
-        for pair in segments.windows(2) {
-            let gap = pair[0].end_point().distance_to(pair[1].start_point());
-            if gap > Self::JOIN_TOLERANCE {
-                return Err(GeometryError::DisjointSegments { gap });
-            }
+        if let Some((_, gap)) = Curve3::first_gap(&segments) {
+            return Err(GeometryError::DisjointSegments { gap });
         }
         Ok(Curve3::Composite(segments))
+    }
+
+    /// The first piece that does not start where the one before it ended, by
+    /// index, and how far off it starts: what makes pieces not a composite.
+    pub fn first_gap(pieces: &[Curve3]) -> Option<(usize, f64)> {
+        pieces.windows(2).enumerate().find_map(|(index, pair)| {
+            let gap = pair[0].end_point().distance_to(pair[1].start_point());
+            (gap > Self::JOIN_TOLERANCE).then_some((index + 1, gap))
+        })
     }
 
     /// How far apart two pieces of a composite may be and still count as joined.
@@ -872,6 +914,97 @@ impl Curve3 {
                 .map(Curve3::horizontal_length)
                 .sum::<Result<f64, GeometryError>>(),
         }
+    }
+
+    /// The same plan, with its heights read from `z` against horizontal station
+    /// instead: each line, arc and spiral cut into pieces no longer than `step`,
+    /// each piece keeping its plan exactly and climbing at a constant grade between
+    /// the heights `z` gives at its two ends. A polyline or a Bézier keeps its
+    /// vertices and takes their heights from `z`.
+    ///
+    /// This is how a vertical curve gets into a curve that carries a constant grade
+    /// per piece: a parabola of radius 3000 m cut every 5 m is off by a millimetre.
+    pub fn draped(&self, z: &dyn Fn(f64) -> f64, step: f64) -> Result<Curve3, GeometryError> {
+        let mut pieces = Vec::new();
+        self.drape_into(0.0, z, step.max(0.1), &mut pieces)?;
+        Curve3::composite(pieces)
+    }
+
+    fn drape_into(
+        &self,
+        offset: f64,
+        z: &dyn Fn(f64) -> f64,
+        step: f64,
+        out: &mut Vec<Curve3>,
+    ) -> Result<(), GeometryError> {
+        let cuts = |length: f64| {
+            let count = ((length / step).ceil() as usize).max(1);
+            (0..=count).map(move |index| length * index as f64 / count as f64)
+        };
+        match self {
+            Curve3::Line(line) => {
+                let length = line.start().horizontal_distance_to(line.end());
+                let stations: Vec<f64> = cuts(length).collect();
+                for pair in stations.windows(2) {
+                    let at = |s: f64| {
+                        let p = line.start().lerp(line.end(), s / length);
+                        Point3::new(p.x, p.y, z(offset + s))
+                    };
+                    out.push(Curve3::Line(Line3::new(at(pair[0]), at(pair[1]))?));
+                }
+            }
+            Curve3::Arc(arc) => {
+                let stations: Vec<f64> = cuts(arc.horizontal_length).collect();
+                for pair in stations.windows(2) {
+                    let (point, tangent) = arc.at(pair[0]);
+                    out.push(Curve3::Arc(Arc3::new(
+                        Point3::new(point.x, point.y, z(offset + pair[0])),
+                        tangent.heading(),
+                        arc.curvature,
+                        pair[1] - pair[0],
+                        z(offset + pair[1]),
+                    )?));
+                }
+            }
+            Curve3::Clothoid(clothoid) => {
+                let stations: Vec<f64> = cuts(clothoid.horizontal_length).collect();
+                let points = clothoid.walk(&stations);
+                for (index, pair) in stations.windows(2).enumerate() {
+                    let point = points[index];
+                    let curvature = |s: f64| clothoid.curvature_start + clothoid.sharpness() * s;
+                    out.push(Curve3::Clothoid(Clothoid3::new(
+                        Point3::new(point.x, point.y, z(offset + pair[0])),
+                        clothoid.heading_at(pair[0]),
+                        curvature(pair[0]),
+                        curvature(pair[1]),
+                        pair[1] - pair[0],
+                        z(offset + pair[1]),
+                    )?));
+                }
+            }
+            Curve3::Bezier(_) | Curve3::Polyline(_) => {
+                let polyline = self.to_polyline(SamplingConfig::default())?;
+                let mut station = 0.0;
+                let mut previous: Option<Point3> = None;
+                let mut points = Vec::new();
+                for point in polyline.points() {
+                    if let Some(last) = previous {
+                        station += last.horizontal_distance_to(*point);
+                    }
+                    previous = Some(*point);
+                    points.push(Point3::new(point.x, point.y, z(offset + station)));
+                }
+                out.push(Curve3::polyline(points)?);
+            }
+            Curve3::Composite(segments) => {
+                let mut at = offset;
+                for segment in segments {
+                    segment.drape_into(at, z, step, out)?;
+                    at += segment.horizontal_length()?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// True arc length, in three dimensions.

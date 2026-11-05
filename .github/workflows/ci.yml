@@ -10,7 +10,13 @@ env:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64 natively rather than under emulation: the release ships an aarch64
+        # wheel, and this is what checks that it behaves like the x86_64 one.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,14 +35,17 @@ jobs:
       # unless they agree; better to hear about a lock file that lags here than on
       # release day.
       - name: The version files agree
+        if: matrix.os == 'ubuntu-latest'
         run: |
           PKG=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
           CRATE=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           test "$PKG" = "$CRATE"
           cargo metadata --locked --format-version 1 >/dev/null
       - name: Format
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
       - name: Lint
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
@@ -44,7 +53,13 @@ jobs:
           ROADGEN_REQUIRE_SUMO: "1"
 
   python:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64 natively rather than under emulation: the release ships an aarch64
+        # wheel, and this is what checks that it behaves like the x86_64 one.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,10 +79,21 @@ jobs:
           python -m pip install --upgrade pip
           # pandas and pyarrow are how the ClipGT tests read the written parquet,
           # which is how a Cosmos reader reads it. sumolib reads the SUMO network.
-          pip install maturin pytest pandas pyarrow sumolib
+          # protobuf and grpcio-tools (which bundles protoc) compile the IR schema
+          # for the importer that reads a document knowing nothing of roadgen.
+          pip install maturin pytest pandas pyarrow sumolib protobuf grpcio-tools
           maturin build --release --out dist
           pip install --find-links dist roadgen
       - name: Test
         run: python -m pytest tests/python -q
         env:
           ROADGEN_REQUIRE_SUMO: "1"
+      # commonroad-io is how a CommonRoad planner reads a scenario, and ships the
+      # schema lxml validates it against. It pins protobuf 3, which the WOMD and IR
+      # tests' grpcio-tools cannot share, so it gets an environment of its own.
+      - name: CommonRoad
+        run: |
+          python -m venv /tmp/commonroad
+          /tmp/commonroad/bin/pip install pytest lxml commonroad-io
+          /tmp/commonroad/bin/pip install --find-links dist roadgen
+          /tmp/commonroad/bin/python -m pytest tests/python/test_commonroad.py -q

@@ -359,8 +359,27 @@ pub fn bent_polyline() -> ValidatedMap {
 /// The transitions are clothoids, which is how a road actually enters a bend — and
 /// the reason OpenDRIVE has a `<spiral>` element at all.
 pub fn spiral_transition_road() -> ValidatedMap {
+    spiral_transition("spiral", 4.0, two_way())
+}
+
+/// [`spiral_transition_road`] as a street, level, with a sidewalk at each kerb.
+pub fn spiral_transition_street() -> ValidatedMap {
+    spiral_transition("sweep_street", 0.0, sidewalk_street())
+}
+
+/// Two driving lanes, one each way, each with a sidewalk at its kerb.
+pub fn sidewalk_street() -> Vec<LaneSpec> {
+    vec![
+        lane(3.5, Direction::Backward),
+        lane(2.0, Direction::Backward).with_type(LaneType::Sidewalk),
+        lane(3.5, Direction::Forward),
+        lane(2.0, Direction::Forward).with_type(LaneType::Sidewalk),
+    ]
+}
+
+fn spiral_transition(name: &str, height: f64, lanes: Vec<LaneSpec>) -> ValidatedMap {
     let radius = 120.0;
-    let alignment = Alignment::new(Point3::new(0.0, 0.0, 4.0), 0.0)
+    let alignment = Alignment::new(Point3::new(0.0, 0.0, height), 0.0)
         .line(80.0, 1.0)
         .unwrap()
         .spiral(60.0, 1.0 / radius, 1.0)
@@ -374,10 +393,10 @@ pub fn spiral_transition_road() -> ValidatedMap {
         .finish()
         .unwrap();
 
-    let mut builder = MapBuilder::new(metadata("spiral"));
+    let mut builder = MapBuilder::new(metadata(name));
     builder
         .add_road(
-            RoadSpec::new(alignment, two_way())
+            RoadSpec::new(alignment, lanes)
                 .with_name("sweep")
                 .with_speed_limit(SpeedLimit::from_kph(80.0).unwrap()),
         )
@@ -453,6 +472,62 @@ pub fn lane_drop() -> ValidatedMap {
             .with_cross_section(
                 drop,
                 vec![lane(3.5, Direction::Forward), lane(3.5, Direction::Forward)],
+            ),
+        )
+        .unwrap();
+    finish(builder)
+}
+
+/// A two-way road whose forward driving lane becomes a cycle lane halfway along,
+/// while the backward lane stays a driving lane all the way.
+///
+/// The forward lane does not carry on: a cycle lane is not more of the same lane, so
+/// the IR has no connection across the boundary on that side — and nothing at all
+/// from the first section's forward carriageway.
+pub fn lane_type_change() -> ValidatedMap {
+    let mut builder = MapBuilder::new(metadata("lane-type-change"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(200.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("r")
+            .with_cross_section(
+                100.0,
+                vec![
+                    lane(3.5, Direction::Forward).with_type(LaneType::Biking),
+                    lane(3.5, Direction::Backward),
+                ],
+            ),
+        )
+        .unwrap();
+    finish(builder)
+}
+
+/// A two-way road whose backward carriageway loses a lane: two lanes run backward
+/// past station 100 and one before it, so traffic running backward — from the far
+/// end — finds its outer lane ending at the boundary.
+pub fn backward_lane_drop() -> ValidatedMap {
+    let mut builder = MapBuilder::new(metadata("backward-lane-drop"));
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(200.0, 0.0, 0.0),
+                two_way(),
+            )
+            .unwrap()
+            .with_name("r")
+            .with_cross_section(
+                100.0,
+                vec![
+                    lane(3.5, Direction::Forward),
+                    lane(3.5, Direction::Backward),
+                    lane(3.5, Direction::Backward),
+                ],
             ),
         )
         .unwrap();
@@ -548,4 +623,162 @@ pub fn controlled_crossroads() -> ValidatedMap {
     builder.add_right_of_way(vec![east_approach], vec![north_approach], Some(stop_line));
     builder.add_crosswalk(&roads[0], 0.8, 4.0).unwrap();
     finish(builder)
+}
+
+/// A four-way crossroads of streets with a pavement down each side, so the
+/// generator lays a pavement round every corner of the junction.
+///
+/// The arms are not all drawn towards the centre: west and south end at the
+/// junction, east and north start there. Which end of a road meets the junction
+/// decides which of its pavements faces which corner, and so whether the pavement
+/// round a corner runs from a sidewalk *arriving* at the junction or from one
+/// *leaving* it — which a format whose lanes are one way has to get right.
+///
+/// `handedness` is the side traffic keeps to. It moves every lane to the other side
+/// of the reference line, and every pavement with it, so the same street makes the
+/// corners join the opposite sidewalks.
+pub fn sidewalk_crossroads(handedness: TrafficHandedness) -> ValidatedMap {
+    let name = match handedness {
+        TrafficHandedness::RightHand => "sidewalks",
+        TrafficHandedness::LeftHand => "sidewalks_lht",
+    };
+    let (builder, _) = sidewalk_crossroads_builder(handedness, name, false);
+    finish(builder)
+}
+
+/// The sidewalk crossroads of [`sidewalk_crossroads`] with a crosswalk across every
+/// arm at the mouth of the junction, and one more half way along the west arm.
+///
+/// Each crosswalk at the junction is 4 m wide and stands a little under 3 m back
+/// from the mouth, as one does to leave a turning car room to wait; at 95 % of the
+/// way along an arm that ends at the junction, and 5 % of the way along one that
+/// starts there. The one half way along the west arm is a mid-block crossing, which
+/// a format that puts crossings at junctions has to do something about.
+///
+/// The arms are returned west, east, north, south.
+pub fn crosswalk_crossroads(handedness: TrafficHandedness) -> (ValidatedMap, [RoadId; 4]) {
+    let name = match handedness {
+        TrafficHandedness::RightHand => "crosswalks",
+        TrafficHandedness::LeftHand => "crosswalks_lht",
+    };
+    let (mut builder, arms) = sidewalk_crossroads_builder(handedness, name, false);
+    let [west, east, north, south] = &arms;
+    for (arm, fraction) in [(west, 0.95), (east, 0.05), (north, 0.05), (south, 0.95)] {
+        builder.add_crosswalk(arm, fraction, 4.0).unwrap();
+    }
+    builder.add_crosswalk(west, 0.5, 4.0).unwrap();
+    (finish(builder), arms)
+}
+
+/// The crosswalk crossroads of [`crosswalk_crossroads`] with a traffic light, a stop
+/// line and a traffic-light rule on every approach: a signalised junction with a
+/// pedestrian crossing across every arm, which in SUMO is a light whose program has
+/// both vehicle and crossing links.
+///
+/// The arms are returned west, east, north, south.
+pub fn signalised_crosswalk_crossroads(
+    handedness: TrafficHandedness,
+) -> (ValidatedMap, [RoadId; 4]) {
+    let name = match handedness {
+        TrafficHandedness::RightHand => "signalised_crosswalks",
+        TrafficHandedness::LeftHand => "signalised_crosswalks_lht",
+    };
+    let (mut builder, arms) = sidewalk_crossroads_builder(handedness, name, false);
+    let [west, east, north, south] = &arms;
+    for (arm, fraction) in [(west, 0.95), (east, 0.05), (north, 0.05), (south, 0.95)] {
+        builder.add_crosswalk(arm, fraction, 4.0).unwrap();
+    }
+    builder.add_crosswalk(west, 0.5, 4.0).unwrap();
+    // West and south end at the junction, so their forward driving lane (the third
+    // of the cross-section) runs into it at its end; east and north start there, so
+    // it is their backward driving lane (the first), at its start.
+    for (arm, index, end) in [
+        (west, 2, LaneEnd::End),
+        (south, 2, LaneEnd::End),
+        (east, 0, LaneEnd::Start),
+        (north, 0, LaneEnd::Start),
+    ] {
+        let approach = LaneRef::new(arm.clone(), index);
+        let stop_line = builder.add_stop_line(&approach, end).unwrap();
+        let light = builder.add_traffic_light(&approach, end, 5.0).unwrap();
+        builder.add_traffic_light_rule(vec![light], Some(stop_line), vec![approach]);
+    }
+    (finish(builder), arms)
+}
+
+/// [`crosswalk_crossroads`] with the west arm one-way, towards the junction, and
+/// without the crosswalk half way along it: a footway at each kerb and a single
+/// driving lane between them, so the pavement on the far kerb runs against the
+/// traffic and is a backward lane of its own — in SUMO, an edge with nothing on it
+/// but a footway, which a crossing has no vehicle lane on to cross.
+///
+/// The arms are returned west, east, north, south.
+pub fn one_way_crosswalk_crossroads(handedness: TrafficHandedness) -> (ValidatedMap, [RoadId; 4]) {
+    let name = match handedness {
+        TrafficHandedness::RightHand => "crosswalks_one_way",
+        TrafficHandedness::LeftHand => "crosswalks_one_way_lht",
+    };
+    let (mut builder, arms) = sidewalk_crossroads_builder(handedness, name, true);
+    let [west, east, north, south] = &arms;
+    for (arm, fraction) in [(west, 0.95), (east, 0.05), (north, 0.05), (south, 0.95)] {
+        builder.add_crosswalk(arm, fraction, 4.0).unwrap();
+    }
+    (finish(builder), arms)
+}
+
+/// The builder of [`sidewalk_crossroads`], with its four arms — west, east, north,
+/// south — so that more can be put on them.
+fn sidewalk_crossroads_builder(
+    handedness: TrafficHandedness,
+    name: &str,
+    one_way_west: bool,
+) -> (MapBuilder, [RoadId; 4]) {
+    let mut builder = MapBuilder::new(MapMetadata {
+        handedness,
+        ..metadata(name)
+    });
+    let one_way = || {
+        vec![
+            lane(2.0, Direction::Backward).with_type(LaneType::Sidewalk),
+            lane(3.5, Direction::Forward),
+            lane(2.0, Direction::Forward).with_type(LaneType::Sidewalk),
+        ]
+    };
+    let junction = builder.add_junction(Some("x"));
+    let mut arm = |name: &str, from: (f64, f64), to: (f64, f64)| {
+        let lanes = if one_way_west && name == "west" {
+            one_way()
+        } else {
+            sidewalk_street()
+        };
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(from.0, from.1, 0.0),
+                    Point3::new(to.0, to.1, 0.0),
+                    lanes,
+                )
+                .unwrap()
+                .with_name(name),
+            )
+            .unwrap()
+    };
+    let west = arm("west", (-70.0, 0.0), (-14.0, 0.0));
+    let east = arm("east", (14.0, 0.0), (70.0, 0.0));
+    let north = arm("north", (0.0, 14.0), (0.0, 70.0));
+    let south = arm("south", (0.0, -70.0), (0.0, -14.0));
+    let arms = [
+        (&west, RoadEnd::End),
+        (&east, RoadEnd::Start),
+        (&north, RoadEnd::Start),
+        (&south, RoadEnd::End),
+    ];
+    for (index, (from, from_end)) in arms.iter().enumerate() {
+        for (to, to_end) in arms.iter().skip(index + 1) {
+            builder
+                .connect_ends(from, *from_end, to, *to_end, Some(&junction))
+                .unwrap();
+        }
+    }
+    (builder, [west, east, north, south])
 }

@@ -6,7 +6,7 @@
 //! junctions, the connections between them, 3D geometry and semantics — with each of
 //! those concerns kept in its own module.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::arena::Arena;
 use crate::buildings::{Building, BuildingPart};
@@ -15,8 +15,18 @@ use crate::geometry::{
     Curve3, Frame3, LaneHeight, Point3, Poly3Profile, Polyline3, Sample, SamplingConfig,
     WidthProfile,
 };
-use crate::id::{BuildingId, BuildingPartId, ConnectionId, JunctionId, LaneId, ObjectId, RoadId};
-use crate::semantics::{BoundaryMarking, LaneType, MapObject, RoadType, TrafficRule};
+use crate::id::{
+    BuildingId, BuildingPartId, ConnectionId, GradeSeparationId, InterchangeId, JunctionId,
+    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
+};
+use crate::land_cover::LandCover;
+use crate::semantics::{
+    BoundaryMarking, FormOfWay, LaneType, MapObject, PavementProfile, RoadMarking, RoadType,
+    TrafficRule,
+};
+use crate::site::Site;
+use crate::structure::{GradeSeparation, Interchange, Structure, StructureProfile};
+use crate::terrain::{TinBreakline, TinSurface};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLink, RoadLinkTarget,
 };
@@ -216,6 +226,13 @@ pub struct Road {
     /// Roll of the road surface about its reference line, radians against horizontal
     /// station. Zero everywhere for a road that is flat across.
     pub superelevation: Poly3Profile,
+    /// What the road is surfaced with along its length; unknown unless the caller
+    /// said.
+    pub pavement: PavementProfile,
+    /// What part the road plays in the network.
+    pub form: FormOfWay,
+    /// Which stretches of it are on a bridge or in a tunnel; at grade elsewhere.
+    pub structure: StructureProfile,
 }
 
 impl Road {
@@ -233,6 +250,12 @@ impl Road {
 
     pub fn is_connector(&self) -> bool {
         self.junction.is_some()
+    }
+
+    /// A freeway's road: controlled access by its form of way, or a motorway by its
+    /// type, whatever the other says.
+    pub fn is_freeway(&self) -> bool {
+        self.form.is_controlled_access() || self.road_type == RoadType::Motorway
     }
 
     /// The station range section `index` covers: from its own station to the next
@@ -425,6 +448,71 @@ impl Lane {
     }
 }
 
+/// One cross-section edge, from the edge's own point of view: the lanes either side.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SectionEdge<'a> {
+    /// The lane to the left of the edge, whose `right_edge` it is.
+    pub left: Option<&'a Lane>,
+    /// The lane to the right of it, whose `left_edge` it is.
+    pub right: Option<&'a Lane>,
+}
+
+/// What a cross-section edge is to a format that draws the drivable surface: the
+/// reading the GPUDrive and WOMD exports share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// The drivable surface ends here, whatever is painted on it.
+    RoadBoundary,
+    /// A kerb between two drivable lanes: something hit rather than crossed.
+    Median,
+    /// Paint between two drivable lanes.
+    Line(BoundaryMarking),
+}
+
+impl<'a> SectionEdge<'a> {
+    /// The curve and the paint, from the lane on the right when there is one — an
+    /// arbitrary but fixed choice; the two answers differ only in a map that said
+    /// two different things about one line.
+    pub fn boundary(&self) -> Option<(&'a Curve3, BoundaryMarking)> {
+        self.right
+            .map(|lane| (&lane.left_boundary, lane.left_marking))
+            .or_else(|| {
+                self.left
+                    .map(|lane| (&lane.right_boundary, lane.right_marking))
+            })
+    }
+
+    /// How many of the lanes either side are drivable.
+    pub fn drivable_sides(&self) -> usize {
+        [self.left, self.right]
+            .iter()
+            .filter(|lane| lane.is_some_and(|lane| lane.lane_type.is_drivable()))
+            .count()
+    }
+
+    /// The lanes either side, left first.
+    pub fn lanes(&self) -> impl Iterator<Item = &'a Lane> {
+        [self.left, self.right].into_iter().flatten()
+    }
+
+    /// What the edge is, with its curve, or `None` when it bounds nothing anyone
+    /// drives — out in the verge or between two footways — or is two drivable lanes
+    /// with no paint between them.
+    pub fn kind(&self) -> Option<(&'a Curve3, EdgeKind)> {
+        let (curve, marking) = self.boundary()?;
+        let kind = match self.drivable_sides() {
+            0 => return None,
+            1 => EdgeKind::RoadBoundary,
+            _ => match marking.marking {
+                RoadMarking::Curbstone => EdgeKind::Median,
+                RoadMarking::None => return None,
+                _ => EdgeKind::Line(marking),
+            },
+        };
+        Some((curve, kind))
+    }
+}
+
 /// The map itself: everything the generator produced, before or after validation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Map {
@@ -441,6 +529,23 @@ pub struct Map {
     /// The massing parts those buildings are made of, held beside them the way lanes
     /// are held beside roads rather than inside them.
     pub building_parts: Arena<BuildingPartId, BuildingPart>,
+    /// The places made of several features — a mine, a works. Empty unless a
+    /// generator filled it.
+    pub sites: Arena<SiteId, Site>,
+    /// The shape of the land, where it was stated. Empty unless a generator filled
+    /// it: a road network on its own says nothing about the ground beside it.
+    pub tin_surfaces: Arena<TinSurfaceId, TinSurface>,
+    /// The breaklines of those surfaces, held beside them the way lanes are held
+    /// beside roads.
+    pub tin_breaklines: Arena<TinBreaklineId, TinBreakline>,
+    /// What the land is used for or covered with.
+    pub land_covers: Arena<LandCoverId, LandCover>,
+    /// The bridges and tunnels that carry roads clear of the ground.
+    pub structures: Arena<StructureId, Structure>,
+    /// Where one road passes over another, or over water, and by what.
+    pub grade_separations: Arena<GradeSeparationId, GradeSeparation>,
+    /// The grade-separated junctions, each as one feature.
+    pub interchanges: Arena<InterchangeId, Interchange>,
 }
 
 impl Map {
@@ -455,6 +560,13 @@ impl Map {
             rules: Vec::new(),
             buildings: Arena::new(),
             building_parts: Arena::new(),
+            sites: Arena::new(),
+            tin_surfaces: Arena::new(),
+            tin_breaklines: Arena::new(),
+            land_covers: Arena::new(),
+            structures: Arena::new(),
+            grade_separations: Arena::new(),
+            interchanges: Arena::new(),
         }
     }
 
@@ -516,8 +628,16 @@ impl Map {
             return Ok(Vec::new());
         };
         let lanes = self.lanes_of(road);
+        // A vertex where a bridge or tunnel begins and ends, too, so the road's
+        // edges stop meeting the land exactly there.
         let required = required_stations(
-            entry.sections.iter().map(|section| section.station),
+            entry.sections.iter().map(|section| section.station).chain(
+                entry
+                    .structure
+                    .spans()
+                    .iter()
+                    .flat_map(|span| [span.from, span.to]),
+            ),
             lanes.iter().map(|lane| &lane.width),
             lanes.iter().map(|lane| &lane.height),
             self.metadata.sampling,
@@ -540,6 +660,87 @@ impl Map {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The edges of one cross-section, keyed by edge index (see [`Lane::left_edge`]),
+    /// each with the lanes either side of it — so that two lanes meeting at an edge
+    /// make one entry rather than two.
+    pub fn section_edges(&self, road: &RoadId, section: usize) -> BTreeMap<i32, SectionEdge<'_>> {
+        let mut edges: BTreeMap<i32, SectionEdge<'_>> = BTreeMap::new();
+        for lane in self.lanes_of_section(road, section) {
+            edges.entry(lane.left_edge).or_default().right = Some(lane);
+            edges.entry(lane.right_edge).or_default().left = Some(lane);
+        }
+        edges
+    }
+
+    /// Whether `lane` is on a road through a junction.
+    pub fn is_connector_lane(&self, lane: &LaneId) -> bool {
+        self.lane(lane)
+            .and_then(|lane| self.road(&lane.road))
+            .is_some_and(Road::is_connector)
+    }
+
+    /// The lanes a traffic light's state is carried by, for a rule over `lanes`.
+    ///
+    /// The IR's rule is about the approaches, the lanes that stop for the light.
+    /// OpenDRIVE refers to a junction's light from the connecting roads, though,
+    /// Lanelet2 maps for Autoware hang it on the lanelets through the intersection,
+    /// and WOMD gives the state to the lane through it. So each approach gives way
+    /// to the junction connectors it feeds; a lane that is a connector already, or
+    /// that feeds none (a light short of no junction), keeps it itself. Each lane
+    /// comes once, in the order first reached.
+    pub fn signal_carriers(&self, lanes: &[LaneId]) -> Vec<LaneId> {
+        let mut carriers: Vec<LaneId> = Vec::new();
+        let mut seen: HashSet<LaneId> = HashSet::new();
+        for lane in lanes {
+            let through: Vec<LaneId> = if self.is_connector_lane(lane) {
+                Vec::new()
+            } else {
+                self.successors(lane)
+                    .into_iter()
+                    .filter(|next| self.is_connector_lane(next))
+                    .collect()
+            };
+            let held = if through.is_empty() {
+                vec![lane.clone()]
+            } else {
+                through
+            };
+            for lane in held {
+                if seen.insert(lane.clone()) {
+                    carriers.push(lane);
+                }
+            }
+        }
+        carriers
+    }
+
+    /// The limit each lane a speed-limit rule names is held to, with the index in
+    /// [`Map::rules`] of the rule that holds it: where several rules name one lane,
+    /// the lowest — the one a driver has to keep to — and the first of equals.
+    ///
+    /// A lane no rule names is held to its own [`Lane::speed_limit`], if any; this
+    /// is only the rules. It is the one reading of them the exports share, so that
+    /// SUMO, WOMD and CommonRoad hold a lane to the same limit.
+    pub fn rule_speed_limits(&self) -> HashMap<&LaneId, (SpeedLimit, usize)> {
+        let mut limits: HashMap<&LaneId, (SpeedLimit, usize)> = HashMap::new();
+        for (index, rule) in self.rules.iter().enumerate() {
+            let TrafficRule::SpeedLimit { limit, lanes } = rule else {
+                continue;
+            };
+            for lane in lanes {
+                limits
+                    .entry(lane)
+                    .and_modify(|held| {
+                        if limit.mps() < held.0.mps() {
+                            *held = (*limit, index);
+                        }
+                    })
+                    .or_insert((*limit, index));
+            }
+        }
+        limits
     }
 
     /// Lanes of a road, in cross-section order.
@@ -577,6 +778,49 @@ impl Map {
             .into_iter()
             .map(|connection| connection.to.lane.clone())
             .collect()
+    }
+
+    /// Where a traffic-light rule with `stop_lines` stops each of its `lanes`, as
+    /// groups of lanes with the line they stop at — every lane in exactly one
+    /// group, and no group empty.
+    ///
+    /// A rule with no line stops all its lanes at none, and one with a single line
+    /// stops them all at it, whichever lanes the line itself names: that is what
+    /// such a rule says. A rule with several — one per junction mouth — stops each
+    /// lane at the first of them that names it, and a lane none names at no line,
+    /// rather than at a line drawn across some other mouth.
+    pub fn traffic_light_stops(
+        &self,
+        stop_lines: &[ObjectId],
+        lanes: &[LaneId],
+    ) -> Vec<(Option<ObjectId>, Vec<LaneId>)> {
+        if lanes.is_empty() {
+            return Vec::new();
+        }
+        match stop_lines {
+            [] => return vec![(None, lanes.to_vec())],
+            [line] => return vec![(Some(line.clone()), lanes.to_vec())],
+            _ => {}
+        }
+        let mut rest: Vec<LaneId> = lanes.to_vec();
+        let mut groups = Vec::new();
+        for line in stop_lines {
+            let named = self
+                .objects
+                .get(line)
+                .map(|object| object.lanes.as_slice())
+                .unwrap_or_default();
+            let (crossed, others): (Vec<LaneId>, Vec<LaneId>) =
+                rest.into_iter().partition(|lane| named.contains(lane));
+            rest = others;
+            if !crossed.is_empty() {
+                groups.push((Some(line.clone()), crossed));
+            }
+        }
+        if !rest.is_empty() {
+            groups.push((None, rest));
+        }
+        groups
     }
 
     /// Lanes that reach `lane` in one step.
@@ -724,6 +968,9 @@ mod tests {
             road_type: RoadType::Town,
             speed_limit: None,
             superelevation: Poly3Profile::default(),
+            pavement: PavementProfile::unknown(),
+            form: FormOfWay::Unspecified,
+            structure: StructureProfile::at_grade(),
         };
         assert_eq!(road.section_at(0.0), Some(0));
         assert_eq!(road.section_at(39.9), Some(0));

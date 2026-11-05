@@ -1,4 +1,4 @@
-"""Generate 3D road networks and write them as OpenDRIVE, Lanelet2, OSM, SUMO, ClipGT, GPUDrive or a CARLA package.
+"""Generate 3D road networks and write them as OpenDRIVE, Lanelet2, OSM, SUMO, ClipGT, RDS-HQ, GPUDrive, WOMD, CommonRoad or a CARLA package.
 
 The road network itself — topology, geometry, semantics, validation — lives in
 Rust. This package is the front end: every object here is a handle on something
@@ -28,7 +28,10 @@ the Rust core owns, so there is one model of the map and not two.
     m.export_lanelet2("map.osm")
     m.export_sumo("sumo/")
     m.export_clipgt("clip/")
+    m.export_rdshq("rds_hq/")
     m.export_gpudrive("scene.json")
+    m.export_womd("map.tfrecord")
+    m.export_commonroad("scenario.xml")
     m.export_carla("Import/")                  # a CARLA UE5 asset package
 
 A town can be generated beside the roads, and the only two things to say about
@@ -85,21 +88,43 @@ long enough to reach over the lanes it governs — and written as props, which
 `Import.py` imports but does not place. `roadgen.carla_furniture(carla_root, package,
 name)` places them, and does the bookkeeping that makes CARLA adopt them as its own
 lights and signs rather than spawn a second set over the middle of the road. The
-script written beside the package does both.
+water comes in flat colours; `roadgen.carla_water(carla_root, package, name)` gives
+it the Unreal materials the package's descriptor names, one for rivers — whose
+texture coordinates run downstream, for a material that pans its normals to flow
+— and one for lakes and ponds. The script written beside the package does all of
+it.
+
+Every export also writes a trace file beside what it wrote — which element of the
+file each road, lane, junction and object became — and `export_ir` writes the map's
+own elements. Loaded together they follow one element across formats:
+
+    m.export_ir("out/map.ir.json")
+    m.export_lanelet2("out/lanelet2_map.osm")    # + lanelet2_map.osm.trace.json
+    m.export_sumo("out/sumo/")                   # + sumo/<prefix>.sumo.trace.json
+    t = roadgen.Trace.load("out/map.ir.json",
+                           "out/lanelet2_map.osm.trace.json",
+                           "out/sumo/demo_town.sumo.trace.json")
+    t.translate("lanelet2", 1000123, to="sumo")
 """
 
 from ._roadgen import (
     Alignment,
+    Corridor,
+    CorridorPlan,
     Junction,
     Lane,
     LaneRef,
     Map,
+    Pit,
     Road,
+    Trace,
     __version__,
     building_presets,
     building_rules,
     read_lanelet2,
+    proto_schema,
     read_opendrive,
+    read_proto,
     render_carla,
     render_clipgt,
     render_gpudrive,
@@ -109,17 +134,22 @@ from ._roadgen import (
 from .furniture import CarlaFurnitureError, carla_furniture
 from .sky import CarlaSkyError, carla_sky
 from .textures import TextureError, fetch_textures, texture_manifest
+from .water import CarlaWaterError, carla_water
 
 
 
 __all__ = [
     "Alignment",
+    "Corridor",
+    "CorridorPlan",
     "Junction",
     "Lane",
     "LaneRef",
     "Map",
+    "Pit",
     "Road",
     "TextureError",
+    "Trace",
     "__version__",
     "building_presets",
     "building_rules",
@@ -128,11 +158,15 @@ __all__ = [
     "CarlaFurnitureError",
     "carla_sky",
     "CarlaSkyError",
+    "carla_water",
+    "CarlaWaterError",
     "render_carla",
     "render_clipgt",
     "render_gpudrive",
     "read_lanelet2",
+    "proto_schema",
     "read_opendrive",
+    "read_proto",
     "render_opendrive",
     "render_sumo",
     "texture_manifest",

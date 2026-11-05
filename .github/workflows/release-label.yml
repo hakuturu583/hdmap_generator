@@ -16,13 +16,13 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read   # the PR's labels, read as they are now
 
-# A push and a label change can arrive together and start two runs that read two
-# different label sets; only the latest event's answer is the PR's. One run per PR,
-# the newer cancelling the older.
-concurrency:
-  group: release-label-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+# No concurrency group. Opening a PR with a label is two events -- `opened`, then
+# `labeled` a moment later -- and a group that cancelled the older run left a
+# cancelled check on every such PR, which reads as a failure. Instead each run
+# reads the PR's labels as they are when it runs, not the event's snapshot of
+# them, so every run gives the PR's current answer and none has to be cancelled.
 
 jobs:
   label:
@@ -30,17 +30,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - env:
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          found=()
-          for level in major minor patch; do
-            if echo ",$LABELS," | grep -q ",release:${level},"; then
-              found+=("release:${level}")
-            fi
+          release_labels() {
+            gh pr view "$PR" -R "$REPO" --json labels --jq '.labels[].name' \
+              | grep -E '^release:(major|minor|patch)$' || true
+          }
+          found=$(release_labels)
+          # A PR opened with a label gets it a moment after it is opened, and the
+          # run for `opened` can start in between. Give it that moment before
+          # calling the PR unlabelled.
+          for _ in 1 2 3 4 5 6; do
+            [ -n "$found" ] && break
+            sleep 5
+            found=$(release_labels)
           done
-          case "${#found[@]}" in
-            1) echo "Release label: ${found[0]}" ;;
+          count=$(printf '%s' "$found" | grep -c . || true)
+          case "$count" in
+            1) echo "Release label: $found" ;;
             0) echo "::error::Add exactly one of release:major, release:minor or release:patch to this pull request -- every merge is a release, and a patch is the least it can be"; exit 1 ;;
-            *) echo "::error::More than one release label (${found[*]}) -- keep exactly one"; exit 1 ;;
+            *) echo "::error::More than one release label ($(echo $found)) -- keep exactly one"; exit 1 ;;
           esac

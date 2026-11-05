@@ -33,14 +33,14 @@ pub mod layers;
 pub mod scenario;
 mod table;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use roadgen_core::map::Map;
-use roadgen_core::{LaneId, ValidatedMap};
+use roadgen_core::{LaneId, Trace, ValidatedMap};
 
 pub use ego::Pose;
 pub use error::ExportError;
-pub use layers::Layer;
+pub use layers::{Layer, TRACE_FORMAT};
 // The route is the IR's own: `Route::From` names a lane of the map and the
 // successors are the map's, so both exporters that drive a map say it the same way.
 pub use roadgen_core::Route;
@@ -149,7 +149,20 @@ impl ClipConfig {
 /// in the order they are written. A caller that wants to look at a clip rather than
 /// keep it does not have to go through the file system to do it.
 pub fn to_layers(map: &ValidatedMap, config: &ClipConfig) -> Result<Vec<Layer>, ExportError> {
-    layers::all(map, config)
+    to_layers_traced(map, config).map(|(layers, _)| layers)
+}
+
+/// [`to_layers`], with the [`Trace`] of which IR element each row came from.
+///
+/// A row is named `<layer>:<row>` — `lane:17`, `lane_line:3` — with the layer as
+/// [`Layer::name`] gives it. Nothing is written, so the trace names no files.
+pub fn to_layers_traced(
+    map: &ValidatedMap,
+    config: &ClipConfig,
+) -> Result<(Vec<Layer>, Trace), ExportError> {
+    let mut trace = Trace::new(TRACE_FORMAT);
+    let layers = layers::all_traced(map, config, &mut trace)?;
+    Ok((layers, trace))
 }
 
 /// Writes `map` into `directory` as a ClipGT clip, creating the directory if needed.
@@ -160,17 +173,33 @@ pub fn write(
     directory: impl AsRef<Path>,
     config: &ClipConfig,
 ) -> Result<String, ExportError> {
+    write_traced(map, directory, config).map(|(clip, _)| clip)
+}
+
+/// [`write`], with the [`Trace`] of which IR element each row came from.
+///
+/// The trace's files are the Parquet files written, one per layer, in the order they
+/// were written.
+pub fn write_traced(
+    map: &ValidatedMap,
+    directory: impl AsRef<Path>,
+    config: &ClipConfig,
+) -> Result<(String, Trace), ExportError> {
     let clip = validate_clip_id(&config.clip_id)?;
     let directory = directory.as_ref();
     std::fs::create_dir_all(directory)
         .map_err(|error| ExportError::Io(format!("{}: {error}", directory.display())))?;
 
-    for layer in to_layers(map, config)? {
+    let (layers, mut trace) = to_layers_traced(map, config)?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for layer in layers {
         let path = directory.join(format!("{clip}.{}.parquet", layer.name));
         table::write(&path, &layer.batch)?;
+        files.push(path);
     }
     write_camera_timestamps(map, directory, clip, config)?;
-    Ok(clip.to_owned())
+    trace.files = files;
+    Ok((clip.to_owned(), trace))
 }
 
 /// Writes `{clip_id}.{camera}.json` for each configured camera: the frames it saw, as
@@ -208,12 +237,27 @@ fn write_camera_timestamps(
 /// the configuration to have the route and the rig checked as well.
 pub fn check(map: &ValidatedMap, config: Option<&ClipConfig>) -> Vec<String> {
     let mut problems = Vec::new();
+    if !map.tin_surfaces.is_empty() || !map.land_covers.is_empty() {
+        problems.push(format!(
+            "ClipGT's layers have no terrain and no land cover, so \
+             the map's {} TIN surfaces and {} land covers are not written",
+            map.tin_surfaces.len(),
+            map.land_covers.len()
+        ));
+    }
     if !map.buildings.is_empty() {
         problems.push(format!(
             "ClipGT's layers describe the road surface and its markings, so the map's \
              {} buildings ({} parts) are not written",
             map.buildings.len(),
             map.building_parts.len()
+        ));
+    }
+    if !map.structures.is_empty() {
+        problems.push(format!(
+            "ClipGT's layers have no bridges or tunnels, so the map's {} structures are \
+             not written; the lanes they carry keep their heights in their points",
+            map.structures.len()
         ));
     }
     if !map.connections.is_empty() {
@@ -285,7 +329,7 @@ fn route_lanes(config: &ClipConfig) -> &[LaneId] {
 
 /// A clip id has to be a single path component, because it is the prefix of every
 /// file name in the directory.
-fn validate_clip_id(id: &str) -> Result<&str, ExportError> {
+pub fn validate_clip_id(id: &str) -> Result<&str, ExportError> {
     let usable = !id.is_empty()
         && id.chars().all(|character| {
             character.is_ascii_alphanumeric() || character == '-' || character == '_'

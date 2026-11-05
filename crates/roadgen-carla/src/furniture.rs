@@ -71,7 +71,7 @@ use std::f64::consts::{PI, TAU};
 use roadgen_core::geometry::{Point3, Vector3};
 use roadgen_core::id::{LaneId, ObjectId, RoadId};
 use roadgen_core::map::{Map, Road};
-use roadgen_core::semantics::{MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
+use roadgen_core::semantics::{LightColor, MapObject, MapObjectKind, ObjectGeometry, TrafficRule};
 use roadgen_core::topology::{Direction, LateralSide};
 use roadgen_opendrive::road_coordinates;
 use roadgen_opendrive::{SignalCatalogue, SignalPlacement};
@@ -400,10 +400,9 @@ fn frame_and_facing(
     Some((frame, wrap(facing)))
 }
 
-/// Where a post ends up: its station along the road, its foot, the way it faces
-/// and how far above the road plane the foot is.
+/// Where a post ends up: its foot, the way it faces and how far above the road
+/// plane the foot is.
 struct Stand {
-    station: f64,
     foot: Point3,
     heading: f64,
     rise: f64,
@@ -431,7 +430,12 @@ fn stand(
         let station = wanted.clamp(0.0, length);
         let section = site.road.section_at(station)?;
         let layout = Layout::of(map, site.road, section, surfaces)?;
-        let (lateral, rise) = layout.post_position(station, site.kerb, config.kerb_setback)?;
+        let (lateral, rise) = layout.post_position(
+            station,
+            site.kerb,
+            config.kerb_setback,
+            ledge(map, site.road, station),
+        )?;
         let (frame, heading) = frame_and_facing(map, site, station)?;
         let foot = frame.to_global([0.0, lateral, rise]);
         let clear = posts
@@ -439,7 +443,6 @@ fn stand(
             .all(|post| horizontal_distance(*post, foot) >= config.clearance);
         let at_end = (station - wanted).abs() > 1e-9;
         found = Some(Stand {
-            station,
             foot,
             heading,
             rise,
@@ -450,6 +453,43 @@ fn stand(
         wanted += back * config.clearance * 1.5;
     }
     found
+}
+
+/// Where a post stands on a structure, beside a road with no pavement: on top
+/// of a bridge's parapet, or on a tunnel's walkway — not out on a verge that is
+/// not there. How far out from the road's outer edge, and how high.
+///
+/// The parapet is the map's own, the barrier the bridge stands along this road,
+/// so the post's foot is on the top the barriers draw; on a bridge with none along
+/// this road, the post stands on the bare curb.
+fn ledge(map: &Map, road: &Road, station: f64) -> Option<(f64, f64)> {
+    let id = road.structure.at(station)?;
+    let structure = map.structures.get(id)?;
+    match (structure.kind.bridge(), structure.kind.tunnel()) {
+        (Some(bridge), _) => {
+            let parapet = map
+                .objects
+                .iter()
+                .filter_map(|object| match &object.kind {
+                    MapObjectKind::Barrier {
+                        height,
+                        structure: Some(of),
+                        ..
+                    } if of == id
+                        && object.lanes.iter().any(|lane| {
+                            map.lanes.get(lane).is_some_and(|lane| lane.road == road.id)
+                        }) =>
+                    {
+                        Some(*height)
+                    }
+                    _ => None,
+                })
+                .fold(0.0, f64::max);
+            Some((bridge.curb / 2.0, parapet))
+        }
+        (_, Some(tunnel)) => Some((tunnel.walkway / 2.0, 0.0)),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -464,39 +504,135 @@ fn light(
 ) -> Option<Placed> {
     let site = site(map, object)?;
     let stand = stand(map, &site, surfaces, config, site.station, posts)?;
-    let section = site.road.section_at(stand.station)?;
-    let layout = Layout::of(map, site.road, section, surfaces)?;
-    let frame = site
-        .road
-        .frame_at(stand.station, map.metadata.sampling)
-        .ok()?;
     let local = Local::new(stand.foot, stand.heading);
 
-    // The arm is at the bar's height above the road, which is where the IR put
-    // the bar; the heads hang below it over the middle of each governed lane.
-    let arm_height = (site.height - stand.rise).max(config.lamp_diameter * 4.0);
-    let mut heads: Vec<[f64; 3]> = Vec::new();
+    // The IR's bar is the bottom edge of the light's housing and its bulbs are
+    // the lamps, so the head is built where they are -- the housing standing on
+    // the bar, the lamps at the bulbs -- and the arm runs above it. Every export
+    // then agrees on where the light is: a Lanelet2 map's traffic_light and
+    // light_bulbs ways are the very housing and lamps CARLA shows.
+    let head = object.kind.light_head().cloned().unwrap_or_default();
+    let default_height = config.lamp_diameter * 3.0 + 0.15;
+    // Where the housing's bottom edge is: the bar, or a signal's own position, or
+    // -- for a signal written at the foot of its post, as CARLA's own `.xodr`
+    // has them -- just under its lowest lamp.
+    let bulbs_local: Vec<[f64; 3]> = head.bulbs.iter().map(|b| local.of(b.position)).collect();
+    let lamp_margin = 0.075 + config.lamp_diameter / 2.0;
+    let (bar_middle, bar_width) = match &object.geometry {
+        ObjectGeometry::Line(bar) => (
+            Some(bar.start_point().lerp(bar.end_point(), 0.5)),
+            bar.start_point().distance_to(bar.end_point()),
+        ),
+        ObjectGeometry::Point(position) => (Some(*position), 0.0),
+        ObjectGeometry::Band { .. } => (None, 0.0),
+    };
+    // A point says how high, not across which lane: a signal written at the foot
+    // of its post stands on the pavement, and its heads still hang over the lanes.
+    let is_bar = matches!(object.geometry, ObjectGeometry::Line(_));
+    // `along` is how far down the road from the pole the heads hang: nothing
+    // when the pole stands abeam of the bar, but a pole moved back to keep clear
+    // of another still hangs its heads over the bar, not abeam of itself.
+    let (mut across, mut bottom, mut along) = match bar_middle.map(|p| local.of(p)) {
+        Some(at) => (
+            is_bar.then_some(at[1]),
+            at[2],
+            if is_bar { at[0] } else { 0.0 },
+        ),
+        None => (None, site.height - stand.rise, 0.0),
+    };
+    if !bulbs_local.is_empty() {
+        let lowest = bulbs_local.iter().map(|b| b[2]).fold(f64::MAX, f64::min);
+        let mean = bulbs_local.iter().map(|b| b[1]).sum::<f64>() / bulbs_local.len() as f64;
+        // A position under the lamps is the housing's bottom; one that is not
+        // (a signal at the foot of its post) says nothing about the head.
+        if !is_bar || bottom > lowest {
+            bottom = lowest - lamp_margin;
+            across = Some(mean);
+            along = bulbs_local.iter().map(|b| b[0]).sum::<f64>() / bulbs_local.len() as f64;
+        }
+    }
+    let bottom = bottom.max(0.0);
+    let head_width = if bar_width > 1e-3 {
+        bar_width
+    } else {
+        config.head_width
+    };
+    // As tall as the head says, and tall enough for every lamp it has.
+    let highest = bulbs_local
+        .iter()
+        .map(|b| b[2] + lamp_margin - bottom)
+        .fold(0.0_f64, f64::max);
+    let head_height = head
+        .height
+        .unwrap_or(default_height)
+        .max(highest)
+        .max(config.lamp_diameter);
+    let head_top = bottom + head_height;
+    let arm_height = head_top + 0.05 + config.arm_radius;
+    let bar_across = across.unwrap_or(0.0);
+    // The lamps relative to the middle of the head, across the road and up: the
+    // bulbs the IR gave, or a column of three when it gave none.
+    let lamp_offsets: Vec<(f64, f64, usize)> = if head.bulbs.is_empty() {
+        (0..3)
+            .map(|row| {
+                let up = head_height - lamp_margin - row as f64 * config.lamp_diameter;
+                (0.0, up, lamp_material(row))
+            })
+            .collect()
+    } else {
+        head.bulbs
+            .iter()
+            .zip(&bulbs_local)
+            .map(|(bulb, at)| {
+                (
+                    at[1] - bar_across,
+                    at[2] - bottom,
+                    bulb_material(bulb.color),
+                )
+            })
+            .collect()
+    };
+    let mut heads: Vec<f64> = Vec::new();
+    // Each lane's middle where the heads hang -- at the bar, not at the pole,
+    // which may stand further back where the lanes are not the same.
+    let bar_layout = Layout::of(
+        map,
+        site.road,
+        site.road.section_at(site.station)?,
+        surfaces,
+    )?;
+    let bar_frame = site
+        .road
+        .frame_at(site.station, map.metadata.sampling)
+        .ok()?;
     for lane in &site.lanes {
-        let Some(centre) = layout.lane_centre(stand.station, &lane.id) else {
+        let Some(centre) = bar_layout.lane_centre(site.station, &lane.id) else {
             continue;
         };
-        let over = frame.to_global([0.0, centre, 0.0]);
-        let mut point = local.of(over);
-        point[2] = arm_height;
-        heads.push(point);
+        heads.push(local.of(bar_frame.to_global([0.0, centre, 0.0]))[1]);
+    }
+    // The head the IR placed hangs where it placed it, to the centimetre; the
+    // others over the middle of their lanes.
+    if let Some(across) = across {
+        if let Some(nearest) = heads
+            .iter_mut()
+            .min_by(|a, b| (**a - across).abs().total_cmp(&(**b - across).abs()))
+        {
+            *nearest = across;
+        }
     }
     if heads.is_empty() {
         return None;
     }
-    // The arm runs from the pole to the farthest head and a little past it. The
-    // heads are all abeam of the pole, so the arm's direction is theirs.
+    // The arm runs across the road to the farthest head and a little past it;
+    // the heads are all `along` down the road from the pole.
     let farthest = heads
         .iter()
-        .max_by(|a, b| a[1].abs().total_cmp(&b[1].abs()))
         .copied()
-        .unwrap_or([0.0, 1.0, 0.0]);
-    let side = if farthest[1] < 0.0 { -1.0 } else { 1.0 };
-    let arm_length = farthest[1].abs() + config.arm_overhang;
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .unwrap_or(1.0);
+    let side = if farthest < 0.0 { -1.0 } else { 1.0 };
+    let arm_length = farthest.abs() + config.arm_overhang;
 
     let ordinal = ordinals.take(Role::TrafficLight);
     let mut mesh = Mesh::new(
@@ -511,11 +647,14 @@ fn light(
         Role::TrafficLight,
         materials::LAMP_RED,
     );
-    let lamp_slots = [
-        lamps.slot_for(materials::LAMP_RED),
-        lamps.slot_for(materials::LAMP_AMBER),
-        lamps.slot_for(materials::LAMP_GREEN),
-    ];
+    // Every head has the three, in this order, whatever its bulbs show.
+    for material in [
+        materials::LAMP_RED,
+        materials::LAMP_AMBER,
+        materials::LAMP_GREEN,
+    ] {
+        lamps.slot_for(material);
+    }
     let top = arm_height + config.pole_radius * 3.0;
     cylinder(
         &mut mesh,
@@ -525,45 +664,52 @@ fn light(
         12,
         steel,
     );
+    // A pole that stood back first reaches along the road to abeam of the
+    // heads; from there the arm runs straight across, over every one of them.
+    if along.abs() > 1e-3 {
+        cylinder(
+            &mut mesh,
+            [0.0, 0.0, arm_height],
+            [along, 0.0, arm_height],
+            config.arm_radius,
+            8,
+            steel,
+        );
+    }
     cylinder(
         &mut mesh,
-        [0.0, 0.0, arm_height],
-        [0.0, side * arm_length, arm_height],
+        [along, 0.0, arm_height],
+        [along, side * arm_length, arm_height],
         config.arm_radius,
         8,
         steel,
     );
-    let head_height = config.lamp_diameter * 3.0 + 0.15;
-    for head in &heads {
-        let y = head[1];
-        let head_top = arm_height - config.arm_radius - 0.05;
+    for &y in &heads {
         // The bracket the head hangs by.
         cylinder(
             &mut mesh,
-            [0.0, y, head_top],
-            [0.0, y, arm_height],
+            [along, y, head_top],
+            [along, y, arm_height],
             config.arm_radius * 0.6,
             6,
             steel,
         );
-        let centre_z = head_top - head_height / 2.0;
         cuboid(
             &mut mesh,
-            [0.0, y, centre_z],
-            [config.head_depth, config.head_width, head_height],
+            [along, y, bottom + head_height / 2.0],
+            [config.head_depth, head_width, head_height],
             housing,
         );
-        // Three lamps on the face towards the traffic, red at the top.
-        let face_x = config.head_depth / 2.0 + 0.005;
-        for (row, slot) in lamp_slots.iter().enumerate() {
-            let z =
-                head_top - 0.075 - config.lamp_diameter / 2.0 - row as f64 * config.lamp_diameter;
+        // The lamps on the face towards the traffic.
+        let face_x = along + config.head_depth / 2.0 + 0.005;
+        for (across, up, material) in &lamp_offsets {
+            let slot = lamps.slot_for(*material);
             disc(
                 &mut lamps,
-                [face_x, y, z],
+                [face_x, y + across, bottom + up],
                 config.lamp_diameter / 2.0,
                 12,
-                *slot,
+                slot,
             );
         }
     }
@@ -671,19 +817,53 @@ fn sign(
     })
 }
 
-/// Where a light applies: the middle of the stop line of the first rule that
-/// names it, if any. CARLA builds a light's stop boxes from the signal's `s`, so
-/// a light whose rule has a stop line stops traffic there rather than under its
-/// own heads.
+/// The material of a lamp in a column of three, counted from the top.
+fn lamp_material(row: usize) -> usize {
+    match row {
+        0 => materials::LAMP_RED,
+        1 => materials::LAMP_AMBER,
+        _ => materials::LAMP_GREEN,
+    }
+}
+
+fn bulb_material(color: LightColor) -> usize {
+    match color {
+        LightColor::Red => materials::LAMP_RED,
+        LightColor::Yellow => materials::LAMP_AMBER,
+        LightColor::Green => materials::LAMP_GREEN,
+    }
+}
+
+/// Where a light applies: the middle of the stop line it stops traffic at, if
+/// any — of the lines the rules that name it stop their lanes at
+/// ([`Map::traffic_light_stops`]), the one a lane of the light's own stops at, or
+/// the first of them where none does. CARLA builds a light's stop boxes from the
+/// signal's `s`, so a light whose rule has a stop line stops traffic there rather
+/// than under its own heads.
 fn stop_line_of(map: &Map, light: &ObjectId) -> Option<Point3> {
-    let stop_line = map.rules.iter().find_map(|rule| match rule {
-        TrafficRule::TrafficLight {
-            lights,
-            stop_line: Some(stop_line),
-            ..
-        } if lights.contains(light) => Some(stop_line),
-        _ => None,
-    })?;
+    let governs = map
+        .objects
+        .get(light)
+        .map(|object| object.lanes.as_slice())
+        .unwrap_or_default();
+    let stops: Vec<(ObjectId, Vec<LaneId>)> = map
+        .rules
+        .iter()
+        .filter_map(|rule| match rule {
+            TrafficRule::TrafficLight {
+                lights,
+                stop_lines,
+                lanes,
+            } if lights.contains(light) => Some(map.traffic_light_stops(stop_lines, lanes)),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|(line, lanes)| Some((line?, lanes)))
+        .collect();
+    let (stop_line, _) = stops
+        .iter()
+        .find(|(_, lanes)| lanes.iter().any(|lane| governs.contains(lane)))
+        .or(stops.first())?;
     let object = map.objects.get(stop_line)?;
     Some(match &object.geometry {
         ObjectGeometry::Point(position) => *position,

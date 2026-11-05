@@ -44,6 +44,15 @@
 //! carriageway, the paint on it, the pavements beside it, the kerb faces between them,
 //! the gutters at the foot of those, and the grass beyond. See [`surfaces`].
 //!
+//! # What kind of place
+//!
+//! A town or a mine is not a branch of this crate but parts on one map: the
+//! caller draws the roads — streets, a ramp, haul roads — and puts pits, heaps and
+//! pads in [`Places`], and [`environment::generate`] fills the IR with what stands
+//! on and under them: buildings along the streets and on the pads, and one land
+//! shaped by every part. The package is then written from the IR the same way for
+//! every map, so this crate's export stays a lowering that pushes nothing back.
+//!
 //! # What stands beside it
 //!
 //! Traffic lights and signs, built to the cross-section — a pole on the pavement, an
@@ -64,7 +73,9 @@
 //! # }
 //! ```
 
+pub mod barriers;
 pub mod crosswalks;
+pub mod environment;
 pub mod error;
 pub mod facades;
 pub mod fbx;
@@ -74,23 +85,30 @@ pub mod materials;
 pub mod mesh;
 pub mod obj;
 pub mod package;
+pub mod pointcloud;
 pub mod script;
+pub mod structures;
 pub mod surfaces;
 pub mod tags;
 pub mod terrain;
+pub mod water;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use roadgen_core::geometry::Point3;
 use roadgen_core::semantics::MapObjectKind;
+use roadgen_core::trace::{Relation, Trace};
 use roadgen_core::ValidatedMap;
 
+pub use environment::{HeapSpec, PadSpec, PitSpec, Places, RampSpec};
 pub use error::ExportError;
 pub use furniture::{FurnitureConfig, SignKind};
 pub use materials::Material;
 pub use mesh::Mesh;
-pub use package::{Descriptor, MapEntry, PropEntry, TextureManifest};
+pub use package::{Descriptor, MapEntry, PropEntry, TextureManifest, WaterMaterials};
+pub use pointcloud::{PointCloudConfig, PointCloudMap};
 pub use surfaces::SurfaceConfig;
 pub use tags::{Folder, Label, Role};
 
@@ -151,6 +169,9 @@ pub struct PackageConfig {
     /// Where the script puts the sun, in degrees, the way CARLA's weather spells it.
     pub sun_altitude: f64,
     pub sun_azimuth: f64,
+    /// The Unreal materials the script gives the map's running and standing
+    /// water, written into the descriptor.
+    pub water: package::WaterMaterials,
 }
 
 impl Default for PackageConfig {
@@ -173,6 +194,7 @@ impl PackageConfig {
             engine: None,
             sun_altitude: 45.0,
             sun_azimuth: -50.0,
+            water: package::WaterMaterials::default(),
         }
     }
 
@@ -202,6 +224,20 @@ impl PackageConfig {
 
     pub fn with_furniture(mut self, furniture: Option<FurnitureConfig>) -> Self {
         self.furniture = furniture;
+        self
+    }
+
+    /// The Unreal materials the map's water is given in place of its flat
+    /// colours: `flowing` for a river's, `still` for a lake's or a pond's.
+    pub fn with_water_materials(
+        mut self,
+        flowing: impl Into<String>,
+        still: impl Into<String>,
+    ) -> Self {
+        self.water = package::WaterMaterials {
+            flowing: flowing.into(),
+            still: still.into(),
+        };
         self
     }
 
@@ -257,12 +293,61 @@ pub fn to_meshes(map: &ValidatedMap, config: &PackageConfig) -> Vec<Mesh> {
     meshes
 }
 
+/// Writes Autoware's point-cloud map of the surface the package's level is built
+/// of into `directory` — see [`pointcloud`] for the layout.
+///
+/// The meshes are the ones [`write`] puts in the FBX, and the town wherever it goes
+/// (in the map, or as props the package's script stands in the level): what the
+/// simulated LiDAR sees. `locate` turns a point in the map's frame into the frame
+/// Autoware reads the map in — the Lanelet2 map's `local_x`, `local_y` and `ele` —
+/// which only the Lanelet2 exporter knows how to work out for every projection.
+pub fn write_pointcloud_map<E: std::fmt::Display>(
+    map: &ValidatedMap,
+    directory: impl AsRef<Path>,
+    config: &PackageConfig,
+    pointcloud: &PointCloudConfig,
+    mut locate: impl FnMut(Point3) -> Result<[f64; 3], E>,
+) -> Result<PointCloudMap, ExportError> {
+    // Before sampling: a spacing of zero would never finish doing it.
+    pointcloud.validate()?;
+    let mut meshes = surfaces::build(map, &config.map, &config.surfaces);
+    if config.buildings != BuildingPlacement::Omitted {
+        let mut ordinals = surfaces::Ordinals::default();
+        meshes.extend(surfaces::buildings(map, &config.map, &mut ordinals));
+    }
+    let points = pointcloud::sample(&meshes, pointcloud.spacing)
+        .into_iter()
+        .map(|point| locate(point).map_err(|error| ExportError::Projection(error.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    pointcloud::write(&points, directory, pointcloud)
+}
+
 /// Writes the package into `directory`, creating it if it is not there.
 pub fn write(
     map: &ValidatedMap,
     directory: impl AsRef<Path>,
     config: &PackageConfig,
 ) -> Result<Package, ExportError> {
+    write_traced(map, directory, config).map(|(package, _)| package)
+}
+
+/// Writes the package, and says where each element of the IR went.
+///
+/// The road network is the `.xodr`, so most of the trace is the OpenDRIVE
+/// exporter's own, with its names unchanged: a CARLA map *is* that document, and
+/// a lane is found in it the way it is found in any other. What the package adds is
+/// the furniture — `actor:<name>` for each light and sign the script stands in the
+/// level, which is the name CARLA's editor shows it by. The meshes are not traced:
+/// a surface is cut from many lanes at once and belongs to none of them.
+///
+/// The trace names every file the package wrote but the meshes, which no link
+/// points into and which are by far the largest: hashing them again on every write
+/// and every load would buy nothing.
+pub fn write_traced(
+    map: &ValidatedMap,
+    directory: impl AsRef<Path>,
+    config: &PackageConfig,
+) -> Result<(Package, Trace), ExportError> {
     if config.map.is_empty() {
         return Err(ExportError::Name("the map has no name".into()));
     }
@@ -300,8 +385,10 @@ pub fn write(
     // map is a mesh and a road network and they have to be the same road network;
     // writing a second one here would be two chances to be wrong about it.
     let xodr_path = folder.join(format!("{}.xodr", config.map));
-    roadgen_opendrive::write_with(map, &xodr_path, &options)
+    let opendrive = roadgen_opendrive::write_with_traced(map, &xodr_path, &options)
         .map_err(|error| ExportError::OpenDrive(error.to_string()))?;
+    let mut trace = Trace::new("carla");
+    trace.links = opendrive.links;
 
     let mut props_path = None;
     let mut props = Vec::new();
@@ -330,7 +417,9 @@ pub fn write(
     let mut furniture_path = None;
     let mut map_logic_path = None;
     if !furniture.is_empty() || !town.is_empty() {
-        let written = write_furniture(map, &folder, config, &furniture, &town, &mut props)?;
+        let written = write_furniture(
+            map, &folder, config, &furniture, &town, &mut props, &mut trace,
+        )?;
         lights_fbx = written.lights_fbx;
         signs_fbx = written.signs_fbx;
         furniture_path = Some(written.manifest);
@@ -350,6 +439,7 @@ pub fn write(
             source: relative(&config.map, &format!("{}.fbx", config.map)),
             use_carla_materials: config.use_carla_materials,
             xodr: relative(&config.map, &format!("{}.xodr", config.map)),
+            water: package::WaterSlots::new(&config.water),
         }],
         props,
     };
@@ -361,9 +451,14 @@ pub fn write(
             .map_err(|error| ExportError::Json(error.to_string()))?,
     )?;
     let script_path = root.join(format!("{}.py", config.package));
+    let water = meshes.iter().any(|mesh| {
+        mesh.materials
+            .iter()
+            .any(|&m| m == materials::FLOWING_WATER || m == materials::STILL_WATER)
+    });
     write_text(
         &script_path,
-        &script::script(config, !furniture.is_empty() || !town.is_empty()),
+        &script::script(config, !furniture.is_empty() || !town.is_empty(), water),
     )?;
     make_executable(&script_path)?;
 
@@ -378,13 +473,15 @@ pub fn write(
     };
     let entries = materials::manifest(&wanted);
     let manifest = TextureManifest::new(entries.clone());
+    let texture_manifest_path = textures.join("polyhaven.manifest");
     write_text(
-        &textures.join("polyhaven.manifest"),
+        &texture_manifest_path,
         &manifest
             .to_json()
             .map_err(|error| ExportError::Json(error.to_string()))?,
     )?;
-    write_text(&textures.join("CREDITS.md"), &materials::credits(&entries))?;
+    let credits_path = textures.join("CREDITS.md");
+    write_text(&credits_path, &materials::credits(&entries))?;
 
     let mut labels: BTreeMap<Label, usize> = BTreeMap::new();
     for mesh in &meshes {
@@ -397,7 +494,22 @@ pub fn write(
             .or_default() += 1;
     }
 
-    Ok(Package {
+    trace.files = [
+        Some(&descriptor_path),
+        Some(&xodr_path),
+        props_path.as_ref(),
+        furniture_path.as_ref(),
+        map_logic_path.as_ref(),
+        Some(&script_path),
+        Some(&texture_manifest_path),
+        Some(&credits_path),
+    ]
+    .into_iter()
+    .flatten()
+    .cloned()
+    .collect();
+
+    let package = Package {
         script: script_path,
         obj: obj_path,
         descriptor: descriptor_path,
@@ -419,7 +531,8 @@ pub fn write(
             .into_iter()
             .filter(|entry| !folder.join(&entry.path).exists())
             .collect(),
-    })
+    };
+    Ok((package, trace))
 }
 
 /// What writing the furniture produced.
@@ -431,7 +544,8 @@ struct WrittenFurniture {
 }
 
 /// Writes the lights and the signs as props, the manifest that places them and
-/// the `map_logic.json` that makes CARLA adopt the lights.
+/// the `map_logic.json` that makes CARLA adopt the lights, and records in `trace`
+/// which actor each IR object is placed as.
 fn write_furniture(
     map: &ValidatedMap,
     folder: &Path,
@@ -439,6 +553,7 @@ fn write_furniture(
     furniture: &furniture::Furniture,
     town: &[Mesh],
     props: &mut Vec<PropEntry>,
+    trace: &mut Trace,
 ) -> Result<WrittenFurniture, ExportError> {
     let settings = config.furniture.unwrap_or_default();
     let mut placements: [Vec<package::Placement>; 2] = [Vec::new(), Vec::new()];
@@ -470,6 +585,12 @@ fn write_furniture(
             tag: tag.as_str().to_owned(),
         });
         for placed in placed {
+            // The manifest's name is the one the script labels the actor with.
+            trace.link(
+                placed.object.clone(),
+                format!("actor:{}", placed.mesh.name),
+                Relation::Exact,
+            );
             placements[index].push(package::Placement {
                 name: placed.mesh.name.clone(),
                 asset: package::prop_asset_path(
@@ -703,7 +824,18 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
         }
     }
 
-    if config.surfaces.ground_extent > 0.0 {
+    if !map.tin_surfaces.is_empty() {
+        let nodes: usize = map.tin_surfaces.iter().map(|s| s.tin.nodes().len()).sum();
+        warnings.push(format!(
+            "the land is the map's own terrain — {} TIN surfaces, {nodes} nodes, \
+             their breaklines kept as edges — re-triangulated round the roads as this \
+             exporter samples them, with at most a {:.0} m seam; it stops where the \
+             terrain does, and it is tagged `Terrain` ({}) throughout",
+            map.tin_surfaces.len(),
+            config.surfaces.verge_width.min(ground::STATED_VERGE),
+            Label::Terrain.stencil()
+        ));
+    } else if config.surfaces.ground_extent > 0.0 {
         warnings.push(format!(
             "the land past the {:.0} m verge is at the roads' own heights, out to \
              {:.0} m beyond the network: flat where the roads are flat and sloping \
@@ -726,6 +858,45 @@ pub fn check(map: &ValidatedMap, config: &PackageConfig) -> Vec<String> {
              and a vehicle that leaves a road there drives off the map"
                 .into(),
         );
+    }
+
+    let resurfaced = map
+        .roads
+        .iter()
+        .filter(|road| {
+            road.pavement
+                .spans()
+                .iter()
+                .any(|&(_, pavement)| materials::road(Some(pavement)) != materials::ASPHALT)
+        })
+        .count();
+    if resurfaced > 0 && config.use_carla_materials {
+        warnings.push(format!(
+            "{resurfaced} roads are surfaced in something other than asphalt — gravel, \
+             concrete, dirt — and drawn so here, but CARLA's own materials are on and \
+             will repaint every road surface as its asphalt; turn them off to keep \
+             what the map says"
+        ));
+    }
+    let berms = map
+        .objects
+        .iter()
+        .filter(|object| {
+            matches!(
+                object.kind,
+                MapObjectKind::Barrier {
+                    structure: None,
+                    ..
+                }
+            )
+        })
+        .count();
+    if berms > 0 {
+        warnings.push(format!(
+            "{berms} barriers are ridges in the map's FBX, tagged `Terrain` ({}): CARLA \
+             has no class for a berm",
+            Label::Terrain.stencil()
+        ));
     }
 
     let connectors = map.roads.iter().filter(|road| road.is_connector()).count();

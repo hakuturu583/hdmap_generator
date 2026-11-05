@@ -1,11 +1,13 @@
 //! What a SUMO edge and lane say about a road.
 //!
 //! SUMO describes a road by what may drive on it and how fast, not by what is
-//! painted on it. So the lowering is three small tables: which vehicle classes a
-//! lane type admits, how fast a road type is when the map gives no limit, and where
-//! a road type sits in the priority order netconvert uses to work out who yields.
+//! painted on it. So the lowering is four small tables: which vehicle classes a
+//! lane type admits, whether the paint between two lanes lets a vehicle cross it,
+//! how fast a road type is when the map gives no limit, and where a road type sits
+//! in the priority order netconvert uses to work out who yields.
 
-use roadgen_core::semantics::{LaneType, RoadType};
+use roadgen_core::semantics::{FormOfWay, LaneType, RoadMarking, RoadType};
+use roadgen_core::topology::LateralSide;
 
 /// What a SUMO lane says about who may use it.
 ///
@@ -29,6 +31,20 @@ impl Permission {
             Permission::Disallow(classes) => ("disallow", classes),
         }
     }
+
+    /// Whether a vehicle of SUMO class `class` — `passenger`, `pedestrian` — may use
+    /// a lane with this permission.
+    ///
+    /// Read off the same space-separated list the attribute is written with, so the
+    /// answer is SUMO's for the file as written and cannot drift from it.
+    pub fn admits(self, class: &str) -> bool {
+        match self {
+            Permission::Allow(classes) => classes.split_whitespace().any(|named| named == class),
+            Permission::Disallow(classes) => {
+                !classes.split_whitespace().any(|named| named == class)
+            }
+        }
+    }
 }
 
 /// Who may use a lane of this type, or `None` for a lane SUMO has no place for.
@@ -50,6 +66,44 @@ pub fn permission(lane_type: LaneType) -> Option<Permission> {
             return None
         }
     })
+}
+
+/// Who may use the edges [`crate::Options::cycle_on_sidewalks`] lays along a
+/// sidewalk for bicycles: bicycles, and pedestrians, since the strip is the sidewalk.
+pub const SHARED_FOOTWAY: Permission = Permission::Allow("pedestrian bicycle");
+
+/// The vehicle classes a lane change across a line no one may cross is still open
+/// to.
+///
+/// SUMO's `changeLeft` and `changeRight` name the classes *allowed* to change, not
+/// the ones kept from it, so a line that forbids crossing is written as the short
+/// list of who may cross it anyway. `emergency` is that list: an ambulance on a
+/// call may cross a solid line, as the traffic codes that paint one generally let
+/// it, and nobody else may.
+pub const CHANGE_ACROSS_SOLID: &str = "emergency";
+
+/// Whether a vehicle on the `from` side of a boundary painted `marking` may cross
+/// it to change lanes.
+///
+/// `from` is read in the reference-line frame the IR keeps markings in — the side
+/// of the reference line's direction the vehicle is on, *not* the side of its own
+/// direction of travel — because that is the frame a double line's two words are
+/// written in: in `solid broken` the solid line is the left one looking along the
+/// reference line, as OpenDRIVE and the IR both read it. The line nearer the
+/// vehicle is the one that binds it, so in `solid broken` a vehicle on the right
+/// sees the broken line and may cross, and one on the left sees the solid line and
+/// may not. That is the asymmetry the marking exists to state: overtaking is
+/// allowed from one side and returning from the other.
+///
+/// A broken line and an unpainted boundary may be crossed. A solid line, a double
+/// solid line and a kerb may not.
+pub fn may_cross(marking: RoadMarking, from: LateralSide) -> bool {
+    match marking {
+        RoadMarking::None | RoadMarking::Broken => true,
+        RoadMarking::Solid | RoadMarking::SolidSolid | RoadMarking::Curbstone => false,
+        RoadMarking::SolidBroken => from == LateralSide::Right,
+        RoadMarking::BrokenSolid => from == LateralSide::Left,
+    }
 }
 
 /// How fast a road of this type is when the map states no limit, metres per second.
@@ -84,6 +138,23 @@ pub fn priority(road_type: RoadType) -> i32 {
     }
 }
 
+/// Where a road sits in the priority order, by its form of way where that says
+/// more than its road type.
+///
+/// The form of way is the road's part in the network, which is what the ladder
+/// ranks: a motorway carriageway is on the motorway rung whatever sort of place it
+/// runs through, and a slip road sits just below it, at 11 — above every road it
+/// could come down to, so a ramp joining a rural road at its foot keeps right of
+/// way over it, and below the carriageway it merges into. Every other form leaves
+/// the road type's rung as it was.
+pub fn priority_for(road_type: RoadType, form: FormOfWay) -> i32 {
+    match form {
+        FormOfWay::Motorway => priority(RoadType::Motorway),
+        FormOfWay::SlipRoad => 11,
+        _ => priority(road_type),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,11 +174,53 @@ mod tests {
     }
 
     #[test]
+    fn only_a_driving_lane_admits_a_passenger_car() {
+        let admits = |lane_type| permission(lane_type).unwrap().admits("passenger");
+        assert!(admits(LaneType::Driving));
+        assert!(!admits(LaneType::Sidewalk));
+        assert!(!admits(LaneType::Biking));
+        assert!(!admits(LaneType::Shoulder));
+        assert!(permission(LaneType::Sidewalk).unwrap().admits("pedestrian"));
+    }
+
+    #[test]
+    fn the_line_nearer_the_vehicle_decides_whether_it_may_cross() {
+        for from in [LateralSide::Left, LateralSide::Right] {
+            assert!(may_cross(RoadMarking::None, from));
+            assert!(may_cross(RoadMarking::Broken, from));
+            assert!(!may_cross(RoadMarking::Solid, from));
+            assert!(!may_cross(RoadMarking::SolidSolid, from));
+            assert!(!may_cross(RoadMarking::Curbstone, from));
+        }
+        // Solid on the left, broken on the right.
+        assert!(!may_cross(RoadMarking::SolidBroken, LateralSide::Left));
+        assert!(may_cross(RoadMarking::SolidBroken, LateralSide::Right));
+        assert!(may_cross(RoadMarking::BrokenSolid, LateralSide::Left));
+        assert!(!may_cross(RoadMarking::BrokenSolid, LateralSide::Right));
+    }
+
+    #[test]
     fn the_priority_ladder_puts_a_motorway_above_a_living_street() {
         assert!(priority(RoadType::Motorway) > priority(RoadType::Rural));
         assert!(priority(RoadType::Rural) > priority(RoadType::Town));
         assert!(priority(RoadType::Town) > priority(RoadType::LowSpeed));
         assert!(priority(RoadType::LowSpeed) > priority(RoadType::Pedestrian));
+    }
+
+    #[test]
+    fn a_motorway_form_is_on_the_motorway_rung_and_a_slip_road_just_below() {
+        assert_eq!(
+            priority_for(RoadType::Town, FormOfWay::Motorway),
+            priority(RoadType::Motorway)
+        );
+        let slip = priority_for(RoadType::Town, FormOfWay::SlipRoad);
+        assert_eq!(slip, 11);
+        assert!(slip < priority(RoadType::Motorway));
+        assert!(slip > priority(RoadType::Rural));
+        assert_eq!(
+            priority_for(RoadType::Rural, FormOfWay::ServiceRoad),
+            priority(RoadType::Rural)
+        );
     }
 
     #[test]
@@ -120,6 +233,55 @@ mod tests {
             RoadType::Pedestrian,
         ] {
             assert!(default_speed(road_type) > 0.0);
+        }
+    }
+
+    /// The two lane types with a class of their own rather than the open road's: a
+    /// cycle lane is for bicycles and nothing else, and a hard shoulder is for the
+    /// emergency services. Both are `allow`, never `disallow`, because what they
+    /// admit is the short list.
+    #[test]
+    fn a_cycle_lane_admits_bicycles_and_a_shoulder_the_emergency_services() {
+        assert_eq!(
+            permission(LaneType::Biking),
+            Some(Permission::Allow("bicycle"))
+        );
+        assert_eq!(
+            permission(LaneType::Shoulder),
+            Some(Permission::Allow("emergency"))
+        );
+        assert_eq!(
+            Permission::Allow("bicycle").attribute(),
+            ("allow", "bicycle")
+        );
+        assert_eq!(
+            Permission::Disallow("pedestrian").attribute(),
+            ("disallow", "pedestrian")
+        );
+    }
+
+    /// Every lane type with no movement along it is dropped — not just the border and
+    /// the strip beyond it, but a parking bay and a restricted lane too.
+    #[test]
+    fn a_parking_bay_and_a_restricted_lane_are_not_sumo_lanes() {
+        assert_eq!(permission(LaneType::Parking), None);
+        assert_eq!(permission(LaneType::Restricted), None);
+    }
+
+    /// The fallback speeds fall down the same ladder the priorities do: a road that
+    /// outranks another at a junction is also the faster of the two when neither
+    /// states a limit.
+    #[test]
+    fn the_fallback_speeds_fall_from_a_motorway_to_a_footway() {
+        let ladder = [
+            RoadType::Motorway,
+            RoadType::Rural,
+            RoadType::Town,
+            RoadType::LowSpeed,
+            RoadType::Pedestrian,
+        ];
+        for pair in ladder.windows(2) {
+            assert!(default_speed(pair[0]) > default_speed(pair[1]), "{pair:?}");
         }
     }
 }

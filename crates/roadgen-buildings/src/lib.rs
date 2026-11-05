@@ -121,6 +121,63 @@ pub struct Report {
 /// until then. It does not have to have been validated: buildings are part of what
 /// validation checks, so they go in first.
 pub fn generate(map: &mut UnvalidatedMap, rules: &Rules) -> Result<Report, Error> {
+    generate_with(map, rules, &Placement::default())
+}
+
+/// Where buildings may go: along which roads, inside which outlines, and whether
+/// the buildings already on the map stay.
+///
+/// A town puts them along every street. Another kind of place puts them only on
+/// its yards — a mine's workshops on its pad, beside the haul road — with the same
+/// lots and the same grammar, so one generator serves both.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Placement {
+    /// Only these roads' frontages, or every road's when `None`.
+    pub roads: Option<Vec<roadgen_core::id::RoadId>>,
+    /// Only lots wholly inside one of these outlines, in plan; anywhere when empty.
+    pub within: Vec<Vec<plane::Point2>>,
+    /// No lot with a corner inside one of these outlines, in plan: a pit, a heap, a
+    /// yard that is another place's.
+    pub outside: Vec<Vec<plane::Point2>>,
+    /// Keep the buildings already on the map, and keep clear of them, rather than
+    /// replacing them.
+    pub keep: bool,
+}
+
+impl Placement {
+    fn admits(&self, lot: &Lot) -> bool {
+        if let Some(roads) = &self.roads {
+            if !roads.contains(&lot.road) {
+                return false;
+            }
+        }
+        let corners = lot.ground_plan();
+        let inside = |ring: &Vec<plane::Point2>, corner: &plane::Point2| {
+            roadgen_core::geometry::plan::ring_contains(ring, *corner)
+        };
+        // Any ground shared — a corner of the lot in the outline, the outline
+        // across the lot, or a small outline wholly on it.
+        if self
+            .outside
+            .iter()
+            .any(|ring| roadgen_core::geometry::plan::rings_overlap(ring, &corners))
+        {
+            return false;
+        }
+        self.within.is_empty()
+            || self
+                .within
+                .iter()
+                .any(|ring| corners.iter().all(|corner| inside(ring, corner)))
+    }
+}
+
+/// [`generate`], with where the buildings may go said: see [`Placement`].
+pub fn generate_with(
+    map: &mut UnvalidatedMap,
+    rules: &Rules,
+    placement: &Placement,
+) -> Result<Report, Error> {
     let Compiled {
         mut interpreter,
         layout,
@@ -128,12 +185,27 @@ pub fn generate(map: &mut UnvalidatedMap, rules: &Rules) -> Result<Report, Error
     } = rules.compile()?;
 
     let blocked = blocked_region(map.as_map(), layout.setback);
-    let lots = land::lots(map.as_map(), &layout);
+    let lots: Vec<Lot> = land::lots(map.as_map(), &layout)
+        .into_iter()
+        .filter(|lot| placement.admits(lot))
+        .collect();
 
     // Neighbours are tested against as they are placed, so the first lot of a street
     // wins a contested corner and the map's own order decides the rest. Cells wide
     // enough to hold a lot, so a candidate touches few of them.
     let mut placed = Index::new(25.0);
+    if placement.keep {
+        for part in map.as_map().building_parts.iter() {
+            placed.insert(
+                part.solid
+                    .footprint
+                    .points()
+                    .iter()
+                    .map(|p| [p.x, p.y])
+                    .collect(),
+            );
+        }
+    }
     let mut report = Report {
         lots: lots.len(),
         ..Report::default()
@@ -206,8 +278,10 @@ pub fn generate(map: &mut UnvalidatedMap, rules: &Rules) -> Result<Report, Error
     }
 
     let map = map.as_map_mut();
-    map.buildings = roadgen_core::Arena::new();
-    map.building_parts = roadgen_core::Arena::new();
+    if !placement.keep {
+        map.buildings = roadgen_core::Arena::new();
+        map.building_parts = roadgen_core::Arena::new();
+    }
     for building in buildings {
         let id = building.id.clone();
         // Identifiers are derived from the road, the side and the position along it,

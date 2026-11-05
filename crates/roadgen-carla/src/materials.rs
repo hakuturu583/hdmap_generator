@@ -327,7 +327,106 @@ pub const MATERIALS: &[Material] = &[
         roughness: 0.4,
         texture: None,
     },
+    // The surfaces of a road that is not paved and of land that has been dug: a
+    // graded haul road, a pit's walls, a heap of broken rock.
+    Material {
+        name: "M_Road_Gravel",
+        color: [0.46, 0.41, 0.35],
+        roughness: 0.95,
+        texture: Some(Texture {
+            slug: "rocky_trail",
+            resolution: "2k",
+            format: "jpg",
+            maps: FULL,
+            scale: 4.0,
+        }),
+    },
+    Material {
+        name: "M_Terrain_Rock",
+        color: [0.43, 0.39, 0.34],
+        roughness: 0.9,
+        texture: Some(Texture {
+            slug: "aerial_rocks_02",
+            resolution: "2k",
+            format: "jpg",
+            maps: FULL,
+            scale: 12.0,
+        }),
+    },
+    // The other surfaces a road can be made of. Colours only: what they look like
+    // is said, and a photograph can be put on them in the editor.
+    Material {
+        name: "M_Road_Concrete",
+        color: [0.60, 0.60, 0.58],
+        roughness: 0.8,
+        texture: None,
+    },
+    Material {
+        name: "M_Road_Cobblestone",
+        color: [0.42, 0.40, 0.38],
+        roughness: 0.85,
+        texture: None,
+    },
+    Material {
+        name: "M_Road_Dirt",
+        color: [0.42, 0.33, 0.24],
+        roughness: 0.95,
+        texture: None,
+    },
+    Material {
+        name: "M_Road_Sand",
+        color: [0.76, 0.68, 0.50],
+        roughness: 0.95,
+        texture: None,
+    },
+    // A river: its bed and banks under the water, and the water's surface over
+    // them. Poly Haven publishes no scan of open water — a water surface is a
+    // shader, not a photograph — so the surface is a colour and a gloss, for an
+    // engine's water material to take over; the bed it is seen through is
+    // photographed. Running water and standing water are two materials, so that
+    // the package's script can give each its own: a river's texture coordinates
+    // run down it and across it, for a material that pans its normals along `u`
+    // to flow downstream, and a lake's or a pond's lie in plan.
+    Material {
+        name: "M_Terrain_Riverbed",
+        color: [0.35, 0.33, 0.28],
+        roughness: 0.85,
+        texture: Some(Texture {
+            slug: "river_small_rocks",
+            resolution: "2k",
+            format: "jpg",
+            maps: FULL,
+            scale: 2.0,
+        }),
+    },
+    Material {
+        name: "M_Water_Still",
+        color: [0.10, 0.22, 0.24],
+        roughness: 0.05,
+        texture: None,
+    },
+    Material {
+        name: "M_Water_Flowing",
+        color: [0.10, 0.22, 0.24],
+        roughness: 0.05,
+        texture: None,
+    },
 ];
+
+/// The material a road surfaced with `pavement` is drawn in; asphalt when nobody
+/// said.
+pub fn road(pavement: Option<roadgen_core::semantics::Pavement>) -> usize {
+    use roadgen_core::semantics::{PavedSurface, Pavement, UnpavedSurface};
+    match pavement {
+        None | Some(Pavement::Paved(PavedSurface::Asphalt)) => ASPHALT,
+        Some(Pavement::Paved(PavedSurface::Concrete)) => ROAD_CONCRETE,
+        Some(Pavement::Paved(PavedSurface::Cobblestone)) => COBBLESTONE,
+        Some(Pavement::Unpaved(UnpavedSurface::Gravel)) => GRAVEL,
+        Some(Pavement::Unpaved(UnpavedSurface::Dirt)) => DIRT,
+        Some(Pavement::Unpaved(UnpavedSurface::Sand)) => SAND,
+        Some(Pavement::Unpaved(UnpavedSurface::Rock)) => ROCK,
+    }
+}
 
 pub const ASPHALT: usize = 0;
 pub const MARKING_WHITE: usize = 1;
@@ -349,6 +448,15 @@ pub const LAMP_GREEN: usize = 16;
 pub const PLATE_RED: usize = 17;
 pub const PLATE_WHITE: usize = 18;
 pub const PLATE_BLUE: usize = 19;
+pub const GRAVEL: usize = 20;
+pub const ROCK: usize = 21;
+pub const ROAD_CONCRETE: usize = 22;
+pub const COBBLESTONE: usize = 23;
+pub const DIRT: usize = 24;
+pub const SAND: usize = 25;
+pub const RIVERBED: usize = 26;
+pub const STILL_WATER: usize = 27;
+pub const FLOWING_WATER: usize = 28;
 
 /// One texture file the package expects, and where it comes from.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

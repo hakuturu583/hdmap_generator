@@ -45,7 +45,10 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned like everything else here: the smoke test installs Playwright's
+    # Chromium with its system dependencies, and Playwright 1.56 knows them for
+    # Ubuntu 24.04 but not 26.04, which `ubuntu-latest` became.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

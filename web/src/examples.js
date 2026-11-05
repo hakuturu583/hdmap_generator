@@ -271,4 +271,114 @@ for warning in m.carla_warnings(name="Town01"):
         print("carla:", warning)
 `,
   },
+  {
+    name: 'An open-pit mine, from parts',
+    description: 'A pit, a ramp, haul roads, heaps and a yard, as parts — and the land as a TIN.',
+    code: `# Not a town: a quarry, put together from parts. A pit is a shape of
+# the land; the roads into it are roads like any other, drawn with
+# add_road. Once the roads are built, the land round all of it is one
+# TIN whose breaklines are every bench's crest and toe and every road's
+# edge.
+import roadgen
+
+m = roadgen.Map(name="quarry", origin=(-23.36, 119.73, 0.0))
+pit = m.add_pit(name="North Pit", benches=5)
+m.generate_land(cell=15.0, seed=2)
+
+haul = [
+    roadgen.Lane(width=7.5, direction="forward", left_marking="none", right_marking="none"),
+    roadgen.Lane(width=3.0, direction="forward", type_="shoulder", left_marking="none", right_marking="none"),
+    roadgen.Lane(width=7.5, direction="backward", left_marking="none", right_marking="none"),
+    roadgen.Lane(width=3.0, direction="backward", type_="shoulder", left_marking="none", right_marking="none"),
+]
+gravel = [(0.0, "gravel")]
+# The usual ramp: a spiral down the wall at 10 %. Any points will do.
+ramp = m.add_road(points=pit.ramp(grade=0.1), lanes=haul, name="ramp",
+                  type_="low_speed", pavement=gravel, site="North Pit")
+m.add_barrier(ramp.lane(1), kind="berm", height=1.5)
+haul_road = m.add_road(start=(100.0, -260.0, 0.0), end=(300.0, -260.0, 0.0),
+                       lanes=haul, name="haul", type_="low_speed",
+                       pavement=gravel, site="North Pit")
+m.add_heap("waste_dump", centre=(440.0, -260.0, 0.0), radius=110.0,
+           height=30.0, site="North Pit")
+m.add_heap("stockpile", centre=(260.0, 40.0, 0.0), radius=38.0,
+           height=14.0, site="North Pit")
+m.add_pad([(140.0, -320.0, 0.0), (260.0, -320.0, 0.0),
+           (260.0, -272.5, 0.0), (140.0, -272.5, 0.0)],
+          buildings="industrial", site="North Pit")
+
+m.validate()
+
+m.export_opendrive("map.xodr")
+m.export_lanelet2("lanelet2.osm")
+m.export_osm("openstreetmap.osm")
+m.export_sumo("sumo/")
+m.export_clipgt("clip/")
+m.export_gpudrive("scene.json")
+# Off, or CARLA repaints the gravel haul roads as its own asphalt.
+m.export_carla("Import/", name="Quarry", use_carla_materials=False)
+
+site = m.site("site/north_pit")
+print("land covers:", [m.land_cover(c)["kind"] for c in site["land_covers"]])
+nodes, triangles = m.tin_mesh(site["surfaces"][0])
+print(len(nodes), "nodes,", len(triangles), "triangles,",
+      "floor at", min(z for _, _, z in nodes), "m")
+print("the ramp is", m.road_pavement(ramp.id))
+
+for warning in m.carla_warnings(name="Quarry", use_carla_materials=False):
+    print("carla:", warning)
+`,
+  },
+  {
+    name: 'A motorway through a town, on a viaduct',
+    description: 'A corridor plans the carriageways, slip roads and an interchange; the rules lift it over the streets.',
+    code: `# A motorway is a corridor: its line, its design speed, and where it is
+# lifted onto a viaduct. The corridor plans every road it needs — both
+# carriageways, split where a slip road leaves or joins, the speed-change
+# lanes, the slip roads, the crossroad over it — and the plan is put on
+# the map with add_plan. Bridges, overpasses and piers come from the rules
+# when the map is built: no pier stands on a street, no building under the
+# deck, none faces the motorway.
+import roadgen
+
+def street():
+    return [
+        roadgen.Lane(width=3.5, direction="backward"),
+        roadgen.Lane(width=2.5, direction="backward", type_="sidewalk"),
+        roadgen.Lane(width=3.5, direction="forward"),
+        roadgen.Lane(width=2.5, direction="forward", type_="sidewalk"),
+    ]
+
+m = roadgen.Map(name="shuto", origin=(35.6586, 139.7454, 0.0), handedness="lht")
+for name, x in (("first", -100.0), ("second", 200.0)):
+    m.add_road(start=(x, -300.0, 0.0), end=(x, 300.0, 0.0), lanes=street(), name=name)
+
+shuto = m.add_corridor("Shuto", [(-800.0, 0.0, 0.0), (1300.0, 0.0, 0.0)],
+                       design_speed=60.0, elevated=[(200.0, 1400.0)])
+# Two slip roads down to a crossroad east of the town.
+shuto.add_interchange("East", at=1700.0, kind="half_diamond", side="right",
+                      crossroad=[(900.0, -250.0, 0.0), (900.0, 250.0, 0.0)],
+                      crossroad_lanes=street(), terminal=60.0, reach=180.0)
+plan = shuto.plan()
+print("planned:", [road["name"] for road in plan.roads])
+m.add_plan(plan)
+m.generate_buildings()
+
+m.validate()
+
+m.export_opendrive("map.xodr")
+m.export_lanelet2("lanelet2.osm")
+m.export_osm("openstreetmap.osm")
+m.export_sumo("sumo/")
+m.export_clipgt("clip/")
+m.export_gpudrive("scene.json")
+m.export_carla("Import/", name="Shuto")
+
+for structure in m.structure_ids():
+    s = m.structure(structure)
+    print(structure, s["form"], len(s.get("supports", [])), "supports")
+print(len(m.grade_separations()), "grade separations,",
+      len(m.building_ids()), "buildings")
+`,
+  },
 ]

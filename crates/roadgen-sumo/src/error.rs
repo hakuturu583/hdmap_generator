@@ -10,7 +10,12 @@ pub enum ExportError {
     /// A reference in the IR had nothing behind it, which means the map changed
     /// under the exporter.
     Unknown(String),
+    /// The map's origin, or a point of the network, cannot be projected — off the
+    /// UTM grid, say — so the network's `<location>` cannot be written.
+    Projection(String),
     Io(String),
+    /// A curve's lateral acceleration that is not a positive number of m/s².
+    InvalidCurveAcceleration(f64),
 }
 
 impl From<GeometryError> for ExportError {
@@ -24,7 +29,14 @@ impl fmt::Display for ExportError {
         match self {
             ExportError::Geometry(error) => write!(f, "{error}"),
             ExportError::Unknown(what) => write!(f, "no SUMO element was built for {what}"),
+            ExportError::Projection(detail) => {
+                write!(f, "the network cannot be georeferenced: {detail}")
+            }
             ExportError::Io(detail) => write!(f, "{detail}"),
+            ExportError::InvalidCurveAcceleration(value) => write!(
+                f,
+                "a curve's lateral acceleration has to be positive, not {value}"
+            ),
         }
     }
 }

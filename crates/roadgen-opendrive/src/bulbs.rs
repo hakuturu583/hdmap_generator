@@ -8,6 +8,8 @@
 //! `color=green;arrow=right;x=12.345;y=-6.789;z=46.382`. A reader that does not
 //! know them passes over them, as `<userData>` is meant to be.
 
+use std::fmt::Write;
+
 use opendrive::core::user_data::UserData;
 
 use roadgen_core::geometry::Point3;
@@ -23,10 +25,10 @@ pub(crate) fn to_user_data(bulbs: &[LightBulb]) -> Vec<UserData> {
         .map(|bulb| {
             let mut value = format!("color={}", bulb.color.as_str());
             if let Some(arrow) = bulb.arrow {
-                value.push_str(&format!(";arrow={}", arrow.as_str()));
+                let _ = write!(value, ";arrow={}", arrow.as_str());
             }
             let p = bulb.position;
-            value.push_str(&format!(";x={:.6};y={:.6};z={:.6}", p.x, p.y, p.z));
+            let _ = write!(value, ";x={:.6};y={:.6};z={:.6}", p.x, p.y, p.z);
             UserData {
                 code: BULB_CODE.to_owned(),
                 value: Some(value),
@@ -64,8 +66,13 @@ fn parse(value: &str) -> Option<LightBulb> {
             _ => {}
         }
     }
+    // `f64` parses `inf` and `NaN` too, and a lamp there is nowhere.
+    let position = Point3::new(x?, y?, z?);
+    if !position.is_finite() {
+        return None;
+    }
     Some(LightBulb {
-        position: Point3::new(x?, y?, z?),
+        position,
         color: color?,
         arrow,
     })
@@ -90,5 +97,20 @@ mod tests {
             },
         ];
         assert_eq!(from_user_data(&to_user_data(&bulbs)), (bulbs, 0));
+    }
+
+    #[test]
+    fn a_lamp_that_is_nowhere_is_not_read() {
+        let entry = |value: &str| UserData {
+            code: BULB_CODE.to_owned(),
+            value: Some(value.to_owned()),
+            elements: Vec::new(),
+        };
+        let (bulbs, unreadable) = from_user_data(&[
+            entry("color=red;x=inf;y=0;z=5"),
+            entry("color=amber;x=1;y=0;z=NaN"),
+        ]);
+        assert!(bulbs.is_empty());
+        assert_eq!(unreadable, 2);
     }
 }

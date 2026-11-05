@@ -15,7 +15,7 @@ use std::ops::Deref;
 
 use crate::error::{ValidationError, ValidationIssue};
 use crate::map::{Lane, Map, Projection};
-use crate::semantics::LaneType;
+use crate::semantics::{LaneType, MapObjectKind};
 use crate::topology::{LaneEnd, RoadEnd, RoadLinkTarget};
 
 /// How far apart two things may be before they count as disconnected.
@@ -27,6 +27,12 @@ pub struct ValidationConfig {
     /// width. Junction connectors between curved arms miss it by a few millimetres at an
     /// end (the cross-section direction there is sampled), which no consumer can tell.
     pub width_tolerance: f64,
+    /// Metres; the clear height a road carried under another on a bridge keeps,
+    /// from its surface to the deck's underside, where the two cross. By default
+    /// [`crate::structure::CLEARANCE`], the standard the generators build to; a map
+    /// drawn to another — an imported one, from a country whose is lower — gives
+    /// its own, and `None` leaves only what a deck physically needs.
+    pub clearance: Option<f64>,
 }
 
 impl Default for ValidationConfig {
@@ -34,6 +40,7 @@ impl Default for ValidationConfig {
         ValidationConfig {
             position_tolerance: 1e-3,
             width_tolerance: 2e-2,
+            clearance: Some(crate::structure::CLEARANCE),
         }
     }
 }
@@ -72,6 +79,17 @@ impl UnvalidatedMap {
         check_connections(&self.0, config, &mut issues);
         check_junctions(&self.0, &mut issues);
         check_buildings(&self.0, &mut issues);
+        check_traffic_lights(&self.0, &mut issues);
+        check_barriers(&self.0, &mut issues);
+        check_terrain(&self.0, config, &mut issues);
+        check_land_covers(&self.0, &mut issues);
+        check_sites(&self.0, &mut issues);
+        crate::structure::check(
+            &self.0,
+            config.position_tolerance.max(1e-2),
+            config.clearance,
+            &mut issues,
+        );
         issues
     }
 
@@ -227,6 +245,388 @@ fn check_buildings(map: &Map, issues: &mut Vec<ValidationIssue>) {
                 part: part.id.clone(),
                 detail: "no storeys; a part of a building has at least one".to_owned(),
             });
+        }
+    }
+}
+
+/// A barrier's height is what a consumer builds it to, so it has to be one; and a
+/// barrier that is part of a structure — a bridge's parapet — has to name one the
+/// map has.
+fn check_barriers(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for object in map.objects.iter() {
+        if let MapObjectKind::Barrier {
+            height, structure, ..
+        } = &object.kind
+        {
+            if !height.is_finite() || *height <= 0.0 {
+                issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: object.id.to_string(),
+                    detail: format!("a barrier {height} m high stands no height at all"),
+                });
+            }
+            if let Some(structure) = structure {
+                if !map.structures.contains(structure) {
+                    issues.push(ValidationIssue::DanglingFeatureReference {
+                        referrer: object.id.to_string(),
+                        feature: structure.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The terrain is checked for its composition and for the one invariant that ties
+/// a breakline to its surface: it is an edge of the triangulation, vertex for vertex
+/// and segment for segment.
+///
+/// What [`Tin::new`](crate::terrain::Tin::new) already rules out — an index past
+/// the nodes, a triangle with no area, a clockwise triangle — is not rechecked.
+/// Folds are: two triangles that share an edge and lie on the same side of it are
+/// a surface folded over itself, which is two heights over one point of the plan.
+fn check_terrain(map: &Map, config: ValidationConfig, issues: &mut Vec<ValidationIssue>) {
+    for surface in map.tin_surfaces.iter() {
+        let feature = surface.id.to_string();
+        if surface.tin.is_empty() {
+            issues.push(ValidationIssue::ImplausibleFeature {
+                feature: feature.clone(),
+                detail: "no triangles; a surface is what its triangles cover".into(),
+            });
+        }
+        // Anticlockwise triangles that do not overlap use each directed edge once.
+        let mut directed: HashSet<(u32, u32)> = HashSet::new();
+        let mut folds = 0usize;
+        for &[a, b, c] in surface.tin.triangles() {
+            for edge in [(a, b), (b, c), (c, a)] {
+                if !directed.insert(edge) {
+                    folds += 1;
+                }
+            }
+        }
+        let overlaps = overlapping_triangles(&surface.tin);
+        if overlaps > 0 {
+            issues.push(ValidationIssue::ImplausibleFeature {
+                feature: feature.clone(),
+                detail: format!(
+                    "{overlaps} triangles overlap another in plan: two heights over one \
+                     point of the land"
+                ),
+            });
+        }
+        if folds > 0 {
+            issues.push(ValidationIssue::ImplausibleFeature {
+                feature: feature.clone(),
+                detail: format!(
+                    "{folds} edges are shared by two triangles on the same side of them: \
+                     the surface folds over itself"
+                ),
+            });
+        }
+        if let Some(site) = &surface.site {
+            check_site_membership(
+                map,
+                site,
+                &feature,
+                |entry| entry.surfaces.contains(&surface.id),
+                issues,
+            );
+        }
+
+        let nodes: std::collections::HashMap<(u64, u64), u32> = surface
+            .tin
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(index, node)| ((node.x.to_bits(), node.y.to_bits()), index as u32))
+            .collect();
+        let edges = surface.tin.edges();
+        for id in &surface.breaklines {
+            let Some(breakline) = map.tin_breaklines.get(id) else {
+                issues.push(ValidationIssue::DanglingFeatureReference {
+                    referrer: feature.clone(),
+                    feature: id.to_string(),
+                });
+                continue;
+            };
+            if breakline.surface != surface.id {
+                issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: id.to_string(),
+                    detail: format!(
+                        "listed by {feature} but names surface {}",
+                        breakline.surface
+                    ),
+                });
+                continue;
+            }
+            let mut indices = Vec::with_capacity(breakline.line.len());
+            for point in breakline.line.points() {
+                match nodes.get(&(point.x.to_bits(), point.y.to_bits())) {
+                    Some(&index)
+                        if (surface.tin.nodes()[index as usize].z - point.z).abs()
+                            <= config.position_tolerance =>
+                    {
+                        indices.push(index)
+                    }
+                    _ => {
+                        issues.push(ValidationIssue::ImplausibleFeature {
+                            feature: id.to_string(),
+                            detail: format!(
+                                "vertex ({:.3}, {:.3}, {:.3}) is not a node of {feature}",
+                                point.x, point.y, point.z
+                            ),
+                        });
+                        indices.clear();
+                        break;
+                    }
+                }
+            }
+            let crossings = indices
+                .windows(2)
+                .filter(|pair| !edges.contains(&(pair[0].min(pair[1]), pair[0].max(pair[1]))))
+                .count();
+            if crossings > 0 {
+                issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: id.to_string(),
+                    detail: format!(
+                        "{crossings} segments are not edges of {feature}: the triangles \
+                         cross the line rather than break along it"
+                    ),
+                });
+            }
+        }
+    }
+    for breakline in map.tin_breaklines.iter() {
+        match map.tin_surfaces.get(&breakline.surface) {
+            None => issues.push(ValidationIssue::DanglingFeatureReference {
+                referrer: breakline.id.to_string(),
+                feature: breakline.surface.to_string(),
+            }),
+            Some(surface) if !surface.breaklines.contains(&breakline.id) => {
+                issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: breakline.id.to_string(),
+                    detail: format!(
+                        "names surface {}, which does not list it",
+                        breakline.surface
+                    ),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// How many triangles of a TIN overlap another in plan without sharing the edge
+/// between them: an edge of one crossing an edge of the other, or one lying inside
+/// the other. A fold over a shared edge is counted where folds are.
+fn overlapping_triangles(tin: &crate::terrain::Tin) -> usize {
+    use crate::geometry::Grid;
+
+    let nodes = tin.nodes();
+    let plan = |index: u32| {
+        let p = nodes[index as usize];
+        [p.x, p.y]
+    };
+    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    let edges: Vec<(u32, u32)> = tin.edges().into_iter().collect();
+    let triangles = tin.triangles();
+    let reach = |points: &[[f64; 2]]| {
+        points.iter().fold(
+            ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
+            |(lo, hi), p| {
+                (
+                    [lo[0].min(p[0]), lo[1].min(p[1])],
+                    [hi[0].max(p[0]), hi[1].max(p[1])],
+                )
+            },
+        )
+    };
+    // Cells about a triangle across, so each is filed under a few.
+    let cell = tin
+        .bounds()
+        .map(|b| (((b[2] - b[0]) * (b[3] - b[1])) / triangles.len().max(1) as f64).sqrt())
+        .unwrap_or(1.0)
+        .max(1.0);
+
+    let mut bad = std::collections::HashSet::new();
+    let mut by_edge: Grid<usize> = Grid::new(cell);
+    for (index, &(a, b)) in edges.iter().enumerate() {
+        let (lo, hi) = reach(&[plan(a), plan(b)]);
+        by_edge.insert(lo, hi, index);
+    }
+    for (index, &(a, b)) in edges.iter().enumerate() {
+        let (p, q) = (plan(a), plan(b));
+        let (lo, hi) = reach(&[p, q]);
+        for &other in by_edge.covering(lo, hi) {
+            if other <= index {
+                continue;
+            }
+            let (c, d) = edges[other];
+            if [a, b].contains(&c) || [a, b].contains(&d) {
+                continue;
+            }
+            let (r, t) = (plan(c), plan(d));
+            // A proper crossing: each segment's ends strictly either side of the
+            // other's line.
+            let (d1, d2) = (cross(p, q, r), cross(p, q, t));
+            let (d3, d4) = (cross(r, t, p), cross(r, t, q));
+            if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+                bad.insert((index, other));
+            }
+        }
+    }
+    let mut by_triangle: Grid<usize> = Grid::new(cell);
+    for (index, triangle) in triangles.iter().enumerate() {
+        let corners = triangle.map(plan);
+        let (lo, hi) = reach(&corners);
+        by_triangle.insert(lo, hi, index);
+    }
+    let mut inside = 0;
+    for (index, triangle) in triangles.iter().enumerate() {
+        let [a, b, c] = triangle.map(plan);
+        let centre = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0];
+        let mut seen = std::collections::HashSet::new();
+        for &other in by_triangle.at(centre[0], centre[1]) {
+            if other == index || !seen.insert(other) {
+                continue;
+            }
+            let [p, q, r] = triangles[other].map(plan);
+            let tolerance = 1e-9;
+            if cross(p, q, centre) > tolerance
+                && cross(q, r, centre) > tolerance
+                && cross(r, p, centre) > tolerance
+            {
+                inside += 1;
+                break;
+            }
+        }
+    }
+    bad.len() + inside
+}
+
+fn check_land_covers(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for cover in map.land_covers.iter() {
+        let feature = cover.id.to_string();
+        if cover.kind.trim().is_empty() {
+            issues.push(ValidationIssue::ImplausibleFeature {
+                feature: feature.clone(),
+                detail: "no kind; a land cover is the land being something".into(),
+            });
+        }
+        if let Some(surface) = &cover.draped_on {
+            if !map.tin_surfaces.contains(surface) {
+                issues.push(ValidationIssue::DanglingFeatureReference {
+                    referrer: feature.clone(),
+                    feature: surface.to_string(),
+                });
+            }
+        }
+        if let Some(site) = &cover.site {
+            check_site_membership(
+                map,
+                site,
+                &feature,
+                |entry| entry.land_covers.contains(&cover.id),
+                issues,
+            );
+        }
+    }
+}
+
+/// A feature that names a site has to be one the site lists: the composition is
+/// recorded from both ends, as a building and its parts record it.
+fn check_site_membership(
+    map: &Map,
+    site: &crate::id::SiteId,
+    feature: &str,
+    listed: impl Fn(&crate::site::Site) -> bool,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    match map.sites.get(site) {
+        None => issues.push(ValidationIssue::DanglingFeatureReference {
+            referrer: feature.to_owned(),
+            feature: site.to_string(),
+        }),
+        Some(entry) if !listed(entry) => issues.push(ValidationIssue::ImplausibleFeature {
+            feature: feature.to_owned(),
+            detail: format!("names site {site}, which does not list it"),
+        }),
+        Some(_) => {}
+    }
+}
+
+fn check_sites(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for site in map.sites.iter() {
+        let referrer = site.id.to_string();
+        for cover in &site.land_covers {
+            match map.land_covers.get(cover) {
+                Some(entry) if entry.site.as_ref() == Some(&site.id) => {}
+                Some(_) => issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: cover.to_string(),
+                    detail: format!("listed by {} but does not name it", site.id),
+                }),
+                None => issues.push(ValidationIssue::DanglingFeatureReference {
+                    referrer: referrer.clone(),
+                    feature: cover.to_string(),
+                }),
+            }
+        }
+        for surface in &site.surfaces {
+            // A surface no site owns is the whole map's land, which every site
+            // on it lies on.
+            match map.tin_surfaces.get(surface) {
+                Some(entry) if entry.site.as_ref().is_none_or(|own| own == &site.id) => {}
+                Some(_) => issues.push(ValidationIssue::ImplausibleFeature {
+                    feature: surface.to_string(),
+                    detail: format!("listed by {} but does not name it", site.id),
+                }),
+                None => issues.push(ValidationIssue::DanglingFeatureReference {
+                    referrer: referrer.clone(),
+                    feature: surface.to_string(),
+                }),
+            }
+        }
+        for road in &site.roads {
+            if !map.roads.contains(road) {
+                issues.push(ValidationIssue::DanglingRoadReference {
+                    referrer: referrer.clone(),
+                    road: road.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// A traffic light's housing height and lamp positions are written verbatim, as a
+/// Lanelet2 `height` tag, lamp points and OpenDRIVE `userData`, so a height that is
+/// not a positive length or a lamp that is nowhere would be a malformed file.
+fn check_traffic_lights(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for object in map.objects.iter() {
+        let Some(head) = object.kind.light_head() else {
+            continue;
+        };
+        let mut report = |detail: String| {
+            issues.push(ValidationIssue::ImplausibleTrafficLight {
+                object: object.id.clone(),
+                detail,
+            })
+        };
+        if let Some(height) = head.height {
+            if !height.is_finite() || height <= 0.0 {
+                report(format!(
+                    "a housing {height} m tall; a housing rises above its bottom edge"
+                ));
+            }
+        }
+        for (index, bulb) in head.bulbs.iter().enumerate() {
+            let at = bulb.position;
+            if !at.is_finite() {
+                report(format!(
+                    "lamp {index} is at ({}, {}, {}), which is not a place",
+                    at.x, at.y, at.z
+                ));
+            }
         }
     }
 }
@@ -693,9 +1093,10 @@ fn check_junctions(map: &Map, issues: &mut Vec<ValidationIssue>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::{LaneSpec, MapBuilder, RoadSpec};
+    use crate::builder::{LaneRef, LaneSpec, MapBuilder, RoadSpec};
     use crate::geometry::Point3;
     use crate::id::{BuildingId, BuildingPartId};
+    use crate::semantics::MapObjectKind;
     use crate::topology::Direction;
     use crate::units::PositiveWidth;
 
@@ -1058,5 +1459,119 @@ mod tests {
             "{:?}",
             error.issues
         );
+    }
+    #[test]
+    fn a_traffic_light_has_to_be_a_light_someone_could_build() {
+        use crate::semantics::{LightBulb, LightColor, LightHead};
+
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    lanes(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let light = builder
+            .add_traffic_light(&LaneRef::new(road, 0), LaneEnd::End, 5.0)
+            .unwrap();
+        let mut map = builder.finish().unwrap();
+        map.as_map_mut().objects.get_mut(&light).unwrap().kind = MapObjectKind::TrafficLight {
+            head: LightHead {
+                height: Some(0.0),
+                bulbs: vec![LightBulb {
+                    position: Point3::new(1.0, f64::INFINITY, 5.0),
+                    color: LightColor::Red,
+                    arrow: None,
+                }],
+            },
+        };
+
+        let error = map.validate().unwrap_err();
+        let details: Vec<_> = error
+            .issues
+            .iter()
+            .filter_map(|issue| match issue {
+                ValidationIssue::ImplausibleTrafficLight { object, detail } if *object == light => {
+                    Some(detail.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(details.len(), 2, "{:?}", error.issues);
+        assert!(details[0].contains("0 m tall"), "{details:?}");
+        assert!(details[1].contains("lamp 0"), "{details:?}");
+    }
+}
+
+#[cfg(test)]
+mod terrain_tests {
+    use crate::builder::MapBuilder;
+    use crate::geometry::Point3;
+    use crate::id::TinSurfaceId;
+    use crate::terrain::{Tin, TinSurface};
+
+    fn with(tin: Tin) -> Vec<String> {
+        let mut map = MapBuilder::default().finish().unwrap();
+        let id = TinSurfaceId::new("land");
+        map.as_map_mut()
+            .tin_surfaces
+            .insert(
+                id.clone(),
+                TinSurface {
+                    id,
+                    site: None,
+                    breaklines: Vec::new(),
+                    tin,
+                },
+            )
+            .unwrap();
+        map.issues(Default::default())
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn triangles_that_overlap_without_sharing_an_edge_are_reported() {
+        let p = |x, y| Point3::new(x, y, 0.0);
+        // Two triangles crossing each other, and a third inside the first.
+        let crossing = Tin::new(
+            vec![
+                p(0.0, 0.0),
+                p(10.0, 0.0),
+                p(0.0, 10.0),
+                p(5.0, -2.0),
+                p(12.0, 5.0),
+                p(5.0, 8.0),
+            ],
+            vec![[0, 1, 2], [3, 4, 5]],
+        )
+        .unwrap();
+        assert!(with(crossing).iter().any(|issue| issue.contains("overlap")));
+        let nested = Tin::new(
+            vec![
+                p(0.0, 0.0),
+                p(10.0, 0.0),
+                p(0.0, 10.0),
+                p(1.0, 1.0),
+                p(3.0, 1.0),
+                p(1.0, 3.0),
+            ],
+            vec![[0, 1, 2], [3, 4, 5]],
+        )
+        .unwrap();
+        assert!(with(nested).iter().any(|issue| issue.contains("overlap")));
+        // Two triangles side by side over a shared edge are a surface.
+        let square = Tin::new(
+            vec![p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0), p(0.0, 10.0)],
+            vec![[0, 1, 2], [0, 2, 3]],
+        )
+        .unwrap();
+        let issues = with(square);
+        assert!(issues.is_empty(), "{issues:?}");
     }
 }

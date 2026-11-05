@@ -17,6 +17,8 @@
 //!   crosswalk         → <objects>/<object>
 //!   Building          → <objects>/<object type="building"> with an <outline> per part
 //!   Right of way      → <junction>/<priority>
+//!   Bridge, viaduct   → <objects>/<bridge> on each road it carries
+//!   Tunnel, underpass → <objects>/<tunnel> on each road it carries
 //! ```
 //!
 //! The same table is read the other way by [`read()`]: an OpenDRIVE document becomes
@@ -48,6 +50,23 @@
 //! corner in one frame — the road's, at the building's own station — so the shape
 //! that comes back is the shape that went in.
 //!
+//! # Structures, which OpenDRIVE knows only as stretches of road
+//!
+//! A `<bridge>` or a `<tunnel>` is a range of `s` on one road and a word for what it
+//! is made of — nothing else. The IR's structure is a feature of its own, with an
+//! outline, piers and abutments or portals, and a list of the roads it carries; what
+//! survives the trip is the list, one element per carried stretch, and the words. A
+//! bridge's material picks its `type` (`concrete`, `steel`, `brick` for masonry,
+//! `wood` for timber); a tunnel is `underpass` when it is one and `standard`
+//! otherwise, lit when the IR says it is, and with no daylight inside. The finer
+//! form the schema has no word for — a viaduct or an overpass rather than a bridge,
+//! a covered cutting rather than a bore — goes in a `<userData>` with the code
+//! [`STRUCTURE_FORM_CODE`], which a reader that does not know it passes over. The
+//! element carries the structure's name, when it has one, so the reader can tell
+//! the two stretches one deck carries are one bridge. [`check`] says what is lost: the
+//! outline, the supports and the road's form of way, which OpenDRIVE has no word
+//! for beyond `<type>`.
+//!
 //! Format-specific decisions stay on this side of the boundary. OpenDRIVE's numeric
 //! ids, its insistence that `s` be measured in the xy-plane, and its rule that a
 //! split needs a junction are all handled here; none of them reaches the IR. A lane
@@ -55,12 +74,14 @@
 //! connecting road per movement: see the `splits` module. A connector entered
 //! from two roads, or leaving into two, is written once for each: see `copies`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
 use opendrive::core::additional_data::AdditionalData;
 use opendrive::core::geo_reference::GeoReference;
 use opendrive::core::header::Header;
+use opendrive::core::user_data::UserData;
 use opendrive::core::OpenDrive;
 use opendrive::junction::connection::Connection;
 use opendrive::junction::contact_point::ContactPoint;
@@ -79,6 +100,7 @@ use opendrive::lane::lane_type::LaneType as OdLaneType;
 use opendrive::lane::lanes::Lanes;
 use opendrive::lane::left::Left;
 use opendrive::lane::left_lane::LeftLane;
+use opendrive::lane::material::Material as LaneMaterial;
 use opendrive::lane::offset::Offset as LaneOffset;
 use opendrive::lane::predecessor_successor::PredecessorSuccessor as LanePredecessorSuccessor;
 use opendrive::lane::right::Right;
@@ -89,6 +111,8 @@ use opendrive::lane::road_mark::RoadMark;
 use opendrive::lane::speed::Speed as LaneSpeed;
 use opendrive::lane::width::Width;
 use opendrive::lane::Lane as OdLane;
+use opendrive::object::bridge::Bridge as OdBridge;
+use opendrive::object::bridge_type::BridgeType;
 use opendrive::object::corner::Corner;
 use opendrive::object::corner_local::CornerLocal;
 use opendrive::object::lane_validity::LaneValidity;
@@ -96,6 +120,9 @@ use opendrive::object::objects::Objects;
 use opendrive::object::orientation::{ObjectType, Orientation};
 use opendrive::object::outline::Outline;
 use opendrive::object::outlines::Outlines;
+use opendrive::object::repeat::Repeat;
+use opendrive::object::tunnel::Tunnel as OdTunnel;
+use opendrive::object::tunnel_type::TunnelType;
 use opendrive::object::Object;
 use opendrive::road::country_code::CountryCode;
 use opendrive::road::element_type::ElementType;
@@ -136,13 +163,15 @@ use ll2_projection::utmups;
 use roadgen_core::buildings::{Building, BuildingPart};
 use roadgen_core::geometry::{Curve3, Point3, Sample, Vector3};
 use roadgen_core::id::ObjectId;
-use roadgen_core::id::{BuildingId, JunctionId, LaneId, RoadId};
+use roadgen_core::id::{BuildingId, ConnectionId, JunctionId, LaneId, RoadId, StructureId};
 use roadgen_core::map::{Lane, Map, Projection, Road, TrafficHandedness};
 use roadgen_core::semantics::{
-    LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking, RoadType,
-    TrafficRule,
+    FormOfWay, LaneType, MapObject, MapObjectKind, MarkingColor, ObjectGeometry, RoadMarking,
+    RoadType, TrafficRule,
 };
+use roadgen_core::structure::{StructureKind, StructureMaterial, TunnelForm};
 use roadgen_core::topology::{Direction, LaneEnd, LateralSide, RoadEnd, RoadLinkTarget};
+use roadgen_core::trace::{IrRef, Relation, Trace};
 use roadgen_core::units::GeoOrigin;
 use roadgen_core::validation::ValidatedMap;
 use roadgen_core::GeometryError;
@@ -155,6 +184,7 @@ pub mod controllers;
 mod copies;
 mod error;
 mod loops;
+mod materials;
 pub mod options;
 pub mod read;
 pub mod road_coordinates;
@@ -165,6 +195,9 @@ pub use controllers::{signal_groups, SignalGroup};
 pub use error::{ExportError, ImportError};
 pub use options::{Options, SignalCatalogue, SignalPlacement};
 pub use read::{from_xml, from_xml_with, read, read_with, Imported, ReadOptions};
+
+/// The format name of the traces this crate writes and reads.
+pub const TRACE_FORMAT: &str = "opendrive";
 pub use road_coordinates::RoadPosition;
 
 /// Width of a painted lane marking, metres. OpenDRIVE wants a number; this is the
@@ -187,6 +220,11 @@ const TRAFFIC_LIGHT_SUBTYPE: &str = "-1";
 /// The `subtype` a stop line is written with, on a `roadMark` object — the one
 /// string that tells a reader a stop line from any other paint.
 const STOP_LINE_SUBTYPE: &str = "stopLine";
+
+/// The `<userData>` code a `<bridge>` or `<tunnel>` says its form under —
+/// `viaduct`, `overpass`, `cut_and_cover` — where the schema's `type` has only
+/// the material or `standard`.
+pub const STRUCTURE_FORM_CODE: &str = "structureForm";
 
 /// The number OpenDRIVE gives a lane: positive to the left of the reference line,
 /// negative to the right, counting outwards from 1, with 0 reserved for the centre.
@@ -238,7 +276,48 @@ pub fn to_opendrive(map: &ValidatedMap) -> Result<OpenDrive, ExportError> {
 /// Turns a validated map into an OpenDRIVE document, with what the caller knows
 /// beyond the map. See [`Options`].
 pub fn to_opendrive_with(map: &ValidatedMap, options: &Options) -> Result<OpenDrive, ExportError> {
+    to_opendrive_traced(map, options).map(|(drive, _)| drive)
+}
+
+/// Turns a validated map into an OpenDRIVE document, and says which element of the
+/// document each element of the IR became.
+///
+/// The trace is recorded by the exporter as it writes each element, from the same
+/// numbering, rather than worked out beside it: an element that is left out — an
+/// object with no road to stand on, a junction nothing passes through — is then
+/// left out of the trace too, and the two can never disagree about an id.
+///
+/// A written element is named `<kind>:<local>`:
+///
+/// ```text
+///   road:<id>                               ← Road, exact
+///   lane:<road id>/<section index>/<lane>   ← Lane, exact
+///   junction:<id>                           ← Junction, exact
+///   connection:<junction id>/<id>           ← LaneConnection, merged
+///   signal:<id>                             ← traffic light and sign, exact
+///   object:<id>                             ← stop line, crosswalk and building, exact
+///   outline:<object id>/<outline id>        ← BuildingPart, exact
+///   controller:<id>                         ← traffic light, merged, role "controller"
+///   bridge:<id>, tunnel:<id>                ← Structure, exact, or part when it
+///                                             carries several stretches
+/// ```
+///
+/// A lane's number is unique only within its `<laneSection>`, which is why the
+/// section's index is part of its name.
+pub fn to_opendrive_traced(
+    map: &ValidatedMap,
+    options: &Options,
+) -> Result<(OpenDrive, Trace), ExportError> {
     Exporter::new(map, options).run()
+}
+
+/// Which element of the document each element of the IR becomes, without keeping
+/// the document. See [`to_opendrive_traced`].
+///
+/// Takes the [`Options`] because they decide what is written: a signal placed where
+/// no road can locate it is left out of the file, and so out of the trace.
+pub fn trace(map: &ValidatedMap, options: &Options) -> Result<Trace, ExportError> {
+    to_opendrive_traced(map, options).map(|(_, trace)| trace)
 }
 
 /// Turns a validated map into OpenDRIVE XML.
@@ -248,9 +327,20 @@ pub fn to_xml(map: &ValidatedMap) -> Result<String, ExportError> {
 
 /// Turns a validated map into OpenDRIVE XML, with [`Options`].
 pub fn to_xml_with(map: &ValidatedMap, options: &Options) -> Result<String, ExportError> {
-    to_opendrive_with(map, options)?
+    to_xml_traced(map, options).map(|(xml, _)| xml)
+}
+
+/// Turns a validated map into OpenDRIVE XML, with its [`Trace`]. The trace names no
+/// files, since none was written.
+pub fn to_xml_traced(
+    map: &ValidatedMap,
+    options: &Options,
+) -> Result<(String, Trace), ExportError> {
+    let (drive, trace) = to_opendrive_traced(map, options)?;
+    let xml = drive
         .to_xml_string()
-        .map_err(|error| ExportError::Serialization(error.to_string()))
+        .map_err(|error| ExportError::Serialization(error.to_string()))?;
+    Ok((xml, trace))
 }
 
 /// Writes a validated map to an `.xodr` file.
@@ -264,9 +354,26 @@ pub fn write_with(
     path: impl AsRef<Path>,
     options: &Options,
 ) -> Result<(), ExportError> {
-    let xml = to_xml_with(map, options)?;
+    write_with_traced(map, path, options).map(|_| ())
+}
+
+/// Writes a validated map to an `.xodr` file, and returns its [`Trace`].
+pub fn write_traced(map: &ValidatedMap, path: impl AsRef<Path>) -> Result<Trace, ExportError> {
+    write_with_traced(map, path, &Options::default())
+}
+
+/// Writes a validated map to an `.xodr` file, with [`Options`], and returns its
+/// [`Trace`], which names the file.
+pub fn write_with_traced(
+    map: &ValidatedMap,
+    path: impl AsRef<Path>,
+    options: &Options,
+) -> Result<Trace, ExportError> {
+    let (xml, mut trace) = to_xml_traced(map, options)?;
     std::fs::write(path.as_ref(), xml)
-        .map_err(|error| ExportError::Io(format!("{}: {error}", path.as_ref().display())))
+        .map_err(|error| ExportError::Io(format!("{}: {error}", path.as_ref().display())))?;
+    trace.files.push(path.as_ref().to_path_buf());
+    Ok(trace)
 }
 
 /// A `<geoReference>` that names the map's origin as `+lat_0`/`+lon_0`, whatever the
@@ -282,6 +389,44 @@ pub fn write_with(
 /// convergence.
 pub fn origin_proj_string(map: &ValidatedMap) -> String {
     proj_string_about(map.metadata.origin)
+}
+
+/// The PROJ string that describes the map's metres: the `<geoReference>` the
+/// OpenDRIVE export writes unless [`Options::geo_reference`] names another, and the
+/// one any other export that georeferences the same coordinates should carry.
+///
+/// PROJ has no exact local east/north/up projection, so a local-Cartesian map is
+/// described as a transverse Mercator at the same origin with unit scale — which
+/// agrees with it to well under a millimetre over the size of a generated map,
+/// and is what consumers of OpenDRIVE expect to find here. A UTM map's metres are
+/// UTM eastings and northings less the origin's, so it is the zone's transverse
+/// Mercator with the origin's easting and northing folded into the false origin:
+/// a bare `+proj=utm` would place the file's `(0, 0)` on the equator.
+pub fn geo_reference(map: &Map) -> Result<String, ExportError> {
+    let origin = map.metadata.origin;
+    Ok(match map.metadata.projection {
+        // MGRS changes how the *Lanelet2* export reports a node's metric
+        // position; the map's own coordinates are still metres about its origin,
+        // so this file describes them the same way either way.
+        Projection::LocalCartesian | Projection::Mgrs => proj_string_about(origin),
+        Projection::Utm => {
+            let (zone, northern, easting, northing) =
+                utmups::forward(origin.latitude(), origin.longitude())
+                    .map_err(|error| ExportError::Projection(error.message().to_owned()))?;
+            // UTM is a transverse Mercator on the zone's central meridian at
+            // scale 0.9996 with a false easting of 500 km and, south of the
+            // equator, a false northing of 10 000 km. Subtracting the origin's
+            // easting and northing from those false values makes the projection
+            // hand back the file's own metres.
+            let false_northing = if northern { 0.0 } else { 10_000_000.0 };
+            format!(
+                "+proj=tmerc +lat_0=0 +lon_0={} +k=0.9996 +x_0={} +y_0={} +datum=WGS84 +units=m +no_defs",
+                utmups::central_meridian(zone),
+                500_000.0 - easting,
+                false_northing - northing
+            )
+        }
+    })
 }
 
 fn proj_string_about(origin: GeoOrigin) -> String {
@@ -335,6 +480,46 @@ pub fn lane_id(map: &ValidatedMap, lane: &LaneId) -> Option<(String, i64)> {
 /// keeps the format's rules on the format's side of the boundary.
 pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = Vec::new();
+    if !map.tin_surfaces.is_empty() || !map.land_covers.is_empty() {
+        problems.push(format!(
+            "OpenDRIVE describes the road's own elevation and nothing of the ground beside it, so \
+             the map's {} TIN surfaces and {} land covers are not written",
+            map.tin_surfaces.len(),
+            map.land_covers.len()
+        ));
+    }
+
+    // A `<bridge>` or `<tunnel>` is a range of `s` and a type. The structure's own
+    // shape — the deck or bore outline, the piers and abutments — has nowhere to go,
+    // and a reader that wants it lays it out again from the road.
+    if !map.structures.is_empty() {
+        let supports: usize = map
+            .structures
+            .iter()
+            .filter_map(|structure| structure.kind.bridge())
+            .map(|bridge| bridge.supports.len())
+            .sum();
+        problems.push(format!(
+            "a <bridge> or <tunnel> is a stretch of road and a type, so the {} structures \
+             are written without their outlines or their {supports} piers and abutments, \
+             and a structure carrying several roads is written once on each",
+            map.structures.len()
+        ));
+    }
+    // What part a road plays in the network is not where it is: `<type>` says the
+    // second and nothing in the schema says the first.
+    let formed = map
+        .roads
+        .iter()
+        .filter(|road| road.form != FormOfWay::Unspecified)
+        .count();
+    if formed > 0 {
+        problems.push(format!(
+            "OpenDRIVE has no form of way, only the road's <type>, so whether each of the \
+             {formed} roads that say so is a motorway carriageway, a slip road or a \
+             service road is not written"
+        ));
+    }
 
     // An `<outline>` is a ring of corners with a height each. There is no ridge in
     // it, so a roof that has one cannot be written and the volume it encloses is all
@@ -399,6 +584,9 @@ struct Numbering {
     objects: HashMap<ObjectId, String>,
     /// Buildings share the object id space, numbered after the furniture.
     buildings: HashMap<BuildingId, String>,
+    /// Each stretch a structure carries is an element of its own, numbered after
+    /// the buildings: the structure, and which of its stretches.
+    structures: HashMap<(StructureId, usize), String>,
 }
 
 impl Numbering {
@@ -429,12 +617,21 @@ impl Numbering {
         for (index, building) in map.buildings.iter().enumerate() {
             buildings.insert(building.id.clone(), (map.objects.len() + index).to_string());
         }
+        let mut structures = HashMap::new();
+        let mut next = map.objects.len() + map.buildings.len();
+        for structure in map.structures.iter() {
+            for index in 0..structure.carries.len() {
+                structures.insert((structure.id.clone(), index), next.to_string());
+                next += 1;
+            }
+        }
         Numbering {
             roads,
             junctions,
             lanes,
             objects,
             buildings,
+            structures,
         }
     }
 }
@@ -454,6 +651,12 @@ struct Exporter<'a> {
     splits: Splits<'a>,
     /// Connectors written again for the other roads they join.
     copies: Copies,
+    /// What has been written so far, recorded where each element is built.
+    ///
+    /// The builders all borrow the exporter's tables and hand back elements, and
+    /// most of them are `&self` for it; a cell lets each one note what it wrote
+    /// without threading a `&mut Trace` through every one of them.
+    trace: RefCell<Trace>,
 }
 
 impl<'a> Exporter<'a> {
@@ -474,10 +677,21 @@ impl<'a> Exporter<'a> {
             buildings,
             options,
             map,
+            trace: RefCell::new(Trace::new(TRACE_FORMAT)),
         }
     }
 
-    fn run(self) -> Result<OpenDrive, ExportError> {
+    /// Notes that `ir` was written as `local`.
+    fn record(&self, ir: impl Into<IrRef>, local: String, relation: Relation) {
+        self.trace.borrow_mut().link(ir, local, relation);
+    }
+
+    /// Notes that `ir` was written as `local`, which plays `role` for it.
+    fn record_as(&self, ir: impl Into<IrRef>, local: String, relation: Relation, role: &str) {
+        self.trace.borrow_mut().link_as(ir, local, relation, role);
+    }
+
+    fn run(self) -> Result<(OpenDrive, Trace), ExportError> {
         let mut drive = OpenDrive {
             header: self.header()?,
             road: Vec::with_capacity(self.map.roads.len()),
@@ -535,6 +749,27 @@ impl<'a> Exporter<'a> {
             let Ok(control) = Vec1::try_from_vec(control) else {
                 continue;
             };
+            // A light has a controller of its own in no format, so it is one of
+            // the several the `<controller>` switches together.
+            for light in &group.lights {
+                self.record_as(
+                    light.clone(),
+                    format!("controller:{}", group.id),
+                    Relation::Merged,
+                    "controller",
+                );
+            }
+            // The rule the group was made from is the controller itself: the
+            // caller saying these lights are one phase, which is what a
+            // `<controller>` says. Lights no rule names have none.
+            if let Some(rule) = group.rule {
+                self.record_as(
+                    IrRef::Rule(rule),
+                    format!("controller:{}", group.id),
+                    Relation::Exact,
+                    "controller",
+                );
+            }
             drive.controller.push(Controller {
                 control,
                 id: group.id.clone(),
@@ -543,7 +778,7 @@ impl<'a> Exporter<'a> {
                 additional_data: AdditionalData::default(),
             });
         }
-        Ok(drive)
+        Ok((drive, self.trace.into_inner()))
     }
 
     fn header(&self) -> Result<Header, ExportError> {
@@ -590,43 +825,13 @@ impl<'a> Exporter<'a> {
     /// The coordinates in the file are always the map's own metres about its origin,
     /// whatever the projection — that is what keeps this file in the same frame as
     /// the SUMO, ClipGT, GPUDrive and CARLA exports — so the string here has to
-    /// describe *those* metres, not the frame they were derived from.
-    ///
-    /// PROJ has no exact local east/north/up projection, so a local-Cartesian map is
-    /// described as a transverse Mercator at the same origin with unit scale — which
-    /// agrees with it to well under a millimetre over the size of a generated map,
-    /// and is what consumers of OpenDRIVE expect to find here. A UTM map's metres are
-    /// UTM eastings and northings less the origin's, so it is the zone's transverse
-    /// Mercator with the origin's easting and northing folded into the false origin:
-    /// a bare `+proj=utm` would place the file's `(0, 0)` on the equator.
+    /// describe *those* metres, not the frame they were derived from: the caller's
+    /// own string, or [`geo_reference`]'s.
     fn proj_string(&self) -> Result<String, ExportError> {
-        if let Some(reference) = &self.options.geo_reference {
-            return Ok(reference.clone());
+        match &self.options.geo_reference {
+            Some(reference) => Ok(reference.clone()),
+            None => geo_reference(self.map),
         }
-        let origin = self.map.metadata.origin;
-        Ok(match self.map.metadata.projection {
-            // MGRS changes how the *Lanelet2* export reports a node's metric
-            // position; the map's own coordinates are still metres about its origin,
-            // so this file describes them the same way either way.
-            Projection::LocalCartesian | Projection::Mgrs => proj_string_about(origin),
-            Projection::Utm => {
-                let (zone, northern, easting, northing) =
-                    utmups::forward(origin.latitude(), origin.longitude())
-                        .map_err(|error| ExportError::Projection(error.message().to_owned()))?;
-                // UTM is a transverse Mercator on the zone's central meridian at
-                // scale 0.9996 with a false easting of 500 km and, south of the
-                // equator, a false northing of 10 000 km. Subtracting the origin's
-                // easting and northing from those false values makes the projection
-                // hand back the file's own metres.
-                let false_northing = if northern { 0.0 } else { 10_000_000.0 };
-                format!(
-                    "+proj=tmerc +lat_0=0 +lon_0={} +k=0.9996 +x_0={} +y_0={} +datum=WGS84 +units=m +no_defs",
-                    utmups::central_meridian(zone),
-                    500_000.0 - easting,
-                    false_northing - northing
-                )
-            }
-        })
     }
 
     fn samples(&self, road: &Road) -> Result<Vec<Sample>, GeometryError> {
@@ -636,8 +841,10 @@ impl<'a> Exporter<'a> {
     fn road(&self, road: &Road) -> Result<OdRoad, ExportError> {
         let samples = self.samples(road)?;
         let length = road.horizontal_length()?;
+        let id = self.road_id(&road.id)?;
+        self.record(road.id.clone(), format!("road:{id}"), Relation::Exact);
         Ok(OdRoad {
-            id: self.road_id(&road.id)?.to_owned(),
+            id: id.to_owned(),
             junction: match &road.junction {
                 Some(junction) => self.junction_id(junction)?.to_owned(),
                 // OpenDRIVE spells "not part of a junction" as -1.
@@ -932,6 +1139,10 @@ impl<'a> Exporter<'a> {
         left.sort_by_key(|lane| std::cmp::Reverse(lane.ordinal));
         right.sort_by_key(|lane| lane.ordinal);
 
+        for lane in left.iter().chain(&right) {
+            self.record(lane.id.clone(), self.lane_ref(lane)?, Relation::Exact);
+        }
+
         let centre_marking = right
             .first()
             .map(|lane| (lane.left_marking.marking, lane.left_marking.color))
@@ -980,6 +1191,34 @@ impl<'a> Exporter<'a> {
         })
     }
 
+    /// `<material>` for a lane: its road's pavement over the lane's stretch, each
+    /// change rebased onto the lane section the way `<width>` is. Empty for a road
+    /// whose pavement nobody stated, which is what this writer always wrote.
+    fn materials(&self, lane: &Lane) -> Vec<LaneMaterial> {
+        let Some(road) = self.map.road(&lane.road) else {
+            return Vec::new();
+        };
+        let spans = road.pavement.spans();
+        let (from, to) = lane.station_range;
+        spans
+            .iter()
+            .enumerate()
+            .filter(|&(index, &(start, _))| {
+                let end = spans.get(index + 1).map_or(f64::INFINITY, |next| next.0);
+                start < to && end > from
+            })
+            .map(|(_, &(start, pavement))| {
+                let (friction, roughness) = materials::nominal(pavement);
+                LaneMaterial {
+                    friction,
+                    roughness: Some(roughness),
+                    s_offset: Length::new::<meter>((start - from).max(0.0)),
+                    surface: Some(pavement.surface_str().to_owned()),
+                }
+            })
+            .collect()
+    }
+
     fn lane(&self, lane: &Lane) -> Result<OdLane, ExportError> {
         // The `<roadMark>` of a lane describes its outer border — the one away from
         // the reference line.
@@ -1008,7 +1247,7 @@ impl<'a> Exporter<'a> {
                 })
                 .collect(),
             road_mark: vec![road_mark(outer.marking, outer.color)],
-            material: Vec::new(),
+            material: self.materials(lane),
             speed: lane
                 .speed_limit
                 .map(|limit| LaneSpeed {
@@ -1033,6 +1272,10 @@ impl<'a> Exporter<'a> {
     /// OpenDRIVE expresses those in the `<junction>` element, and duplicating them
     /// on the lane would claim a continuation that does not exist. The connecting
     /// road's own lanes do link to the lanes at either side of it.
+    ///
+    /// Each IR connection written here has no element of its own — it is the
+    /// successor of one lane and the predecessor of the other — so it is traced as
+    /// `collapsed` into both lanes, with the side of the link as the role.
     fn lane_link(&self, lane: &Lane) -> Result<Option<LaneLink>, ExportError> {
         let Some(road) = self.map.road(&lane.road) else {
             return Ok(None);
@@ -1070,6 +1313,10 @@ impl<'a> Exporter<'a> {
         };
         let mut predecessor = Vec::new();
         let mut successor = Vec::new();
+        let local = self.lane_ref(lane)?;
+        let record = |connection: &ConnectionId, role: &str| {
+            self.record_as(connection.clone(), local.clone(), Relation::Collapsed, role);
+        };
 
         let ends = self
             .map
@@ -1097,10 +1344,12 @@ impl<'a> Exporter<'a> {
             let entry = LanePredecessorSuccessor {
                 id: self.lane_id(&other.id)?,
             };
-            match end {
-                LaneEnd::End => successor.push(entry),
-                LaneEnd::Start => predecessor.push(entry),
-            }
+            let (links, role) = match end {
+                LaneEnd::End => (&mut successor, "successor"),
+                LaneEnd::Start => (&mut predecessor, "predecessor"),
+            };
+            links.push(entry);
+            record(&connection.id, role);
         }
 
         if predecessor.is_empty() && successor.is_empty() {
@@ -1123,11 +1372,14 @@ impl<'a> Exporter<'a> {
         // that is one connection; a connector that was read from a document may be
         // several lanes, entered from either end.
         let mut connections = Vec::new();
+        // The IR's movements each `<connection>` carries, by the connection's id.
+        let mut movements: Vec<(String, Vec<ConnectionId>)> = Vec::new();
         for connector_id in &entry.connecting_roads {
             let Some(connector) = self.map.road(connector_id) else {
                 continue;
             };
-            let mut groups: Vec<((RoadId, LaneEnd), Vec<JunctionLaneLink>)> = Vec::new();
+            type Group = ((RoadId, LaneEnd), Vec<JunctionLaneLink>, Vec<ConnectionId>);
+            let mut groups: Vec<Group> = Vec::new();
             for connector_lane in &connector.lanes {
                 for connection in self.map.connections_to(connector_lane) {
                     let Some(from) = self.map.lanes.get(&connection.from.lane) else {
@@ -1142,13 +1394,16 @@ impl<'a> Exporter<'a> {
                         from: self.lane_id(&connection.from.lane)?,
                         to: self.lane_id(connector_lane)?,
                     };
-                    match groups.iter_mut().find(|(held, _)| *held == key) {
-                        Some((_, links)) => links.push(link),
-                        None => groups.push((key, vec![link])),
+                    match groups.iter_mut().find(|(held, _, _)| *held == key) {
+                        Some((_, links, ids)) => {
+                            links.push(link);
+                            ids.push(connection.id.clone());
+                        }
+                        None => groups.push((key, vec![link], vec![connection.id.clone()])),
                     }
                 }
             }
-            for ((incoming, contact), lane_link) in groups {
+            for ((incoming, contact), lane_link, ids) in groups {
                 let end = match contact {
                     LaneEnd::Start => RoadEnd::Start,
                     LaneEnd::End => RoadEnd::End,
@@ -1163,9 +1418,14 @@ impl<'a> Exporter<'a> {
                     .collect();
                 let linked = matches!(connector.link.at(end),
                     Some(RoadLinkTarget::Road(target)) if target.road == incoming);
-                let mut targets: Vec<(String, Vec<JunctionLaneLink>)> = Vec::new();
+                type Target = (String, Vec<JunctionLaneLink>, Vec<ConnectionId>);
+                let mut targets: Vec<Target> = Vec::new();
                 if linked || copies.is_empty() {
-                    targets.push((self.road_id(connector_id)?.to_owned(), lane_link.clone()));
+                    targets.push((
+                        self.road_id(connector_id)?.to_owned(),
+                        lane_link.clone(),
+                        ids.clone(),
+                    ));
                 }
                 for (index, copy) in copies {
                     let carried: Vec<i64> = connector
@@ -1175,16 +1435,20 @@ impl<'a> Exporter<'a> {
                         .filter(|lane| copy.carries(self.map, lane))
                         .map(|lane| self.lane_id(&lane.id))
                         .collect::<Result<_, _>>()?;
-                    let links: Vec<JunctionLaneLink> = lane_link
-                        .iter()
-                        .filter(|link| carried.contains(&link.to))
-                        .cloned()
-                        .collect();
+                    let (links, carried_ids): (Vec<JunctionLaneLink>, Vec<ConnectionId>) =
+                        lane_link
+                            .iter()
+                            .zip(&ids)
+                            .filter(|(link, _)| carried.contains(&link.to))
+                            .map(|(link, id)| (link.clone(), id.clone()))
+                            .unzip();
                     if !links.is_empty() {
-                        targets.push((self.copy_id(index), links));
+                        targets.push((self.copy_id(index), links, carried_ids));
                     }
                 }
-                for (connecting_road, lane_link) in targets {
+                for (connecting_road, lane_link, ids) in targets {
+                    let id = connections.len().to_string();
+                    movements.push((id.clone(), ids));
                     connections.push(Connection {
                         predecessor: None,
                         successor: None,
@@ -1194,7 +1458,7 @@ impl<'a> Exporter<'a> {
                             LaneEnd::Start => ContactPoint::Start,
                             LaneEnd::End => ContactPoint::End,
                         }),
-                        id: connections.len().to_string(),
+                        id,
                         incoming_road: Some(self.road_id(&incoming)?.to_owned()),
                         linked_road: None,
                         r#type: None,
@@ -1217,6 +1481,23 @@ impl<'a> Exporter<'a> {
             // A junction with nothing through it is not an OpenDRIVE junction.
             return Ok(None);
         };
+        let junction_id = self.junction_id(junction)?;
+        self.record(
+            junction.clone(),
+            format!("junction:{junction_id}"),
+            Relation::Exact,
+        );
+        // A `<connection>` is every lane link from one road into one end of one
+        // connector, so each IR movement is one of the several it holds.
+        for (id, ids) in movements {
+            for movement in ids {
+                self.record(
+                    movement,
+                    format!("connection:{junction_id}/{id}"),
+                    Relation::Merged,
+                );
+            }
+        }
         Ok(Some(OdJunction {
             connection,
             priority: self.priorities(junction)?,
@@ -1231,7 +1512,7 @@ impl<'a> Exporter<'a> {
                 })
                 .collect(),
             surface: None,
-            id: self.junction_id(junction)?.to_owned(),
+            id: junction_id.to_owned(),
             main_road: None,
             name: entry.name.clone(),
             orientation: None,
@@ -1373,6 +1654,8 @@ impl<'a> Exporter<'a> {
                     z: Length::new::<meter>(placement.position.z),
                 })
             });
+            let id = self.object_id(&object.id)?;
+            self.record(object.id.clone(), format!("signal:{id}"), Relation::Exact);
             signals.push(Signal {
                 validity: self.validity(object, road)?,
                 dependency: Vec::new(),
@@ -1382,13 +1665,14 @@ impl<'a> Exporter<'a> {
                 country_revision: None,
                 dynamic,
                 // A light's housing, up from the bottom edge `zOffset` stands at.
-                height: match &object.kind {
-                    MapObjectKind::TrafficLight { head } => head.height.map(Length::new::<meter>),
-                    _ => None,
-                },
+                height: object
+                    .kind
+                    .light_head()
+                    .and_then(|head| head.height)
+                    .map(Length::new::<meter>),
                 // Typed as a length by the schema crate; the attribute is radians.
                 h_offset: h_offset.map(Length::new::<meter>),
-                id: self.object_id(&object.id)?.to_owned(),
+                id: id.to_owned(),
                 name: Some(object.id.to_string()),
                 orientation: self.orientation(object),
                 pitch: None,
@@ -1403,10 +1687,10 @@ impl<'a> Exporter<'a> {
                 width: (placement.is_none() && width > 0.0).then(|| Length::new::<meter>(width)),
                 z_offset: Length::new::<meter>(stands.height),
                 additional_data: AdditionalData {
-                    user_data: match &object.kind {
-                        MapObjectKind::TrafficLight { head } => bulbs::to_user_data(&head.bulbs),
-                        _ => Vec::new(),
-                    },
+                    user_data: object
+                        .kind
+                        .light_head()
+                        .map_or_else(Vec::new, |head| bulbs::to_user_data(&head.bulbs)),
                     ..AdditionalData::default()
                 },
             });
@@ -1558,8 +1842,99 @@ impl<'a> Exporter<'a> {
                         additional_data: AdditionalData::default(),
                     }
                 }
+                // A berm or a rail runs along the road, so it is a continuous
+                // `<repeat>` — distance zero — from one end of its band to the other,
+                // as wide as the band and as high as the barrier stands.
+                MapObjectKind::Barrier { kind, height, .. } => {
+                    let ObjectGeometry::Band { left, right } = &object.geometry else {
+                        continue;
+                    };
+                    let at = |point: Point3| road_coordinates::locate(self.map, road, point);
+                    let (Some(start_left), Some(start_right), Some(end_left), Some(end_right)) = (
+                        at(left.start_point()),
+                        at(right.start_point()),
+                        at(left.end_point()),
+                        at(right.end_point()),
+                    ) else {
+                        continue;
+                    };
+                    let mut start = (start_left.s + start_right.s) / 2.0;
+                    let mut end = (end_left.s + end_right.s) / 2.0;
+                    let mut t = [
+                        (start_left.t + start_right.t) / 2.0,
+                        (end_left.t + end_right.t) / 2.0,
+                    ];
+                    let mut width = [
+                        (start_left.t - start_right.t).abs(),
+                        (end_left.t - end_right.t).abs(),
+                    ];
+                    let mut z = [
+                        (start_left.height + start_right.height) / 2.0,
+                        (end_left.height + end_right.height) / 2.0,
+                    ];
+                    // A band drawn against the road's direction still starts at the
+                    // lower `s`, which is where a repeat counts from.
+                    if end < start {
+                        std::mem::swap(&mut start, &mut end);
+                        t.swap(0, 1);
+                        width.swap(0, 1);
+                        z.swap(0, 1);
+                    }
+                    let metres = Length::new::<meter>;
+                    Object {
+                        dynamic: Some(false),
+                        hdg: None,
+                        height: Some(metres(*height)),
+                        id: self.object_id(&object.id)?.to_owned(),
+                        length: Some(metres(end - start)),
+                        name: Some(object.id.to_string()),
+                        orientation: Some(Orientation::None),
+                        perp_to_road: None,
+                        pitch: None,
+                        radius: None,
+                        roll: None,
+                        s: metres(start),
+                        subtype: Some(kind.clone()),
+                        t: metres(t[0]),
+                        r#type: Some(ObjectType::Barrier),
+                        valid_length: None,
+                        width: Some(metres(width[0])),
+                        z_offset: metres(z[0]),
+                        repeat: vec![Repeat {
+                            distance: metres(0.0),
+                            height_end: metres(*height),
+                            height_start: metres(*height),
+                            length: metres(end - start),
+                            length_end: None,
+                            length_start: None,
+                            radius_end: None,
+                            radius_start: None,
+                            s: metres(start),
+                            t_end: metres(t[1]),
+                            t_start: metres(t[0]),
+                            width_end: Some(metres(width[1])),
+                            width_start: Some(metres(width[0])),
+                            z_offset_end: Some(metres(z[1])),
+                            z_offset_start: Some(metres(z[0])),
+                        }],
+                        outline: None,
+                        outlines: None,
+                        material: Vec::new(),
+                        validity: self.validity(object, road)?,
+                        parking_space: None,
+                        markings: None,
+                        borders: None,
+                        surface: None,
+                        additional_data: AdditionalData::default(),
+                    }
+                }
                 _ => continue,
             };
+            self.record(
+                object.id.clone(),
+                format!("object:{}", entry.id),
+                Relation::Exact,
+            );
             objects.push(entry);
         }
         for building in self.buildings.get(&road.id).into_iter().flatten() {
@@ -1567,16 +1942,111 @@ impl<'a> Exporter<'a> {
                 objects.push(entry);
             }
         }
-        if objects.is_empty() {
+        let (tunnel, bridge) = self.structures(road)?;
+        if objects.is_empty() && tunnel.is_empty() && bridge.is_empty() {
             return Ok(None);
         }
         Ok(Some(Objects {
             object: objects,
             object_reference: Vec::new(),
-            tunnel: Vec::new(),
-            bridge: Vec::new(),
+            tunnel,
+            bridge,
             additional_data: AdditionalData::default(),
         }))
+    }
+
+    /// The `<tunnel>`s and `<bridge>`s on a road: one for every stretch of it a
+    /// structure carries, in the order the road meets them.
+    ///
+    /// The element is the stretch, not the structure. A deck that carries both
+    /// carriageways of a motorway is two `<bridge>`s, one on each road, each with
+    /// the structure's name — which is what the reader goes by to put them back
+    /// together. A structure with no name is written without one: its IR id is a
+    /// made-up one, and a reader that took it for a name would make up another
+    /// from it.
+    ///
+    /// Each element is traced to its structure as `bridge:<id>` or `tunnel:<id>`:
+    /// exactly, when the structure carries this one stretch, or as a part of it when
+    /// it carries several and each is an element of its own.
+    fn structures(&self, road: &Road) -> Result<(Vec<OdTunnel>, Vec<OdBridge>), ExportError> {
+        let (mut tunnels, mut bridges) = (Vec::new(), Vec::new());
+        for span in road.structure.spans() {
+            let Some(structure) = self.map.structures.get(&span.structure) else {
+                continue;
+            };
+            let index = structure
+                .carries
+                .iter()
+                .position(|carried| {
+                    carried.road == road.id && (carried.from - span.from).abs() < 1e-6
+                })
+                .unwrap_or(0);
+            let id = self
+                .numbering
+                .structures
+                .get(&(structure.id.clone(), index))
+                .cloned()
+                .ok_or_else(|| ExportError::Unknown(structure.id.to_string()))?;
+            let relation = if structure.carries.len() > 1 {
+                Relation::Part
+            } else {
+                Relation::Exact
+            };
+            let kind = if structure.kind.bridge().is_some() {
+                "bridge"
+            } else {
+                "tunnel"
+            };
+            self.record(structure.id.clone(), format!("{kind}:{id}"), relation);
+            let s = Length::new::<meter>(span.from);
+            let length = Length::new::<meter>(span.to - span.from);
+            let name = structure.name.clone();
+            let additional_data = AdditionalData {
+                user_data: vec![UserData {
+                    code: STRUCTURE_FORM_CODE.to_owned(),
+                    value: Some(structure.kind.form().to_owned()),
+                    elements: Vec::new(),
+                }],
+                ..AdditionalData::default()
+            };
+            match &structure.kind {
+                StructureKind::Bridge(bridge) => bridges.push(OdBridge {
+                    id,
+                    length,
+                    name,
+                    s,
+                    r#type: match bridge.material {
+                        StructureMaterial::Concrete => BridgeType::Concrete,
+                        StructureMaterial::Steel => BridgeType::Steel,
+                        StructureMaterial::Masonry => BridgeType::Brick,
+                        StructureMaterial::Timber => BridgeType::Wood,
+                    },
+                    validity: Vec::new(),
+                    additional_data: additional_data.clone(),
+                }),
+                StructureKind::Tunnel(tunnel) => tunnels.push(OdTunnel {
+                    // How much daylight reaches the road, 0 to 1. A bored tunnel and
+                    // a covered cutting are both closed overhead; an underpass is
+                    // short enough that the light at its mouths reaches in.
+                    daylight: Some(match tunnel.form {
+                        TunnelForm::Underpass => 0.5,
+                        TunnelForm::Bored | TunnelForm::CutAndCover => 0.0,
+                    }),
+                    id,
+                    length,
+                    lighting: Some(if tunnel.lighting { 1.0 } else { 0.0 }),
+                    name,
+                    s,
+                    r#type: match tunnel.form {
+                        TunnelForm::Underpass => TunnelType::Underpass,
+                        TunnelForm::Bored | TunnelForm::CutAndCover => TunnelType::Standard,
+                    },
+                    validity: Vec::new(),
+                    additional_data,
+                }),
+            }
+        }
+        Ok((tunnels, bridges))
     }
 
     /// `<priority>` entries for a junction, from the map's right-of-way rules.
@@ -1608,7 +2078,7 @@ impl<'a> Exporter<'a> {
         };
 
         let mut priorities = Vec::new();
-        for rule in &self.map.rules {
+        for (index, rule) in self.map.rules.iter().enumerate() {
             let TrafficRule::RightOfWay {
                 right_of_way,
                 yielding,
@@ -1624,6 +2094,7 @@ impl<'a> Exporter<'a> {
                 ids.extend(self.copies.of(road).map(|(index, _)| self.copy_id(index)));
                 Ok(ids)
             };
+            let before = priorities.len();
             for high in connectors_for(right_of_way) {
                 for low in connectors_for(yielding) {
                     for high in written(high)? {
@@ -1635,6 +2106,17 @@ impl<'a> Exporter<'a> {
                         }
                     }
                 }
+            }
+            // A `<priority>` has no id of its own, so the rule is traced to the
+            // junction that carries its entries, alongside whatever other rules the
+            // junction carries.
+            if priorities.len() > before {
+                self.record_as(
+                    IrRef::Rule(index),
+                    format!("junction:{}", self.junction_id(junction)?),
+                    Relation::Merged,
+                    "priority",
+                );
             }
         }
         Ok(priorities)
@@ -1685,6 +2167,7 @@ impl<'a> Exporter<'a> {
         let pivot = plan(centre);
 
         let mut outlines = Vec::with_capacity(parts.len());
+        let mut written = Vec::with_capacity(parts.len());
         for (index, part) in parts.iter().enumerate() {
             let corners: Vec<Corner> = part
                 .solid
@@ -1711,6 +2194,7 @@ impl<'a> Exporter<'a> {
             let Ok(choice) = Vec1::try_from_vec(corners) else {
                 continue;
             };
+            written.push((&part.id, index));
             outlines.push(Outline {
                 closed: Some(true),
                 fill_type: None,
@@ -1724,6 +2208,15 @@ impl<'a> Exporter<'a> {
         let Ok(outline) = Vec1::try_from_vec(outlines) else {
             return Ok(None);
         };
+        let id = self.building_id(&building.id)?;
+        self.record(building.id.clone(), format!("object:{id}"), Relation::Exact);
+        for (part, index) in written {
+            self.record(
+                part.clone(),
+                format!("outline:{id}/{index}"),
+                Relation::Exact,
+            );
+        }
 
         let top = parts
             .iter()
@@ -1738,7 +2231,7 @@ impl<'a> Exporter<'a> {
             dynamic: Some(false),
             hdg: Some(Angle::new::<radian>(0.0)),
             height: Some(Length::new::<meter>(top - ground)),
-            id: self.building_id(&building.id)?.to_owned(),
+            id: id.to_owned(),
             length: None,
             name: Some(building.id.to_string()),
             orientation: Some(Orientation::None),
@@ -2184,6 +2677,16 @@ impl<'a> Exporter<'a> {
             .get(junction)
             .map(String::as_str)
             .ok_or_else(|| ExportError::Unknown(junction.to_string()))
+    }
+
+    /// The trace's name for a written lane: its road, lane section and lane id.
+    fn lane_ref(&self, lane: &Lane) -> Result<String, ExportError> {
+        Ok(format!(
+            "lane:{}/{}/{}",
+            self.road_id(&lane.road)?,
+            lane.section,
+            self.lane_id(&lane.id)?
+        ))
     }
 
     fn lane_id(&self, lane: &LaneId) -> Result<i64, ExportError> {

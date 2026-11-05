@@ -262,7 +262,14 @@ fn traffic_control_arrives_where_the_ir_put_it() {
 
     let lights = layer(directory.path(), &clip, "traffic_light");
     assert_eq!(lights.len(), 1);
-    assert!(lights[0].point("center").distance_to(centre) < 1e-9);
+    // The bar is the housing's bottom edge: the 1 m box stands on it, its centre
+    // half its height above the bar.
+    let center = lights[0].point("center");
+    assert!((center.distance_to(centre) - 0.5).abs() < 1e-9);
+    assert!(
+        (center.z - centre.z - 0.5).abs() < 1e-6,
+        "{center:?} over {centre:?}"
+    );
     // Five metres up the road's normal, and that height is in the file.
     assert!(lights[0].point("center").z > 4.9);
 

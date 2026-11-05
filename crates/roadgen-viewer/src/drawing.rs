@@ -53,7 +53,9 @@ impl Mark {
 }
 
 /// What a shape is. The z-order the layers are drawn in is the order of this enum,
-/// so an area lands under the lines that bound it and a device on top of everything.
+/// so an area lands under the lines that bound it and a device on top of everything
+/// — within each level: a shape on a bridge is drawn after everything on the ground,
+/// whatever its kind (see [`Shape::Level`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
     /// Ground: a verge, a patch of terrain. First of all, because everything else
@@ -64,6 +66,11 @@ pub enum Kind {
     Building,
     /// A junction's extent, as an area.
     Junction,
+    /// The deck of a bridge, as a darker band a little wider than the road it
+    /// carries. Before the surface, so that the lanes on a bridge are drawn on it —
+    /// and since a bridge is drawn a level above the ground (see [`Shape::Level`]),
+    /// the deck covers whatever the bridge passes over.
+    Casing,
     /// The ground a lane covers. Drawn where the format says how wide a lane is —
     /// which is not everywhere: GPUDrive's map is centrelines and has no widths at
     /// all, so its picture has no surface under them.
@@ -133,6 +140,14 @@ pub enum Shape {
         /// Radians counterclockwise from +x.
         heading: f64,
     },
+    /// A shape that is not on the ground: on a bridge, a positive level, drawn after
+    /// everything on the ground and the levels below it; in a tunnel, a negative one,
+    /// drawn before the ground and faded, since from above it is hidden.
+    ///
+    /// The level is how many structures up or down, not a height: a plan view stacks
+    /// what crosses, and that is all it needs to know. Everything on the ground is
+    /// level 0 and is never wrapped.
+    Level { level: i32, shape: Box<Shape> },
 }
 
 impl Shape {
@@ -143,6 +158,15 @@ impl Shape {
             | Shape::Band { kind, .. }
             | Shape::Dot { kind, .. }
             | Shape::Box { kind, .. } => *kind,
+            Shape::Level { shape, .. } => shape.kind(),
+        }
+    }
+
+    /// Which level the shape is drawn at: 0 on the ground, above it positive.
+    pub fn level(&self) -> i32 {
+        match self {
+            Shape::Level { level, .. } => *level,
+            _ => 0,
         }
     }
 
@@ -170,11 +194,15 @@ impl Shape {
             }
             Shape::Dot { at, .. } => vec![*at],
             Shape::Box { .. } => self.corners().unwrap_or_default(),
+            Shape::Level { shape, .. } => shape.extent(),
         }
     }
 
     /// The four corners of a [`Shape::Box`], counterclockwise from the near right.
     pub fn corners(&self) -> Option<Vec<Point>> {
+        if let Shape::Level { shape, .. } = self {
+            return shape.corners();
+        }
         let Shape::Box {
             at,
             length,
@@ -256,16 +284,39 @@ impl Drawing {
     /// nothing to draw and every format produces one now and then, where a lane is
     /// shorter than the sampling step.
     pub fn path(&mut self, kind: Kind, points: Vec<Point>) {
-        if points.len() >= 2 {
-            self.push(Shape::Path { kind, points });
-        }
+        self.path_at(0, kind, points);
     }
 
     /// A closed outline, dropped when it is not one — too few points, or no area
     /// between them, which is what a vertical face is from above.
     pub fn area(&mut self, kind: Kind, points: Vec<Point>) {
+        self.area_at(0, kind, points);
+    }
+
+    /// [`Drawing::path`], at a level above or below the ground.
+    pub fn path_at(&mut self, level: i32, kind: Kind, points: Vec<Point>) {
+        if points.len() >= 2 {
+            self.push_at(level, Shape::Path { kind, points });
+        }
+    }
+
+    /// [`Drawing::area`], at a level above or below the ground.
+    pub fn area_at(&mut self, level: i32, kind: Kind, points: Vec<Point>) {
         if points.len() >= 3 && plan_area(&points) > 1e-6 {
-            self.push(Shape::Area { kind, points });
+            self.push_at(level, Shape::Area { kind, points });
+        }
+    }
+
+    /// A shape at `level`: as it is on the ground, wrapped in a [`Shape::Level`]
+    /// anywhere else.
+    pub fn push_at(&mut self, level: i32, shape: Shape) {
+        if level == 0 {
+            self.push(shape);
+        } else {
+            self.push(Shape::Level {
+                level,
+                shape: Box::new(shape),
+            });
         }
     }
 

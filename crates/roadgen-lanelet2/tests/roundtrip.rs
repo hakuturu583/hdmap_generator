@@ -267,3 +267,94 @@ fn the_same_map_exports_identically_twice() {
         roadgen_lanelet2::to_osm_xml(&two_roads()).unwrap()
     );
 }
+
+#[test]
+fn a_motorway_and_its_slip_road_are_highway_lanelets() {
+    let mut builder = MapBuilder::new(metadata());
+    for (name, y, form) in [
+        ("main", 0.0, roadgen_core::FormOfWay::Motorway),
+        ("ramp", 50.0, roadgen_core::FormOfWay::SlipRoad),
+        ("street", 100.0, roadgen_core::FormOfWay::Unspecified),
+    ] {
+        builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, y, 0.0),
+                    Point3::new(100.0, y, 0.0),
+                    lanes(),
+                )
+                .unwrap()
+                .with_name(name)
+                .with_form(form),
+            )
+            .unwrap();
+    }
+    let map = builder.finish().unwrap().validate().unwrap();
+    let loaded = load(&roadgen_lanelet2::to_osm_xml(&map).unwrap(), &map);
+    let lanelets = lanelets_of(&loaded);
+    assert_eq!(lanelets.len(), 6);
+    for lanelet in lanelets {
+        let attributes = lanelet.attributes().read();
+        let y = lanelet.left_bound().front().unwrap().y();
+        let expected = if y < 75.0 {
+            ("highway", "nonurban")
+        } else {
+            ("road", "urban")
+        };
+        assert_eq!(
+            (
+                attributes["subtype"].value(),
+                attributes["location"].value()
+            ),
+            expected,
+            "the lanelet at y = {y}"
+        );
+    }
+}
+
+#[test]
+fn a_pedestrian_walks_a_walkway_either_way_and_a_car_drives_a_road_one_way() {
+    let sidewalk = |direction| {
+        LaneSpec::new(PositiveWidth::new(2.0).unwrap(), direction).with_type(LaneType::Sidewalk)
+    };
+    let mut builder = MapBuilder::new(metadata());
+    builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(100.0, 0.0, 0.0),
+                vec![
+                    LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+                    sidewalk(Direction::Backward),
+                    LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+                    sidewalk(Direction::Forward),
+                ],
+            )
+            .unwrap()
+            .with_name("street"),
+        )
+        .unwrap();
+    let map = builder.finish().unwrap().validate().unwrap();
+    let loaded = load(&roadgen_lanelet2::to_osm_xml(&map).unwrap(), &map);
+    let pedestrian = TrafficRules::create(locations::GERMANY, participants::PEDESTRIAN).unwrap();
+    let vehicle = TrafficRules::create(locations::GERMANY, participants::VEHICLE).unwrap();
+    let (mut walkways, mut roads) = (0, 0);
+    for lanelet in lanelets_of(&loaded) {
+        let subtype = lanelet.attributes().read()["subtype"].value().to_owned();
+        match subtype.as_str() {
+            "walkway" => {
+                walkways += 1;
+                assert_eq!(lanelet.attributes().read()["one_way"].value(), "no");
+                assert!(pedestrian.can_pass(&lanelet));
+                assert!(pedestrian.can_pass(&lanelet.invert()));
+            }
+            "road" => {
+                roads += 1;
+                assert!(vehicle.can_pass(&lanelet));
+                assert!(!vehicle.can_pass(&lanelet.invert()));
+            }
+            other => panic!("unexpected lanelet subtype {other}"),
+        }
+    }
+    assert_eq!((walkways, roads), (2, 2));
+}

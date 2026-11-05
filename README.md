@@ -1,9 +1,11 @@
 # roadgen
 
-Generate 3D road networks — with a town beside them, if you want one — and write the
+Generate 3D road networks — with a town beside them, or an open-pit mine round them,
+if you want one — and write the
 same network out as **OpenDRIVE**, as an **Autoware-ready Lanelet2** map, as plain
 **OpenStreetMap**, as a **SUMO** network, as a **CARLA UE5 asset package**, as a
-**ClipGT** clip for NVIDIA Cosmos, and as a **GPUDrive** scene.
+**ClipGT** clip and an **RDS-HQ** clip for NVIDIA Cosmos, as a **GPUDrive** scene, as
+the map of a **Waymo Open Motion Dataset** scenario, and as a **CommonRoad** scenario.
 
 This is a generator, not a converter. You describe roads, lanes, junctions and the
 movements between them, and the library builds the geometry and writes the files.
@@ -11,7 +13,9 @@ Two formats can be read back into the same model and written out again in every
 other: an **OpenDRIVE** document ([reading OpenDRIVE back](#reading-opendrive-back)),
 whether roadgen wrote it or someone else did, and a **Lanelet2** map
 ([reading Lanelet2 back](#reading-lanelet2-back)), whose roads and junctions are
-reconstructed from its lanes.
+reconstructed from its lanes. And the model itself can be written and read as
+**Protocol Buffers**, losing nothing, to a [schema](#the-ir-as-protocol-buffers) any
+other program can compile and read.
 
 **[Try it in a browser](https://hakuturu583.github.io/hdmap_generator/)** — the demo
 page runs this package, compiled for WebAssembly. Write a script, press Run, and flip
@@ -46,7 +50,11 @@ m.export_osm("openstreetmap.osm")
 m.export_sumo("sumo/")
 m.export_carla("Import/")       # .fbx + .xodr + the descriptor CARLA imports
 m.export_clipgt("clip/")
+m.export_rdshq("rds_hq/")       # the layout Cosmos-Drive-Dreams renders from
 m.export_gpudrive("scene.json")
+m.export_womd("map.tfrecord")
+m.export_commonroad("scenario.xml")   # lanelets, signs, lights, a planning problem
+m.export_commonroad_map("map.pb")     # the map alone, CommonRoad's 2024 protobuf
 ```
 
 ## How it is put together
@@ -64,8 +72,11 @@ m.export_gpudrive("scene.json")
        │             │             │
        └─────────────┼─────────────┘
                      ▼
-              Canonical Road IR ◀──── roadgen-buildings ◀── CGA shape grammar
-                     │                                        `symbios-shape`
+              Canonical Road IR ◀──── roadgen_carla::environment::Places
+                     │                 ├─ buildings ◀── roadgen-buildings ◀── CGA shape grammar
+                     │                 ├─ pits, heaps, pads: parts the land is shaped into
+                     │                 ├─ corridors, hills, rivers: bridges, tunnels, earthworks
+                     │                 └─ one land as a TIN round all of it (`spade`)
                  validate()
                      ▼
                 ValidatedMap
@@ -76,23 +87,36 @@ m.export_gpudrive("scene.json")
                      ├──▶ SUMO           .nod/.edg/.con.xml  `quick-xml` + netconvert
                      ├──▶ CARLA          .fbx + .xodr        `roadgen-opendrive`
                      ├──▶ ClipGT         .parquet layers     `arrow`/`parquet`
-                     └──▶ GPUDrive       scene .json         `serde_json`
+                     ├──▶ RDS-HQ         WebDataset .tar     `tar`
+                     ├──▶ GPUDrive       scene .json         `serde_json`
+                     ├──▶ WOMD           .tfrecord Scenario  `prost`
+                     ├──▶ CommonRoad     scenario .xml       `quick-xml`
+                     ├──▶ CommonRoad     map .pb (2024)      `prost`
+                     └──▶ the IR itself  .roadgen.pb         `prost`
 
               the written files ──▶ roadgen-viewer ──▶ SVG
 
                 map.xodr ──▶ roadgen-opendrive::read ──▶ Canonical Road IR
                  map.osm ──▶ roadgen-lanelet2::read  ──▶ Canonical Road IR
+          map.roadgen.pb ──▶ roadgen-proto::read     ──▶ Canonical Road IR
 ```
 
 Every exporter reads a `ValidatedMap` and writes nothing back into it: what a format
 cannot hold comes back to the caller through that exporter's `check()`, never as a
 field in the IR.
 
-`roadgen-buildings` is the one arrow pointing *into* the IR, and it is a generator
-rather than an exporter — it reads roads and writes [buildings](#buildings), the
+The arrow pointing *into* the IR is the environment a CARLA map is generated for,
+and it is a generator rather than an exporter: one value, `Environment`, whose
+branches are the kinds of place. `Urban` puts a town along the caller's streets with
+`roadgen-buildings`, and that crate is a generator — it reads roads and writes [buildings](#buildings), the
 same way the builder reads a `RoadSpec` and writes lanes. It runs after generation
 and before validation, because a lot is measured against geometry that does not exist
 until the first and buildings are part of what the second checks.
+
+`Mine` fills the part of the IR a road network leaves empty — the shape of the
+land, what the land is, and the place they add up to — and lays out the roads that
+place needs: see [Mines](#mines). Whichever branch runs, it writes only the IR, so
+what it generates reaches every format and not only CARLA's.
 
 The arrows at the bottom go the other way. `roadgen-viewer` reads the **written
 files** — never the IR — so a picture it draws is a picture of what a consumer would
@@ -104,7 +128,10 @@ movements, furniture and rules rather than as a picture — see
 other, and a different kind of job: a Lanelet2 map holds every lane exactly and no
 road at all, so the roads and junctions are *reconstructed* — see
 [Reading Lanelet2 back](#reading-lanelet2-back). No other format is read, and
-[`docs/import-feasibility.md`](docs/import-feasibility.md) says why.
+[`docs/import-feasibility.md`](docs/import-feasibility.md) says why. The IR's own
+document is not a format in that sense: `roadgen-proto` writes the IR field for field
+and reads it back as the map it was, so it lowers nothing and approximates nothing —
+see [The IR as Protocol Buffers](#the-ir-as-protocol-buffers).
 
 Four separations are load-bearing, and each is a module of `roadgen-core`:
 
@@ -164,7 +191,9 @@ connection/j0/north_0/east_0
 ```
 
 OpenDRIVE and Lanelet2 ids are assigned by the exporters, in the IR's own iteration
-order, and never flow back into the IR.
+order, and never flow back into the IR. What does come back is a record of them:
+every export writes a trace file saying which of its elements each IR element
+became — see [following an element across formats](#following-an-element-across-formats).
 
 ## Installing
 
@@ -194,6 +223,7 @@ roadgen-lanelet2 = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-clipgt = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-osm = { git = "https://github.com/hakuturu583/hdmap_generator" }
 roadgen-buildings = { git = "https://github.com/hakuturu583/hdmap_generator" }
+roadgen-proto = { git = "https://github.com/hakuturu583/hdmap_generator" }
 ```
 
 ```rust
@@ -251,20 +281,30 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `validate()` / `issues()` / `format_warnings()` | check before exporting |
 | `clipgt_warnings(scenario=None)` | what a ClipGT export would lose, and what its scenario gets wrong |
 | `gpudrive_warnings(scenario=None)` | what a GPUDrive export would lose, and what its scene runs up against |
+| `womd_warnings()` | what a Waymo Open Motion scenario would lose |
+| `commonroad_warnings(benchmark_id=, planning_problem=, elevation=, light_cycle=)` | what a CommonRoad scenario would lose |
 | `carla_warnings(name=, package=, buildings=, ...)` | what a CARLA package cannot carry, and what its import will get wrong quietly |
 | `osm_warnings()` | what a plain OpenStreetMap export would lose |
 | `sumo_warnings()` | what a SUMO export would lose |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
 | `export_opendrive(path)` / `export_lanelet2(path)` / `export_osm(path)` | write the files |
-| `export_sumo(directory)` | write a SUMO plain-XML network and its netconvert configuration; returns the prefix |
+| `export_sumo(directory)` | write a SUMO plain-XML network and its netconvert configuration; returns the prefix (`cycle_on_sidewalks=True` lets bicycles ride the sidewalks both ways) |
 | `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
 | `export_gpudrive(path, scenario=, name=, scenario_id=, steps=, time_step=, speed=, route=)` | write a GPUDrive scene |
+| `export_womd(path, scenario_id=, steps=, time_step=, current_time_index=)` | write a TFRecord holding one Waymo Open Motion `Scenario` |
+| `export_commonroad(path, benchmark_id=, author=, affiliation=, source=, date=, time_step=, planning_problem=, goal_steps=, elevation=, light_cycle=)` | write a CommonRoad 2020a XML scenario |
 | `export_carla(directory, name=, package=, buildings=, use_carla_materials=, kerb_height=, verge_width=, ground_extent=, furniture=, carla_root=, engine=, sun_altitude=, sun_azimuth=)` | write a CARLA UE5 package and the script that imports it; returns what was written and what each mesh will be tagged |
+| `export_pointcloud_map(directory, name=, buildings=, kerb_height=, verge_width=, ground_extent=, spacing=, cell_size=)` | write Autoware's point-cloud map of the surface a CARLA package is built of: `pointcloud_map/*.pcd` and `pointcloud_map_metadata.yaml`, in the Lanelet2 map's frame |
 | `fetch_textures(package, overwrite=, resolution=)` | download the Poly Haven textures a written package asks for |
 | `carla_sky(carla_root, package, map_name, engine=, sun_altitude=, sun_azimuth=)` | after `Import.py`: give the imported level a daylight sky, with the editor's own scripting |
 | `carla_furniture(carla_root, package, map_name, engine=, manifest=)` | after `Import.py`: stand the package's traffic lights, signs and props town in the level, and make CARLA adopt the lights and signs |
+| `carla_water(carla_root, package, map_name, engine=, descriptor=, flowing=, still=)` | after `Import.py`: put the Unreal materials the descriptor names in the water's slots — `M_Water_Flowing` on rivers, whose UVs run downstream for a panning normal map, and `M_Water_Still` on lakes and ponds |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
+| `to_womd_bytes(scenario_id=, steps=, time_step=, current_time_index=)` | one serialized `Scenario`, not framed as a TFRecord |
+| `to_commonroad_xml(...)` | the CommonRoad scenario as a string, with `export_commonroad`'s arguments |
+| `export_commonroad_map(path, benchmark_id=, author=, affiliation=, source=, date=, elevation=)` | write the map alone as a CommonRoad 2024 `CommonRoadMap` protocol buffer |
+| `to_commonroad_map_bytes(...)` / `commonroad_map_warnings(benchmark_id=, elevation=)` | the same, as bytes; and what it would lose |
 | `road_ids()`, `lane_ids()`, `connections()`, `successors(lane)`, `lane_centerline(lane)` | inspect the built map |
 | `render_opendrive(path)` / `render_sumo(directory)` / `render_carla(path)` / `render_clipgt(directory)` / `render_gpudrive(path)` | read a written export back and draw it, as an SVG document |
 | `read_opendrive(path, sampling=, origin=, projection=)` | read an OpenDRIVE file as a `Map` — one that exports like any other and cannot be added to |
@@ -515,8 +555,8 @@ govern — and both formats get them:
 | IR | OpenDRIVE | Lanelet2 |
 | --- | --- | --- |
 | Traffic light | `<signal dynamic="true">` with `<validity>`, its housing's `height`, a `<userData>` per lamp | `traffic_light` way with its `height`, `light_bulbs` way + `traffic_light` regulatory element |
-| Traffic sign | `<signal>` carrying the caller's catalogue code | `traffic_sign` way, code as its subtype |
-| Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` |
+| Traffic sign | `<signal>` carrying the caller's catalogue code | `traffic_sign` way, code as its subtype; a stop sign (`stop`, `206`, `R1-1`, …) is spelt `stop_sign`, as Autoware reads it, and gets a `traffic_sign` regulatory element — the stop line across the lanes that stop as its `ref_line`, on the junction lanelets they feed, as a light's |
+| Stop line | `<object type="roadMark" name="stopLine">` | `stop_line` way, the rule's `ref_line` — a traffic-light rule with several (one per junction mouth) is one regulatory element per line, on the junction lanelets the rule's lanes it names feed, referring to the lights over them |
 | Crosswalk | `<object type="crosswalk">` with its outline as `<cornerLocal>` corners | a lanelet of subtype `crosswalk` |
 | Right of way | `<junction><priority high low>` | `right_of_way` regulatory element |
 
@@ -532,15 +572,19 @@ surface rather than straight up, which is what "five metres above the road" mean
 slope and what `zOffset` carries.
 
 A traffic light's line is the bottom edge of its housing, which is where `zOffset`
-puts a signal. What Autoware draws of a light besides — the `height` of its housing
-and the lamps of its `light_bulbs` way, each with its position, `color` and `arrow`
-— is kept in the IR as the light's `LightHead`, and both formats carry it: Lanelet2
-as Autoware wrote it, and OpenDRIVE as the signal's `height` and one `<userData
-code="lightBulb" value="color=green;arrow=right;x=…;y=…;z=…">` per lamp, in the
-document's inertial frame, which the reader reads back and any other consumer
-passes over. A `light_bulbs` way whose `traffic_light_id` names none of its
-element's lights goes with the light listed in the same place, and the reader says
-so.
+puts a signal. `add_traffic_light` gives a light a standard head: a housing 0.38 m
+wide and 1.05 m tall over the middle of its lane, its bar that wide at the `height`
+asked for, and three lamps one above the other — green, yellow, red from the bottom. A light can also say what Autoware draws of it besides — the height
+of its housing and its lamps, each with a position, a colour and an arrow — as its
+`LightHead`, and both formats carry it: Lanelet2 as Autoware writes it, the
+`height` tag on the light's way and a `light_bulbs` way of tagged points naming
+the light by `traffic_light_id`; OpenDRIVE as the signal's `height` and one
+`<userData code="lightBulb" value="color=green;arrow=right;x=…;y=…;z=…">` per lamp,
+in the document's inertial frame, which the OpenDRIVE reader reads back and any
+other consumer passes over.
+The Lanelet2 reader reads both back; a `light_bulbs` way whose `traffic_light_id`
+names none of its element's lights goes with the light listed in the same place,
+and the reader says so.
 
 A crosswalk's outline is written as `<cornerLocal>` corners in the object's own frame
 — the object lying across the road, its `hdg` a quarter turn from the road's, the
@@ -749,7 +793,8 @@ part/high_street/left/3/0/1        ← the one standing on it
 | **OpenStreetMap** | [Simple 3D Buildings](https://wiki.openstreetmap.org/wiki/Simple_3D_Buildings): the outline as a closed `building=<kind>` way, a `building:part=yes` way per part where there is more than one, with `height`, `min_height`, `building:levels`, `roof:shape`, `roof:height` and `roof:direction`. The solid survives; the frontage, a sloping base and the union of several parts' outlines do not, and `check` says so. |
 | **OpenDRIVE** | one `<object type="building">` carrying an `<outline>` per part, corners as `<cornerLocal>`. The massing survives; the roof shape does not, and `format_warnings()` says how many were flattened. |
 | **CARLA** | actual walls and roofs, from `Solid::shell()`. The whole solid survives — it is the only export that draws the roof rather than describing it — but CARLA's import will tag it `Terrain` unless the town is exported as [props](#where-the-town-goes-and-why-it-is-a-choice), in which case it is tagged and the package's script places it. |
-| Lanelet2, SUMO, ClipGT, GPUDrive | nothing; each one's warnings say how many were dropped. |
+| **CommonRoad map** | each part's outline in plan, as an environment obstacle of type `BUILDING`. Heights and roofs are not written. |
+| Lanelet2, SUMO, ClipGT, GPUDrive, WOMD, the CommonRoad scenario | nothing; each one's warnings say how many were dropped. |
 
 OSM measures a roof's direction clockwise from north, as a bearing; the IR measures it
 anticlockwise from east, as an angle. That conversion is the whole of the difference
@@ -762,6 +807,175 @@ consumer evaluating the file back gets a banana. `cornerLocal` measures every co
 one frame — the road's, at the building's own station — so the shape that comes back is
 the shape that went in. The [viewer](#which-viewer-draws-what) draws every part from
 those outlines, which is why a town shows up in the OpenDRIVE picture and in no other.
+
+## Mines
+
+Not every map is a town. A mine is put together from parts, the same way a town is
+put together from roads: a pit, the roads into it — any shape, drawn with
+`add_road` like every other road — the heaps they lead to, a yard for the
+workshops, a berm along the ramp. Once the roads are built, the land round all of it
+is generated as one triangulated surface.
+
+```python
+m = roadgen.Map(name="quarry")
+pit = m.add_pit(name="North Pit", centre=(0.0, 0.0, 0.0), benches=6, bench_height=12.0)
+
+haul = [
+    roadgen.Lane(width=7.5, direction="forward"),
+    roadgen.Lane(width=3.0, direction="forward", type_="shoulder"),
+    roadgen.Lane(width=7.5, direction="backward"),
+    roadgen.Lane(width=3.0, direction="backward", type_="shoulder"),
+]
+# The ramp is a road like any other. pit.ramp() gives the points of the usual
+# spiral down the wall; pass points of your own for any other shape.
+ramp = m.add_road(points=pit.ramp(grade=0.1, clockwise=True), lanes=haul,
+                  pavement=[(0.0, "gravel")], site="North Pit")
+m.add_barrier(ramp.lane(1), kind="berm", height=1.5)     # on the pit-side shoulder
+m.add_road(start=(100.0, -260.0, 0.0), end=(300.0, -260.0, 0.0), lanes=haul,
+           pavement=[(0.0, "gravel")], site="North Pit")
+m.add_heap("waste_dump", centre=(440.0, -260.0, 0.0), radius=110.0, height=30.0,
+           site="North Pit")
+m.add_pad([(140.0, -320.0, 0.0), (260.0, -320.0, 0.0), (260.0, -272.5, 0.0),
+           (140.0, -272.5, 0.0)], buildings="industrial", site="North Pit")
+
+m.export_carla("Import/", name="Quarry", use_carla_materials=False)
+
+site = m.site("site/north_pit")          # {"kind": "open_pit_mine", "land_covers": [...], ...}
+nodes, triangles = m.tin_mesh(site["surfaces"][0])
+m.terrain_height(0.0, 0.0)               # the pit's floor: -72.0
+```
+
+A second pit is a second `add_pit`, with its own roads and its own `site`: every
+part shapes the same land, which is stated once for the whole map, and two parts
+that overlap are refused.
+
+What it adds to the IR is the land, said once and in the IR's own terms — the
+GDF ideas the rest of it is built on, applied to the Terrain Elevation and Land
+Cover themes:
+
+| IR | What it is |
+| --- | --- |
+| `TinSurface` | the land as a feature: a TIN whose nodes and triangles are its geometry, not features of their own |
+| `TinBreakline` | a line the land breaks along — a bench's crest or toe, a heap's, a road's edge — and **an edge of its surface**, which `validate()` checks |
+| `LandCover` | what an area of land is (`pit`, `waste_dump`, `stockpile`, `pad`), `draped_on` the surface it lies on |
+| `Site` | the complex feature that gathers them, and the roads, into one mine |
+| `Road.pavement` | paved or unpaved, then what with — so an unpaved asphalt road is a value the type cannot hold |
+| `MapObjectKind::Barrier` | the safety berm along the ramp's pit side |
+
+A mine and a town are not two generators: they are parts on one map. The land is
+one TIN builder — every road's edges as breaklines, the country rolling away from
+them — shaped by whatever pits and heaps are on the map, or by nothing
+(`m.generate_land()` states a town's land the same way, and tunes a mine's). The
+buildings are one shape grammar on lots along roads: a town's streets
+(`generate_buildings()`, kept off the pits, heaps, pads and site roads), or a pad's.
+
+The roads go into the TIN as breaklines, so the land under a road is the road's own
+plane, vertex for vertex. CARLA builds its ground from the TIN rather than from the
+roads — rock in the pit and on the heaps, gravel on the haul roads and the yard;
+OpenDRIVE writes the gravel as `<lane><material>` and the berm as a `barrier`
+object; OpenStreetMap writes `landuse=quarry`, `man_made=spoil_heap` and `surface=`.
+The rest write the roads and say what they dropped. The design, and what is not
+done yet, is in [`docs/mine-design.md`](docs/mine-design.md).
+
+## Motorways
+
+A motorway is put together the way a mine is: from parts and roads. What is new is
+that a road can leave the ground. A **bridge** or a **tunnel** is a feature of its
+own, carrying stretches of road; a road says along its length which stretches are
+on one; and wherever one road passes over another, a **grade separation** says so
+and names the structure that does it.
+
+```python
+m = roadgen.Map(name="crossing")
+m.add_road(start=(-300.0, 0.0, 9.0), end=(300.0, 0.0, 9.0), lanes=two_way,
+           name="motorway", type_="motorway", form="motorway")
+m.add_road(start=(0.0, -200.0, 0.0), end=(0.0, 200.0, 0.0), lanes=two_way, name="street")
+m.add_bridge([("motorway", 200.0, 400.0)], form="viaduct", name="Street Viaduct")
+
+m.structure("structure/street_viaduct")   # {"form": "viaduct", "supports": [...], ...}
+m.grade_separations()                     # [{"over": ("road/motorway", ...), "under": ("road/street", ...), ...}]
+```
+
+`form=` is the road's form of way — `motorway`, `slip_road`, `multiple_carriageway`,
+`parallel_road`, … — kept apart from `type_`, which says what kind of place the road
+is in. A motorway or a slip road **crosses nothing on the level**: one that crosses
+another road away from a junction, with nothing carrying one over the other, fails
+validation. Two ordinary streets crossing without a junction are still a map.
+
+### A corridor plans the roads
+
+Drawing two carriageways, the slip roads, the speed-change lanes and the junctions
+by hand is a lot of points. A **corridor** is a part that knows the rules a motorway
+is built to — Japan's Road Structure Ordinance for the design speed asked for, as
+defaults — and draws a first plan of every road it needs:
+
+```python
+e1 = m.add_corridor("E1", [(-2000.0, 0.0, 0.0), (1000.0, 0.0, 0.0), (3000.0, 700.0, 0.0)],
+                    design_speed=100.0, profile=[(0.0, 0.0), (500.0, 10.0), (4900.0, 0.0)],
+                    end_transition=400.0)
+e1.add_interchange("Kita IC", at=1700.0, crossroad=[(-300.0, -450.0, 0.0), (-300.0, 450.0, 0.0)],
+                   crossroad_lanes=street)
+m.add_river(centre=[(-1450.0, -600.0, 0.0), (-1350.0, 600.0, 0.0)], width=80.0, depth=6.0)
+m.add_hill(crest=[(1650.0, 1350.0, 0.0), (2350.0, -650.0, 0.0)], width=700.0, height=50.0)
+
+plan = e1.plan()          # roads, junctions, movements, signals, structures — and notes
+plan.roads[0]["points"]   # every road's points, to look at or replace with set_points
+m.add_plan(plan)
+```
+
+The plan rounds the centre line's corners at the design speed's radius, rounds the
+profile's crests and sags with vertical curves, splits each carriageway where a slip
+road leaves or joins it with a deceleration or acceleration lane before the nose,
+lifts the crossroad over the motorway on an overpass, and signals the ramp
+terminals. Nothing in it is fixed: it is points and lanes, and the caller can move
+any of them before adding it. A road drawn outside the standard is noted, not
+refused.
+
+`kind=` says what the interchange is built as: a `diamond` (the default) or a
+`half_diamond`, whose ramp terminals are signalled; a `parclo`, whose turns on
+across the crossroad are loops; or one of the free-flowing kinds, where every slip
+road merges or diverges and nothing is signalled — a `trumpet`, whose crossroad
+crosses on its overpass and splits round a loop on the far `side`; a `cloverleaf`,
+a loop in each quadrant, its slip roads off and on to a collector–distributor road
+beside each carriageway so the weaving stays off the through lanes; and a
+`directional` T, where another motorway, drawn by `crossroad`, comes from `side`
+and ends at this one, its flyovers to and from the far carriageway stacked three
+levels high on viaducts.
+
+When the map is built, the rest follows from the land. The **natural** land — the
+country, the hills, the rivers, the parts — is worked out before the motorway is
+fitted to it, and every corridor road is classified along its length: far above the
+land or over water, a bridge (a viaduct when it is long); far below it, a bored
+tunnel; otherwise the ground, cut and filled to meet it, with the cutting's crest
+and the embankment's toe as breaklines. Anywhere one road crosses over another with
+nothing under it, an overpass is put there. Piers are spaced along every bridge and
+kept off every carriageway below. `elevated=` and `sunken=` stretches lift a
+corridor onto a viaduct or drop it into a cut-and-cover tunnel — through a town, say
+— and `add_ramp()` adds a lone slip road for a street to be joined to. With
+`urban="elevated"` (or `"sunken"`) the corridor finds the town itself: wherever its
+line comes within 60 m of a street already on the map, or of a pad with buildings,
+it goes onto a viaduct (or into a tunnel), with room either side to climb to it at
+its grade.
+
+The town keeps to its side: no building faces a motorway or a slip road, none
+stands under a deck or on a corridor's slopes.
+
+| IR | What it is |
+| --- | --- |
+| `Structure` | a bridge (`bridge`, `viaduct`, `overpass`) with its abutments and piers, or a tunnel (`bored`, `cut_and_cover`, `underpass`) with its portals |
+| `Road.structure` | which stretches of the road are on, or in, which structure |
+| `GradeSeparation` | "this road passes over that one (or over water) by way of this structure" |
+| `Road.form` | the road's form of way |
+| `Interchange` | the junctions, slip roads and structures of one interchange, as one feature |
+
+Every format gets what it can hold. OpenDRIVE writes `<bridge>` and `<tunnel>` and
+reads them back; OpenStreetMap splits a way at each structure and tags `bridge=`,
+`tunnel=`, `layer=` and `motorway_link`; Lanelet2 marks motorway lanelets `highway`;
+GPUDrive, which is flat, cuts the road edges where one road passes over another,
+and WOMD, which keeps the z, leaves them whole at their own heights;
+CARLA draws the decks' undersides and parapets, the piers and abutments, the tunnel
+bores and portals, and lays the land under the bridges and over the tunnels. The
+design — and what is not done yet — is in [`docs/highway-design.md`](docs/highway-design.md).
 
 ## Coordinates
 
@@ -908,7 +1122,9 @@ prefix = m.export_sumo("network/")     # returns the name the files were given
 | `<name>.nod.xml` | junctions and road ends, as points |
 | `<name>.edg.xml` | one edge per direction of travel, with its lanes |
 | `<name>.con.xml` | which lane may be left for which lane |
-| `<name>.netccfg` | the netconvert run that turns the three into a `.net.xml` |
+| `<name>.tll.xml` | the program of each signalised junction, when the map has one |
+| `<name>.netccfg` | the netconvert run that turns the rest into a `.net.xml` |
+| `<name>.safe.{src,dst,via}.xml` | `randomTrips.py` weights; see [Random traffic](#random-traffic-randomtripspy-weights) |
 
 ```bash
 netconvert -c network/demo_town.netccfg
@@ -920,7 +1136,7 @@ A SUMO edge is a one-way bundle of lanes, so a road carrying traffic both ways i
 of them pointing at each other:
 
 ```xml
-<edge id="north.fwd" from="n_north_start" to="j_x" priority="4" numLanes="1"
+<edge id="north.fwd" from="n_north_start" to="j_x" priority="5" numLanes="1"
       speed="13.890" spreadType="center" name="north"
       shape="-1.750,70.000,0.000 -1.750,14.000,0.000">
   <lane index="0" width="3.500" disallow="pedestrian"
@@ -934,27 +1150,114 @@ network imported from OpenStreetMap has to make do with. The heights go with it:
 SUMO shape is `x,y,z`, so the relief that plain OSM could only put in `ele` tags is
 part of the geometry here.
 
-Lanes are numbered from the **right in the direction of travel**, index 0 outwards.
-The IR counts outwards from the reference line instead, which for the opposing
-carriageway is the other way round — so the same physical lane has different numbers
-in the two directions. `sumo_lane_ids()` is the way back:
+Lanes are numbered from the **outside of the carriageway**, index 0 being the kerb
+lane: the rightmost in the direction of travel where traffic drives on the right, the
+leftmost where it drives on the left. The IR counts outwards from the reference line
+instead, which for the opposing carriageway is the other way round — so the same
+physical lane has different numbers in the two directions. `sumo_lane_ids()` is the
+way back:
 
 ```python
 dict(m.sumo_lane_ids())["lane/north/1"]     # 'north.bwd_0'
 ```
 
+### Left-hand traffic
+
+netconvert does not read handedness off the geometry: it builds a right-hand network
+unless it is told otherwise. A map made with `handedness="lht"` therefore gets
+`lefthand` in its `.netccfg`, and netconvert records it on the `<net>` it writes:
+
+```xml
+<processing>
+    <offset.disable-normalization value="true"/>
+    <no-turnarounds value="true"/>
+    <lefthand value="true"/>
+</processing>
+```
+
+That is more than bookkeeping. Left-hand traffic decides which turn crosses the
+oncoming carriageway — the right one — and so which movement on a major approach has
+to give way, which side of a junction the internal lanes are laid out on, and which
+lane is the slow one. Without it a left-hand map would be simulated as a right-hand
+one drawn on the wrong side of the road: right turns would cut across oncoming
+traffic with priority, and the kerb lane would be SUMO's overtaking lane. A right-hand
+map writes nothing, since that is netconvert's default.
+
 `speed` is the road's limit in m/s, or SUMO's own default for the OSM `highway` value
-the road type maps to. What may use a lane is the whole of what SUMO knows about lane
+the road type maps to. A lane with a limit of its own carries it as the lane's `speed`,
+and so does a lane a **`SpeedLimit` rule** names — the rule *is* that lane's limit and
+replaces any it had, as it overwrites the lanelet's `speed_limit` tag in the Lanelet2
+export:
+
+```xml
+<lane index="0" width="3.500" shape="..." speed="8.333" disallow="pedestrian"/>
+```
+
+An IR lane runs the whole of one cross-section, which is exactly one lane of one edge,
+so the rule covers the SUMO lane from end to end. Where two rules name one lane, the
+lower is written. The trace records the rule as `merged` into each `lane:` it set,
+with role `speed`, the way a right-of-way rule is merged into an edge's `priority`.
+
+What may use a lane is the whole of what SUMO knows about lane
 type: a driving lane is written as one pedestrians are kept out of, a footway as one
 that admits only them, a bike lane only bicycles and a hard shoulder only emergency
 vehicles.
+
+### Lane changes
+
+SUMO has no paint, but it has what the paint between two lanes is *for*: whether a
+vehicle may change across it. Each lane is written with `changeLeft` and
+`changeRight` read off the IR's marking on the boundary it shares with its
+neighbour in the edge — `left_marking` and `right_marking` on a `LaneSpec`, or the
+`left_marking=` / `right_marking=` arguments of `Lane` in Python:
+
+| marking between the two lanes | lane change |
+| --- | --- |
+| `broken`, `none` | open — nothing is written, which SUMO reads as open to everyone |
+| `solid`, `solid solid`, `curb` | `emergency` only |
+| `solid broken`, `broken solid` | decided by the half nearer the vehicle |
+
+```xml
+<lane index="0" ... changeLeft="emergency"/>
+<lane index="1" ... changeRight="emergency"/>
+```
+
+SUMO's attributes name the classes **allowed** to change, so a line nobody may cross
+is written as the short list of those who may cross it anyway.
+
+A double line's two words are read looking along the road's reference line, left
+word first, as OpenDRIVE reads them: in `solid broken` the solid line is on the left.
+A vehicle obeys the line on its own side, so in a lane to the right of a
+`solid broken` line it may change across and in the lane to its left it may not — the
+asymmetry the marking exists for. The IR keeps markings by the side of the reference
+line, so a lane running against it has its `left_marking` on its right in travel;
+the exporter accounts for that, and for handedness, by working from where the lanes
+are.
+
+`changeLeft` and `changeRight` are the driver's left and right in travel under either
+handedness. A left-hand network numbers its lanes from the kerb on the left, so there
+the next lane up is on the driver's **right**: with a solid line between two lanes
+driving on the left, lane 0 is written with `changeRight` and lane 1 with
+`changeLeft` — the mirror of the example above.
+
+Two things open a change the paint would close. A lane that leads nowhere while the
+rest of its edge carries on — a lane drop — can only be left sideways, and
+netconvert refuses a prohibition that would trap a vehicle in it, so none is written.
+And two lanes that are neighbours in SUMO without sharing a boundary in the IR — a
+painted island between them that SUMO has no lane for — are kept apart as if by a
+solid line, since crossing the island is no lane change the map offers.
+
+`LaneSpec` and Python's `Lane` default to a solid line on both sides, so a road
+built without saying otherwise closes every lane change on it. Give lanes that may be
+changed between a `broken` line on the side they share.
 
 ### Right of way
 
 SUMO's right of way is a **matrix over pairs of movements** — which stream gives way
 to which other stream — and a plain XML file has no way to state one: `<request>` is
 something netconvert computes and writes into the `.net.xml`. What the format does
-have is the edge `priority` ladder, the same one the OpenStreetMap export climbs.
+have is the edge `priority` ladder, the same one the OpenStreetMap export climbs —
+lifted one rung, so that even a footway has a rung below it to yield on.
 
 So a `RightOfWay` rule moves the **approach edges it names** one rung apart, and the
 junction is marked `rightOfWay="edgePriority"`:
@@ -979,7 +1282,90 @@ movement of the priority arm must still give way to an oncoming one is netconver
 decision, and `sumo_warnings()` says so.
 
 A road whose **cross-section changes** becomes a chain of edges with a node between
-them, because an edge has one lane count from end to end.
+them, because an edge has one lane count from end to end. Which lane carries on into
+which is still the IR's: the connections it holds across the boundary are written as
+`<connection>`s through that node, and netconvert, given an edge's connections, adds
+none of its own — a lane with no connection onward ends at the boundary.
+
+That leaves the edge with *no* connection across: every lane on that side ends, say a
+driving lane that becomes a cycle lane. netconvert reads an edge with nothing listed
+as one whose movements are unspecified, and would guess some, carrying the driving
+lane on into the cycle lane. So the movements of such an edge onto every edge
+leaving the node it runs into are listed as deleted,
+`<delete from="r.0.fwd" to="r.1.fwd"/>`, and netconvert warns that the edge goes
+nowhere — which is what the map says. (A `<connection from="r.0.fwd"/>` with no
+target means the same to recent netconvert, but SUMO 1.18 still guesses past it;
+the deletions hold on both, and deleting a movement netconvert would not have built
+is silent.) The same
+holds for any edge the IR carries nothing on from, wherever it ends short of a dead
+end — except a footway, since pedestrians cross a node on its walking area rather
+than along connections, so there is nothing for netconvert to guess.
+
+### Stop lines
+
+SUMO has no stop line as a thing of its own. What it has is a lane's **stop offset**:
+how far short of the end of the lane a vehicle waiting at the junction ahead comes to
+a halt. Without one it halts at the very end of the lane — for an arm that stops where
+the IR's junction begins, the junction's mouth rather than the line painted before
+it.
+
+So each stop line is measured along every written lane it crosses, from where it
+crosses the lane's centreline to the lane's end in the direction of travel, and the
+distance becomes that lane's `<stopOffset>`:
+
+```xml
+<lane index="0" width="3.500" shape="-1.750,40.000,0.000 -1.750,14.000,0.000" disallow="pedestrian">
+    <stopOffset value="8.000"/>
+</lane>
+```
+
+It carries no `vClasses`: a stop line binds everything that drives up to it, which is
+SUMO's default of `all`. netconvert keeps a lane's custom shape as it was given rather
+than cutting it back to the junction, so the end it is measured from is the end the
+built network has, and the tests read the offset back out of the `.net.xml` and check
+that the point it puts the stop at is the painted line, to within a few centimetres.
+
+The lanes measured are the ones the stop line names, and those that a rule naming it
+governs — a right-of-way rule's yielding lanes, a traffic-light rule's lanes — where
+the line actually crosses them. An offset is only meaningful where the lane runs into
+a junction, so on an approach split over several edges by a change of cross-section
+it goes on the edge that reaches the junction and nowhere else. A line within 10 cm of
+the end of its lane needs no offset, since that is where SUMO stops a vehicle anyway,
+so it leaves neither a `<stopOffset>` nor a trace link, and `sumo_warnings()` counts
+it apart from the lines that are written; and where two stop lines cross one lane, the
+one nearer the junction holds its one offset. The trace records each offset as
+`merged` into the lane, with the role `stopOffset`.
+
+Where a stop line cannot become an offset, `sumo_warnings()` names it with the lane
+it misses and the reason: a stop line not drawn as a line across the road at all, a
+lane no SUMO lane is written for (a junction's connector), an edge that does not end at
+a junction, a line set back further than the last edge before the junction is long
+(so on an earlier edge of the approach, named on that edge's lane), a lane whose
+centreline it does not cross, a lane where it is at the start — drawn across both
+carriageways, it belongs to the other one — a lane where it is further back than its
+edge is long — which netconvert would refuse — or one whose offset a line nearer the
+junction already holds. It is named lane by lane, so a line drawn across both
+carriageways that is written on the approach is reported only for the lane leading
+away.
+
+A line carries no direction, so which carriageway it belongs to is judged only where
+it is in doubt: for a line that crosses lanes running both ways, as one drawn across
+the whole road does. That is decided on the IR, before anything about SUMO edges or
+nodes: the crossing with each lane is projected onto the road's reference line, and
+the line belongs to a lane if it is nearer the junction the lane runs into than the
+junction it leaves, each measured along the road — every cross-section of it — and on
+through the roads joined to it end to end by plain joints, up to the first junction
+that way; a dead end has no junction beyond it. So a road joined to the next by a
+plain joint at one end and running into a junction at the other, or a stub with a dead
+end, is judged by the one junction it has, not by its own two ends. A lane for which
+the line is nearer the junction behind it is "at the start" of it, however the roads
+are cut into edges; exactly halfway, or with no junction either way, a lane a rule
+naming the line governs is preferred, and the others are at the start. Only the lanes
+the line belongs to are then placed as above — on the edge that reaches the junction,
+or reported as on an earlier edge, or as running into no junction. A line whose lanes
+all run the same way stands before wherever they run to, however short the road, so
+an approach split by a change of cross-section close to the junction keeps its stop
+line even when the last edge is shorter than the line is set back.
 
 ### Junctions, which SUMO models the same way round as the IR
 
@@ -988,35 +1374,339 @@ as a **node**: the arms stop at its edge, and netconvert generates an internal l
 for every connection across it. The two models agree about the thing that matters —
 the movements are enumerated, not guessed — so the connectors are not written as
 edges. Each becomes the `<connection>` saying its approach lane may be left for its
-exit lane:
+exit lane, and the connector's **centreline is written as the connection's shape**:
 
 ```xml
-<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"/>
+<connection from="north.fwd" to="west.bwd" fromLane="0" toLane="0"
+            shape="-1.750,14.000,0.000 -1.748,13.200,0.000 … -14.000,1.750,0.000"/>
 ```
 
-This is why the arms are left exactly where the IR puts them, 14 m short of the
-centre: **the gap is the junction**, and netconvert fills it. Nothing here moves
-geometry, which is the one thing the OpenStreetMap export has to do.
+netconvert takes a connection's shape as the shape of the internal lane it draws for
+it, so the path across the junction in SUMO is the curve the IR drew — the same one
+the OpenDRIVE connecting road and the Lanelet2 lanelet carry — and not one netconvert
+invented. A turn that must wait inside the junction for oncoming traffic is still
+split into two internal lanes at the point where it waits, but both lie along the
+connector. A movement through a chain of connectors gets their centrelines end to end,
+in the order it crosses them.
 
-A junction with a traffic light on an approach becomes a `traffic_light` node.
-netconvert generates the phases, because the IR holds no signal timing to write.
+This is why the arms are left exactly where the IR puts them, 14 m short of the
+centre: **the gap is the junction**, and netconvert fills it along the IR's
+connectors. Nothing here moves geometry, which is the one thing the OpenStreetMap
+export has to do.
+
+**Footways are the exception.** The IR lays a pavement round every corner of a
+junction — a connector from one arm's sidewalk to the next arm's — but SUMO's
+pedestrians do not walk along connections. They cross a node on a **walking area**
+that netconvert builds there, joining every footway that meets at the node, walked
+either way. So no connection is written between two footways, and the `.netccfg`
+sets `walkingareas`, which makes netconvert build one wherever footways meet rather
+than only where there is a pedestrian crossing. Each paved corner comes out as one
+walking area joining the same two sidewalks, and a pedestrian walks round it in
+either direction; the trace puts the pavement, and the connections into and out of
+it, in the junction's `node:` with the role `walkingarea`, because netconvert names
+the walking area itself. Writing the pavement as a connection would not work: which
+sidewalk faces a corner depends on which end of each arm meets the junction and on
+the side traffic keeps to, so a pavement can run from a sidewalk *leaving* the
+junction, and netconvert refuses a connection out of an edge that does not end
+there. `sumo_warnings()` counts the footway connections left to the walking areas.
+
+**A crosswalk becomes a pedestrian crossing.** SUMO's crossing is not a strip with a
+place along the road, as the IR's is: it belongs to a node, and netconvert lays it
+across the mouth of the edges it names, between the walking areas either side. So a
+crosswalk near the end of a road — where the IR puts one at a junction, a little short
+of the mouth — is written as the crossing at that end's node, across both
+carriageways of the road:
+
+```xml
+<crossing node="j_x" edges="west.bwd west.fwd" priority="1" width="4.000"/>
+```
+
+"Near" is within 15 m of the road end, measured to the crosswalk's nearer edge;
+`sumo_warnings()` says how far the furthest one moved. Pedestrians have priority on
+every crossing, because a crosswalk in the IR is a painted one; at a signalised
+node the light decides instead (see [Traffic lights](#traffic-lights)). (`priority` is written as `1`
+rather than `true` because SUMO's schema types it as a number, and netconvert refuses
+`true` when it validates the file.) Two kinds of crosswalk are not written, and
+`sumo_warnings()` names each: one further along the road than that, a mid-block
+crossing, which SUMO could only carry by splitting the road with a node of its own
+there; and one across a road without a footway at both kerbs, which netconvert would
+build with nothing leading off one end. The trace names a crossing
+`crossing:<node>/<edge>+<edge>`, the edges sorted, since the plain format gives it no
+id; once the built network is loaded, the crosswalk also reaches the lane of the
+crossing netconvert built for it (`:j_x_c0_0`, role `crossing`), matched by the
+`crossingEdges` netconvert records on it.
+
+### Bicycles on sidewalks
+
+By default a sidewalk is the pedestrians' (`allow="pedestrian"`), and bicycles keep to
+the carriageway and the cycle lanes. `cycle_on_sidewalks=True` lets them ride the
+sidewalks as well, **both ways**:
+
+```python
+prefix = m.export_sumo("network/", cycle_on_sidewalks=True)
+```
+
+A SUMO bicycle is a vehicle, so it rides an edge in that edge's direction and crosses
+a node along a connection. Each sidewalk therefore gets two edges for bicycles, laid
+along the same strip: `<edge>.bike<index>` runs the same way as the sidewalk's edge,
+and `<edge>.bike<index>.rev` runs the other way (`<index>` is the sidewalk's lane in
+`<edge>`). Every walk the IR has between two footways — the pavement round each
+corner, a joint between two roads — becomes one connection each way between them,
+drawn along the pavement:
+
+```xml
+<edge id="west.fwd.bike0" from="n_west.fwd.bike0_start" to="n_west.fwd.bike0_p1" …>
+    <lane index="0" width="2.000" allow="pedestrian bicycle" …/>
+</edge>
+<connection from="west.fwd.bike0.p1" to="south.bwd.bike0" fromLane="0" toLane="0" shape="…"/>
+<connection from="south.bwd.bike0.rev.p1" to="west.fwd.bike0.rev" fromLane="0" toLane="0" shape="…"/>
+```
+
+The sidewalk lane itself stays the pedestrians' own. A bicycle on a lane of the
+carriageway's edge would be, to netconvert, on a cycle lane beside the traffic: every
+turning car would have to give way to it, and at a signalised junction netconvert
+1.18 builds a program SUMO refuses to run. The two edges also admit pedestrians
+because they *are* the sidewalk. netconvert only joins the footways round a node into
+one walking area when no lane closed to pedestrians lies between them, so with that
+the walking areas and crossings come out exactly as they do without bicycles. A few
+details keep netconvert quiet:
+
+- each edge is written in at least two pieces (`….p1` and on): cut where bicycles
+  change between it and the carriageway (below), or else halfway, joined at
+  `n_<edge>_p1`, so it never runs back between the two nodes a carriageway of its road
+  runs between, which netconvert would read as a second turnaround;
+- at a road end the IR links nowhere, the two edges of a sidewalk meet at a node of
+  their own (`n_<edge>.bike<index>_start` / `_end`) rather than at the road's dead end;
+- at a signalised junction the rides round a corner are `uncontrolled`, since the
+  pavement round a corner crosses no traffic.
+
+A bicycle can also **change between sidewalk and road, cross the road, and turn
+back**. SUMO only moves a vehicle from one edge to another along a connection at a
+node, so these all happen at nodes — and for a bicycle to change between sidewalk and
+road between junctions too, the export puts nodes there:
+
+```xml
+<!-- off the sidewalk onto the carriageway it runs beside, straight on across the junction -->
+<connection from="west.fwd.bike0.p1" to="east.fwd" fromLane="0" toLane="1"/>
+<!-- off the carriageway onto the sidewalk of the road it turns into -->
+<connection from="west.fwd" to="north.fwd.bike0" fromLane="1" toLane="0"/>
+<!-- between junctions, where the carriageway and its sidewalk are cut at one node -->
+<connection from="west.fwd.bike0" to="west.fwd.p1" fromLane="0" toLane="1"/>
+<connection from="west.fwd" to="west.fwd.bike0.p1" fromLane="1" toLane="0"/>
+<!-- across the west arm, where a crosswalk is, to the sidewalk on the other kerb -->
+<connection from="west.fwd.bike0.p1" to="west.bwd.bike0" fromLane="0" toLane="0"/>
+<!-- back the other way at the dead end the sidewalk runs out to, round a small loop -->
+<connection from="west.fwd.bike0.rev.p1" to="west.fwd.bike0" fromLane="0" toLane="0" shape="…"/>
+```
+
+| ride | where | how |
+| --- | --- | --- |
+| onto the carriageway | every node the IR has a movement through, with lanes a bicycle may use | from the sidewalk beside the arriving carriageway, riding its way, to the leaving carriageway's kerbmost such lane |
+| off the carriageway | the same | from the arriving carriageway's kerbmost such lane onto the sidewalk beside the leaving carriageway, riding its way |
+| onto and off the carriageway, between junctions | every 50 m at most along a carriageway with a sidewalk and a lane a bicycle may use, evenly spaced and short of its last stop line | from the sidewalk, riding the carriageway's way, onto that lane, and from that lane onto the sidewalk, at a node `n_<edge>_x<i>` both are cut at |
+| across the road | wherever a crosswalk became a SUMO crossing | from the sidewalk on one kerb to the one on the other, each way |
+| turning back | the end of every sidewalk at a dead end | from the edge arriving onto the one leaving |
+
+The bicycle edges sit below every carriageway in the priority order, so at a junction
+without a light a bicycle coming off the sidewalk gives way to the traffic it meets.
+At a signalised junction the light controls the rides too:
+
+- **Onto the carriageway.** A bicycle coming off a sidewalk goes first, in an 8 s green
+  and a 3 s yellow of its own, ahead of the green of the traffic of its approach.
+  Released together, the two would meet as two permissive movements each giving way
+  to the other, which netconvert 1.18 builds a junction logic SUMO refuses to run for.
+- **Off the carriageway.** A bicycle getting off the road goes with the traffic it
+  leaves.
+- **Across the road.** A bicycle riding across a road is protected (`G`) while that
+  road is held at red, and its green ends in a yellow. Traffic turning into the road
+  gives way to it, as to someone on a pedestrian crossing.
+
+A light with no bicycle coming off a sidewalk gets no bicycle phase, so the program
+of a map without bicycles is the same as it always was. The `.netccfg` needs no
+option for any of this.
+
+The bicycle edges get a trip weight of 0, so `randomTrips.py` never starts or ends a
+car trip on them. In the trace, each piece is `part` of its sidewalk with the role
+`bicycle`. Each ride carries what it stands for, also with the role `bicycle`: the
+footway connections and pavement lane round a corner, the IR's movements beside a ride
+onto or off a carriageway, the crosswalks beside a ride across the road, and the
+sidewalk a bicycle turns back on.
+
+### Traffic lights
+
+A junction with a traffic light on an approach — or on a lane a `TrafficLight` rule
+names — becomes a `traffic_light` node, and its light is named after it, so that the
+name follows from the map rather than from netconvert:
+
+```xml
+<node id="j_x" x="0.000" y="0.000" z="0.000" type="traffic_light" tl="j_x"/>
+```
+
+The IR holds no signal timing, and netconvert would happily make a program up — but
+its phases and its numbering of the movements would be netconvert's, moving whenever
+its version or its reading of the junction did, and nothing could say which slot of
+the program a light of the map controls. So the export decides the program itself and
+writes it to `<name>.tll.xml`: the phases, and the link index of every movement into
+the node, which fixes the position of each movement in every state string.
+
+For the four-arm crossroads of the exporter's tests, one lane each way, the program
+written is exactly this (links 0–2 leave the north arm for east, south and west, and
+so on round, 3–5 from the east, 6–8 from the south, 9–11 from the west):
+
+```xml
+<tlLogic id="j_x" type="static" programID="0" offset="0">
+    <phase duration="35" state="gGgrrrGggrrr"/>
+    <phase duration="3" state="yyyrrryyyrrr"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
+    <phase duration="35" state="rrrggGrrrgGg"/>
+    <phase duration="3" state="rrryyyrrryyy"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
+</tlLogic>
+<connection from="north.fwd" to="east.bwd" fromLane="0" toLane="0" tl="j_x" linkIndex="0"/>
+...
+```
+
+North and south go together, then east and west. The straights are protected; each
+left turn gives way to the oncoming traffic, and with one lane per exit a right turn
+gives way too, since it runs into the same lane as the left turn from opposite.
+
+The program is a static heuristic — the one Autoware's `lanelet2_to_sumo` writes:
+
+- Approaches are grouped by **axis**: two share a phase only if they arrive on
+  headings opposite to within 35° — so an approach and the one facing it run together
+  and the crossing road waits, however acute the angle the roads cross at.
+- Each group gets a **green** of 35 s (25 s when a junction has more than two groups),
+  then 3 s of **yellow** and 2 s of **all-red**.
+- In a green, a movement is **permissive** (`g`) if it turns across the oncoming
+  traffic released with it, or if another released movement runs into the same lane;
+  everything else released is protected (`G`), and the rest red.
+
+"Across the oncoming traffic" is a left turn where traffic keeps right and a right turn
+where it keeps left. It is read off the geometry and the map's handedness — the swing
+from the lane a movement leaves to the lane it joins — and not off netconvert's own
+`dir`, so the program does not depend on netconvert being told which side the map
+drives on. A turn with nothing facing it, off the stem of a tee, is protected.
+
+At a node with pedestrian crossings the built program is longer than the one
+written. netconvert accepts the export's program and extends it: it appends the
+crossings' links after the vehicle links, numbered on from the last of them, and
+splits each green to end it with a pedestrian clearance (a 35 s green becomes 30 s
+and then 5 s in which the crossings turn red), keeping the yellow and the all-red.
+The vehicle links and their indices are still the export's, and so is the order of
+green, yellow and red each of them goes through; the crossing slots are netconvert's,
+and the trace does not name them.
+
+The tests build the network and check that netconvert kept exactly this program and
+these link indices — at a node with crossings, the vehicle links of it — then drive
+traffic through every movement in `sumo`.
+
+No U-turns. Left to itself netconvert adds one at every dead end, so a vehicle could
+turn back at the far end of an arm where the OpenDRIVE and Lanelet2 maps of the same
+IR simply end the lane. The IR states no such movement, so the `.netccfg` sets
+`no-turnarounds`, and the network has the movements the map has and no others.
+
+### Random traffic: `randomTrips.py` weights
+
+No U-turns means every unlinked road end is a dead end a car cannot turn back at, so
+a trip that starts on the carriageway running *into* one, or ends on the one running
+*out of* one, has no route. Alongside the network the export writes three
+[`edgedata`](https://sumo.dlr.de/docs/Tools/Trip.html#customized_weights) files that
+tell `randomTrips.py` where trips may go:
+
+| file | an edge is weighted when |
+| --- | --- |
+| `<name>.safe.src.xml` | a trip may **depart** there: some connection leaves it |
+| `<name>.safe.dst.xml` | a trip may **arrive** there: some connection reaches it |
+| `<name>.safe.via.xml` | a trip may **pass through** there (`--intermediate`): both |
+
+```bash
+netconvert -c network/demo_town.netccfg
+python $SUMO_HOME/tools/randomTrips.py -n network/demo_town.net.xml \
+    --weights-prefix network/demo_town.safe -o trips.xml -r routes.rou.xml --validate
+```
+
+A weighted edge carries its length, so long roads draw more trips than short ones;
+every other edge is written with 0, which `randomTrips.py` never draws. The weights are
+for **passenger cars**, its default vehicle class: an edge with no lane a car may use —
+a footway, a cycle track, a hard shoulder — is 0 in all three, where `randomTrips.py`
+left to itself would happily start a car on a footway. And only the largest connected
+part of the network is weighted, so that a trip is never drawn between two pieces no
+route could join — the two carriageways of a lone road with nothing at either end, for
+one, are two separate one-way strips once U-turns are gone.
+
+The rule is per file rather than `lanelet2_to_sumo`'s "both a way in and a way out for
+all three": on a tree-shaped network with dead-end arms, every arm edge has only one
+of the two, and that rule would weight nothing. Even so, within one part of the network
+a car cannot turn back onto the arm it came from, so keep `--validate`, which has
+`duarouter` drop the few trips left without a route. A network with no connection at all
+— one road, linked to nothing — has no edge a car can leave, and every weight is 0.
+
+### Where on the globe
+
+The network is in the map's own metres about its origin — the generated configuration
+turns off netconvert's offset normalisation so that it stays that way, in the same
+coordinates as the other exports — and it is **georeferenced** all the same. The node
+file opens with a `<location>`, which netconvert carries into the `.net.xml` without
+moving a node:
+
+```xml
+<location netOffset="0.000,0.000" convBoundary="-2000.000,-2000.000,2000.000,2000.000"
+          origBoundary="139.737907026,35.661974335,139.782092974,35.698025610"
+          projParameter="+proj=tmerc +lat_0=35.68 +lon_0=139.76 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"/>
+```
+
+SUMO reads a network position as the projected position plus `netOffset`, so
+`sumolib`'s `net.convertXY2LonLat(x, y)` hands back the latitude and longitude the IR
+puts a point at — the ones the Lanelet2 export writes. For a UTM map netconvert
+writes the offset to the centimetre, which leaves them less than a centimetre apart.
+
+| map projection | `projParameter` | `netOffset` |
+| --- | --- | --- |
+| `local_cartesian`, `mgrs` | transverse Mercator about the origin, `+k=1+h/R` for an origin `h` m up (`R` the ellipsoid's mean radius of curvature there) — at `h = 0` the OpenDRIVE `<geoReference>` string, word for word | `0,0` |
+| `utm` | `+proj=utm +zone=<zone>` (`+south` below the equator) | minus the origin's easting and northing |
+
+An MGRS map's metres are local Cartesian about its origin like any other — MGRS only
+changes the grid position the Lanelet2 export reports beside them — so it is written
+the same way as a local one.
+
+A local map's metres are an east/north/up frame: a plane tangent to the ellipsoid at
+the origin's *altitude*, which the Lanelet2 export projects through. A metre on that
+plane is longer, measured on the ellipsoid beneath it, by `1 + h/R`, so the transverse
+Mercator is scaled by that much — at unit scale, 2 km out from an origin 2000 m up, it
+would be 0.63 m off; scaled, it is 1.5 mm off. (The OpenDRIVE `<geoReference>` is
+not scaled, so above sea level the two strings differ by the `+k`.) What a 2D
+`<location>` cannot carry at all is a point's own height above that plane: a point
+`z` above it and `d` from the origin is placed `d·|z|/R` from where the Lanelet2
+export puts it — 1.6 cm for 50 m at 2 km — and `sumo_warnings()` states that bound
+for the map whenever it reaches a centimetre.
 
 ### What it cannot carry
 
 - **Lane markings.** Which line is painted between two lanes, and in what colour, has
-  nowhere to go.
+  nowhere to go. Only whether it may be crossed survives, as above.
 - **One width per lane.** A tapering lane is written at its mean width along — the
   area of the lane divided by its length — and `sumo_warnings()` names it.
 - **Superelevation.** A SUMO lane is flat across. The heights along it survive.
 - **Lanes traffic does not run along** — borders, painted islands, parking bays — are
   dropped rather than written as something they are not.
-- **Crosswalks and signs.** A SUMO crossing belongs to a node and a sign is an
-  additional file, not part of the network.
+- **Signs.** A sign is an additional file, not part of the network.
+- **Crosswalks far from either end of their road**, and across a road without a
+  footway at both kerbs, as above: a SUMO crossing belongs to a node and joins two
+  footways.
 - **A pairwise right-of-way matrix**, as above: the IR can say which approach holds
   right of way and no more.
-- **The geo-reference.** The network is in the map's own metres about its origin, and
-  the generated configuration turns off netconvert's offset normalisation so that it
-  stays that way — the same coordinates as the other four exports.
+- **Signal timing.** The IR has none, so a signalised junction runs on the fixed-time
+  program above rather than one the map states.
+- **The stop line's paint.** Where it is survives as a stop offset, as above; a stop
+  line with nowhere to go is named.
+- **A speed-limit rule on a lane that is not written.** The connector lanes inside a
+  junction become internal lanes whose speed netconvert sets for the turn, and a lane
+  of a type SUMO has no place for is dropped with its rule. Where rules disagree about
+  a lane, the higher ones are dropped. `sumo_warnings()` names the lanes in each case.
+- **Heights in the geo-reference.** A `<location>` is horizontal only; the heights
+  are the map's own `z`, as in every other export. The origin's altitude goes into a
+  local map's projection scale rather than being lost, but each point's own height
+  above the origin's plane cannot be, which `sumo_warnings()` bounds as above.
 
 ## CARLA
 
@@ -1157,13 +1847,16 @@ measured where it actually is:
             └─ raised by the kerb height ──────────────┘            └─ Terrain
 ```
 
-A lane whose type is `sidewalk` is raised by the kerb height, which puts a vertical face
-between it and the surface beside it — that face is the **curb**, and the strip of road
+A lane stands where the IR lifts it — its [`height`](#a-lane-off-the-road-surface),
+station by station — and a `sidewalk` the IR left flat is raised by the kerb height
+instead. Either way a lane above its neighbour puts a vertical face between them — that face is the **curb**, and the strip of road
 at the foot of it is the **gutter**, split off the outermost part of the carriageway the
 way a real one is. Neither is a lane in the IR and neither should be: they are what a
 *surface* has and a road network does not. Painted lines are geometry rather than
 texture — a broken line is a strip per dash, cut by arc length so that a three-metre
-dash is three metres however the sampler laid its vertices.
+dash is three metres however the sampler laid its vertices. The surface is what the
+road's pavement says it is — asphalt, concrete, cobbles, gravel, dirt, sand, rock —
+changing material where the pavement changes.
 
 Beyond the outermost band is the **land**: one mesh, from every road's edge out to
 150 m past the network (`ground_extent`), for a lidar to reach and a vehicle that
@@ -1210,12 +1903,17 @@ the navigation comes out as `Content/<Package>/Maps/<name>/Nav/<name>.bin`, whic
 server hands to clients and `world.get_random_location_from_navigation()` draws on.
 
 Two things about that `.obj` are not obvious and both were found the hard way. The
-loader labels triangles in file order and the last label wins, so the meshes are
-written in order of precedence — buildings and kerbs first, then the land, the
-roads, the sidewalks and last the markings — so that where two meet along an edge
-the one a walker should be on wins the voxels there. And the crosswalk bands in it are not the
-painted stripes: they are one quad per crossing, `crosswalk` from kerb to kerb,
-because the stripes are what a camera sees and the band is what a walker needs.
+rasterizer does not let the last label win: where two surfaces lie within a climb
+(0.3 m) of each other it keeps the *higher area id* — sidewalk 1, crosswalk 2, road
+3, grass 4 — whatever the order. A crosswalk laid over the road it crosses would
+become road, which a walker that does not cross roads is never routed over: so the
+road under each crossing is cut out of the `.obj`, and there only the crossing is
+left. And the crosswalk bands in it are not the painted stripes: they are one quad
+per crossing, `crosswalk` from kerb to kerb and `CROSSWALK_OVERLAP` (0.3 m) onto
+each pavement, because the stripes are what a camera sees and the band is what a
+walker needs. Only that far onto the pavement: CARLA's walkers stop and look for a
+light wherever their route steps from a pavement onto a crossing, and a band over the
+whole width of the pavement would stop everyone walking along it.
 
 Crosswalks *are* painted, too — a bar and a gap of half a metre each, across the
 carriageway, from the crossing objects in the IR — and so are stop lines, as a bar
@@ -1306,9 +2004,12 @@ drops any mesh whose name holds `light` or `sign` before it is placed.
 So the furniture is built, and it is built to the road: a pole on the pavement,
 `kerb_setback` in from the kerb on the side the governed traffic keeps to; a mast arm
 from there, perpendicular to the road, long enough to reach `arm_overhang` past the
-middle of the farthest lane the light governs, at the height the IR gave the bar; a
-three-lamp head hung from it over the middle of every governed lane, facing the
-traffic. A sign is a post on the same pavement, `sign_setback_along` before the line
+middle of the farthest lane the light governs; a head hung from it over the middle
+of every governed lane, facing the traffic. The head is the IR's: its housing stands
+on the light's bar (the bar is the housing's bottom edge), as wide as the bar and as
+tall as the head's `height`, with a lamp at each of its bulbs, and the arm runs just
+above it. So the housing and lamps CARLA shows are the `traffic_light` and
+`light_bulbs` ways the Lanelet2 map gives Autoware, to the centimetre. A sign is a post on the same pavement, `sign_setback_along` before the line
 it applies to, with an octagon, a triangle, a disc or a square on it for what the
 code says it is. A road with no pavement stands both on the verge instead.
 
@@ -1426,6 +2127,52 @@ block the SDK checks. Text needs neither, so this crate has no compression depen
 no magic constants, and produces a file that can be opened in an editor and diffed when
 a map comes out wrong.
 
+### A point-cloud map for Autoware, from the same surface
+
+Autoware localizes by matching its LiDAR against a point-cloud map (NDT), and a
+generated map has no survey to take one from. It does have the meshes CARLA's level
+is built from — which are exactly what the simulated LiDAR sees — so the point-cloud
+map is sampled from those:
+
+```python
+m.export_carla("Import/", name="Town01")
+m.export_lanelet2("autoware/Town01/lanelet2_map.osm")
+m.export_pointcloud_map("autoware/Town01", name="Town01")
+```
+
+```text
+autoware/Town01/
+├── lanelet2_map.osm
+├── pointcloud_map/
+│   ├── 0_0.pcd                 one grid cell each: binary, x y z as 32-bit floats
+│   ├── 0_-1.pcd
+│   └── …
+└── pointcloud_map_metadata.yaml
+```
+
+That is Autoware's *divided* point-cloud map, which its map loader reads for partial
+loading: `x_resolution` and `y_resolution` are the cell size, and each cell's file
+name maps to the corner it starts at (`0_-1.pcd: [0, -20]` covers x 0–20,
+y −20–0). Run Autoware with `pointcloud_map_file:=pointcloud_map`.
+
+- **The frame is the Lanelet2 map's.** Every point is put through the conversion
+  the Lanelet2 exporter gives its nodes' `local_x` and `local_y` — the map's own
+  metres, or metres within the MGRS square for an `mgrs` map, worked out point by
+  point as the nodes are — and its height is the map's `z`, which is the nodes'
+  `ele`. The two files agree because they are converted by the same code.
+- **The surface is `export_carla`'s.** `name`, `buildings`, `kerb_height`,
+  `verge_width` and `ground_extent` mean the same things and should be given the
+  same values. The town is in the cloud wherever it goes — in the map, or as props
+  the package's script stands in the level — because it is in the level either way.
+  The traffic lights and signs are not.
+- **`spacing`** (0.5 m) is how far apart samples are along a triangle's edges, and
+  the size of the voxel that keeps one of the points that land in it: triangles
+  share edges and the roads lie over the land, so the same place is sampled many
+  times. It is finer than the voxels Autoware downsamples the map and its scans to.
+  **`cell_size`** (20 m) is the side of a cell, in whole metres: Autoware's loader
+  reads each corner as an integer, and a map with one it cannot read is not loaded
+  at all.
+
 ### What it cannot carry
 
 `Map.carla_warnings()` reports all of it. Beyond the tagging traps above and whichever
@@ -1533,6 +2280,62 @@ reports that rather than letting a caller assume a round trip, and checks the
 scenario's route against the map while it is there. The `pole`, `road_island` and
 `road_marking` layers have no counterpart in the IR and are not written.
 
+## RDS-HQ
+
+RDS-HQ is the dataset layout NVIDIA's
+[Cosmos-Drive-Dreams](https://github.com/nv-tlabs/Cosmos-Drive-Dreams) toolkit renders
+its HD-map and world-scenario control videos from, and the one the
+[PhysicalAI-Autonomous-Vehicle-Cosmos-Drive-Dreams](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicle-Cosmos-Drive-Dreams)
+dataset is published in. A dataset is a root of folders, each holding one
+`{clip_id}.tar` per clip; each tar is a single WebDataset sample.
+
+```python
+clip_id = m.export_rdshq("rds_hq/", scenario="scenario.yaml")
+```
+
+```
+rds_hq/
+├── 3d_lanes/demo_town.tar             each drivable lane's centreline, in travel order
+├── 3d_lanelines/demo_town.tar         painted edges, with `colors` and `styles`
+├── 3d_road_boundaries/demo_town.tar   the outermost edge on each side of a cross-section
+├── 3d_wait_lines/demo_town.tar        stop lines
+├── 3d_crosswalks/demo_town.tar        crossings, as polygons
+├── 3d_traffic_lights/demo_town.tar    boxes, with each light's IR id as `feature_id`
+├── 3d_traffic_signs/demo_town.tar     boxes
+├── 3d_poles/, 3d_road_markings/       written empty: the IR has neither
+├── pose/demo_town.tar                 camera-to-world per frame and camera, OpenCV axes
+├── vehicle_pose/demo_town.tar         rig-to-world per frame, forward-left-up
+├── timestamp/demo_town.tar            microseconds per frame
+├── all_object_info/demo_town.tar      an empty object list per frame: the IR has no traffic
+├── ftheta_intrinsic/demo_town.tar     cx, cy, w, h, polynomial, direction, c, d, e
+└── pinhole_intrinsic/demo_town.tar    fx, fy, cx, cy, w, h
+```
+
+Map layers are in the IR's own east-north-up frame, heights and all; a shape's points
+are `labels[i].labelData.shape3d.{polyline3d,surface,cuboid3d}.vertices`, the keys the
+toolkit's renderer reads and its Waymo converter writes. Several clips can share one
+root, and the output renders as it stands:
+
+```sh
+python render_from_rds_hq.py -i rds_hq/ -o render/ -d rds_hq -cj demo_town -c ftheta
+```
+
+**It takes ClipGT's scenario file.** The route, the speed and the rig are the same
+[scenario](#the-scenario-file), and the ego track and the boxes for lights and signs
+are ClipGT's own, so a map exported both ways is the same drive in both. A camera's
+f-theta lens goes into `ftheta_intrinsic` as it is; the pinhole beside it has the same
+focal length at the centre of the frame, which is where the two lenses agree. With no
+`sensors`, the clip is given the one camera the toolkit's single-view configuration
+renders, `camera_front_wide_120fov`, an equidistant 120° lens.
+
+**What the toolkit will make of it.** `Map.rdshq_warnings(scenario)` reports what the
+map loses — topology, junctions, sign codes, everything off the road surface — and,
+given the scenario, what the renderer will do that a caller may not expect: it reads
+every pose at 30 fps whatever the clip was made at, it cuts 121-frame videos and drops
+a shorter tail, it renders only 16:9 f-theta cameras, and its world-scenario path
+reads a lane-line or traffic-light layer holding exactly one label as a placeholder
+for none.
+
 ## GPUDrive
 
 [GPUDrive](https://github.com/Emerge-Lab/gpudrive) is a GPU-accelerated driving
@@ -1630,6 +2433,147 @@ is there — 515 objects, 956 road elements, 1746 vertices an element and 91 tim
 past which the simulator silently drops what does not fit. The `speed_bump` and
 `driveway` elements go the other way: the IR has nothing that means either, so they
 are never written.
+
+## Waymo Open Motion Dataset
+
+The [Waymo Open Motion Dataset](https://waymo.com/open/data/motion/) (WOMD) ships its
+scenarios as TFRecord files of `waymo.open_dataset.Scenario` protocol buffers. A
+scenario is a map, the traffic-signal states on it at every timestep, and the logged
+tracks of the agents; `export_womd` writes the first two, in the same container, so the
+dataset's own tooling, [Waymax](https://github.com/waymo-research/waymax) and anything
+else that reads WOMD read the file as it is.
+
+```python
+m.export_womd("map.tfrecord")                  # 91 steps of 0.1 s, "now" at step 10
+data = m.to_womd_bytes(scenario_id="town-1")   # the bare Scenario message
+```
+
+The schema is Waymo's own: `map.proto` and `scenario.proto` are carried in
+`crates/roadgen-womd/proto/` (Apache-2.0) and compiled at build time, with only the
+per-step lidar and camera-token fields of `Scenario` taken out and their numbers
+reserved. Every other field keeps its upstream name and number, so the upstream schema
+reads the file unchanged.
+
+| Feature | What goes in it |
+| --- | --- |
+| `lane` | each drivable lane's centreline in travel order, with its `entry_lanes` and `exit_lanes`, its same-direction `left_neighbors` and `right_neighbors`, the line or edge on either side as `left_boundaries` and `right_boundaries`, its type, and its speed limit in mph. A lane through a junction is `interpolating` and has no boundaries. |
+| `road_line` | a painted boundary between lanes, with its line type |
+| `road_edge` | the edge of the drivable surface (`TYPE_ROAD_EDGE_BOUNDARY`), a kerbed median (`TYPE_ROAD_EDGE_MEDIAN`), and the rest of every pavement's outline — its back edge, and the outer side of the pavement round a junction's corner (`TYPE_UNKNOWN`). The inner side of that corner pavement is the kerb carried round the corner, so it is a `TYPE_ROAD_EDGE_BOUNDARY` like the kerbs along the arms |
+| `crosswalk` | the outline of a crossing |
+| `stop_sign` | where the sign stands, and the lanes it controls |
+| `dynamic_map_states` | at every step, a state for each lane through a junction a traffic light governs, with its stop point at the lane's mouth |
+
+**WOMD keeps the z.** Every point is `(x, y, z)` in the IR's own metres, so the
+elevation reaches the file, and where one road passes over another both keep their
+edges whole, apart in height — unlike GPUDrive's flat scene, where they are cut.
+
+The line types and edge kinds are the ones the GPUDrive export writes, since GPUDrive
+borrowed WOMD's vocabulary, and the same two decisions hold: an edge is one feature,
+a line or a road edge but never both, and a junction connector has no edges.
+A traffic light's state goes, as in the Lanelet2 export, to the lanes *through* the
+junction its approaches feed.
+
+**What it cannot carry.** The scenario has no tracks: a generated map has no logged
+traffic, so there is no self-driving car and nothing to predict. The IR has no signal
+timing, so every lane state is `LANE_STATE_UNKNOWN`; the light heads themselves, stop
+lines, right-of-way rules and signs other than the stop sign have no feature. Footways
+and verges are not lanes in WOMD's sense and are not written as lanes — a pavement
+survives as its outline of road edges, a verge not at all — and the lane widths go
+with them. Feature ids are numbered as they are written. `Map.womd_warnings()` says all of
+that.
+
+## CommonRoad
+
+[CommonRoad](https://commonroad.in.tum.de/) is the benchmark format of TU Munich's
+motion-planning suite: one XML document holding a lanelet network, the traffic signs
+and lights on it, its intersections, any other traffic, and the planning problems posed
+on it. `export_commonroad` writes the 2020a schema that
+[`commonroad-io`](https://pypi.org/project/commonroad-io/) ships and validates against,
+so its `CommonRoadFileReader` opens the file as it is, and the scenario goes straight to
+a planner, CommonRoad's route planner or its drivability checker.
+
+```python
+m.export_commonroad("scenario.xml")              # ZAM_<map name>-1_1_T-1, dated today
+xml = m.to_commonroad_xml(benchmark_id="ZAM_Town-1_1_T-1", date="2026-01-01",
+                          time_step=0.1, goal_steps=300, elevation=True)
+m.export_commonroad("lit.xml", light_cycle="default")   # the lights run a cycle
+m.export_commonroad("own.xml", light_cycle=[("red", 30), ("redYellow", 2),
+                                            ("green", 25), ("yellow", 3)])
+```
+
+| Element | What goes in it |
+| --- | --- |
+| `lanelet` | each driving lane, bicycle lane and footway: its left and right bound in travel order, as many points each, with the paint on them (`solid`, `dashed`, `solid_solid`, `solid_dashed`, `curb`, …); its predecessors and successors; the lanelet beside it on either side and whether it runs the same way; what it is (`urban`, `country`, `highway`, `mainCarriageWay`, `accessRamp`, `exitRamp`, `bicycleLane`, `sidewalk`, and `intersection` for a lane through a junction) and who uses it — vehicles or bicycles one way, pedestrians both ways. A crossing is a `crosswalk` lanelet too |
+| `trafficSign` | the map's signs CommonRoad's catalogue has, by their German number — a stop sign however its code is spelt is `206`, and `274-50` is a 50 km/h limit; a virtual `274` for each distinct speed limit, held in metres per second; a virtual `205` give-way for each right-of-way rule. Each is referred to by the lanelets it governs, and a stop or a give-way puts a `stopLine` across them, at the stop line the map draws when it draws one |
+| `trafficLight` | each light where it stands, referred to by the lanes that stop for it, which stop at its stop line; dark — one `inactive` phase — unless `light_cycle` gives it a cycle |
+| `intersection` | each junction a street meets — the crossroad end of a slip road too — with an incoming per approach, the lanes of one road going one way, and the lanelets each turns into, sorted `successorsLeft`, `successorsStraight` and `successorsRight` by how far they swing; the crossings at its mouths |
+| `planningProblem` | the schema requires one: from rest at the start of the map's first lane to the end of the route the map's own policy drives from it, within the time it takes at 5 m/s, or `goal_steps` steps |
+
+**Ids are one space.** Lanelets, signs, lights, intersections, their incomings and the
+planning problem are numbered from 1 in that order, as the schema keys them. The scenario
+is set in Zamunda (`ZAM`), the country CommonRoad keeps for scenarios that are nowhere
+real, whose signs are Germany's; the origin's latitude and longitude go in `location`,
+with the same PROJ string the OpenDRIVE export writes as its `geoReference`, so that a
+tool which reprojects a scenario — the Scenario Designer, say — puts both files in one
+place.
+
+**A lanelet lies in the plane** unless `elevation=True`. The schema allows a `z`, but
+CommonRoad's tools work in two dimensions, so where one road passes over another the two
+lanelets cross, unconnected.
+
+**Footways are walked both ways**, and the IR joins pavements end to end whichever way
+each is drawn. CommonRoad's successor runs from one lanelet's end to the next one's
+start, so a pavement round a junction's corner is written the way that links it to the
+pavements either side, and a link that joins two ends that both lead out cannot be said.
+
+**Light timing is asked for, not read.** The IR has no signal timing, so a light is
+dark unless `light_cycle` gives it one: `"default"` for the Scenario Designer's own —
+red 6 s, red and amber 1 s, green 6 s, amber 1 s — or a list of `(colour, seconds)`.
+Every light runs the same cycle, but not in step: at each junction, the lights on the
+approaches across the first one run behind it by the time the cycle takes to reach
+green, so north–south and east–west take turns. That works when the time to green is
+half the cycle, as the default's is; `commonroad_warnings(light_cycle=...)` says when a
+cycle would put crossing directions on green together. A junction approached from more
+than two directions still has only two groups.
+
+**What it cannot carry.** There is no other traffic, only the planning problem. Right of way is a
+give-way sign on the lanes that yield, not a relation to the lanes they yield to. A
+speed-limit sign holds, in CommonRoad, along the lanelets after it until the next, so a
+lane with no limit of its own takes the one before it. Shoulders, borders, parking
+strips and verges are not lanelets; buildings, barriers, structures and terrain are not
+written; and a junction of motorways and slip roads alone is a merge, not an
+intersection. `Map.commonroad_warnings()` says all of that.
+
+### The map alone: CommonRoad 2024
+
+The 2020a XML above is a *scenario*, and its schema will not have one without a
+planning problem. CommonRoad's 2024 format splits a scenario into three files — the
+map, the dynamic part (traffic, light timing) and the scenario that ties them to
+planning problems — and `export_commonroad_map` writes the first: the map and nothing
+more, as one `CommonRoadMap` protocol buffer of CommonRoad's own schema, which
+`commonroad-io` opens with `CommonRoadFileReader(filename_map=path).open_map()`.
+
+```python
+m.export_commonroad_map("map.pb")              # ZAM_<map name>-1, in the plane
+data = m.to_commonroad_map_bytes(elevation=True)
+m.commonroad_map_warnings()
+```
+
+It is the scenario's lanelet network — the same lanelets, ids, signs, lights and
+intersections — cut into the 2024 format's elements:
+
+- **bounds and stop lines are elements of their own** that lanelets refer to by id.
+  Each lanelet has its own two bounds in its direction of travel: the format can share
+  one between neighbours with a "reversed" flag, but `commonroad-io`'s reader ignores
+  the flag, so a shared bound would read backwards on one side. A stop line has its
+  two ends — across the lanelet's end where the map draws none;
+- **signs are named** (`MAX_SPEED`, `STOP`, `YIELD`) rather than numbered, and every
+  one stands somewhere: a virtual speed limit beside the start of the first lanelet
+  it holds on, a virtual give-way beside the end;
+- **a light has no cycle**: timing belongs to the dynamic file, so `light_cycle` does
+  not apply;
+- **the buildings are in it**: every building part is an environment obstacle of type
+  `BUILDING`, its outline in plan.
 
 ## The demo page
 
@@ -1745,6 +2689,82 @@ Each exporter adds the constraints its own format imposes, through
 from Python). Those constraints stay on the exporter's side of the boundary and are
 never pushed back into the IR.
 
+## The IR as Protocol Buffers
+
+```python
+m.export_proto("map.roadgen.pb")
+m = roadgen.read_proto("map.roadgen.pb")    # the same map, to export later
+```
+
+```rust
+roadgen_proto::write(&map, "map.roadgen.pb")?;
+let map = roadgen_proto::read("map.roadgen.pb")?.validate()?;
+```
+
+Every exporter lowers the IR onto something narrower, and the IR dump
+(`export_ir`) leaves the geometry out. This writes **all** of it — roads, lanes and
+their curves, junctions, connections, objects, rules, buildings, bridges and
+tunnels, grade separations, interchanges, terrain, land cover and sites — field for
+field and in the IR's own order, and reads it back as a map equal to the one written.
+So the document is something to keep, to hand to another process, or to export from
+later: the round-trip tests check that a map read back writes the same OpenDRIVE and
+Lanelet2, byte for byte, as the one that was written. (The one thing that would not
+survive is the sign of a zero — proto3 writes no field that holds zero, so a `-0.0`
+would come back as `0.0` — and the IR does not make one.)
+
+The reader is not only for documents roadgen wrote. Every value goes back through
+the IR's own constructors, so one that the IR cannot hold — a width of zero, a
+polyline of one point, a composite with a gap in it, a coordinate that is not a
+number, an origin off the globe, an enum left unset where the schema gives unset no
+meaning — is refused, naming the field (`lanes[3].width.knots[0].width`). A message
+left out where the schema says what empty means — a lane's height, a road's links —
+is read as empty, which is what a writer that never touched it meant. Whether the result is a
+consistent road network is `validate()`'s question, as it is for any map.
+
+### Reading it somewhere else
+
+The schema is in [`crates/roadgen-proto/proto/roadgen_ir/v1/`](crates/roadgen-proto/proto/roadgen_ir/v1/),
+and it is written for whoever reads a document *without* roadgen: every field says
+what it means, in what unit and against what reference. A reader in any language
+compiles it with `protoc` and needs to know three things, all of which `map.proto`
+says at the top:
+
+- **References are identifiers.** Every element has an `id` such as `road/north`
+  or `lane/north/0`, and every reference is one. Build a dictionary per kind.
+- **Every curve can carry its vertices.** A reference line is a line, an arc, a
+  clothoid, a Bézier, a polyline or a chain of them, and a reader is welcome to
+  evaluate them — but each curve also carries `samples`: itself evaluated at the
+  map's sampling length, the polyline every polyline export of the map gets. A
+  reader that wants polylines reads those and never integrates a clothoid.
+  `curve_samples=False` leaves them out, for a document about half the size.
+- **Lanes are stored along the reference line.** `left_boundary` is the edge to the
+  left of the road's reference line whichever way traffic runs; a backward lane's
+  curves reversed, with left and right swapped, are its travel order.
+
+[`examples/proto_importer.py`](examples/proto_importer.py) is a whole importer of
+the road network in about a hundred lines of Python that never imports roadgen —
+lanes in travel order, their boundaries, speed limits, successors and predecessors
+— and the Python tests run it on what `export_proto` wrote:
+
+```bash
+pip install protobuf grpcio-tools
+python -m grpc_tools.protoc -I crates/roadgen-proto/proto --python_out=generated \
+    crates/roadgen-proto/proto/roadgen_ir/v1/*.proto
+PYTHONPATH=generated python examples/proto_importer.py map.roadgen.pb
+```
+
+Without the repository, `roadgen.proto_schema()` is the same files as
+`{path: source}`, and in Rust `roadgen_proto::SCHEMA` is too, with
+`roadgen_proto::FILE_DESCRIPTOR_SET` the schema compiled, for a reader that works
+from descriptors at run time. The package is `roadgen_ir.v1` rather than
+`roadgen.ir.v1` so that the Python protoc generates (`roadgen_ir/v1/map_pb2.py`)
+imports beside the `roadgen` package instead of inside it. Within `v1` fields are
+only ever added; a change a reader would trip over gets `v2`.
+
+The Rust crate compiles the schema at build time with
+[protox](https://github.com/andrewhickman/protox), a protobuf compiler in Rust, so
+building roadgen needs no `protoc`.
+
 ## Reading OpenDRIVE back
 
 ```python
@@ -1790,13 +2810,55 @@ Python, one line per thing the map now says less exactly than the file did:
 - a lane type the IR does not have — `stop`, `median`, `bus`, the ramps — lands on
   the nearest it does, and a road type likewise;
 - a building's roof is flat, because an outline has one height per corner;
+- what an older writer leaves out is filled in before the document is parsed —
+  CARLA 0.10's maps (RoadRunner, OpenDRIVE 1.4) give a `<roadMark>` no `color`
+  (read as `standard`), an outline `<cornerLocal>` no `height` (read as 0), an
+  `<object>` the `type` `-1` (read as `none`), and a `<userData>` elements but no
+  `code` (passed over, as ancillary data is, and not reported);
+- a road that ends up to 10 cm from the road it is linked to is moved, whole, onto
+  it, when its other end is linked to no road; and a lane that ends up to 10 cm
+  from the lane it continues has its end moved onto that lane's — the lane of a
+  junction's connecting road where there is one. CARLA stores a road's start in
+  single precision, so its roads miss each other by a millimetre or so, and
+  Lanelet2 joins lanelets only where they share points;
 - a signal or object that names no lanes is read as governing every lane of its
-  section that runs the way it faces.
+  section that runs the way it faces;
+- a traffic light that names the lanes *inside* a junction — CARLA's Town maps
+  stand a junction's light on a post valid on no lane of its own road and refer to
+  it with a `<signalReference>` from each connecting road — is read as governing
+  the approaches that feed those lanes instead: the IR's traffic light is about
+  the lanes that stop for it (the Lanelet2 export hangs it back on the lanes
+  through the junction, as below). A sign
+  keeps the lanes it names, since what a sign means is its code, which the reader
+  passes through without reading;
+- a `<controller>` is one traffic-light rule, with the stop lines of each junction
+  mouth its lanes enter by: the document's own where any cross that mouth's lanes
+  (the one across most of them first), and otherwise `object/stopline/<road>/<end>`,
+  a line the reader draws across the lanes where they enter the junction, from the
+  driver's left to the right — one per mouth however many controllers stop there.
+  Lanes that enter no junction stop at a document line across them, or at none.
+  A map roadgen wrote with a traffic-light rule that has no stop line gains one
+  the same way when it is read back, so that map comes back with one object more.
+
+Every lane of a traffic-light rule gets one `traffic_light` regulatory element in
+the Lanelet2 export. A rule with no stop line or one is a single element over all
+its lanes, with that line as the `ref_line` whichever lanes the line itself names.
+A rule with several is one element per line, on the rule's lanes that line names
+and referring to the lights over them; a lane no line names — a mouth whose
+document line crosses only some of its lanes — gets an element of its own without
+a `ref_line`. The SUMO export stops lanes at a line by the same rule
+(`Map::traffic_light_stops`), and no element is written that no lanelet holds.
+The element hangs on the lanelets *through* the junction that a rule's lane feeds
+— the ones tagged `turn_direction`, where the OpenDRIVE refers to the light and
+where Lanelet2 maps for Autoware hang it, with the stop line before them as the
+`ref_line` — and on the lane itself only when it feeds no junction. A vehicle on
+the approach meets the element on the lanelet its route enters next.
 
 What is an error rather than a note is a document that is not a road network: a
 reference line with a gap in it wider than 10 cm (a narrower one is closed and
 reported), a link to a road that is not there, a lane link to a lane the neighbour
-does not have. A `<geoReference>` the reader does not recognise places the map at
+does not have. Roads or lanes linked across more than 10 cm are read as the
+document has them, and validation says they do not meet. A `<geoReference>` the reader does not recognise places the map at
 latitude 0, longitude 0 and says so; `origin=` overrides it.
 
 Roads and junctions are named after the file's ids, so the file's road 12 is
@@ -1999,6 +3061,123 @@ junctions and 13 the junction beside them. Every one of the
 Lanelet2 routing graph's 970 successors is now a movement the document states, up
 from 795, and none of its lane links names a lane its road does not reach, down from
 153.
+## Following an element across formats
+
+Every format numbers its output its own way. OpenDRIVE numbers roads in the IR's
+order; Lanelet2 and OpenStreetMap count; SUMO names edges after roads and counts lanes
+from the kerb; ClipGT and GPUDrive have nothing but the row. None of those numbers
+flow back into the IR, so "which lanelet is OpenDRIVE road 4, lane -1?" has no answer
+in the files themselves.
+
+So every export writes, beside what it wrote, a **trace file** — which element of the
+file each road, lane, junction, connection, object, rule and building of the IR became
+— and `export_ir` writes the IR's own elements, without their geometry. Loaded
+together, they follow one element from any format to any other, through the IR:
+
+```python
+m.export_ir("out/map.ir.json")
+m.export_opendrive("out/map.xodr")           # + out/map.xodr.trace.json
+m.export_lanelet2("out/lanelet2_map.osm")    # + out/lanelet2_map.osm.trace.json
+m.export_sumo("out/sumo/")                   # + out/sumo/demo_town.sumo.trace.json
+
+t = roadgen.Trace.load("out/map.ir.json",
+                       "out/map.xodr.trace.json",
+                       "out/lanelet2_map.osm.trace.json",
+                       "out/sumo/demo_town.sumo.trace.json")
+t.to_ir("lanelet2", 1000123)                 # [{"ir": "lane/north/0", ...}]
+t.translate("lanelet2", 1000123, to="sumo")  # [{"ref": "lane:north.fwd_0", ...}]
+t.translate("sumo", "north.fwd_0", to="opendrive")
+```
+
+Formats are never mapped onto each other directly: a lanelet goes back to the IR lane
+it came from, and that lane forward into SUMO. Each export only has to record its own
+side, a trace written today joins one written tomorrow, and a format added later needs
+one more trace and changes none.
+
+| Format | Trace file | What an element is called |
+| --- | --- | --- |
+| OpenDRIVE | `<file>.trace.json` | `road:4`, `lane:4/0/-1` (road / section / lane), `junction:16`, `connection:16/2`, `signal:3`, `object:5`, `outline:9/0`, `controller:0`, `bridge:7`, `tunnel:8` |
+| Lanelet2 | `<file>.trace.json` | `lanelet:1001004`, `linestring:1001000`, `regulatory_element:1001050` |
+| OpenStreetMap | `<file>.trace.json` | `way:-12`, `node:-3`, `relation:-40` |
+| SUMO | `<dir>/<prefix>.sumo.trace.json` | `edge:north.fwd`, `lane:north.fwd_0`, `node:j_x`, `connection:north.fwd_0>west.bwd_0` |
+| ClipGT | `<dir>/<clip id>.clipgt.trace.json` | `<layer>:<row>` — `lane:17`, `lane_line:3`, `wait_line:0` |
+| GPUDrive | `<file>.trace.json` | `road:42`, `agent:1` |
+| WOMD | `<file>.trace.json` | `feature:12`, `signal:12` (the lane state on feature 12) |
+| CommonRoad | `<file>.trace.json` | `lanelet:3`, `traffic_sign:40`, `traffic_light:41`, `intersection:42`, `incoming:43`, `planning_problem:48` |
+| CommonRoad map | `<file>.trace.json` | as CommonRoad, and `boundary:60`, `environment_obstacle:90` |
+| CARLA | `<dir>/<name>.carla.trace.json` | the package's `.xodr` as OpenDRIVE, and `actor:<name>` for each light and sign; the meshes are not traced |
+
+**A file read has a trace too.** `read_opendrive` records which element of the map
+each road, lane, junction, signal, object and controller of the file became, in the
+same kinds as the OpenDRIVE export, and `write_read_trace` writes it beside the file
+(`direction: "import"`). That is how a signal of somebody else's OpenDRIVE — a CARLA
+traffic light, by its OpenDRIVE id — is followed to the SUMO movements it switches:
+
+```python
+m = roadgen.read_opendrive("Town10HD_Opt.xodr")
+m.export_ir("town.ir.json")
+m.write_read_trace()                         # + Town10HD_Opt.xodr.read.trace.json
+prefix = m.export_sumo("sumo/")
+
+t = roadgen.Trace.load("town.ir.json", "Town10HD_Opt.xodr.read.trace.json",
+                       f"sumo/{prefix}.sumo.trace.json")
+t.translate("opendrive", "signal:949", to="sumo")   # [{"ref": "tls:j_189/12", ...}, ...]
+```
+
+The read trace is format `opendrive` too, so one `Trace` holds either it or an
+OpenDRIVE export's trace, not both. A document that gives two signals one id has
+both traced to that `signal:`.
+
+A light is traced to the movements off the lanes it stands over — the approaches,
+for a CARLA light the file names over its junction's connecting roads. The lights
+of one OpenDRIVE `<controller>` are read as one rule over all their lanes, which is
+right for the program, but each light still answers only for its own movements, and for those
+its rule gives it that no light stands over. A stop line the reader drew, having
+no element in the file, is traced `collapsed` to the controller it was drawn for,
+with the role `stop_line`.
+
+A bare element takes the kind that format is usually asked about — a lanelet id is a
+lanelet, a SUMO id a lane — so `1000123` and `"lanelet:1000123"` are the same question.
+
+**One element is not always one element.** A road is two SUMO edges; a boundary is
+shared by two lanelets; a junction connector has no SUMO lane of its own and becomes a
+connection. Every link says which: `exact`, `part` (the IR element was split and this
+is a piece), `merged` (several IR elements were written as one) or `collapsed` (the IR
+element was absorbed into this one). Answers therefore come as a list. When the target
+format has nothing for any IR element the source came from — a lane, asked of
+OpenStreetMap, which writes roads — the lookup steps one neighbour out in the IR dump
+(the lane's road) and says so in `via`.
+
+**A trace is refused rather than trusted.** Each one records a digest of every file it
+describes and a fingerprint of the IR it was written from. A file written again since
+— whose counters may now name different things — or a trace from another map is an
+error when loaded, not a wrong answer later. `trace=False` on any export skips the
+file; `check_files=False` on `Trace.load` reads one whose files are elsewhere.
+
+**SUMO's internal lanes.** netconvert draws a lane across the junction for every
+connection, and names it itself (`:j_x_0_0`), so the export cannot. The built network
+says which connection each carries, and those are in the trace:
+
+```python
+t = roadgen.Trace.load("out/sumo/demo_town.sumo.trace.json")
+t.add_sumo_net("out/sumo/demo_town.net.xml")
+t.to_ir("sumo", ":j_x_0_0")                  # the junction connector it runs along
+```
+
+A network is taken only if it was built from the export the trace describes: the same
+edges, lanes and connections, and a junction where the export's `.nod.xml` put each
+node. A network of another map whose roads happen to share their names is refused.
+
+A turn that waits inside the junction gets two internal lanes, and both trace to the
+same connector. Every internal lane traces to something: the exported `.netccfg` tells
+netconvert not to add the U-turn it otherwise puts at every dead end, which the IR —
+and so every other format — does not have. A network built without that
+configuration gets them back, and they trace to nothing.
+
+In Rust, the exporters' `*_traced` functions return the `roadgen_core::trace::Trace`,
+and `roadgen-trace` writes it (`write_trace`, `write_ir`) and joins it (`TraceIndex`).
+The design, and why it is shaped this way, is in
+[docs/ir-trace-design.md](docs/ir-trace-design.md).
 
 ## Layout
 
@@ -2012,18 +3191,29 @@ roadgen/
 │   │   ├── semantics/       lane types, rules, markings, objects
 │   │   ├── buildings/       footprints, heights, storeys
 │   │   ├── id/              typed identifiers
+│   │   ├── trace/           what an export wrote for each IR element
 │   │   └── validation/      UnvalidatedMap → ValidatedMap
 │   ├── roadgen-buildings/   a town beside the roads, from a CGA shape grammar
-│   ├── roadgen-carla/       meshes, FBX and the package CARLA UE5 imports
+│   ├── roadgen-carla/       meshes, FBX and the package CARLA UE5 imports, and
+│   │                        Autoware's point-cloud map of the same surface
 │   ├── roadgen-opendrive/   lowering onto the `opendrive` crate, and reading it back
 │   ├── roadgen-lanelet2/    lowering onto `simple_lanelet2`
 │   ├── roadgen-clipgt/      lowering onto ClipGT's parquet layers
+│   ├── roadgen-rdshq/       lowering onto RDS-HQ's WebDataset shards
 │   ├── roadgen-gpudrive/    lowering onto GPUDrive's scene JSON
+│   ├── roadgen-womd/        lowering onto a Waymo Open Motion `Scenario`, with
+│   │                        Waymo's schema (`proto/`) and the TFRecord framing
+│   ├── roadgen-commonroad/  lowering onto a CommonRoad scenario's XML, and onto
+│   │                        a 2024 map with CommonRoad's schema (`proto/`)
 │   ├── roadgen-osm/         lowering onto plain OpenStreetMap XML
 │   ├── roadgen-sumo/        lowering onto SUMO's plain-XML network
+│   ├── roadgen-proto/       the IR as Protocol Buffers: the schema (`proto/`),
+│   │                        and a lossless writer and reader
+│   ├── roadgen-trace/       the IR dump, trace files, and lookups across them
 │   ├── roadgen-viewer/      reading the exports back, and drawing them as SVG
 │   └── roadgen-python/      PyO3 bindings
-├── examples/                ClipGT and GPUDrive scenario files
+├── examples/                ClipGT/RDS-HQ and GPUDrive scenario files, and an IR importer
+│                            that knows only the Protocol Buffers schema
 ├── web/                     the demo page: roadgen in a browser, through Pyodide
 ├── python/roadgen/          the Python package
 ├── tests/
@@ -2052,6 +3242,10 @@ it, so what they check is not the exporter's opinion of what it wrote. Install i
 with `apt install sumo` (and `pip install sumolib` for the Python side); without it
 those tests **skip**, saying so. Setting `ROADGEN_REQUIRE_SUMO=1` turns the skip into
 a failure, which is what CI does.
+
+The Python test that reads an IR document knowing only its schema compiles the
+schema with `protoc`, from `pip install protobuf grpcio-tools`; without them it
+skips.
 
 ## Releasing
 
@@ -2127,4 +3321,14 @@ The GPUDrive scene fields were read the same way, off the simulator's own reader
 [`src/json_serialization.hpp`](https://github.com/Emerge-Lab/gpudrive/blob/main/src/json_serialization.hpp),
 and its `init.hpp` and `types.hpp` beside it. Nothing from those files is reproduced
 either — what is written down here is the shape of the document they accept.
+
+The WOMD schema is Waymo's own `map.proto` and `scenario.proto`, from
+[waymo-open-dataset](https://github.com/waymo-research/waymo-open-dataset), under
+Apache-2.0 and carried with their copyright headers; the one change is said at the top
+of `scenario.proto`.
+
+The CommonRoad element names, their order and the sign catalogue were read off the
+2020a XML schema and the reader that `commonroad-io` (BSD-3-Clause) ships; nothing of
+either is carried here. The 2024 map's schema is CommonRoad's own `.proto` files, carried
+unchanged in `crates/roadgen-commonroad/proto/` with their BSD-3-Clause licence.
 Check licence compatibility before adding a dependency.

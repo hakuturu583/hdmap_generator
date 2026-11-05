@@ -1,0 +1,22 @@
+[package]
+name = "roadgen-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The roadgen canonical IR as Protocol Buffers: the schema, and a lossless writer and reader"
+
+[dependencies]
+roadgen-core.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+prost.workspace = true
+prost-build.workspace = true
+protox.workspace = true
+
+[dev-dependencies]
+prost-types.workspace = true
+tempfile.workspace = true

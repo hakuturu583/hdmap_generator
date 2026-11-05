@@ -17,8 +17,9 @@
 //! straight taper through samples of it; a width that reaches zero is held at a
 //! floor; an `<elevation>` that curves within one plan-view piece is split into
 //! straight grades; a lane type the IR does not have lands on the nearest it does;
-//! a building's roof is flat. None of these is an error, because none of them stops
-//! the map being a map — they are the reader's equivalent of an exporter's `check`.
+//! a building's roof is flat; a bridge's piers are laid out again rather than read.
+//! None of these is an error, because none of them stops the map being a map —
+//! they are the reader's equivalent of an exporter's `check`.
 //!
 //! What is an error is a document that cannot be read as a road network at all: a
 //! reference line with a gap in it too wide to close, a link to a road that is not
@@ -31,12 +32,26 @@
 //! identifiers — which is what the exporter writes there — gets that identifier
 //! back, so a map that goes out and comes in keeps its object names. Lanes are
 //! numbered by position, as the builder numbers them.
+//!
+//! None of that is a promise to rely on: a name can clash, and an object takes its
+//! name over its id. [`Imported::trace`] is the record — which IR element each
+//! `<road>`, lane, `<junction>`, `<signal>`, `<object>` and `<controller>` became,
+//! in the kinds the exporter's own trace uses (`road:12`, `lane:12/0/-1`,
+//! `signal:949`, `object:31`, `controller:964`) — so a signal in the file can be
+//! followed to whatever another export made of it. A stop line the reader drew
+//! where the document has none (`object/stopline/<road>/<end>`, at a junction
+//! mouth its lights stop) is traced, as `collapsed` with the role `stop_line`, to
+//! the controller it was drawn for.
 
 mod furniture;
+mod gaps;
 mod geometry;
 mod lanes;
 mod links;
+mod repair;
+mod structures;
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -47,12 +62,13 @@ use opendrive::road::rule::Rule;
 use opendrive::road::Road as OdRoad;
 use uom::si::length::meter;
 
-use roadgen_core::geometry::{Poly3Piece, Poly3Profile, SamplingConfig};
+use roadgen_core::geometry::{Poly3Piece, Poly3Profile, SamplingConfig, Vector3};
 use roadgen_core::id::{JunctionId, LaneId, RoadId};
 use roadgen_core::layout::{self, RoadGeometry, SectionLayout};
 use roadgen_core::map::{CrossSection, Map, MapMetadata, Projection, Road, TrafficHandedness};
 use roadgen_core::semantics::RoadType;
 use roadgen_core::topology::{Junction, RoadEnd};
+use roadgen_core::trace::{Relation, Trace};
 use roadgen_core::units::{GeoOrigin, SpeedLimit};
 use roadgen_core::validation::UnvalidatedMap;
 
@@ -80,6 +96,9 @@ pub struct Imported {
     /// Everything the map says less exactly than the document did, one entry each.
     /// Empty for a document roadgen wrote from a map the IR could hold.
     pub approximations: Vec<String>,
+    /// What each element of the map was read from (format `opendrive`, direction
+    /// import). Lists the file when the document was read from one.
+    pub trace: Trace,
 }
 
 /// Reads an OpenDRIVE document from a string.
@@ -89,9 +108,15 @@ pub fn from_xml(xml: &str) -> Result<Imported, ImportError> {
 
 /// Reads an OpenDRIVE document from a string, with the caller's options.
 pub fn from_xml_with(xml: &str, options: &ReadOptions) -> Result<Imported, ImportError> {
+    let mut repairs = Approximations::default();
+    let xml = repair::repair(xml, &mut repairs)?;
     let document =
-        OpenDrive::from_xml_str(xml).map_err(|error| ImportError::Parse(format!("{error:?}")))?;
-    from_document(&document, options)
+        OpenDrive::from_xml_str(&xml).map_err(|error| ImportError::Parse(format!("{error:?}")))?;
+    let mut imported = from_document(&document, options)?;
+    let mut approximations = repairs.finish();
+    approximations.append(&mut imported.approximations);
+    imported.approximations = approximations;
+    Ok(imported)
 }
 
 /// Reads an OpenDRIVE file.
@@ -104,7 +129,9 @@ pub fn read_with(path: impl AsRef<Path>, options: &ReadOptions) -> Result<Import
     let path = path.as_ref();
     let xml = std::fs::read_to_string(path)
         .map_err(|error| ImportError::Io(format!("{}: {error}", path.display())))?;
-    from_xml_with(&xml, options)
+    let mut imported = from_xml_with(&xml, options)?;
+    imported.trace.files.push(path.to_path_buf());
+    Ok(imported)
 }
 
 /// Reads a parsed document.
@@ -142,6 +169,10 @@ struct Reader<'a> {
     /// The IR lane at each OpenDRIVE (road, lane section, lane id).
     lanes: HashMap<(RoadId, usize, i64), LaneId>,
     approximations: Approximations,
+    trace: Trace,
+    /// The lanes each lane is entered from by the map's connections, built the
+    /// first time furniture asks (see `furniture::Reader::predecessors`).
+    predecessors: OnceCell<HashMap<LaneId, Vec<LaneId>>>,
 }
 
 /// What the reading could not keep, collected as it goes.
@@ -201,6 +232,8 @@ impl<'a> Reader<'a> {
             map: Map::new(metadata),
             lanes: HashMap::new(),
             approximations,
+            trace: Trace::imported(crate::TRACE_FORMAT),
+            predecessors: OnceCell::new(),
         }
     }
 
@@ -218,15 +251,33 @@ impl<'a> Reader<'a> {
                 .map_err(|duplicate| {
                     ImportError::Inconsistent(format!("two junctions are numbered {}", duplicate.0))
                 })?;
+            self.trace.link(
+                JunctionId::new(&junction.id),
+                format!("junction:{}", junction.id),
+                Relation::Exact,
+            );
         }
+        let shifts = gaps::closing_shifts(
+            self.document,
+            &self.names,
+            self.sampling(),
+            &mut self.approximations,
+        )?;
         for road in &self.document.road {
-            self.read_road(road)?;
+            let shift = shifts
+                .get(&RoadId::new(&road.id))
+                .copied()
+                .unwrap_or(Vector3::ZERO);
+            self.read_road(road, shift)?;
         }
         links::connect(&mut self)?;
+        gaps::close_lane_gaps(&mut self.map, &mut self.approximations);
         furniture::read(&mut self)?;
+        structures::read(&mut self)?;
         Ok(Imported {
             map: UnvalidatedMap::from_map(self.map),
             approximations: self.approximations.finish(),
+            trace: self.trace,
         })
     }
 
@@ -238,14 +289,15 @@ impl<'a> Reader<'a> {
         self.map.metadata.handedness
     }
 
-    /// One `<road>`: its reference line, its profiles, its sections and the lanes
-    /// laid out against them.
-    fn read_road(&mut self, road: &OdRoad) -> Result<(), ImportError> {
+    /// One `<road>`: its reference line, moved by `shift`, its profiles, its sections
+    /// and the lanes laid out against them.
+    fn read_road(&mut self, road: &OdRoad, shift: Vector3) -> Result<(), ImportError> {
         let id = RoadId::new(&road.id);
         let config = self.sampling();
         let length = road.length.get::<meter>();
 
-        let reference_line = geometry::reference_line(road, config, &mut self.approximations)?;
+        let reference_line =
+            geometry::reference_line(road, shift, config, &mut self.approximations)?;
         let lane_offset = profile(
             road.lanes
                 .lane_offset
@@ -290,6 +342,7 @@ impl<'a> Reader<'a> {
             }
         };
         let link = links::road_link(road, &self.names, &mut self.approximations)?;
+        let pavement = lanes::pavement(road, &mut self.approximations);
 
         // The sections, each as the lane specs the layout takes.
         let sections = lanes::sections(
@@ -325,7 +378,7 @@ impl<'a> Reader<'a> {
             let layout = SectionLayout::new(
                 &section.specs,
                 (section.station, end),
-                lane_offset.clone(),
+                section.lane_offset.clone(),
                 self.handedness(),
             );
             let built = layout::section_lanes(
@@ -340,6 +393,11 @@ impl<'a> Reader<'a> {
             for (lane, number) in built.iter().zip(&section.opendrive_ids) {
                 self.lanes
                     .insert((id.clone(), index, *number), lane.id.clone());
+                self.trace.link(
+                    lane.id.clone(),
+                    format!("lane:{}/{index}/{number}", road.id),
+                    Relation::Exact,
+                );
             }
             cross_sections.push(CrossSection {
                 station: section.station,
@@ -361,6 +419,9 @@ impl<'a> Reader<'a> {
             road_type,
             speed_limit,
             superelevation,
+            pavement,
+            form: roadgen_core::semantics::FormOfWay::Unspecified,
+            structure: roadgen_core::structure::StructureProfile::at_grade(),
         };
         self.map
             .roads
@@ -368,6 +429,8 @@ impl<'a> Reader<'a> {
             .map_err(|duplicate| {
                 ImportError::Inconsistent(format!("two roads are numbered {}", duplicate.0))
             })?;
+        self.trace
+            .link(id.clone(), format!("road:{}", road.id), Relation::Exact);
         for lane in all_lanes {
             self.map
                 .lanes
