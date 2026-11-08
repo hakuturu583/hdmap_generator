@@ -170,6 +170,71 @@ pub fn bores(map: &Map) -> Vec<Bore> {
     out
 }
 
+/// What the land has to know of one bridge's deck to stay under it. A deck is no
+/// road at grade either, and the land is not cut out under it: over a valley the
+/// ground is far below and that is no matter, but at an abutment it met the
+/// road's end, whose outline runs across the road from the top of one pavement
+/// to the top of the other, and made a step that high across the carriageway.
+pub struct Deck {
+    /// The deck in plan, out to its curbs, from the first rung in from one end to
+    /// the first rung in from the other: each point at the deck's underside,
+    /// which is as high as the land under it may come.
+    pub outline: Vec<Point3>,
+    /// Each end in plan, from the abutment to the first rung in: the abutment's
+    /// edge at the road's height, the rung's at the underside. The land leaves
+    /// them out, as it does a road's outline, and meets the deck's outline.
+    pub ends: Vec<Vec<Point3>>,
+    /// The underside under the deck's centre line, rung by rung.
+    pub keel: Vec<Point3>,
+}
+
+/// Every bridge's deck, one per road it carries, as the land sees it. A deck too
+/// short for a rung between its two ends is left out.
+pub fn decks(map: &Map) -> Vec<Deck> {
+    let mut out = Vec::new();
+    for structure in map.structures.iter() {
+        let StructureKind::Bridge(bridge) = &structure.kind else {
+            continue;
+        };
+        let left = |row: &Row| row.left + bridge.curb;
+        let right = |row: &Row| row.right - bridge.curb;
+        for span in &structure.carries {
+            let rows = rows(map, span);
+            let n = rows.len();
+            if n < 3 {
+                continue;
+            }
+            let end = |abutment: &Row, inner: &Row| {
+                vec![
+                    abutment.at(left(abutment), 0.0),
+                    abutment.at(right(abutment), 0.0),
+                    inner.at(right(inner), -bridge.deck_depth),
+                    inner.at(left(inner), -bridge.deck_depth),
+                ]
+            };
+            let inner = &rows[1..n - 1];
+            out.push(Deck {
+                outline: inner
+                    .iter()
+                    .map(|row| row.at(left(row), -bridge.deck_depth))
+                    .chain(
+                        inner
+                            .iter()
+                            .rev()
+                            .map(|row| row.at(right(row), -bridge.deck_depth)),
+                    )
+                    .collect(),
+                ends: vec![end(&rows[0], &rows[1]), end(&rows[n - 1], &rows[n - 2])],
+                keel: rows
+                    .iter()
+                    .map(|row| row.at(0.0, -bridge.deck_depth))
+                    .collect(),
+            });
+        }
+    }
+    out
+}
+
 /// Every structure on the map, each as a mesh of its own.
 pub fn meshes(
     map: &Map,
@@ -473,11 +538,27 @@ mod tests {
     }
 
     fn map(tunnel: bool) -> ValidatedMap {
+        map_with(tunnel, false)
+    }
+
+    /// The test road, with a pavement each side when asked: a road's outline runs
+    /// across its end from the top of one pavement to the other's.
+    fn map_with(tunnel: bool, pavements: bool) -> ValidatedMap {
         let mut builder = MapBuilder::default();
-        let lanes = vec![
-            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
-            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
-        ];
+        let width = |w| PositiveWidth::new(w).unwrap();
+        let lanes = if pavements {
+            vec![
+                LaneSpec::new(width(3.5), Direction::Backward),
+                LaneSpec::new(width(2.0), Direction::Backward).with_type(LaneType::Sidewalk),
+                LaneSpec::new(width(3.5), Direction::Forward),
+                LaneSpec::new(width(2.0), Direction::Forward).with_type(LaneType::Sidewalk),
+            ]
+        } else {
+            vec![
+                LaneSpec::new(width(3.5), Direction::Forward),
+                LaneSpec::new(width(3.5), Direction::Backward),
+            ]
+        };
         let road = builder
             .add_road(
                 RoadSpec::line(
@@ -615,49 +696,96 @@ mod tests {
         assert!(capped(100.0) && capped(200.0));
     }
 
+    /// The land of the map's whole surface: the terrain in grass.
+    fn land(map: &ValidatedMap) -> Vec<Mesh> {
+        crate::surfaces::build(map, "m", &crate::surfaces::SurfaceConfig::default())
+            .into_iter()
+            .filter(|mesh| mesh.role == Role::Terrain && mesh.materials[0] == materials::GRASS)
+            .collect()
+    }
+
+    /// The land's heights over (x, y): one from each of its triangles there.
+    fn heights(land: &[Mesh], x: f64, y: f64) -> Vec<f64> {
+        let mut out = Vec::new();
+        for mesh in land {
+            for triangle in &mesh.triangles {
+                let [a, b, c] = triangle.map(|i| mesh.positions[i as usize]);
+                let det = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+                if det.abs() < 1e-12 {
+                    continue;
+                }
+                let u = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / det;
+                let v = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / det;
+                if u >= 0.0 && v >= 0.0 && u + v <= 1.0 {
+                    out.push(u * a.z + v * b.z + (1.0 - u - v) * c.z);
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn the_land_stays_over_a_bore_and_out_of_its_mouths() {
         // No hill: the ground is taken from the roads, which is the road's own
         // height over the tunnel, and the land there once closed the bore whole.
-        let map = map(true);
-        let meshes = crate::surfaces::build(&map, "m", &crate::surfaces::SurfaceConfig::default());
-        let land: Vec<&Mesh> = meshes
-            .iter()
-            .filter(|mesh| mesh.role == Role::Terrain && mesh.materials[0] == materials::GRASS)
-            .collect();
+        let land = land(&map(true));
         assert!(!land.is_empty());
-        // The land's heights over (x, y): one from each of its triangles there.
-        let heights = |x: f64, y: f64| -> Vec<f64> {
-            let mut out = Vec::new();
-            for mesh in &land {
-                for triangle in &mesh.triangles {
-                    let [a, b, c] = triangle.map(|i| mesh.positions[i as usize]);
-                    let det = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
-                    if det.abs() < 1e-12 {
-                        continue;
-                    }
-                    let u = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / det;
-                    let v = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / det;
-                    if u >= 0.0 && v >= 0.0 && u + v <= 1.0 {
-                        out.push(u * a.z + v * b.z + (1.0 - u - v) * c.z);
-                    }
-                }
-            }
-            out
-        };
         let top = 10.0 + 5.0 + 0.6 + HEADWALL;
         for y in [-3.0, 0.0, 3.0] {
             // The mouths, from each portal to the first rung in: open.
             for x in [100.5, 101.5, 198.5, 199.5] {
-                assert!(heights(x, y).is_empty(), "land in a mouth at ({x}, {y})");
+                assert!(
+                    heights(&land, x, y).is_empty(),
+                    "land in a mouth at ({x}, {y})"
+                );
             }
             // The bore: the land is there, and over the headwall's top.
             for step in 0..=47 {
                 let x = 103.0 + step as f64 * 2.0;
-                let over = heights(x, y);
+                let over = heights(&land, x, y);
                 assert!(!over.is_empty(), "no land over the bore at ({x}, {y})");
                 for z in over {
                     assert!(z >= top - 1e-6, "land at {z} over the bore at ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_land_stays_under_a_deck_and_never_over_the_road() {
+        // No hill: the ground is taken from the roads, which is the road's own
+        // height at each abutment. The land there once came up through the deck,
+        // and met the road's end across the carriageway at the pavements' height.
+        for pavements in [false, true] {
+            deck_land(pavements);
+        }
+    }
+
+    fn deck_land(pavements: bool) {
+        let land = land(&map_with(false, pavements));
+        assert!(!land.is_empty());
+        let underside = 10.0 - 2.5;
+        for y in [-3.0, -1.0, 0.0, 1.0, 3.0] {
+            // Up to the abutment and over it: the land is never over the road.
+            for x in [99.0, 99.8, 100.0, 100.2, 200.0, 200.2] {
+                for z in heights(&land, x, y) {
+                    assert!(z <= 10.0 + 1e-6, "land at {z} over the road at ({x}, {y})");
+                }
+            }
+            // From each end to the first rung in: under the road, whatever else.
+            for x in [100.5, 101.5, 198.5, 199.5] {
+                for z in heights(&land, x, y) {
+                    assert!(z <= 10.0 + 1e-6, "land at {z} over the road at ({x}, {y})");
+                }
+            }
+            // Under the rest of the deck: under its underside.
+            for step in 0..=47 {
+                let x = 103.0 + step as f64 * 2.0;
+                for z in heights(&land, x, y) {
+                    assert!(
+                        z <= underside + 1e-6,
+                        "land at {z} under the deck at ({x}, {y})"
+                    );
                 }
             }
         }
