@@ -473,7 +473,7 @@ fn an_elevated_motorway_on_a_shared_deck_is_one_viaduct_on_piers_down_the_median
     let meshes = roadgen_carla::to_meshes(&map, &roadgen_carla::PackageConfig::new("shuto"));
     let terrain: Vec<[Point3; 3]> = meshes
         .iter()
-        .filter(|mesh| mesh.role == roadgen_carla::Role::Terrain)
+        .filter(|mesh| mesh.role == roadgen_carla::Role::Structure)
         .flat_map(|mesh| {
             mesh.triangles
                 .iter()

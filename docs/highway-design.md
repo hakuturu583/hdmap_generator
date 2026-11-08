@@ -534,7 +534,7 @@ m.interchange("interchange/kita_ic")
 
 川の水面の UV は流れに沿わせる。IR の川は外形しか持たないので、中心線は外形から読み戻す：外形のうち前後で最も大きく（半回転近く）向きを変える辺 2 本を両端とし、その間の 2 本の岸を、それぞれの長さに対する割合で対応させた中点を中心線とする。水面の高い方の端を水源として、`u` は水源から中心線に沿った距離、`v` は中心線からの横断方向の距離（下流を向いて左が正）。どちらもメートルをテクスチャの縮尺（4 m）で割った値。法線マップを `u` 方向にパンするマテリアルなら、下流へ流れて見える。湖・池の UV は平面座標のまま。
 
-CARLA のパッケージの記述（`<Package>.json`）の各マップには `water` を書き、流れる水と止まった水それぞれのスロット名（FBX の材質名）と、そこに入れる UE のマテリアルを示す。既定は UE の Water プラグインの `/Water/Materials/WaterSurface/Water_Material_River` と `…/Water_Material_Lake` で、`PackageConfig::with_water_materials` か記述の JSON の書き換えで差し替えられる。`Import.py` は知らないキーを読み飛ばす。パッケージのスクリプトは、水がある地図なら `Import.py` の後に `roadgen.carla_water()`（`python -m roadgen water`）を走らせ、パッケージのメッシュのうち名前が一致するスロットにそのマテリアルを入れる。`flowing=`・`still=` で記述のマテリアルを上書きでき、プロジェクトにないマテリアルは警告して平らな色のまま残す。
+CARLA のパッケージの記述（`<Package>.json`）の各マップには `water` を書き、流れる水と止まった水それぞれのスロット名（FBX の材質名）と、そこに入れる UE のマテリアルを示す。既定は CARLA のコンテンツの `/Game/Carla/Static/GenericMaterials/Water/MI_Water_River` と `…/MI_Water_Lake` で（CARLA のプロジェクトは UE の Water プラグインを有効にしていない）、`PackageConfig::with_water_materials` か記述の JSON の書き換えで差し替えられる。`Import.py` は知らないキーを読み飛ばす。パッケージのスクリプトは、水がある地図なら `Import.py` の後に `roadgen.carla_water()`（`python -m roadgen water`）を走らせ、パッケージのメッシュのうち名前が一致するスロットにそのマテリアルを入れる。`flowing=`・`still=` で記述のマテリアルを上書きでき、プロジェクトにないマテリアルは警告して平らな色のまま残す。
 
 ## 8. テスト
 

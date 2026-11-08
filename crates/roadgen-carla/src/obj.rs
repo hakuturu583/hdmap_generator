@@ -279,7 +279,7 @@ impl Writer {
 fn precedence(role: Role) -> u8 {
     match role {
         Role::Building | Role::TrafficLight | Role::TrafficSign => 0,
-        Role::Terrain => 1,
+        Role::Terrain | Role::Structure | Role::Water => 1,
         Role::Road | Role::Gutter | Role::Curb => 2,
         Role::Sidewalk => 3,
         Role::Marking => 4,
@@ -295,7 +295,7 @@ fn material_of(role: Role) -> Option<&'static str> {
         // roads, closed to one that may not (see the module's docs).
         Role::Road | Role::Gutter | Role::Curb => "road",
         Role::Sidewalk => "sidewalk",
-        Role::Terrain => "grass",
+        Role::Terrain | Role::Structure | Role::Water => "grass",
         Role::Building => "block",
         // Furniture is never in the map's meshes, and a post is not something a
         // pedestrian walks through in any case.

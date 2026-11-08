@@ -11,7 +11,8 @@
 //! structure instead, in the structure's own mesh and material (see
 //! [`raise`]), so it is drawn once and built of what its bridge is built of.
 //!
-//! CARLA's import has no class for any of these, so they are terrain.
+//! CARLA's import has no class for any of these, so they are terrain to it: a
+//! berm as land, a wall or a rail as a [`Role::Structure`].
 
 use roadgen_core::geometry::SamplingConfig;
 use roadgen_core::geometry::{Point3, Polyline3};
@@ -54,9 +55,16 @@ pub fn berms(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh> {
             "wall" | "jersey" | "concrete" => (None, materials::CURB),
             _ => (None, materials::STEEL),
         };
+        // Earth is land to CARLA, and takes its landscape material; a wall keeps
+        // its own concrete or steel.
+        let role = if slope.is_some() {
+            Role::Terrain
+        } else {
+            Role::Structure
+        };
         let mut mesh = Mesh::new(
-            mesh_name(map_name, Role::Terrain, ordinals.take(Role::Terrain)),
-            Role::Terrain,
+            mesh_name(map_name, role, ordinals.take(role)),
+            role,
             material,
         );
         solid(&mut mesh, object, *height, slope, sampling);

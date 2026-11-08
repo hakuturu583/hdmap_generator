@@ -251,23 +251,26 @@ fn a_barrier_is_built_the_way_its_kind_is() {
         .unwrap()
         .id
         .clone();
-    let draw = |map: &roadgen_core::map::Map| {
+    // A berm is earth and the land to CARLA; a wall is built, and named apart
+    // from the land so that CARLA leaves it its own material.
+    let draw = |map: &roadgen_core::map::Map, role: Role| {
         let map = roadgen_core::validation::UnvalidatedMap::from_map(map.clone())
             .validate()
             .unwrap();
         roadgen_carla::to_meshes(&map, &PackageConfig::new("Quarry"))
             .into_iter()
-            .filter(|mesh| mesh.role == Role::Terrain && mesh.materials.len() == 1)
+            .filter(|mesh| mesh.role == role && mesh.materials.len() == 1)
             .map(|mesh| mesh.materials[0])
             .collect::<Vec<_>>()
     };
-    assert!(draw(&map).contains(&materials::GRAVEL));
+    assert!(draw(&map, Role::Terrain).contains(&materials::GRAVEL));
     map.objects.get_mut(&berm).unwrap().kind = MapObjectKind::Barrier {
         kind: "wall".into(),
         height: 1.0,
         structure: None,
     };
-    assert!(draw(&map).contains(&materials::CURB));
+    assert!(draw(&map, Role::Structure).contains(&materials::CURB));
+    assert!(!draw(&map, Role::Terrain).contains(&materials::CURB));
 }
 
 #[test]

@@ -346,7 +346,7 @@ fn carla_draws_the_decks_piers_and_tunnels() {
     let meshes = roadgen_carla::to_meshes(map, &config);
     let concrete = meshes
         .iter()
-        .filter(|mesh| mesh.role == Role::Terrain && mesh.materials == [materials::ROAD_CONCRETE])
+        .filter(|mesh| mesh.role == Role::Structure && mesh.materials == [materials::ROAD_CONCRETE])
         .count();
     assert_eq!(concrete, map.structures.len());
     // The land goes over the tunnels: higher than any road on the map.
@@ -737,7 +737,7 @@ fn one_bridge_over_both_carriageways_is_one_deck_across_the_median() {
     let meshes = roadgen_carla::to_meshes(&map, &PackageConfig::new("deck"));
     let deck: Vec<Point3> = meshes
         .iter()
-        .filter(|mesh| mesh.role == Role::Terrain && mesh.materials == [materials::ROAD_CONCRETE])
+        .filter(|mesh| mesh.role == Role::Structure && mesh.materials == [materials::ROAD_CONCRETE])
         .flat_map(|mesh| mesh.positions.iter().copied())
         .collect();
     assert!(!deck.is_empty());
@@ -920,7 +920,7 @@ fn carla_draws_every_structure(map: &ValidatedMap) {
     let meshes = roadgen_carla::to_meshes(map, &PackageConfig::new("pass"));
     let concrete = meshes
         .iter()
-        .filter(|mesh| mesh.role == Role::Terrain && mesh.materials == [materials::ROAD_CONCRETE])
+        .filter(|mesh| mesh.role == Role::Structure && mesh.materials == [materials::ROAD_CONCRETE])
         .count();
     assert_eq!(concrete, map.structures.len());
 }

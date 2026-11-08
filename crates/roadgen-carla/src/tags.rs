@@ -209,6 +209,17 @@ pub enum Role {
     /// The land: the verges beside the roads and the ground past them, out to
     /// where a lidar reaches, as one surface.
     Terrain,
+    /// Something built that is no road: a bridge, a tunnel, a wall beside the
+    /// road. CARLA has no folder for it and files it as terrain, the same as the
+    /// land; named apart from the land, it keeps its own material, where a name
+    /// holding `Terrain` is given CARLA's landscape material — projected from
+    /// above, which runs down an upright face in stripes.
+    Structure,
+    /// A river's or a lake's surface. CARLA has a class for water but no folder
+    /// a map's meshes can reach it by, so it is terrain to CARLA; named apart from
+    /// the land, it keeps the water material the package's script puts on it,
+    /// where a name holding `Terrain` is given the landscape's.
+    Water,
     /// A part of a building.
     Building,
     /// A traffic light: pole, mast arm and the heads hung from it. Never in a
@@ -231,6 +242,8 @@ impl Role {
             Role::Curb => ("Road", "Curb"),
             Role::Gutter => ("Road", "Gutter"),
             Role::Terrain => ("Terrain", "Ground"),
+            Role::Structure => ("Structure", "Solid"),
+            Role::Water => ("Water", "Surface"),
             Role::Building => ("Building", "Part"),
             // Both hold a word `ValidateStaticMesh` rejects, which is fine for a
             // prop — the check is run on a map's meshes and on nothing else — and
@@ -250,7 +263,7 @@ impl Role {
             Role::Road => Folder::Road,
             Role::Marking => Folder::RoadLine,
             Role::Sidewalk | Role::Curb | Role::Gutter => Folder::SideWalk,
-            Role::Terrain => Folder::Terrain,
+            Role::Terrain | Role::Structure | Role::Water => Folder::Terrain,
             Role::Building => Folder::Building,
             Role::TrafficLight => Folder::TrafficLight,
             Role::TrafficSign => Folder::TrafficSign,
@@ -265,6 +278,8 @@ impl Role {
             Role::Curb => "curb",
             Role::Gutter => "gutter",
             Role::Terrain => "terrain",
+            Role::Structure => "structure",
+            Role::Water => "water",
             Role::Building => "building",
             Role::TrafficLight => "traffic light",
             Role::TrafficSign => "traffic sign",
@@ -494,8 +509,31 @@ mod tests {
         // And it is the only role whose folder is not one a map's meshes can reach,
         // which is why it is the only one with a placement to choose.
         assert!(!Folder::from_a_map().contains(&Folder::Building));
-        for role in [Role::Road, Role::Marking, Role::Sidewalk, Role::Terrain] {
+        for role in [
+            Role::Road,
+            Role::Marking,
+            Role::Sidewalk,
+            Role::Terrain,
+            Role::Structure,
+            Role::Water,
+        ] {
             assert!(Folder::from_a_map().contains(&role.intended_folder()));
+        }
+    }
+
+    #[test]
+    fn a_structure_is_terrain_to_carla_and_keeps_its_own_material() {
+        // `PrepareAssetsForCookingCommandlet` gives every mesh whose name holds
+        // `Terrain` CARLA's landscape material, projected from above, which runs
+        // down a tunnel's walls in stripes. A structure's name does not hold it,
+        // and its folder is the land's all the same.
+        // The same goes for water, which the package's script dresses.
+        for role in [Role::Structure, Role::Water] {
+            let name = mesh_name("Town01", role, 0);
+            assert!(!name.to_ascii_lowercase().contains("terrain"), "{name}");
+            assert_eq!(folder_of(&name), Folder::Terrain);
+            assert_eq!(folder_of(&name), role.intended_folder());
+            assert!(is_rejected_by_import(&name).is_none());
         }
     }
 
