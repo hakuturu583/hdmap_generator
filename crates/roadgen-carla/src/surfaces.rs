@@ -189,6 +189,7 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             config.verge_width,
         ),
     };
+    land.bores(crate::structures::bores(map));
     if let Some(terrain) = land.mesh(ground.as_ref(), verge, map_name, &mut ordinal) {
         meshes.push(terrain);
     }

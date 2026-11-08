@@ -108,6 +108,68 @@ impl Carried {
     }
 }
 
+/// What the land has to know of one tunnel's bore to stay out of it: the land is
+/// one surface triangulated round the roads' edges, and a bore is no road at
+/// grade, so without this the land runs straight across a mouth, from the road's
+/// edge at the portal up the hill, and closes it.
+pub struct Bore {
+    /// The bore in plan, out to its lining, from the first rung in from one
+    /// mouth to the first rung in from the other: each point at the top of the
+    /// headwall over it, which is as low as the land over the bore may come.
+    pub outline: Vec<Point3>,
+    /// Each mouth in plan, from its portal to the first rung in: the portal's
+    /// edge at the road's height, the rung's at the headwall's top. The land
+    /// leaves them open; [`bore`] closes them over with the portal's block.
+    pub mouths: Vec<Vec<Point3>>,
+    /// The top of the headwall over the bore's centre line, rung by rung.
+    pub crown: Vec<Point3>,
+}
+
+/// Every tunnel's bore, as the land sees it. A bore too short for a rung between
+/// its two mouths has no outline; its mouths are still left open.
+pub fn bores(map: &Map) -> Vec<Bore> {
+    let mut out = Vec::new();
+    for structure in map.structures.iter() {
+        let StructureKind::Tunnel(tunnel) = &structure.kind else {
+            continue;
+        };
+        let top = tunnel.clear_height + tunnel.lining + HEADWALL;
+        let left = |row: &Row| row.left + tunnel.walkway + tunnel.lining;
+        let right = |row: &Row| row.right - tunnel.walkway - tunnel.lining;
+        for span in &structure.carries {
+            let rows = rows(map, span);
+            let n = rows.len();
+            if n < 2 {
+                continue;
+            }
+            let mouth = |portal: &Row, inner: &Row| {
+                vec![
+                    portal.at(left(portal), 0.0),
+                    portal.at(right(portal), 0.0),
+                    inner.at(right(inner), top),
+                    inner.at(left(inner), top),
+                ]
+            };
+            let inner = &rows[1..n - 1];
+            let outline = if inner.is_empty() {
+                Vec::new()
+            } else {
+                inner
+                    .iter()
+                    .map(|row| row.at(left(row), top))
+                    .chain(inner.iter().rev().map(|row| row.at(right(row), top)))
+                    .collect()
+            };
+            out.push(Bore {
+                outline,
+                mouths: vec![mouth(&rows[0], &rows[1]), mouth(&rows[n - 1], &rows[n - 2])],
+                crown: rows.iter().map(|row| row.at(0.0, top)).collect(),
+            });
+        }
+    }
+    out
+}
+
 /// Every structure on the map, each as a mesh of its own.
 pub fn meshes(
     map: &Map,
@@ -337,6 +399,59 @@ fn bore(mesh: &mut Mesh, rows: &[Row], tunnel: &Tunnel) {
             mesh.face(&ring, 0);
         }
     }
+
+    // Each portal's block, back to the first rung in: the land leaves that much of
+    // the mouth open (see [`Bore`]), so its top, facing up, and its two sides,
+    // facing out, close it over between the headwall and the land.
+    let n = rows.len();
+    for (portal, inner) in [(&rows[0], &rows[1]), (&rows[n - 1], &rows[n - 2])] {
+        let left = |row: &Row| row.left + walkway + lining;
+        let right = |row: &Row| row.right - walkway - lining;
+        let up = portal.frame.up.get();
+        let out = portal.frame.left.get();
+        face_toward(
+            mesh,
+            &[
+                portal.at(left(portal), top),
+                portal.at(right(portal), top),
+                inner.at(right(inner), top),
+                inner.at(left(inner), top),
+            ],
+            [up.x, up.y, up.z],
+        );
+        for (side, sign) in [(&left as &dyn Fn(&Row) -> f64, 1.0), (&right, -1.0)] {
+            face_toward(
+                mesh,
+                &[
+                    portal.at(side(portal), 0.0),
+                    inner.at(side(inner), 0.0),
+                    inner.at(side(inner), top),
+                    portal.at(side(portal), top),
+                ],
+                [sign * out.x, sign * out.y, sign * out.z],
+            );
+        }
+    }
+}
+
+/// A face on `ring`, wound to face `toward`.
+fn face_toward(mesh: &mut Mesh, ring: &[Point3], toward: [f64; 3]) {
+    let (a, b, c) = (ring[0], ring[1], ring[2]);
+    let (u, v) = (
+        [b.x - a.x, b.y - a.y, b.z - a.z],
+        [c.x - a.x, c.y - a.y, c.z - a.z],
+    );
+    let normal = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    if normal[0] * toward[0] + normal[1] * toward[1] + normal[2] * toward[2] >= 0.0 {
+        mesh.face(ring, 0);
+    } else {
+        let reversed: Vec<Point3> = ring.iter().rev().copied().collect();
+        mesh.face(&reversed, 0);
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +603,63 @@ mod tests {
         for p in &mesh.positions {
             let in_opening = p.y.abs() < 3.5 && p.z > 10.0 + 1e-6 && p.z < 15.0 - 1e-6;
             assert!(!in_opening, "{p:?}");
+        }
+        // Each portal's block is closed over, back to the first rung in (102 and
+        // 198), at the headwall's top.
+        let top = 10.0 + 5.0 + 0.6 + HEADWALL;
+        let capped = |x: f64| {
+            faces.iter().any(|(n, a)| {
+                n.z > 0.99 && (a.z - top).abs() < 1e-6 && (a.x - x).abs() < 2.0 + 1e-6
+            })
+        };
+        assert!(capped(100.0) && capped(200.0));
+    }
+
+    #[test]
+    fn the_land_stays_over_a_bore_and_out_of_its_mouths() {
+        // No hill: the ground is taken from the roads, which is the road's own
+        // height over the tunnel, and the land there once closed the bore whole.
+        let map = map(true);
+        let meshes = crate::surfaces::build(&map, "m", &crate::surfaces::SurfaceConfig::default());
+        let land: Vec<&Mesh> = meshes
+            .iter()
+            .filter(|mesh| mesh.role == Role::Terrain && mesh.materials[0] == materials::GRASS)
+            .collect();
+        assert!(!land.is_empty());
+        // The land's heights over (x, y): one from each of its triangles there.
+        let heights = |x: f64, y: f64| -> Vec<f64> {
+            let mut out = Vec::new();
+            for mesh in &land {
+                for triangle in &mesh.triangles {
+                    let [a, b, c] = triangle.map(|i| mesh.positions[i as usize]);
+                    let det = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+                    if det.abs() < 1e-12 {
+                        continue;
+                    }
+                    let u = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / det;
+                    let v = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / det;
+                    if u >= 0.0 && v >= 0.0 && u + v <= 1.0 {
+                        out.push(u * a.z + v * b.z + (1.0 - u - v) * c.z);
+                    }
+                }
+            }
+            out
+        };
+        let top = 10.0 + 5.0 + 0.6 + HEADWALL;
+        for y in [-3.0, 0.0, 3.0] {
+            // The mouths, from each portal to the first rung in: open.
+            for x in [100.5, 101.5, 198.5, 199.5] {
+                assert!(heights(x, y).is_empty(), "land in a mouth at ({x}, {y})");
+            }
+            // The bore: the land is there, and over the headwall's top.
+            for step in 0..=47 {
+                let x = 103.0 + step as f64 * 2.0;
+                let over = heights(x, y);
+                assert!(!over.is_empty(), "no land over the bore at ({x}, {y})");
+                for z in over {
+                    assert!(z >= top - 1e-6, "land at {z} over the bore at ({x}, {y})");
+                }
+            }
         }
     }
 }
