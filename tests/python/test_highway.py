@@ -1,6 +1,8 @@
 """Motorways: bridges, tunnels and viaducts, the corridor that plans them, and a
 motorway meeting a town."""
 
+import xml.etree.ElementTree as ET
+
 import pytest
 
 import roadgen
@@ -204,6 +206,30 @@ def test_a_corridor_motorway_with_a_river_a_ridge_and_a_diamond():
     for structure in m.structure_ids():
         for support in m.structure(structure).get("supports", []):
             assert support["base"] is not None
+
+
+def test_every_lane_of_a_diamond_has_a_width_from_the_start_of_its_section(tmp_path):
+    # A speed-change lane that only starts to taper partway along its road once had
+    # no `<width>` before the taper, which OpenDRIVE leaves undefined and CARLA
+    # refuses to load.
+    m = roadgen.Map(name="expressway")
+    e1 = m.add_corridor("E1", [(-2000.0, 0.0, 0.0), (1000.0, 0.0, 0.0), (3000.0, 700.0, 0.0)],
+                        design_speed=100.0)
+    e1.add_interchange("Kita IC", at=1700.0, crossroad=[(-300.0, -450.0, 0.0), (-300.0, 450.0, 0.0)],
+                       crossroad_lanes=street_lanes(), terminal=80.0, reach=320.0)
+    m.add_plan(e1.plan())
+    m.validate()
+    path = tmp_path / "expressway.xodr"
+    m.export_opendrive(str(path), trace=False)
+    lanes = 0
+    for lane in ET.parse(path).getroot().iter("lane"):
+        if lane.get("id") == "0":
+            continue
+        lanes += 1
+        offsets = [float(width.get("sOffset")) for width in lane.findall("width")]
+        assert offsets and offsets[0] == 0.0, (lane.get("id"), offsets)
+        assert offsets == sorted(offsets)
+    assert lanes
 
 
 @pytest.mark.parametrize("kind,side,loops", [("parclo", None, 2), ("trumpet", "right", 1)])

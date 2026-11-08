@@ -177,7 +177,36 @@ impl WidthProfile {
     ///
     /// Exact for both tapers: a straight run is a cubic with zero second and third
     /// coefficients, and the smooth ease is `3Δ/L²·ds² − 2Δ/L³·ds³`.
+    ///
+    /// The stations are shifted by `offset`, and the result starts at zero there
+    /// whatever the knots: OpenDRIVE leaves a lane's width undefined before its first
+    /// `<width>`, so a section that starts before the first knot gets a piece holding
+    /// that knot's width, and one that starts after a knot gets the piece then in
+    /// force, re-expanded about its start, in place of the pieces before it.
     pub fn to_poly3(&self, offset: f64) -> Poly3Profile {
+        let pieces = self.poly3_pieces();
+        let start = match pieces
+            .iter()
+            .rposition(|piece| piece.station <= offset + 1e-9)
+        {
+            Some(index) => pieces[index].starting_at(offset),
+            None => Poly3Piece::new(offset, self.knots[0].1.metres(), 0.0, 0.0, 0.0),
+        };
+        let rebased = std::iter::once(start)
+            .chain(
+                pieces
+                    .into_iter()
+                    .filter(|piece| piece.station > offset + 1e-9),
+            )
+            .map(|piece| Poly3Piece {
+                station: piece.station - offset,
+                ..piece
+            });
+        Poly3Profile::new(rebased).expect("every coefficient comes from a finite knot")
+    }
+
+    /// One cubic per knot, at the knot's own station.
+    fn poly3_pieces(&self) -> Vec<Poly3Piece> {
         let mut pieces = Vec::with_capacity(self.knots.len());
         for (index, &(station, width)) in self.knots.iter().enumerate() {
             let piece = match self.knots.get(index + 1) {
@@ -185,15 +214,11 @@ impl WidthProfile {
                     let span = next_station - station;
                     let delta = next_width.metres() - width.metres();
                     match self.taper {
-                        Taper::Linear => Poly3Piece::new(
-                            station - offset,
-                            width.metres(),
-                            delta / span,
-                            0.0,
-                            0.0,
-                        ),
+                        Taper::Linear => {
+                            Poly3Piece::new(station, width.metres(), delta / span, 0.0, 0.0)
+                        }
                         Taper::Smooth => Poly3Piece::new(
-                            station - offset,
+                            station,
                             width.metres(),
                             0.0,
                             3.0 * delta / (span * span),
@@ -202,11 +227,11 @@ impl WidthProfile {
                     }
                 }
                 // The last knot, or a repeated station: hold the value.
-                _ => Poly3Piece::new(station - offset, width.metres(), 0.0, 0.0, 0.0),
+                _ => Poly3Piece::new(station, width.metres(), 0.0, 0.0, 0.0),
             };
             pieces.push(piece);
         }
-        Poly3Profile::new(pieces).expect("every coefficient comes from a finite knot")
+        pieces
     }
 }
 
@@ -338,6 +363,30 @@ mod tests {
         let cubic = profile.to_poly3(100.0);
         assert!((cubic.evaluate(0.0) - 3.5).abs() < 1e-12);
         assert!((cubic.evaluate(25.0) - 2.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_cubic_form_starts_at_the_section_whatever_the_knots() {
+        // OpenDRIVE has no width before a lane's first `<width>`, so the first piece
+        // is at the section's start: a lane that only starts to taper partway along,
+        // and a section that starts partway through a taper.
+        for taper in [Taper::Linear, Taper::Smooth] {
+            let profile = WidthProfile::new([(180.0, w(3.5)), (240.0, w(0.25))], taper).unwrap();
+            for offset in [0.0, 200.0, 240.0, 300.0] {
+                let cubic = profile.to_poly3(offset);
+                assert_eq!(cubic.pieces()[0].station, 0.0, "{taper:?} from {offset}");
+                assert!(cubic.pieces().iter().all(|piece| piece.station >= 0.0));
+                for step in 0..=400 {
+                    let station = offset + step as f64 * 0.5;
+                    let direct = profile.evaluate(station).metres();
+                    let lowered = cubic.evaluate(station - offset);
+                    assert!(
+                        (direct - lowered).abs() < 1e-9,
+                        "{taper:?} from {offset} at {station}: {direct} vs {lowered}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

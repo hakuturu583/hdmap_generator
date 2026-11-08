@@ -30,6 +30,19 @@ impl Poly3Piece {
         }
     }
 
+    /// The same polynomial, expanded about `station` instead: it takes over there and
+    /// evaluates to exactly what this piece does from there on.
+    pub fn starting_at(&self, station: f64) -> Self {
+        let h = station - self.station;
+        Poly3Piece::new(
+            station,
+            self.evaluate(station),
+            self.b + 2.0 * self.c * h + 3.0 * self.d * h * h,
+            self.c + 3.0 * self.d * h,
+            self.d,
+        )
+    }
+
     /// Whether the piece is a straight line: no quadratic or cubic term.
     pub fn is_straight(&self) -> bool {
         self.c.abs() < 1e-12 && self.d.abs() < 1e-12
