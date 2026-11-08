@@ -1882,7 +1882,10 @@ crosswalk, and keeps off the rest. So the package carries the surface twice: the
 `.fbx` the level is built from, and a `<name>.obj` in CARLA's frame (y up, the
 roadgen y negated) whose materials are those labels. The tool that reads it is one the
 UE5 branch builds but does not put where `Import.py` looks, so the build script
-finds it under `Build/` and stages it, with the `.obj`, into `Util/DockerUtils/dist/`;
+finds it under `Build/` (CMake's `Build/_deps/recastnavigation-build/`, a build
+directory under `Build/`, or a packaged server's `Tools/`) and stages it, with the
+`.obj`, into `Util/DockerUtils/dist/`, and runs it itself when `Import.py` left no
+navigation behind (`--no-navmesh` builds none);
 the navigation comes out as `Content/<Package>/Maps/<name>/Nav/<name>.bin`, which the
 server hands to clients and `world.get_random_location_from_navigation()` draws on.
 
@@ -1897,7 +1900,11 @@ per crossing, `crosswalk` from kerb to kerb and `CROSSWALK_OVERLAP` (0.3 m) onto
 each pavement, because the stripes are what a camera sees and the band is what a
 walker needs. Only that far onto the pavement: CARLA's walkers stop and look for a
 light wherever their route steps from a pavement onto a crossing, and a band over the
-whole width of the pavement would stop everyone walking along it.
+whole width of the pavement would stop everyone walking along it. The kerb is `road` in it, not
+a block: CARLA's walkers that may cross a road anywhere
+(`world.set_pedestrians_cross_factor`) step off a pavement over it, and the rest,
+whose filter excludes road, keep to the crossings; a kerb as a block walled every
+road off from its pavements for all of them.
 
 Crosswalks *are* painted, too — a bar and a gap of half a metre each, across the
 carriageway, from the crossing objects in the IR — and so are stop lines, as a bar
