@@ -37,6 +37,7 @@ use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation
 use crate::ground::Ground;
 use crate::materials;
 use crate::mesh::Mesh;
+use crate::structures::Bore;
 use crate::surfaces::Ordinals;
 use crate::tags::{mesh_name, Role};
 
@@ -63,13 +64,20 @@ struct Section {
     footprint: Polygon,
 }
 
-/// What the land is built round: every road section's outline.
+/// What the land is built round: every road section's outline, and every tunnel's
+/// bore, which it stays over and whose mouths it leaves open.
 #[derive(Default)]
 pub struct Land {
     sections: Vec<Section>,
+    bores: Vec<Bore>,
 }
 
 impl Land {
+    /// Adds the tunnels' bores.
+    pub fn bores(&mut self, bores: Vec<Bore>) {
+        self.bores.extend(bores);
+    }
+
     /// Adds one road section from its left and right flanks.
     pub fn section(&mut self, left: Flank, right: Flank) {
         let ring: Vec<Point3> = left
@@ -113,7 +121,47 @@ impl Land {
         if self.sections.is_empty() {
             return None;
         }
-        let footprints: Vec<&Polygon> = self.sections.iter().map(|s| &s.footprint).collect();
+        // A tunnel's mouths are cut out of the land as a road's outline is, and the
+        // land over its bore is raised to clear the headwall wherever the ground
+        // is lower: on a hillside running down to a portal it is, and the land
+        // would otherwise come down through the bore.
+        let mouths: Vec<Polygon> = self
+            .bores
+            .iter()
+            .flat_map(|bore| &bore.mouths)
+            .map(|mouth| Polygon::new(mouth.iter().map(|p| [p.x, p.y]).collect()))
+            .collect();
+        let over: Vec<(Polygon, &Bore)> = self
+            .bores
+            .iter()
+            .filter(|bore| !bore.outline.is_empty())
+            .map(|bore| {
+                (
+                    Polygon::new(bore.outline.iter().map(|p| [p.x, p.y]).collect()),
+                    bore,
+                )
+            })
+            .collect();
+        let raise = |point: Point3| -> Point3 {
+            let crown = over
+                .iter()
+                .filter(|(outline, _)| outline.contains(point.x, point.y))
+                .filter_map(|(_, bore)| {
+                    bore.crown.iter().min_by(|a, b| {
+                        a.horizontal_distance_to(point)
+                            .total_cmp(&b.horizontal_distance_to(point))
+                    })
+                })
+                .map(|crown| crown.z)
+                .fold(point.z, f64::max);
+            Point3::new(point.x, point.y, crown)
+        };
+        let footprints: Vec<&Polygon> = self
+            .sections
+            .iter()
+            .map(|s| &s.footprint)
+            .chain(mouths.iter())
+            .collect();
         let roads = Index::new(&footprints);
         let edges = Edges::new(&self.sections, verge.max(0.0));
 
@@ -124,9 +172,10 @@ impl Land {
         let mut points: Vec<Point3> = Vec::new();
         if let Some(field) = field {
             points.extend(
-                field.vertices().filter(|point| {
-                    !roads.contains(point.x, point.y) && !edges.within(point, None)
-                }),
+                field
+                    .vertices()
+                    .filter(|point| !roads.contains(point.x, point.y) && !edges.within(point, None))
+                    .map(raise),
             );
         }
         for (index, section) in self.sections.iter().enumerate() {
@@ -135,25 +184,45 @@ impl Land {
                     continue;
                 }
                 let z = field.map_or(toe.z, |field| field.height(toe.x, toe.y, toe.z));
-                points.push(Point3::new(toe.x, toe.y, z));
+                points.push(raise(Point3::new(toe.x, toe.y, z)));
             }
         }
-        // The lines the land is built along: every road's outline, and the lines a
-        // stated terrain breaks along — the crest and toe of every bench and heap —
-        // kept as edges here too, or a triangle across a crest would round it off.
-        // Wherever one of those comes nearer a road than the verge it is left to
-        // the road's own edge, which breaks it into the runs clear of every road.
+        // The lines the land is built along: every road's outline, every bore's
+        // outline and mouths, and the lines a stated terrain breaks along — the
+        // crest and toe of every bench and heap — kept as edges here too, or a
+        // triangle across a crest would round it off. Wherever one of those comes
+        // nearer a road than the verge it is left to the road's own edge, which
+        // breaks it into the runs clear of every road.
+        let ground_under = |point: Point3| -> Point3 {
+            let z = field.map_or(point.z, |field| field.height(point.x, point.y, point.z));
+            Point3::new(point.x, point.y, z.max(point.z))
+        };
         let mut lines: Vec<Vec<Point3>> = self
             .sections
             .iter()
             .map(|section| section.ring.clone())
             .collect();
+        for bore in &self.bores {
+            if !bore.outline.is_empty() {
+                lines.push(bore.outline.iter().copied().map(ground_under).collect());
+            }
+            for mouth in &bore.mouths {
+                // The portal's edge at the road, the rung's where the outline is.
+                lines.push(vec![
+                    mouth[0],
+                    mouth[1],
+                    ground_under(mouth[2]),
+                    ground_under(mouth[3]),
+                ]);
+            }
+        }
+        let closed = lines.len();
         if let Some(ground) = field {
             for line in ground.breaklines() {
                 let mut run = Vec::new();
                 for &point in line {
                     if !roads.contains(point.x, point.y) && !edges.within(&point, None) {
-                        run.push(point);
+                        run.push(raise(point));
                     } else if !run.is_empty() {
                         lines.push(std::mem::take(&mut run));
                     }
@@ -163,15 +232,19 @@ impl Land {
                 }
             }
         }
-        knit(&mut lines, self.sections.len(), &mut points);
-        let (rings, breaklines) = lines.split_at(self.sections.len());
+        knit(&mut lines, closed, &mut points);
+        let (rings, breaklines) = lines.split_at(closed);
+        let (road_rings, bore_rings) = rings.split_at(self.sections.len());
         let mut cdt: ConstrainedDelaunayTriangulation<Vertex> =
             ConstrainedDelaunayTriangulation::bulk_load(
                 points.into_iter().map(Vertex::free).collect(),
             )
             .ok()?;
 
-        for ring in rings {
+        // The bores' lines before the roads': where a road's outline crosses one
+        // (a road over the hill a tunnel goes through), the crossing takes the
+        // height of the line added last, and the road's is the one that matters.
+        for ring in bore_rings.iter().chain(road_rings) {
             let mut handles = Vec::with_capacity(ring.len());
             for &point in ring {
                 if let Ok(handle) = cdt.insert(Vertex::on_road(point)) {
