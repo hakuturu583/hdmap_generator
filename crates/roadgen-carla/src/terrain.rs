@@ -37,7 +37,7 @@ use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation
 use crate::ground::Ground;
 use crate::materials;
 use crate::mesh::Mesh;
-use crate::structures::Bore;
+use crate::structures::{Bore, Deck};
 use crate::surfaces::Ordinals;
 use crate::tags::{mesh_name, Role};
 
@@ -64,18 +64,25 @@ struct Section {
     footprint: Polygon,
 }
 
-/// What the land is built round: every road section's outline, and every tunnel's
-/// bore, which it stays over and whose mouths it leaves open.
+/// What the land is built round: every road section's outline, every tunnel's
+/// bore, which it stays over and whose mouths it leaves open, and every bridge's
+/// deck, which it stays under.
 #[derive(Default)]
 pub struct Land {
     sections: Vec<Section>,
     bores: Vec<Bore>,
+    decks: Vec<Deck>,
 }
 
 impl Land {
     /// Adds the tunnels' bores.
     pub fn bores(&mut self, bores: Vec<Bore>) {
         self.bores.extend(bores);
+    }
+
+    /// Adds the bridges' decks.
+    pub fn decks(&mut self, decks: Vec<Deck>) {
+        self.decks.extend(decks);
     }
 
     /// Adds one road section from its left and right flanks.
@@ -124,11 +131,14 @@ impl Land {
         // A tunnel's mouths are cut out of the land as a road's outline is, and the
         // land over its bore is raised to clear the headwall wherever the ground
         // is lower: on a hillside running down to a portal it is, and the land
-        // would otherwise come down through the bore.
+        // would otherwise come down through the bore. The land under a bridge's
+        // deck is lowered to its underside wherever the ground is higher, as it is
+        // at an abutment on an embankment, and its ends are cut out like mouths.
         let mouths: Vec<Polygon> = self
             .bores
             .iter()
             .flat_map(|bore| &bore.mouths)
+            .chain(self.decks.iter().flat_map(|deck| &deck.ends))
             .map(|mouth| Polygon::new(mouth.iter().map(|p| [p.x, p.y]).collect()))
             .collect();
         let over: Vec<(Polygon, &Bore)> = self
@@ -142,19 +152,36 @@ impl Land {
                 )
             })
             .collect();
-        let raise = |point: Point3| -> Point3 {
-            let crown = over
+        let under: Vec<(Polygon, &Deck)> = self
+            .decks
+            .iter()
+            .map(|deck| {
+                (
+                    Polygon::new(deck.outline.iter().map(|p| [p.x, p.y]).collect()),
+                    deck,
+                )
+            })
+            .collect();
+        let nearest = |line: &[Point3], point: Point3| -> Option<f64> {
+            line.iter()
+                .min_by(|a, b| {
+                    a.horizontal_distance_to(point)
+                        .total_cmp(&b.horizontal_distance_to(point))
+                })
+                .map(|nearest| nearest.z)
+        };
+        let fit = |point: Point3| -> Point3 {
+            let z = over
                 .iter()
                 .filter(|(outline, _)| outline.contains(point.x, point.y))
-                .filter_map(|(_, bore)| {
-                    bore.crown.iter().min_by(|a, b| {
-                        a.horizontal_distance_to(point)
-                            .total_cmp(&b.horizontal_distance_to(point))
-                    })
-                })
-                .map(|crown| crown.z)
+                .filter_map(|(_, bore)| nearest(&bore.crown, point))
                 .fold(point.z, f64::max);
-            Point3::new(point.x, point.y, crown)
+            let z = under
+                .iter()
+                .filter(|(outline, _)| outline.contains(point.x, point.y))
+                .filter_map(|(_, deck)| nearest(&deck.keel, point))
+                .fold(z, f64::min);
+            Point3::new(point.x, point.y, z)
         };
         let footprints: Vec<&Polygon> = self
             .sections
@@ -175,7 +202,7 @@ impl Land {
                 field
                     .vertices()
                     .filter(|point| !roads.contains(point.x, point.y) && !edges.within(point, None))
-                    .map(raise),
+                    .map(fit),
             );
         }
         for (index, section) in self.sections.iter().enumerate() {
@@ -184,19 +211,22 @@ impl Land {
                     continue;
                 }
                 let z = field.map_or(toe.z, |field| field.height(toe.x, toe.y, toe.z));
-                points.push(raise(Point3::new(toe.x, toe.y, z)));
+                points.push(fit(Point3::new(toe.x, toe.y, z)));
             }
         }
         // The lines the land is built along: every road's outline, every bore's
-        // outline and mouths, and the lines a stated terrain breaks along — the
+        // outline and mouths, every deck's outline, and the lines a stated terrain
+        // breaks along — the
         // crest and toe of every bench and heap — kept as edges here too, or a
         // triangle across a crest would round it off. Wherever one of those comes
         // nearer a road than the verge it is left to the road's own edge, which
         // breaks it into the runs clear of every road.
-        let ground_under = |point: Point3| -> Point3 {
-            let z = field.map_or(point.z, |field| field.height(point.x, point.y, point.z));
-            Point3::new(point.x, point.y, z.max(point.z))
+        let ground = |point: Point3| -> f64 {
+            field.map_or(point.z, |field| field.height(point.x, point.y, point.z))
         };
+        let ground_under =
+            |point: Point3| Point3::new(point.x, point.y, ground(point).max(point.z));
+        let ground_over = |point: Point3| Point3::new(point.x, point.y, ground(point).min(point.z));
         let mut lines: Vec<Vec<Point3>> = self
             .sections
             .iter()
@@ -216,13 +246,25 @@ impl Land {
                 ]);
             }
         }
+        for deck in &self.decks {
+            lines.push(deck.outline.iter().copied().map(ground_over).collect());
+            for end in &deck.ends {
+                // The abutment's edge at the road, the rung's where the outline is.
+                lines.push(vec![
+                    end[0],
+                    end[1],
+                    ground_over(end[2]),
+                    ground_over(end[3]),
+                ]);
+            }
+        }
         let closed = lines.len();
         if let Some(ground) = field {
             for line in ground.breaklines() {
                 let mut run = Vec::new();
                 for &point in line {
                     if !roads.contains(point.x, point.y) && !edges.within(&point, None) {
-                        run.push(raise(point));
+                        run.push(fit(point));
                     } else if !run.is_empty() {
                         lines.push(std::mem::take(&mut run));
                     }
@@ -234,17 +276,18 @@ impl Land {
         }
         knit(&mut lines, closed, &mut points);
         let (rings, breaklines) = lines.split_at(closed);
-        let (road_rings, bore_rings) = rings.split_at(self.sections.len());
+        let (road_rings, structure_rings) = rings.split_at(self.sections.len());
         let mut cdt: ConstrainedDelaunayTriangulation<Vertex> =
             ConstrainedDelaunayTriangulation::bulk_load(
                 points.into_iter().map(Vertex::free).collect(),
             )
             .ok()?;
 
-        // The bores' lines before the roads': where a road's outline crosses one
-        // (a road over the hill a tunnel goes through), the crossing takes the
-        // height of the line added last, and the road's is the one that matters.
-        for ring in bore_rings.iter().chain(road_rings) {
+        // The structures' lines before the roads': where a road's outline crosses
+        // one (a road over the hill a tunnel goes through, or under a bridge), the
+        // crossing takes the height of the line added last, and the road's is the
+        // one that matters.
+        for ring in structure_rings.iter().chain(road_rings) {
             let mut handles = Vec::with_capacity(ring.len());
             for &point in ring {
                 if let Ok(handle) = cdt.insert(Vertex::on_road(point)) {
