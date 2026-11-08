@@ -11,8 +11,10 @@ whose components CARLA's cooking gave the land's material.
 The two are apart because the meshes are: a river's texture coordinates run down
 it from its source (`u`) and across it (`v`), so a material that pans its normal
 map along `u` flows downstream; a lake's or a pond's lie in plan. By default they
-are the Unreal Engine Water plugin's river and lake materials; any other — one of
-the project's own under `/Game/` — is named by editing the descriptor, or here:
+are CARLA's own river and lake materials, under
+`/Game/Carla/Static/GenericMaterials/Water/` (CARLA's project does not enable the
+Unreal Engine Water plugin); any other — one of the project's own under `/Game/` —
+is named by editing the descriptor, or here:
 
     roadgen.carla_water("/opt/carla", "Town01Package", "Town01")
     roadgen.carla_water("/opt/carla", "Town01Package", "Town01",

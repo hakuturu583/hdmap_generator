@@ -5,7 +5,9 @@
 //! channel's depth over its bed — level across a river, and falling along it
 //! with the bed; level all over a lake or a pond: where the banks rise above it the land hides it, so its edge is
 //! wherever the banks cross that height, with nothing to compute. The sheet
-//! is terrain to CARLA, like everything else of the land.
+//! is terrain to CARLA, like everything else of the land, but named as
+//! [`Role::Water`](crate::tags::Role::Water) so that CARLA leaves it the water
+//! material rather than giving it the landscape's.
 //!
 //! Running water and standing water are surfaced apart. A river's sheet is
 //! [`materials::FLOWING_WATER`](crate::materials::FLOWING_WATER), its texture
@@ -95,8 +97,8 @@ pub fn meshes(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh> {
             None
         };
         let mut mesh = Mesh::new(
-            mesh_name(map_name, Role::Terrain, ordinals.take(Role::Terrain)),
-            Role::Terrain,
+            mesh_name(map_name, Role::Water, ordinals.take(Role::Water)),
+            Role::Water,
             if flows {
                 materials::FLOWING_WATER
             } else {

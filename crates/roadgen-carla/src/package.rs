@@ -66,11 +66,13 @@ pub struct MapEntry {
     pub water: WaterSlots,
 }
 
-/// The Unreal Engine Water plugin's river material, which a river's surface is
-/// given unless the package says otherwise.
-pub const FLOWING_WATER_MATERIAL: &str = "/Water/Materials/WaterSurface/Water_Material_River";
-/// The same plugin's lake material, for a lake's or a pond's.
-pub const STILL_WATER_MATERIAL: &str = "/Water/Materials/WaterSurface/Water_Material_Lake";
+/// CARLA's own river material, which a river's surface is given unless the
+/// package says otherwise. It is in CARLA's content, so every CARLA project has it
+/// and a content pack can take it along; the Unreal Engine Water plugin's
+/// materials are not, as CARLA's project does not enable that plugin.
+pub const FLOWING_WATER_MATERIAL: &str = "/Game/Carla/Static/GenericMaterials/Water/MI_Water_River";
+/// CARLA's lake material, for a lake's or a pond's.
+pub const STILL_WATER_MATERIAL: &str = "/Game/Carla/Static/GenericMaterials/Water/MI_Water_Lake";
 
 /// The Unreal materials a package's water is given: paths in the content tree,
 /// `/Game/…` for one of the project's own.

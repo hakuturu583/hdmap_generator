@@ -8,8 +8,8 @@
 //! and a portal face round each mouth facing out.
 //!
 //! None of it is a road a vehicle drives on, and CARLA's import has no class for a
-//! bridge a map can reach, so it is all terrain — the same as a berm — in concrete,
-//! or in steel for a steel bridge.
+//! bridge a map can reach, so it is all terrain to CARLA — named as a
+//! [`Role::Structure`], so it keeps its own concrete, or steel for a steel bridge.
 
 use roadgen_core::geometry::{Frame3, Point3};
 use roadgen_core::map::Map;
@@ -252,8 +252,8 @@ pub fn meshes(
             _ => materials::ROAD_CONCRETE,
         };
         let mut mesh = Mesh::new(
-            mesh_name(map_name, Role::Terrain, ordinals.take(Role::Terrain)),
-            Role::Terrain,
+            mesh_name(map_name, Role::Structure, ordinals.take(Role::Structure)),
+            Role::Structure,
             material,
         );
         match &structure.kind {
@@ -586,6 +586,8 @@ mod tests {
         assert_eq!(meshes.len(), 1);
         let mesh = &meshes[0];
         assert_eq!(crate::tags::label_of(&mesh.name), crate::Label::Terrain);
+        // Terrain to CARLA, but not named as the land: it keeps its own concrete.
+        assert_eq!(mesh.role, Role::Structure);
         // Under the deck: 10 − 2.5.
         let underside = faces(mesh)
             .iter()
