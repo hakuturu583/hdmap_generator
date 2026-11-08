@@ -431,6 +431,16 @@ fn bore(mesh: &mut Mesh, rows: &[Row], tunnel: &Tunnel) {
     mesh.strip(&line(&right_wall, 0.0), &line(&right_wall, height), 0);
     // The ceiling, facing down.
     mesh.strip(&line(&right_wall, height), &line(&left_wall, height), 0);
+    // The lining's outside: its two sides facing out and its top facing up, so
+    // that the bore is a closed solid and not an open shell under a sheet of
+    // land. In CARLA, without it, light came through in dark-and-light patches
+    // all along a tunnel's walls; with it, only a fringe of them is left.
+    let left_outer = |row: &Row| row.left + walkway + tunnel.lining;
+    let right_outer = |row: &Row| row.right - walkway - tunnel.lining;
+    let roof = height + tunnel.lining;
+    mesh.strip(&line(&left_outer, 0.0), &line(&left_outer, roof), 0);
+    mesh.strip(&line(&right_outer, roof), &line(&right_outer, 0.0), 0);
+    mesh.strip(&line(&left_outer, roof), &line(&right_outer, roof), 0);
 
     // The portals: the face round each mouth, its two piers and the lintel over
     // the opening, facing out of the tunnel.
@@ -696,6 +706,25 @@ mod tests {
             })
         };
         assert!(capped(100.0) && capped(200.0));
+        // The lining is closed in: a top facing up and two sides facing out, the
+        // whole length of the bore, so that the bore keeps the light out.
+        let roof = 10.0 + 5.0 + 0.6;
+        let outside = 3.5 + 0.75 + 0.6;
+        let along = |pred: &dyn Fn(&(roadgen_core::geometry::Vector3, Point3)) -> bool| {
+            faces
+                .iter()
+                .filter(|f| pred(f))
+                .map(|(_, a)| a.x)
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| {
+                    (lo.min(x), hi.max(x))
+                })
+        };
+        let top = along(&|(n, a)| n.z > 0.99 && (a.z - roof).abs() < 1e-6);
+        let left = along(&|(n, a)| n.y > 0.99 && (a.y - outside).abs() < 1e-6);
+        let right = along(&|(n, a)| n.y < -0.99 && (a.y + outside).abs() < 1e-6);
+        for (lo, hi) in [top, left, right] {
+            assert!(lo <= 100.0 + 2.0 && hi >= 200.0 - 2.0, "{lo}..{hi}");
+        }
     }
 
     /// The land of the map's whole surface: the terrain in grass.
