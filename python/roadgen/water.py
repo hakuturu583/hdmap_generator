@@ -53,7 +53,9 @@ def water_slots(descriptor, map_name, *, flowing=None, still=None):
         raise CarlaWaterError("%s names no water for %s" % (descriptor, map_name))
     water = entry["water"]
     slots = {}
-    for kind, override in (("flowing", flowing), ("still", still)):
+    # The bed under the water is the land's; it is dressed with the water so that
+    # its banks are not left in their flat colour.
+    for kind, override in (("flowing", flowing), ("still", still), ("bed", None)):
         slot = water.get(kind)
         if slot:
             slots[slot["slot"]] = override or slot["material"]

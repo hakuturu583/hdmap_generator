@@ -237,6 +237,7 @@ impl PackageConfig {
         self.water = package::WaterMaterials {
             flowing: flowing.into(),
             still: still.into(),
+            ..package::WaterMaterials::default()
         };
         self
     }

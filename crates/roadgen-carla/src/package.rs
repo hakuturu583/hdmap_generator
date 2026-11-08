@@ -73,6 +73,10 @@ pub struct MapEntry {
 pub const FLOWING_WATER_MATERIAL: &str = "/Game/Carla/Static/GenericMaterials/Water/MI_Water_River";
 /// CARLA's lake material, for a lake's or a pond's.
 pub const STILL_WATER_MATERIAL: &str = "/Game/Carla/Static/GenericMaterials/Water/MI_Water_Lake";
+/// CARLA's dirt, for a river's bed and banks. With CARLA's materials the package
+/// fetches no texture of its own, so the bed would otherwise keep its flat
+/// colour, which the sun bleaches to white on the banks.
+pub const RIVERBED_MATERIAL: &str = "/Game/Carla/Static/GenericMaterials/Ground/MI_Dirt";
 
 /// The Unreal materials a package's water is given: paths in the content tree,
 /// `/Game/…` for one of the project's own.
@@ -83,6 +87,8 @@ pub struct WaterMaterials {
     pub flowing: String,
     /// For a lake, a pond: the mesh's texture coordinates are in plan.
     pub still: String,
+    /// For the bed and banks under either: part of the land, in plan.
+    pub bed: String,
 }
 
 impl Default for WaterMaterials {
@@ -90,16 +96,18 @@ impl Default for WaterMaterials {
         WaterMaterials {
             flowing: FLOWING_WATER_MATERIAL.to_owned(),
             still: STILL_WATER_MATERIAL.to_owned(),
+            bed: RIVERBED_MATERIAL.to_owned(),
         }
     }
 }
 
-/// Running water and standing water, each as the slot the FBX names and the
-/// material the package's script puts in it.
+/// Running water, standing water and the bed under them, each as the slot the
+/// FBX names and the material the package's script puts in it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WaterSlots {
     pub flowing: WaterSlot,
     pub still: WaterSlot,
+    pub bed: WaterSlot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -120,6 +128,7 @@ impl WaterSlots {
         WaterSlots {
             flowing: slot(materials::FLOWING_WATER, &materials.flowing),
             still: slot(materials::STILL_WATER, &materials.still),
+            bed: slot(materials::RIVERBED, &materials.bed),
         }
     }
 }
@@ -371,6 +380,9 @@ mod tests {
         assert_eq!(water["still"]["slot"], "M_Water_Still");
         assert_eq!(water["still"]["material"], "/Game/Water/M_Pond");
         assert_ne!(water["flowing"]["slot"], water["still"]["slot"]);
+        // And the bed under both, which is the land's and not the water's.
+        assert_eq!(water["bed"]["slot"], "M_Terrain_Riverbed");
+        assert_eq!(water["bed"]["material"], RIVERBED_MATERIAL);
     }
 
     #[test]
