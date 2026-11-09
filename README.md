@@ -294,6 +294,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `carla_sky(carla_root, package, map_name, engine=, sun_altitude=, sun_azimuth=)` | after `Import.py`: give the imported level a daylight sky, with the editor's own scripting |
 | `carla_furniture(carla_root, package, map_name, engine=, manifest=)` | after `Import.py`: stand the package's traffic lights, signs and props town in the level, and make CARLA adopt the lights and signs |
 | `carla_water(carla_root, package, map_name, engine=, descriptor=, flowing=, still=)` | after `Import.py`: put the Unreal materials the descriptor names in the water's slots — `M_Water_Flowing` on rivers, whose UVs run downstream for a panning normal map, and `M_Water_Still` on lakes and ponds |
+| `carla_pack_assets(map, pack_dir, map_name=, formats=, xodr=, pointcloud_reach=, pointcloud_spacing=)` | put the map in every other format into a CARLA content pack beside its level, list them in the pack's `roadgen_asset.json` and stage them, so that the built pack carries them |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `to_womd_bytes(scenario_id=, steps=, time_step=, current_time_index=)` | one serialized `Scenario`, not framed as a TFRecord |
 | `to_commonroad_xml(...)` | the CommonRoad scenario as a string, with `export_commonroad`'s arguments |
@@ -2163,6 +2164,55 @@ y −20–0). Run Autoware with `pointcloud_map_file:=pointcloud_map`.
   **`cell_size`** (20 m) is the side of a cell, in whole metres: Autoware's loader
   reads each corner as an integer, and a map with one it cannot read is not loaded
   at all.
+
+### Every other format, in the content pack
+
+A CARLA 1.0 content pack carries a map for the simulator; built from a roadgen map,
+it can carry the same road network for everything else too. After `carla-pack init`
+and `carla-pack add --map` have put the level in a pack:
+
+```python
+roadgen.carla_pack_assets(m, "Unreal/CarlaUnreal/Plugins/Packs/HighwayPack", "Highway")
+# then: carla-pack build HighwayPack
+```
+
+writes, in the pack folder:
+
+| Path | What |
+| --- | --- |
+| `Content/HDMaps/<map>/autoware/` | `lanelet2_map.osm`, `pointcloud_map.pcd`, `map_projector_info.yaml`: Autoware's map directory |
+| `Content/HDMaps/<map>/{osm,sumo,commonroad,commonroad_map,clipgt,rdshq,gpudrive,womd,roadgen_proto,roadgen_ir}/` | one folder per format |
+| `Content/Config/roadgen_asset.json` | which format is where, by map |
+| `Config/PluginSettings.ini` | `Content/HDMaps` added to the folders the cook stages as loose files |
+
+`carla-pack build` then copies them into the pack as they are and lists each, with
+its SHA-256, in `carla-pack.json`. The OpenDRIVE is not written again: the asset
+file points at the one `carla-pack add` put beside the level.
+
+`roadgen_asset.json` is optional; a pack without it is an ordinary CARLA pack. Its
+paths are relative to the pack folder, the one holding `carla-pack.json`:
+
+```json
+{"schema": 1, "generator": {"name": "roadgen", "version": "0.43.0"},
+ "maps": {"Highway": {"projection": "local_cartesian", "formats": {
+   "lanelet2": {"type": "file", "path": "Content/HDMaps/Highway/autoware/lanelet2_map.osm"},
+   "autoware": {"type": "directory", "path": "Content/HDMaps/Highway/autoware",
+                "files": {"lanelet2_map": "…", "pointcloud_map": "…", "map_projector_info": "…"}},
+   "…": {}}}}}
+```
+
+The format names are `opendrive`, `lanelet2`, `pointcloud`, `autoware`, `osm`,
+`sumo`, `commonroad`, `commonroad_map`, `clipgt`, `rdshq`, `gpudrive`, `womd`,
+`roadgen_proto` and `roadgen_ir`. The point cloud is the one large file: it is
+joined from `export_pointcloud_map`'s cells into the single `pointcloud_map.pcd`,
+keeping only the cells within `pointcloud_reach` metres of a road (150 by default;
+`None` keeps the whole land, which over a stated terrain runs kilometres from any
+road). On a 5 km motorway over a ridge that is 9.5 million points, 110 MB, against
+36 million for the whole land; every other format together is some 25 MB.
+
+[carla-pack](https://github.com/hakuturu583/carla_content_pack_registry) reads the
+asset file when a pack has one: it lists a pack's formats, finds packs by format,
+and hands back the path of a map in a format.
 
 ### What it cannot carry
 
