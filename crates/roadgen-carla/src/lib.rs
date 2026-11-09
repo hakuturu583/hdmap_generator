@@ -417,7 +417,10 @@ pub fn write_traced(
     let mut signs_fbx = None;
     let mut furniture_path = None;
     let mut map_logic_path = None;
-    if !furniture.is_empty() || !town.is_empty() {
+    // A lit tunnel's lamps are hung by the furniture's script, with or without
+    // any other furniture to stand.
+    let lit = !structures::tunnel_lamps(map).is_empty();
+    if !furniture.is_empty() || !town.is_empty() || lit {
         let written = write_furniture(
             map, &folder, config, &furniture, &town, &mut props, &mut trace,
         )?;
@@ -459,7 +462,11 @@ pub fn write_traced(
     });
     write_text(
         &script_path,
-        &script::script(config, !furniture.is_empty() || !town.is_empty(), water),
+        &script::script(
+            config,
+            !furniture.is_empty() || !town.is_empty() || lit,
+            water,
+        ),
     )?;
     make_executable(&script_path)?;
 
@@ -639,6 +646,13 @@ fn write_furniture(
                     &format!("{}_Buildings", config.map),
                     &mesh.name,
                 ),
+            })
+            .collect(),
+        tunnel_lamps: structures::tunnel_lamps(map)
+            .into_iter()
+            .map(|lamp| package::TunnelLampEntry {
+                position: [lamp.position.x, lamp.position.y, lamp.position.z],
+                heading: lamp.heading,
             })
             .collect(),
     };

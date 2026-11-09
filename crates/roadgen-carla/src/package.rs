@@ -196,6 +196,16 @@ pub struct FurnitureManifest {
     /// The town, when it was exported as props: meshes in the map's own
     /// coordinates already, so each stands at the origin, unturned.
     pub buildings: Vec<BuildingProp>,
+    /// The lamps of the map's lit tunnels, for the script to hang as lights.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tunnel_lamps: Vec<TunnelLampEntry>,
+}
+
+/// One tunnel lamp, as the script hangs it: a light, not a mesh.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TunnelLampEntry {
+    pub position: [f64; 3],
+    pub heading: f64,
 }
 
 /// One building, as a prop for the script to stand in the level.

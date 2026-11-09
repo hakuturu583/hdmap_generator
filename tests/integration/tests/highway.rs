@@ -348,7 +348,8 @@ fn carla_draws_the_decks_piers_and_tunnels() {
         .iter()
         .filter(|mesh| mesh.role == Role::Structure && mesh.materials == [materials::ROAD_CONCRETE])
         .count();
-    assert_eq!(concrete, map.structures.len());
+    // A bridge is one solid; a tunnel's bore is in pieces, a few rungs each.
+    assert!(concrete >= map.structures.len(), "{concrete}");
     // The land goes over the tunnels: higher than any road on the map.
     let terrain = meshes
         .iter()
@@ -915,14 +916,15 @@ fn through_the_hill(structured: bool) -> (UnvalidatedMap, roadgen_carla::environ
     )
 }
 
-/// One concrete solid for each structure in CARLA's meshes.
+/// A concrete solid for each structure in CARLA's meshes: one for a bridge, and
+/// a tunnel's bore in pieces.
 fn carla_draws_every_structure(map: &ValidatedMap) {
     let meshes = roadgen_carla::to_meshes(map, &PackageConfig::new("pass"));
     let concrete = meshes
         .iter()
         .filter(|mesh| mesh.role == Role::Structure && mesh.materials == [materials::ROAD_CONCRETE])
         .count();
-    assert_eq!(concrete, map.structures.len());
+    assert!(concrete >= map.structures.len(), "{concrete}");
 }
 
 #[test]

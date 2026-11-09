@@ -235,6 +235,55 @@ pub fn decks(map: &Map) -> Vec<Deck> {
     out
 }
 
+/// How far apart a lit tunnel's lamps hang, metres.
+pub const LAMP_SPACING: f64 = 25.0;
+/// How far under the ceiling a lamp hangs, metres.
+const LAMP_DROP: f64 = 0.2;
+
+/// One of a lit tunnel's lamps: where it hangs, under the ceiling over the middle
+/// of its road, and which way the road runs there, anticlockwise from east.
+pub struct TunnelLamp {
+    pub position: Point3,
+    pub heading: f64,
+}
+
+/// The lamps of every tunnel the map says is lit, [`LAMP_SPACING`] apart down
+/// each road it carries, the first and last half that in from the mouths. A
+/// bored tunnel is dark a few metres in; without them CARLA lights its inside
+/// with what the sky leaks in and the camera's exposure.
+pub fn tunnel_lamps(map: &Map) -> Vec<TunnelLamp> {
+    let mut out = Vec::new();
+    for structure in map.structures.iter() {
+        let StructureKind::Tunnel(tunnel) = &structure.kind else {
+            continue;
+        };
+        if !tunnel.lighting {
+            continue;
+        }
+        for span in &structure.carries {
+            let Some(road) = map.road(&span.road) else {
+                continue;
+            };
+            let mut station = span.from + LAMP_SPACING / 2.0;
+            while station < span.to {
+                if let (Ok(frame), Some((left, right))) = (
+                    road.frame_at(station, map.metadata.sampling),
+                    road_extent(map, &span.road, station),
+                ) {
+                    let row = Row { frame, left, right };
+                    let tangent = row.frame.tangent.get();
+                    out.push(TunnelLamp {
+                        position: row.at((left + right) / 2.0, tunnel.clear_height - LAMP_DROP),
+                        heading: tangent.y.atan2(tangent.x),
+                    });
+                }
+                station += LAMP_SPACING;
+            }
+        }
+    }
+    out
+}
+
 /// Every structure on the map, each as a mesh of its own.
 pub fn meshes(
     map: &Map,
@@ -297,8 +346,38 @@ pub fn meshes(
                 }
             }
             StructureKind::Tunnel(tunnel) => {
+                // In pieces of its own, a few rungs long. Lumen lights a tunnel by
+                // each mesh's distance field, which has a resolution cap per mesh:
+                // over a bore hundreds of metres long a voxel is metres across, the
+                // lining a fraction of one, and the sky came through it all along.
                 for span in &structure.carries {
-                    bore(&mut mesh, &rows(map, span), tunnel);
+                    let rows = rows(map, span);
+                    let last = rows.len().saturating_sub(1);
+                    let mut start = 0;
+                    while start < last {
+                        let end = (start + BORE_PIECE).min(last);
+                        if !mesh.is_empty() {
+                            out.push(std::mem::replace(
+                                &mut mesh,
+                                Mesh::new(
+                                    mesh_name(
+                                        map_name,
+                                        Role::Structure,
+                                        ordinals.take(Role::Structure),
+                                    ),
+                                    Role::Structure,
+                                    material,
+                                ),
+                            ));
+                        }
+                        bore(
+                            &mut mesh,
+                            &rows[start..=end],
+                            tunnel,
+                            [start == 0, end == last],
+                        );
+                        start = end;
+                    }
                 }
             }
         }
@@ -306,6 +385,9 @@ pub fn meshes(
     }
     out
 }
+
+/// How many rungs one piece of a bore is: [`STEP`] apart, twenty metres.
+const BORE_PIECE: usize = 10;
 
 /// Where a road's deck runs on into another's, side by side on one deck: for each
 /// of its two sides, left then right, how far out — to halfway across the gap to
@@ -410,7 +492,10 @@ fn column(mesh: &mut Mesh, ring: &[Point3], base: f64, top: f64) {
 
 /// A bore's walls, ceiling and walkways, facing in, and a portal at each mouth
 /// facing out.
-fn bore(mesh: &mut Mesh, rows: &[Row], tunnel: &Tunnel) {
+/// `ends` says which of the piece's two ends is a mouth of the tunnel: a portal
+/// and its block are drawn there, and nothing at an end where the next piece
+/// carries on.
+fn bore(mesh: &mut Mesh, rows: &[Row], tunnel: &Tunnel, ends: [bool; 2]) {
     if rows.len() < 2 {
         return;
     }
@@ -447,6 +532,9 @@ fn bore(mesh: &mut Mesh, rows: &[Row], tunnel: &Tunnel) {
     let top = height + tunnel.lining + HEADWALL;
     let lining = tunnel.lining;
     for (row, outward) in [(&rows[0], false), (&rows[rows.len() - 1], true)] {
+        if !ends[usize::from(outward)] {
+            continue;
+        }
         let (high, low) = (row.left + walkway, row.right - walkway);
         let quads = [
             (high, high + lining, 0.0, top),
@@ -479,7 +567,13 @@ fn bore(mesh: &mut Mesh, rows: &[Row], tunnel: &Tunnel) {
     // the mouth open (see [`Bore`]), so its top, facing up, and its two sides,
     // facing out, close it over between the headwall and the land.
     let n = rows.len();
-    for (portal, inner) in [(&rows[0], &rows[1]), (&rows[n - 1], &rows[n - 2])] {
+    for (end, (portal, inner)) in [(&rows[0], &rows[1]), (&rows[n - 1], &rows[n - 2])]
+        .into_iter()
+        .enumerate()
+    {
+        if !ends[end] {
+            continue;
+        }
         let left = |row: &Row| row.left + walkway + lining;
         let right = |row: &Row| row.right - walkway - lining;
         let up = portal.frame.up.get();
@@ -673,11 +767,67 @@ mod tests {
     }
 
     #[test]
+    fn a_lit_tunnel_has_its_lamps_down_the_middle_of_the_road_under_the_ceiling() {
+        // 100 to 200 m, 25 m apart and half that in from each mouth.
+        let lamps = tunnel_lamps(&map(true));
+        let stations: Vec<f64> = lamps.iter().map(|lamp| lamp.position.x).collect();
+        assert_eq!(stations.len(), 4, "{stations:?}");
+        for (lamp, want) in lamps.iter().zip([112.5, 137.5, 162.5, 187.5]) {
+            assert!((lamp.position.x - want).abs() < 1e-6, "{}", lamp.position.x);
+            assert!(lamp.position.y.abs() < 1e-6, "{}", lamp.position.y);
+            assert!((lamp.position.z - (10.0 + 5.0 - LAMP_DROP)).abs() < 1e-6);
+            assert!(lamp.heading.abs() < 1e-9);
+        }
+        // A bridge has none.
+        assert!(tunnel_lamps(&map(false)).is_empty());
+    }
+
+    #[test]
+    fn an_unlit_tunnel_has_no_lamps() {
+        let mut builder = MapBuilder::default();
+        let lanes = vec![
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+            LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+        ];
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 10.0),
+                    Point3::new(300.0, 0.0, 10.0),
+                    lanes,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let spec = TunnelSpec {
+            lighting: false,
+            ..TunnelSpec::default()
+        };
+        builder
+            .add_tunnel(vec![RoadSpan::new(road, 100.0, 200.0)], spec)
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        assert!(tunnel_lamps(&map).is_empty());
+    }
+
+    #[test]
     fn a_tunnel_is_closed_over_its_road_and_open_at_its_mouths() {
         let map = map(true);
         let meshes = meshes(&map, None, "m", &mut Ordinals::default());
-        let mesh = &meshes[0];
-        let faces = faces(mesh);
+        // In pieces of twenty metres each, all of them structures, which is what
+        // keeps a bore's lining thick enough to Lumen's distance field.
+        assert_eq!(meshes.len(), 5);
+        for piece in &meshes {
+            assert_eq!(piece.role, Role::Structure);
+            let (lo, hi) = piece
+                .positions
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                    (lo.min(p.x), hi.max(p.x))
+                });
+            assert!(hi - lo <= 20.0 + 1e-6, "{lo}..{hi}");
+        }
+        let faces: Vec<_> = meshes.iter().flat_map(faces).collect();
         // A ceiling over the road, facing down at 10 + 5.
         assert!(faces
             .iter()
@@ -693,7 +843,7 @@ mod tests {
         assert!(facing(-1.0, 100.0));
         assert!(facing(1.0, 200.0));
         // Nothing of the tunnel stands where the road is: the opening is clear.
-        for p in &mesh.positions {
+        for p in meshes.iter().flat_map(|mesh| &mesh.positions) {
             let in_opening = p.y.abs() < 3.5 && p.z > 10.0 + 1e-6 && p.z < 15.0 - 1e-6;
             assert!(!in_opening, "{p:?}");
         }
