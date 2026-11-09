@@ -29,6 +29,12 @@ LAMP_COLOURS = {
 #: The actor tag everything placed here carries, so a second run can find the
 #: first run's work and take it down before placing again.
 TAG = "roadgen.furniture"
+#: A tunnel lamp: a light of this many candelas, a white LED's colour, reaching as
+#: far as the next lamp along. Movable, as nothing in CARLA's maps is baked, and
+#: casting no shadow, which a row of them would pay for and not show.
+LAMP_CANDELAS = 3000.0
+LAMP_REACH = 25.0
+LAMP_COLOUR = (255, 244, 229)
 
 
 def say(message):
@@ -271,6 +277,27 @@ for entry in manifest.get("buildings", []):
     mesh = prepare(entry["asset"], "building", lamps)
     if mesh is not None and stand(mesh, entry["name"], [0.0, 0.0, 0.0], 0.0) is not None:
         buildings += 1
+
+# The lamps of the lit tunnels: lights, not meshes, hung under the ceiling.
+hung = 0
+for index, entry in enumerate(manifest.get("tunnel_lamps", [])):
+    location, rotation = to_unreal(entry["position"], entry["heading"])
+    actor = actors.spawn_actor_from_class(unreal.PointLight, location, rotation)
+    if actor is None:
+        say("could not hang tunnel lamp %d" % index)
+        continue
+    actor.set_actor_label("%s_TunnelLamp_%d" % (MAP, index), False)
+    light = actor.get_component_by_class(unreal.PointLightComponent)
+    light.set_mobility(unreal.ComponentMobility.MOVABLE)
+    light.set_editor_property("intensity_units", unreal.LightUnits.CANDELAS)
+    light.set_editor_property("intensity", LAMP_CANDELAS)
+    light.set_editor_property("attenuation_radius", LAMP_REACH * 100.0)
+    light.set_editor_property("light_color", unreal.Color(r=LAMP_COLOUR[0], g=LAMP_COLOUR[1], b=LAMP_COLOUR[2], a=255))
+    light.set_editor_property("cast_shadows", False)
+    actor.set_editor_property("tags", [unreal.Name(TAG)])
+    hung += 1
+if hung:
+    say("hung %d tunnel lamps" % hung)
 
 say("placed %d lights and %d signs (%d signs with a CARLA marker) and %d buildings" % (lights, signs, marked, buildings))
 say("saved %s" % unreal.EditorLoadingAndSavingUtils.save_current_level())
