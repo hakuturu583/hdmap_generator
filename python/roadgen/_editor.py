@@ -38,10 +38,11 @@ def editor_paths(carla_root, engine, error):
     return editor, uproject
 
 
-def run_editor_script(editor, uproject, script, environment, log=None):
+def run_editor_script(editor, uproject, script, environment, log=None, arguments=()):
     """Runs `script` inside the editor and returns its output, line by line.
 
-    `environment` is added to the process's own. Returns `(lines, returncode,
+    `environment` is added to the process's own, and `arguments` to the editor's
+    command line (`-EnablePlugins=<Pack>` for a content pack's mount point). Returns `(lines, returncode,
     succeeded)`, where `succeeded` is whether the editor reported the script
     running to completion — an exception inside it does not fail the process.
     """
@@ -57,6 +58,7 @@ def run_editor_script(editor, uproject, script, environment, log=None):
         "-nosourcecontrol",
         "-nopause",
     ]
+    command.extend(arguments)
     # The editor's output goes to a file rather than a pipe: the editor leaves a
     # trace daemon behind that inherits its stdout, and a pipe read to its end
     # would wait for that daemon to close it, long after the editor has gone.

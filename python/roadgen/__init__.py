@@ -132,6 +132,7 @@ from ._roadgen import (
 )
 from .furniture import CarlaFurnitureError, carla_furniture
 from .pack_assets import CarlaPackAssetsError, carla_pack_assets
+from .pack_level import CarlaPackLevelError, carla_pack_level
 from .sky import CarlaSkyError, carla_sky
 from .textures import TextureError, fetch_textures, texture_manifest
 from .water import CarlaWaterError, carla_water
@@ -158,6 +159,8 @@ __all__ = [
     "CarlaFurnitureError",
     "carla_pack_assets",
     "CarlaPackAssetsError",
+    "carla_pack_level",
+    "CarlaPackLevelError",
     "carla_sky",
     "CarlaSkyError",
     "carla_water",

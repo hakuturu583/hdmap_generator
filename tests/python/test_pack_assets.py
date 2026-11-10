@@ -25,13 +25,13 @@ def town():
     return m
 
 
-def pack(tmp_path, xodr=True):
-    """A pack folder as `carla-pack init` and `add --map` leave it."""
+def pack(tmp_path, xodr=True, level="/PackedPack/Maps/Packed"):
+    """A pack folder as `carla-pack init` and `carla_pack_level` leave it."""
     folder = tmp_path / "PackedPack"
     (folder / "Config").mkdir(parents=True)
     maps = []
     if xodr:
-        maps.append({"name": "Packed", "package": "/Game/P/Maps/Packed/Packed",
+        maps.append({"name": "Packed", "package": level,
                      "xodr": "Maps/OpenDrive/Packed/Packed.xodr"})
     (folder / "carla-pack.json").write_text(json.dumps({
         "name": "PackedPack", "version": "1.0.0", "carla_version": "1.0", "base_release": "",
@@ -128,3 +128,16 @@ def test_tiles_join_into_one_cloud(tmp_path):
     assert b"WIDTH 3\n" in head and b"POINTS 3\n" in head
     assert list(struct.iter_unpack("<fff", body)) == [(1.0, 2.0, 3.0), (4.0, 5.0, 6.0), (7.0, 8.0, 9.0)]
     assert merge_pcd(str(tiles), str(target), keep={"0_1.pcd"}) == 2
+
+
+def test_a_level_at_the_packs_maps_root_draws_no_warning(tmp_path, recwarn):
+    roadgen.carla_pack_assets(town(), str(pack(tmp_path)), formats=["osm"])
+    assert not [w for w in recwarn if "navigation" in str(w.message)]
+
+
+@pytest.mark.parametrize("level", ["/Game/P/Maps/Packed/Packed", "/PackedPack/Maps/Packed/Packed"])
+def test_a_level_anywhere_else_is_warned_about(tmp_path, level):
+    # In place under /Game, or a folder down in the pack (`carla-pack add --import`):
+    # CARLA serves a client none of the map's navigation or Traffic Manager files.
+    with pytest.warns(UserWarning, match="carla_pack_level"):
+        roadgen.carla_pack_assets(town(), str(pack(tmp_path, level=level)), formats=["osm"])

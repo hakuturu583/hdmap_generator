@@ -4,8 +4,10 @@
     python -m roadgen sky /opt/carla Town01Package Town01       # give an imported map a sky
     python -m roadgen furniture /opt/carla Town01Package Town01 # stand its lights and signs
     python -m roadgen water /opt/carla Town01Package Town01     # dress its water
+    python -m roadgen pack-level /opt/carla Town01Package Town01 Town01Pack
+                                                                # put its level in a content pack
 
-All four are what the script `export_carla()` writes beside a package runs. Commands
+The first four are what the script `export_carla()` writes beside a package runs. Commands
 live here rather than in the modules that do the work, so that those stay modules
 the package can import eagerly.
 """
@@ -15,7 +17,13 @@ import sys
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
-    commands = {"furniture": _furniture, "sky": _sky, "textures": _textures, "water": _water}
+    commands = {
+        "furniture": _furniture,
+        "pack-level": _pack_level,
+        "sky": _sky,
+        "textures": _textures,
+        "water": _water,
+    }
     if not argv or argv[0] not in commands:
         print("usage: python -m roadgen {%s} …" % "|".join(sorted(commands)), file=sys.stderr)
         return 2
@@ -30,6 +38,12 @@ def _sky(argv):
 
 def _furniture(argv):
     from .furniture import main
+
+    return main(argv)
+
+
+def _pack_level(argv):
+    from .pack_level import main
 
     return main(argv)
 

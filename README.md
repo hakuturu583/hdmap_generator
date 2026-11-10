@@ -294,6 +294,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `carla_sky(carla_root, package, map_name, engine=, sun_altitude=, sun_azimuth=)` | after `Import.py`: give the imported level a daylight sky, with the editor's own scripting |
 | `carla_furniture(carla_root, package, map_name, engine=, manifest=)` | after `Import.py`: stand the package's traffic lights, signs and props town in the level, and make CARLA adopt the lights and signs |
 | `carla_water(carla_root, package, map_name, engine=, descriptor=, flowing=, still=)` | after `Import.py`: put the Unreal materials the descriptor names in the water's slots — `M_Water_Flowing` on rivers, whose UVs run downstream for a panning normal map, and `M_Water_Still` on lakes and ponds |
+| `carla_pack_level(carla_root, package, map_name, pack, engine=)` | after `Import.py`: save the imported level into a CARLA content pack at `/<pack>/Maps/<map>`, the one place in a pack CARLA serves a map's navigation and Traffic Manager files from, and register it with `carla-pack`, sidecars and all |
 | `carla_pack_assets(map, pack_dir, map_name=, formats=, xodr=, pointcloud_reach=, pointcloud_spacing=)` | put the map in every other format into a CARLA content pack beside its level, list them in the pack's `roadgen_asset.json` and stage them, so that the built pack carries them |
 | `to_opendrive_xml()` / `to_lanelet2_osm()` / `to_osm_xml()` / `to_gpudrive_json()` | the same, as strings |
 | `to_womd_bytes(scenario_id=, steps=, time_step=, current_time_index=)` | one serialized `Scenario`, not framed as a TFRecord |
@@ -1739,6 +1740,7 @@ m.export_carla("out/", name="Town01",
 ```sh
 python out/Town01Package.py            # imports it, adds the sky, says how to run it
 python out/Town01Package.py --launch   # and starts the server on it
+python out/Town01Package.py --pack Town01Pack   # and puts the level into a CARLA 1.0 content pack
 ```
 
 It removes what an earlier import of the same package left under
@@ -2168,13 +2170,38 @@ y −20–0). Run Autoware with `pointcloud_map_file:=pointcloud_map`.
 ### Every other format, in the content pack
 
 A CARLA 1.0 content pack carries a map for the simulator; built from a roadgen map,
-it can carry the same road network for everything else too. After `carla-pack init`
-and `carla-pack add --map` have put the level in a pack:
+it can carry the same road network for everything else too. The level goes into the
+pack first, with the build script's `--pack` or `carla_pack_level`:
 
 ```python
+m.export_carla("Import/", name="Highway")
+# python Import/HighwayPackage.py --pack HighwayPack     # imports it and puts the level in the pack, or:
+roadgen.carla_pack_level("/opt/carla", "HighwayPackage", "Highway", "HighwayPack")
 roadgen.carla_pack_assets(m, "Unreal/CarlaUnreal/Plugins/Packs/HighwayPack", "Highway")
 # then: carla-pack build HighwayPack
 ```
+
+The level has to be at `/<Pack>/Maps/<Map>`, straight in the pack's `Maps/` folder.
+A pack keeps the map's OpenDRIVE, navigation and Traffic Manager data in its
+`Content/Maps/{OpenDrive,Nav,TM}/`, and the server hands a client those files from
+beside the level, so they only meet there:
+
+| Where the pack registers the level | What a client gets |
+| --- | --- |
+| `/<Pack>/Maps/<Map>` (`carla_pack_level`, `--pack`) | the OpenDRIVE, the navigation, the Traffic Manager cache |
+| `/<Pack>/Maps/<Map>/<Map>` (`carla-pack add --import`) | none of them |
+| `/Game/<Package>/Maps/<Map>/<Map>` (`carla-pack add --map`, in place) | none of them |
+
+Without them `get_random_location_from_navigation()` returns `None`, so no
+pedestrian can walk the map, and the Traffic Manager rebuilds its map on every
+load. Registering in place is meant for CARLA's own towns, whose files the base
+package carries anyway. `carla_pack_level` saves the level `Import.py` built under
+the pack's mount point with the editor's Save As (the imported one stays, and still
+opens in the editor), makes the pack with `carla-pack init` if there is none, and
+registers the level with `carla-pack add`, handing it the OpenDRIVE, its
+`map_logic.json`, the navigation and the Traffic Manager data from beside the
+imported level. `carla_pack_assets` warns about a pack that registers the level
+anywhere else.
 
 writes, in the pack folder:
 
@@ -2187,7 +2214,7 @@ writes, in the pack folder:
 
 `carla-pack build` then copies them into the pack as they are and lists each, with
 its SHA-256, in `carla-pack.json`. The OpenDRIVE is not written again: the asset
-file points at the one `carla-pack add` put beside the level.
+file points at the one registered for the level.
 
 `roadgen_asset.json` is optional; a pack without it is an ordinary CARLA pack. Its
 paths are relative to the pack folder, the one holding `carla-pack.json`:
