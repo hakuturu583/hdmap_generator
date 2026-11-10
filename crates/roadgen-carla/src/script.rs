@@ -20,7 +20,9 @@
 //! it moves every other `.json` under `Import/` out of the way while `Import.py`
 //! runs, because that script imports every descriptor it finds, and puts them back
 //! afterwards, whatever happened; and it says how to start the server at the end
-//! rather than starting it, unless asked.
+//! rather than starting it, unless asked. Told `--pack`, it also puts the level
+//! into a CARLA content pack with `roadgen.carla_pack_level()`, at the one place in
+//! a pack from which CARLA serves a map's navigation and Traffic Manager files.
 
 use crate::PackageConfig;
 
@@ -38,7 +40,7 @@ pub fn script(config: &PackageConfig, furniture: bool, water: bool) -> String {
 """Written by roadgen beside the package for {map}. Imports it into a CARLA UE5
 checkout and gives the level a sky.
 
-    python {package}.py [--carla ROOT] [--engine DIR] [--no-navmesh] [--launch]
+    python {package}.py [--carla ROOT] [--engine DIR] [--no-navmesh] [--pack PACK] [--launch]
 
 `--carla` is the CARLA checkout (the one with Unreal/CarlaUnreal in it) and
 `--engine` the Unreal Engine it was built against. Each is taken from the option,
@@ -47,6 +49,10 @@ the package was exported with. Run it with the interpreter that has `roadgen` an
 CARLA's own `carla` module: CARLA's Import.py needs the second, and is run with
 the same one. It also builds the pedestrians' navigation mesh, with the
 RecastBuilder CARLA's build left under Build/, unless told --no-navmesh.
+
+`--pack` puts the level into that CARLA content pack afterwards, at
+/<PACK>/Maps/{map} — the pack is made if there is none — with its OpenDRIVE,
+navigation and Traffic Manager files; `carla-pack build <PACK>` then builds it.
 """
 
 import argparse
@@ -82,6 +88,7 @@ def main(argv=None):
     parser.add_argument("--no-furniture", action="store_true", help="leave the lights and signs unplaced")
     parser.add_argument("--no-water", action="store_true", help="leave the water in its flat colours")
     parser.add_argument("--no-navmesh", action="store_true", help="build no navigation mesh for pedestrians")
+    parser.add_argument("--pack", help="put the level into this CARLA content pack, at /<PACK>/Maps/<map>")
     parser.add_argument("--launch", action="store_true", help="start the CARLA server on the map afterwards")
     args = parser.parse_args(argv)
     if not args.carla or not args.engine:
@@ -190,6 +197,13 @@ def main(argv=None):
         dressed = roadgen.carla_water(str(carla), PACKAGE, MAP, engine=str(engine))
         print("%d water meshes dressed" % dressed)
 
+    # A content pack, which CARLA serves the map's files from only when the level
+    # sits straight in the pack's Maps/ folder: that is where this puts it.
+    if args.pack:
+        print("putting %s into the content pack %s" % (MAP, args.pack))
+        packed = roadgen.carla_pack_level(str(carla), PACKAGE, MAP, args.pack, engine=str(engine))
+        print("%s is in the pack; build it with: carla-pack build %s" % (packed, args.pack))
+
     editor = engine / "Engine" / "Binaries" / ("Win64" if os.name == "nt" else "Linux") / "UnrealEditor"
     level = "/Game/%s/Maps/%s/%s" % (PACKAGE, MAP, MAP)
     command = [str(editor), str(uproject), level, "-game", "-vulkan", "-carla-rpc-port=2000", "-RenderOffScreen"]
@@ -257,6 +271,14 @@ mod tests {
         assert!(text.contains("SUN_ALTITUDE = 45") && text.contains("roadgen.carla_sky("));
         assert!(text.contains("FURNITURE = True") && text.contains("roadgen.carla_furniture("));
         assert!(text.contains("WATER = True") && text.contains("roadgen.carla_water("));
+    }
+
+    #[test]
+    fn the_script_puts_the_level_into_a_content_pack_when_told() {
+        let text = script(&PackageConfig::new("Town01"), false, false);
+        assert!(text.contains("parser.add_argument(\"--pack\""));
+        assert!(text.contains("roadgen.carla_pack_level(str(carla), PACKAGE, MAP, args.pack"));
+        assert!(text.contains("/<PACK>/Maps/Town01"));
     }
 
     #[test]

@@ -9,7 +9,7 @@ ClipGT, RDS-HQ, GPUDrive and WOMD, all from the one map and in one download:
 
     m = ...                                            # a roadgen.Map
     m.export_carla("Import/", name="Highway")          # the level, imported as usual
-    # carla-pack init/add the level into Plugins/Packs/HighwayPack, then:
+    # python Import/HighwayPackage.py --pack HighwayPack  (the level into the pack), then:
     roadgen.carla_pack_assets(m, "Unreal/CarlaUnreal/Plugins/Packs/HighwayPack",
                               "Highway")
     # carla-pack build HighwayPack
@@ -25,6 +25,11 @@ added to them here, so the cook copies both into the built pack as they are and
 `carla-pack build` lists every file, with its SHA-256, in the pack's
 `carla-pack.json`. The OpenDRIVE is not written twice: the asset file points at the
 one `carla-pack add` put beside the level, when there is one.
+
+The level has to be in the pack at `/<Pack>/Maps/<Map>`, where
+`roadgen.carla_pack_level()` (which `--pack` runs) puts it: CARLA hands a client
+the map's navigation and Traffic Manager files from beside the level, and from
+anywhere else it hands none. This warns when the pack registers the level elsewhere.
 
 `roadgen_asset.json` is optional to the pack and to anything that reads one: a pack
 without it is an ordinary CARLA pack, with the formats its `carla-pack.json` lists.
@@ -60,6 +65,7 @@ import os
 import re
 import shutil
 import tempfile
+import warnings
 
 __all__ = [
     "ASSET_FILE",
@@ -153,6 +159,9 @@ def carla_pack_assets(
         name = map_name or metadata.get("name") or ""
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name):
             raise CarlaPackAssetsError("map name %r is not one a pack can hold; pass map_name" % name)
+        misplaced = _misplaced_level(manifest_path, name)
+        if misplaced:
+            warnings.warn(misplaced, stacklevel=2)
         root_rel = "%s/%s" % (HDMAPS_DIR, name)
         root = os.path.join(pack_dir, *root_rel.split("/"))
         if os.path.isdir(root):
@@ -342,6 +351,27 @@ def _cells_near_roads(metadata_path, lanelet2_path, reach):
                 if (nx - x) ** 2 + (ny - y) ** 2 <= reach * reach:
                     near.add((cx + dx, cy + dy))
     return {name for cell, name in cells.items() if cell in near}
+
+
+def _misplaced_level(manifest_path, name):
+    """Why the pack's level for `name` will reach a client without its files, or None.
+
+    CARLA hands a client a map's OpenDRIVE, navigation and Traffic Manager files
+    from beside its level, and a pack keeps them in its `Content/Maps/`: only a level
+    at `/<Pack>/Maps/<Map>` has them beside it.
+    """
+    with open(manifest_path) as handle:
+        manifest = json.load(handle)
+    expected = "/%s/Maps/%s" % (manifest.get("name", ""), name)
+    for entry in manifest.get("maps", []):
+        if entry.get("name") == name and entry.get("package") and entry["package"] != expected:
+            return (
+                "the pack registers %s's level at %s, not at %s: a CARLA client gets none of its "
+                "navigation or Traffic Manager files from there, so no pedestrian can walk it. "
+                "Put the level in the pack with roadgen.carla_pack_level() (or `python -m roadgen "
+                "pack-level`) first." % (name, entry["package"], expected)
+            )
+    return None
 
 
 def _registered_xodr(manifest_path, name):
