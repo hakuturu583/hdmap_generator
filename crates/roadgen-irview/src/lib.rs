@@ -11,6 +11,9 @@
 //!                   └──▶ JSON (feature `serde`), for a canvas in a browser
 //! ```
 //!
+//! Surface features — ruts, potholes, puddles, humps, roughness — are drawn as
+//! their footprints on the road, with the depth or height they reach.
+//!
 //! A [`Scene`] is a plan view: x and y in the map's own metres, heights dropped. It
 //! keeps no topology beyond the identifiers, and nothing goes back into the IR from
 //! here.
@@ -43,5 +46,6 @@ pub mod svg;
 
 pub use scene::{
     AreaView, Bounds, EndView, JunctionView, LaneView, LineView, ObjectView, RoadView, Scene,
+    SurfaceView,
 };
 pub use svg::SvgOptions;

@@ -146,6 +146,97 @@ pub struct RoadDoc {
     /// km/h.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub speed_limit: Option<f64>,
+    /// Where the road's surface departs from its design: ruts, potholes, puddles,
+    /// humps, roughness.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
+    pub surface: Vec<SurfaceDoc>,
+}
+
+/// A rut worn along a path through one lane rather than straight down the road.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RutPath {
+    /// The lane, by its position in the road's lane list.
+    pub lane: usize,
+    /// `[station, offset]` pairs, the offset metres to the left of the lane's
+    /// middle; stations ascending. Joined smoothly.
+    pub knots: Vec<[f64; 2]>,
+}
+
+/// One departure of a road's surface from its design.
+///
+/// The footprint is in the road's own coordinates: from `station` for `length`
+/// metres along it, `width` metres across, centred `offset` metres to the left of
+/// the reference line. Which of the other fields count depends on `kind`; the rest
+/// are kept, so switching a feature's kind back and forth loses nothing.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct SurfaceDoc {
+    /// `rut`, `pothole`, `puddle`, `bump` or `roughness`.
+    pub kind: String,
+    pub station: f64,
+    pub length: f64,
+    pub offset: f64,
+    pub width: f64,
+    /// How deep a rut, a pothole or a puddle goes, metres.
+    pub depth: f64,
+    /// How high a bump stands, metres.
+    pub height: f64,
+    /// A rut's two troughs: centre to centre, and each one's width, metres.
+    pub track: f64,
+    pub trough: f64,
+    /// What a bump is: `bump`, `hump`, `table`, `cushion` or `heave`.
+    pub bump: String,
+    /// A bump's profile — `circular`, `parabolic`, `sinusoidal` or `flat` — or
+    /// empty for the one its kind is usually built to.
+    pub profile: String,
+    /// The ramp length of a `flat` profile, metres.
+    pub ramp: f64,
+    /// Roughness's ISO 8608 class, `A` to `H`.
+    pub class: String,
+    /// What makes one pothole's rim, or one rough patch, unlike another.
+    pub seed: u64,
+    /// For a rut: the path it follows through a lane. Its footprint is then
+    /// fitted to the path, and the four footprint fields above are ignored.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub path: Option<RutPath>,
+}
+
+impl Default for SurfaceDoc {
+    fn default() -> Self {
+        SurfaceDoc {
+            kind: "pothole".to_owned(),
+            station: 0.0,
+            length: 1.0,
+            offset: 0.0,
+            width: 1.0,
+            depth: 0.05,
+            height: 0.075,
+            track: 1.8,
+            trough: 0.4,
+            bump: "hump".to_owned(),
+            profile: String::new(),
+            ramp: 1.0,
+            class: "C".to_owned(),
+            seed: 0,
+            path: None,
+        }
+    }
+}
+
+impl SurfaceDoc {
+    /// A feature of `kind`, `length` by `width`, from `station` at `offset`.
+    pub fn new(kind: &str, station: f64, length: f64, offset: f64, width: f64) -> Self {
+        SurfaceDoc {
+            kind: kind.to_owned(),
+            station,
+            length,
+            offset,
+            width,
+            ..SurfaceDoc::default()
+        }
+    }
 }
 
 impl Default for RoadDoc {
@@ -160,6 +251,7 @@ impl Default for RoadDoc {
             ],
             road_type: "town".to_owned(),
             speed_limit: None,
+            surface: Vec::new(),
         }
     }
 }
@@ -240,7 +332,8 @@ impl Document {
     }
 
     /// A small town to start from: a crossroads, one arm of it bending away and
-    /// carrying on past a straight joint into a road with a pavement.
+    /// carrying on past a straight joint into a road with a pavement, and another
+    /// worn, with a hump before the crossing.
     pub fn example() -> Document {
         let z = 0.0;
         let mut east = RoadDoc::two_way(
@@ -258,10 +351,34 @@ impl Document {
         avenue
             .lanes
             .push(LaneDoc::driving(2.0, Travel::Backward).with_type("sidewalk"));
+        // A worn approach: a pothole and a puddle in its lanes, ruts in the
+        // eastbound lane's wheel paths, and a hump to slow traffic before the
+        // crossroads. Right-hand traffic: eastbound is to the right, at -1.75.
+        let mut west = RoadDoc::two_way("west", vec![[-80.0, 0.0, z], [-12.0, 0.0, z]]);
+        west.surface = vec![
+            SurfaceDoc {
+                depth: 0.02,
+                ..SurfaceDoc::new("rut", 4.0, 30.0, -1.75, 2.2)
+            },
+            SurfaceDoc {
+                depth: 0.08,
+                seed: 7,
+                ..SurfaceDoc::new("pothole", 38.0, 1.2, -2.2, 0.9)
+            },
+            SurfaceDoc {
+                depth: 0.03,
+                ..SurfaceDoc::new("puddle", 24.0, 3.0, 1.9, 2.4)
+            },
+            SurfaceDoc {
+                bump: "hump".to_owned(),
+                height: 0.075,
+                ..SurfaceDoc::new("bump", 52.0, 3.7, 0.0, 7.0)
+            },
+        ];
         Document {
             name: "example".to_owned(),
             roads: vec![
-                RoadDoc::two_way("west", vec![[-80.0, 0.0, z], [-12.0, 0.0, z]]),
+                west,
                 east,
                 RoadDoc::two_way("south", vec![[0.0, -80.0, z], [0.0, -12.0, z]]),
                 RoadDoc::two_way("north", vec![[0.0, 12.0, z], [0.0, 70.0, z]]),

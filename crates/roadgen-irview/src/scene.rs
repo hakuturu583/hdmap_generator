@@ -1,8 +1,8 @@
 //! The plan view of a map, as plain data.
 
 use roadgen_core::{
-    Curve3, Direction, GeometryError, LateralSide, Map, MarkingColor, ObjectGeometry, Point3,
-    RoadMarking, SamplingConfig,
+    Curve3, Direction, GeometryError, LateralSide, Map, MarkingColor, ObjectGeometry, Point3, Road,
+    RoadMarking, SamplingConfig, SurfaceFeature, SurfaceFeatureKind,
 };
 
 /// A point in plan: x east, y north, metres.
@@ -159,6 +159,33 @@ pub struct AreaView {
     pub outline: Vec<Xy>,
 }
 
+/// A departure of a road's surface from its design: a rut, a pothole, a puddle, a
+/// bump or a patch of roughness, drawn where it lies on the road.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct SurfaceView {
+    /// The IR identifier, `surface/<road>/<kind>/<n>`.
+    pub id: String,
+    pub road: String,
+    /// `rut`, `pothole`, `puddle`, `bump` or `roughness`.
+    pub kind: String,
+    /// The feature in a few words: `pothole 8 cm deep`, `hump 7.5 cm, circular`.
+    pub label: String,
+    /// The footprint in the road's own coordinates: station range, and lateral
+    /// range right edge first, metres to the left of the reference line.
+    pub stations: [f64; 2],
+    pub laterals: [f64; 2],
+    /// The deepest below the design and the highest above it, metres.
+    pub extremes: [f64; 2],
+    /// Whether water stands on it.
+    pub wet: bool,
+    /// What the feature covers in plan: the ellipse of a pothole or a puddle, the
+    /// rectangle of a bump or a rough patch, the footprint a rut runs in.
+    pub outline: Vec<Xy>,
+    /// For a rut, the middle of each trough; empty otherwise.
+    pub troughs: Vec<Vec<Xy>>,
+}
+
 /// Everything in a map that can be drawn in plan.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -170,6 +197,7 @@ pub struct Scene {
     pub junctions: Vec<JunctionView>,
     pub objects: Vec<ObjectView>,
     pub areas: Vec<AreaView>,
+    pub surfaces: Vec<SurfaceView>,
     /// What could not be drawn and why, one entry each. A scene is drawn from maps
     /// that failed validation too, so a broken element is skipped, not fatal.
     pub warnings: Vec<String>,
@@ -364,6 +392,20 @@ impl Scene {
             });
         }
 
+        for feature in map.surface_features.iter() {
+            let Some(road) = map.road(&feature.road) else {
+                warnings.push(format!(
+                    "{}: on {}, which the map does not have",
+                    feature.id, feature.road
+                ));
+                continue;
+            };
+            match surface_view(map, road, feature, sampling) {
+                Ok(view) => scene.surfaces.push(view),
+                Err(error) => warnings.push(warn(feature.id.as_str(), error)),
+            }
+        }
+
         scene.warnings = warnings;
         scene.bounds = Bounds::of(
             scene
@@ -395,6 +437,126 @@ impl Scene {
         }
         found
     }
+}
+
+/// Where a road's `(station, lateral)` is in plan: the lateral measured along the
+/// horizontal left of the reference line, the way a surface feature's footprint
+/// is stated.
+fn road_point(
+    road: &Road,
+    sampling: SamplingConfig,
+    station: f64,
+    lateral: f64,
+) -> Result<Xy, GeometryError> {
+    let sample = road.reference_line.sample_at(station, sampling)?;
+    let tangent = sample.tangent.get();
+    let norm = tangent.x.hypot(tangent.y);
+    if norm < 1e-12 {
+        return Ok(xy(sample.point));
+    }
+    Ok([
+        sample.point.x - tangent.y / norm * lateral,
+        sample.point.y + tangent.x / norm * lateral,
+    ])
+}
+
+/// Stations from `from` to `to`, both included, no further apart than a metre.
+fn stations_along(from: f64, to: f64) -> Vec<f64> {
+    let steps = ((to - from) / 1.0).ceil().max(1.0) as usize;
+    (0..=steps)
+        .map(|i| from + (to - from) * i as f64 / steps as f64)
+        .collect()
+}
+
+fn surface_view(
+    map: &Map,
+    road: &Road,
+    feature: &SurfaceFeature,
+    sampling: SamplingConfig,
+) -> Result<SurfaceView, GeometryError> {
+    let (s0, s1) = feature.stations();
+    let (t0, t1) = feature.laterals();
+    let at = |s: f64, t: f64| road_point(road, sampling, s, t);
+    let (low, high) = feature.extremes();
+    let cm = |metres: f64| format!("{:.1} cm", metres * 100.0).replace(".0 cm", " cm");
+
+    let mut troughs = Vec::new();
+    let (label, outline) = match &feature.kind {
+        SurfaceFeatureKind::Pothole { depth, .. } | SurfaceFeatureKind::Puddle { depth } => {
+            // The ellipse inscribed in the footprint, which is what both fill.
+            let (sc, tc) = ((s0 + s1) / 2.0, (t0 + t1) / 2.0);
+            let (rs, rt) = ((s1 - s0) / 2.0, (t1 - t0) / 2.0);
+            let ring = (0..32)
+                .map(|i| {
+                    let a = i as f64 / 32.0 * std::f64::consts::TAU;
+                    at(sc + rs * a.cos(), tc + rt * a.sin())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (
+                format!("{} {} deep", feature.kind.as_str(), cm(*depth)),
+                ring,
+            )
+        }
+        kind => {
+            let along = stations_along(s0, s1);
+            let mut ring = along
+                .iter()
+                .map(|&s| at(s, t0))
+                .collect::<Result<Vec<_>, _>>()?;
+            for &s in along.iter().rev() {
+                ring.push(at(s, t1)?);
+            }
+            let label = match kind {
+                SurfaceFeatureKind::Rut {
+                    depth, track, path, ..
+                } => {
+                    // The middle of each trough: either side of the footprint's
+                    // middle, or of the path the rut was worn along.
+                    let centre = |s: f64| -> f64 {
+                        match path {
+                            Some(path) => map
+                                .lane_centre(&path.lane)
+                                .map(|lane| lane(s) + path.offset_at(s).0)
+                                .unwrap_or((t0 + t1) / 2.0),
+                            None => (t0 + t1) / 2.0,
+                        }
+                    };
+                    for side in [-0.5, 0.5] {
+                        troughs.push(
+                            along
+                                .iter()
+                                .map(|&s| at(s, centre(s) + side * track))
+                                .collect::<Result<Vec<_>, _>>()?,
+                        );
+                    }
+                    let along_path = if path.is_some() { ", along a path" } else { "" };
+                    format!("rut {} deep{along_path}", cm(*depth))
+                }
+                SurfaceFeatureKind::Bump {
+                    kind,
+                    height,
+                    profile,
+                } => format!("{} {}, {}", kind.as_str(), cm(*height), profile.as_str()),
+                SurfaceFeatureKind::Roughness { class, .. } => {
+                    format!("roughness, ISO 8608 class {}", class.as_str())
+                }
+                _ => unreachable!("potholes and puddles are drawn above"),
+            };
+            (label, ring)
+        }
+    };
+    Ok(SurfaceView {
+        id: feature.id.as_str().to_owned(),
+        road: feature.road.as_str().to_owned(),
+        kind: feature.kind.as_str().to_owned(),
+        label,
+        stations: [s0, s1],
+        laterals: [t0, t1],
+        extremes: [low, high],
+        wet: feature.holds_water(),
+        outline,
+        troughs,
+    })
 }
 
 fn xy(point: Point3) -> Xy {
@@ -594,6 +756,77 @@ mod tests {
         ]);
         assert_eq!(hull.len(), 4);
         assert!(!hull.contains(&[0.5, 0.5]));
+    }
+
+    #[test]
+    fn surface_features_lie_where_the_road_says() {
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    two_lanes(),
+                )
+                .unwrap()
+                .with_name("r"),
+            )
+            .unwrap();
+        builder
+            .add_surface_feature(
+                &road,
+                40.0,
+                2.0,
+                -1.75,
+                1.0,
+                SurfaceFeatureKind::Pothole {
+                    depth: 0.08,
+                    seed: 1,
+                },
+            )
+            .unwrap();
+        builder
+            .add_surface_feature(
+                &road,
+                10.0,
+                30.0,
+                -1.75,
+                2.2,
+                SurfaceFeatureKind::Rut {
+                    depth: 0.02,
+                    track: 1.8,
+                    trough: 0.4,
+                    path: None,
+                },
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().into_map();
+        let scene = Scene::from_map(&map);
+        assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+        assert_eq!(scene.surfaces.len(), 2);
+
+        let pothole = scene.surfaces.iter().find(|s| s.kind == "pothole").unwrap();
+        assert_eq!(pothole.label, "pothole 8 cm deep");
+        assert_eq!(pothole.extremes, [-0.08, 0.0]);
+        // An eastbound road: station is x, and the lateral is y.
+        for [x, y] in &pothole.outline {
+            assert!(
+                (39.0..=42.0).contains(x) && (-2.3..=-1.2).contains(y),
+                "{x}, {y}"
+            );
+        }
+        assert!(contains(&pothole.outline, [41.0, -1.75]));
+
+        let rut = scene.surfaces.iter().find(|s| s.kind == "rut").unwrap();
+        assert_eq!(rut.troughs.len(), 2);
+        let ys: Vec<f64> = rut.troughs.iter().map(|t| t[0][1]).collect();
+        assert!(
+            (ys[0] - (-2.65)).abs() < 1e-6 && (ys[1] - (-0.85)).abs() < 1e-6,
+            "{ys:?}"
+        );
+        assert!(scene
+            .to_svg(&Default::default())
+            .contains("pothole 8 cm deep"));
     }
 
     #[test]

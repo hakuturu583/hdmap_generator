@@ -31,7 +31,8 @@ pub mod import;
 
 pub use build::{build, Built, Problem, Severity};
 pub use document::{
-    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, Shape, Side, Travel,
+    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, RutPath, Shape, Side,
+    SurfaceDoc, Travel,
 };
 pub use import::from_map;
 
@@ -184,6 +185,85 @@ mod tests {
         });
         let built = build(&document);
         assert!(built.is_valid(), "{:#?}", built.problems);
+    }
+
+    #[test]
+    fn surface_features_go_on_their_roads() {
+        let map = build(&Document::example()).validated().unwrap();
+        let kinds: Vec<&str> = map
+            .surface_features
+            .iter()
+            .map(|feature| feature.kind.as_str())
+            .collect();
+        for kind in ["rut", "pothole", "puddle", "bump"] {
+            assert!(kinds.contains(&kind), "no {kind} in {kinds:?}");
+        }
+        assert!(map
+            .surface_features
+            .iter()
+            .all(|feature| feature.road.as_str() == "road/west"));
+    }
+
+    #[test]
+    fn a_rut_can_follow_a_path_through_a_lane() {
+        let mut document = Document::example();
+        document.roads[0].surface = vec![SurfaceDoc {
+            depth: 0.025,
+            path: Some(RutPath {
+                lane: 0,
+                knots: vec![[5.0, 0.0], [20.0, 0.6], [35.0, 0.0]],
+            }),
+            ..SurfaceDoc::new("rut", 0.0, 0.0, 0.0, 0.0)
+        }];
+        let built = build(&document);
+        assert!(built.is_valid(), "{:#?}", built.problems);
+        let map = built.validated().unwrap();
+        let rut = map.surface_features.iter().next().unwrap();
+        // The footprint was fitted to the path, not taken from the document.
+        assert!((rut.station - 5.0).abs() < 1e-9 && (rut.length - 30.0).abs() < 1e-9);
+        assert!(rut.width > 2.2);
+    }
+
+    #[test]
+    fn a_bad_surface_feature_is_named_and_the_rest_builds() {
+        let mut document = Document::example();
+        document.roads[0].surface[1].kind = "crater".to_owned();
+        document.roads[0].surface[2].bump = "wall".to_owned();
+        document.roads[0].surface[2].kind = "bump".to_owned();
+        let built = build(&document);
+        let named: Vec<Option<usize>> = built
+            .problems
+            .iter()
+            .filter(|p| p.road.as_deref() == Some("west"))
+            .map(|p| p.surface)
+            .collect();
+        assert_eq!(named, vec![Some(1), Some(2)], "{:#?}", built.problems);
+        let map = built.map.unwrap();
+        assert_eq!(map.as_map().surface_features.len(), 2);
+    }
+
+    #[test]
+    fn surface_features_come_back_from_the_ir() {
+        let mut original = Document::example();
+        original.roads[2].surface = vec![SurfaceDoc {
+            class: "E".to_owned(),
+            seed: 3,
+            ..SurfaceDoc::new("roughness", 10.0, 40.0, 0.0, 7.0)
+        }];
+        let map = build(&original).validated().unwrap();
+        let (document, notes) = from_map(&map);
+        assert!(notes.is_empty(), "{notes:?}");
+        for road in &original.roads {
+            let back = &document.road(&road.id).unwrap().surface;
+            assert_eq!(back.len(), road.surface.len(), "{}", road.id);
+            for (a, b) in road.surface.iter().zip(back) {
+                assert_eq!(a.kind, b.kind);
+                assert!((a.station - b.station).abs() < 1e-9);
+                assert!((a.offset - b.offset).abs() < 1e-9);
+            }
+        }
+        let rebuilt = build(&document).validated().unwrap();
+        assert_eq!(rebuilt.surface_features.len(), map.surface_features.len());
     }
 
     #[test]

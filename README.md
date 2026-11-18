@@ -2846,7 +2846,7 @@ change:
 
 | Crate | What it is |
 | --- | --- |
-| `roadgen-irview` | Draws the IR itself, before any format is involved: lanes, markings, junction hulls, furniture, buildings. As data (a `Scene`, JSON with the `serde` feature) or as SVG. Every shape keeps the IR identifier it came from, which is what lets a click on a lane select its road. |
+| `roadgen-irview` | Draws the IR itself, before any format is involved: lanes, markings, junction hulls, furniture, buildings, surface features. As data (a `Scene`, JSON with the `serde` feature) or as SVG. Every shape keeps the IR identifier it came from, which is what lets a click on a lane select its road. |
 | `roadgen-editor` | The document, and `build`, which turns it into the IR. No dependencies beyond `roadgen-core`. |
 | `roadgen-editor-wasm` | The engine the page loads: `buildDocument`, `exportDocument`, `importFile`. |
 
@@ -2864,11 +2864,17 @@ A few things the document does for you:
   the rest is drawn. The Problems tab lists each, and clicking one selects what it is
   about. Exporting needs a map with nothing left out that validates; the document
   itself, the IR and an SVG can be saved at any time.
+- **The surface is part of the road.** Each road carries its
+  [surface features](#what-a-wheel-meets-ruts-potholes-puddles-humps) — ruts, potholes, puddles, humps, roughness —
+  in its own station and offset. They are drawn where they lie, added from the
+  inspector, edited there, and dragged along and across the road on the canvas. The
+  OpenDRIVE export writes them as the OpenCRG grids the `.xodr` refers to, alongside
+  it.
 - **Opening a file makes it editable.** An OpenDRIVE file or an IR document opens as a
   document: reference lines as polylines simplified to 2 cm, the first cross-section's
   lanes at their starting widths, each junction as the links its connectors were made
-  from. What that leaves behind — furniture, rules, buildings, lane-count changes,
-  tapers — is listed under Map.
+  from, each road's surface features with it. What that leaves behind — furniture,
+  rules, buildings, lane-count changes, tapers — is listed under Map.
 
 The document is plain JSON (`*.roadgen.json`), saved in the browser between visits
 and downloadable from the Export menu:

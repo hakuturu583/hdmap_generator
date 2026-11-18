@@ -42,6 +42,18 @@ pub fn lane_fill(lane_type: &str, connector: bool) -> &'static str {
     }
 }
 
+/// Fill of a surface feature, and how opaque: water blue, a bump amber, a hole
+/// dark, roughness a light wash over the lane.
+pub fn surface_fill(kind: &str) -> (&'static str, f64) {
+    match kind {
+        "puddle" => ("#3b82c4", 0.75),
+        "pothole" => ("#16181b", 0.9),
+        "bump" => ("#e0a030", 0.8),
+        "rut" => ("#2c3036", 0.55),
+        _ => ("#b07d5a", 0.35),
+    }
+}
+
 /// Colour of a painted line.
 pub fn line_stroke(color: &str, marking: &str) -> &'static str {
     match (marking, color) {
@@ -149,6 +161,27 @@ impl Scene {
                 num(width),
                 dash,
             );
+        }
+
+        for surface in &self.surfaces {
+            let (fill, opacity) = surface_fill(&surface.kind);
+            let _ = write!(
+                out,
+                r#"<polygon data-id="{}" points="{}" fill="{}" fill-opacity="{}"><title>{}</title></polygon>"#,
+                escape(&surface.id),
+                points(&surface.outline),
+                fill,
+                opacity,
+                escape(&surface.label),
+            );
+            for trough in &surface.troughs {
+                let _ = write!(
+                    out,
+                    r##"<polyline points="{}" fill="none" stroke="#1d2024" stroke-width="{}" stroke-linecap="round"/>"##,
+                    points(trough),
+                    num(0.3f64.max(px)),
+                );
+            }
         }
 
         if options.arrows {

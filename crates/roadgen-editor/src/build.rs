@@ -17,8 +17,10 @@ use roadgen_core::{
     ValidatedMap, ValidationConfig, Vector3,
 };
 
+use roadgen_core::{BumpKind, BumpProfile, LaneRef, RoughnessClass, SurfaceFeatureKind};
+
 use crate::document::{
-    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, Shape, Side, Travel,
+    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, Shape, Side, SurfaceDoc, Travel,
 };
 
 /// How bad a problem is.
@@ -41,6 +43,9 @@ pub struct Problem {
     pub road: Option<String>,
     /// The link the problem is about, by its position in the document.
     pub link: Option<usize>,
+    /// The surface feature the problem is about, by its position in its road's
+    /// list; `road` says which road.
+    pub surface: Option<usize>,
     pub message: String,
 }
 
@@ -50,6 +55,7 @@ impl Problem {
             severity: Severity::Error,
             road: None,
             link: None,
+            surface: None,
             message: message.into(),
         }
     }
@@ -176,6 +182,7 @@ pub fn build(document: &Document) -> Built {
                 severity: Severity::Invalid,
                 road: None,
                 link: None,
+                surface: None,
                 message: issue.to_string(),
             });
         }
@@ -208,6 +215,21 @@ fn assemble(
         }
     }
 
+    for road in document
+        .roads
+        .iter()
+        .filter(|road| built.contains(road.id.as_str()))
+    {
+        for (index, feature) in road.surface.iter().enumerate() {
+            if let Err(message) = add_surface(&mut builder, road, feature) {
+                let mut problem =
+                    Problem::error(format!("surface feature {index}: {message}")).on_road(&road.id);
+                problem.surface = Some(index);
+                report(problem);
+            }
+        }
+    }
+
     let mut accepted = Vec::new();
     for &index in links {
         let link = &document.links[index];
@@ -232,6 +254,84 @@ fn assemble(
         }
     }
     (builder.finish(), accepted)
+}
+
+/// Puts one of a road's surface features on the map.
+fn add_surface(
+    builder: &mut MapBuilder,
+    road: &RoadDoc,
+    feature: &SurfaceDoc,
+) -> Result<(), String> {
+    let id = RoadId::new(&road.id);
+    let kind = match feature.kind.to_ascii_lowercase().as_str() {
+        "rut" => {
+            if let Some(path) = &feature.path {
+                if path.lane >= road.lanes.len() {
+                    return Err(format!(
+                        "its path is in lane {}, and the road has {}",
+                        path.lane,
+                        road.lanes.len()
+                    ));
+                }
+                let knots = path.knots.iter().map(|[s, t]| (*s, *t)).collect();
+                return builder
+                    .add_rut_along(
+                        &LaneRef::new(id, path.lane),
+                        knots,
+                        feature.depth,
+                        feature.track,
+                        feature.trough,
+                    )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+            }
+            SurfaceFeatureKind::Rut {
+                depth: feature.depth,
+                track: feature.track,
+                trough: feature.trough,
+                path: None,
+            }
+        }
+        "pothole" => SurfaceFeatureKind::Pothole {
+            depth: feature.depth,
+            seed: feature.seed,
+        },
+        "puddle" => SurfaceFeatureKind::Puddle {
+            depth: feature.depth,
+        },
+        "bump" => {
+            let kind = BumpKind::parse(&feature.bump)
+                .ok_or_else(|| format!("'{}' is not a kind of bump", feature.bump))?;
+            let profile = if feature.profile.trim().is_empty() {
+                kind.default_profile()
+            } else {
+                BumpProfile::parse(&feature.profile, feature.ramp)
+                    .ok_or_else(|| format!("'{}' is not a bump profile", feature.profile))?
+            };
+            SurfaceFeatureKind::Bump {
+                kind,
+                height: feature.height,
+                profile,
+            }
+        }
+        "roughness" => SurfaceFeatureKind::Roughness {
+            class: RoughnessClass::parse(&feature.class)
+                .ok_or_else(|| format!("'{}' is not an ISO 8608 class", feature.class))?,
+            seed: feature.seed,
+        },
+        other => return Err(format!("'{other}' is not a kind of surface feature")),
+    };
+    builder
+        .add_surface_feature(
+            &id,
+            feature.station,
+            feature.length,
+            feature.offset,
+            feature.width,
+            kind,
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn check_link(link: &LinkDoc, built: &BTreeSet<&str>) -> Result<(), String> {

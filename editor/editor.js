@@ -24,6 +24,18 @@ const ROAD_TYPES = ['town', 'rural', 'motorway', 'low_speed', 'pedestrian']
 const MARKINGS = ['none', 'solid', 'broken', 'solid solid', 'broken solid', 'solid broken', 'curb']
 const COLORS = ['white', 'yellow']
 
+const SURFACE_KINDS = ['rut', 'pothole', 'puddle', 'bump', 'roughness']
+const BUMP_KINDS = ['bump', 'hump', 'table', 'cushion', 'heave']
+const BUMP_PROFILES = [['', 'usual for its kind'], 'circular', 'parabolic', 'sinusoidal', 'flat']
+const ROUGHNESS_CLASSES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+const SURFACE_FILL = {
+  puddle: ['#3b82c4', 0.75],
+  pothole: ['#16181b', 0.9],
+  bump: ['#e0a030', 0.8],
+  rut: ['#2c3036', 0.55],
+  roughness: ['#b07d5a', 0.35],
+}
+
 const LANE_FILL = {
   driving: '#4a4f57',
   biking: '#7a4d4d',
@@ -42,6 +54,7 @@ const state = {
   built: null,
   selection: null, // {kind: 'road', id} | {kind: 'junction', id} | {kind: 'link', index}
   point: null, // index of the selected control point of the selected road
+  surface: null, // index of the selected surface feature of the selected road
   lane: null, // index of the lane being edited in the inspector
   tool: 'select',
   view: { cx: 0, cy: 0, scale: 3 },
@@ -154,6 +167,7 @@ function validateSelection() {
   if (state.selection?.kind !== 'road') state.point = null
   const road = state.selection?.kind === 'road' && findRoad(state.selection.id)
   if (road && state.point != null && state.point >= road.points.length) state.point = null
+  if (!road || state.surface >= (road.surface?.length ?? 0)) state.surface = null
 }
 
 let saveTimer = null
@@ -319,6 +333,29 @@ function render() {
   }
 
   for (const line of scene.lines ?? []) drawMarking(line, px)
+
+  for (const surface of scene.surfaces ?? []) {
+    const [fill, alpha] = SURFACE_FILL[surface.kind] ?? SURFACE_FILL.roughness
+    polygon(surface.outline)
+    ctx.globalAlpha = alpha
+    ctx.fillStyle = fill
+    ctx.fill()
+    ctx.globalAlpha = 1
+    for (const trough of surface.troughs) {
+      path(trough, false)
+      ctx.strokeStyle = '#1d2024'
+      ctx.lineWidth = Math.max(0.3, px)
+      ctx.lineCap = 'round'
+      ctx.stroke()
+      ctx.lineCap = 'butt'
+    }
+    if (isSelectedSurface(surface)) {
+      polygon(surface.outline)
+      ctx.strokeStyle = '#4ea1ff'
+      ctx.lineWidth = 2 * px
+      ctx.stroke()
+    }
+  }
 
   if (scale > 1.5) {
     ctx.fillStyle = '#ffffff70'
@@ -583,6 +620,62 @@ function inside(ring, [x, y]) {
   return result
 }
 
+/// Which of its road's document features a drawn surface feature is. The IR names
+/// a feature `surface/<road>/<kind>/<n>`, `n` counting that kind on that road in
+/// the order the document lists them.
+function surfaceIndex(view) {
+  const road = findRoad(roadKey(view.road))
+  if (!road) return null
+  const n = Number(view.id.split('/').pop())
+  let seen = -1
+  for (let i = 0; i < (road.surface ?? []).length; i++) {
+    if (road.surface[i].kind === view.kind && ++seen === n) return { road: road.id, index: i }
+  }
+  return null
+}
+
+function isSelectedSurface(view) {
+  if (state.selection?.kind !== 'road' || state.surface == null) return false
+  const found = surfaceIndex(view)
+  return found?.road === state.selection.id && found.index === state.surface
+}
+
+/// The surface feature under a world point, the smallest when several overlap.
+function surfaceAt(world) {
+  let found = null
+  let area = Infinity
+  for (const view of state.built?.scene?.surfaces ?? []) {
+    if (!inside(view.outline, world)) continue
+    const size = (view.stations[1] - view.stations[0]) * (view.laterals[1] - view.laterals[0])
+    if (size < area) {
+      found = view
+      area = size
+    }
+  }
+  return found && surfaceIndex(found)
+}
+
+/// A world point in a road's own coordinates: station along its reference line
+/// and metres to the left of it, read off the drawn reference line.
+function project(roadId, [x, y]) {
+  const line = state.built?.scene?.roads?.find((r) => r.id === `road/${roadId}`)?.reference_line
+  if (!line || line.length < 2) return null
+  let best = null
+  let along = 0
+  for (let i = 1; i < line.length; i++) {
+    const [a, b] = [line[i - 1], line[i]]
+    const [dx, dy] = [b[0] - a[0], b[1] - a[1]]
+    const length = Math.hypot(dx, dy)
+    if (length === 0) continue
+    const t = Math.max(0, Math.min(1, ((x - a[0]) * dx + (y - a[1]) * dy) / (length * length)))
+    const [px, py] = [a[0] + t * dx, a[1] + t * dy]
+    const d = Math.hypot(x - px, y - py)
+    if (!best || d < best.d) best = { d, s: along + t * length, t: (dx * (y - a[1]) - dy * (x - a[0])) / length }
+    along += length
+  }
+  return best && { s: best.s, t: best.t }
+}
+
 /// The lane under a world point, a connector winning over the road it crosses.
 function laneAt(world) {
   let found = null
@@ -653,12 +746,33 @@ canvas.addEventListener('pointerdown', (event) => {
     return
   }
   const end = endAt(screen, null, HANDLE_PX)
+  const hit = !end && surfaceAt(world)
+  if (hit) {
+    const feature = findRoad(hit.road).surface[hit.index]
+    state.selection = { kind: 'road', id: hit.road }
+    state.surface = hit.index
+    state.point = null
+    state.drag = {
+      kind: 'surface',
+      road: hit.road,
+      index: hit.index,
+      from: project(hit.road, world),
+      original: JSON.parse(JSON.stringify(feature)),
+      snapshot: JSON.stringify(state.doc),
+      moved: false,
+    }
+    canvas.setPointerCapture(event.pointerId)
+    renderPanels()
+    render()
+    return
+  }
   const lane = laneAt(world)
   const selection = end ? { kind: 'road', id: end.road } : selectionForLane(lane)
   if (selection) {
     const same = JSON.stringify(selection) === JSON.stringify(state.selection)
     state.selection = selection
     state.point = null
+    state.surface = null
     if (lane && selection.kind === 'road' && roadKey(lane.road) === selection.id) state.lane = lane.index
     else if (!same) state.lane = null
     renderPanels()
@@ -667,7 +781,9 @@ canvas.addEventListener('pointerdown', (event) => {
   }
   state.selection = null
   state.point = null
+  state.surface = null
   renderPanels()
+  render()
   startPan(event, screen)
 })
 
@@ -693,6 +809,10 @@ canvas.addEventListener('pointermove', (event) => {
     movePoint(drag, world, event.shiftKey)
     return
   }
+  if (drag?.kind === 'surface') {
+    moveSurface(drag, world)
+    return
+  }
   if (state.tool !== 'select') render()
 })
 
@@ -700,7 +820,7 @@ canvas.addEventListener('pointerup', (event) => {
   const drag = state.drag
   state.drag = null
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
-  if (drag?.kind === 'point' && drag.moved) {
+  if ((drag?.kind === 'point' || drag?.kind === 'surface') && drag.moved) {
     checkpoint(drag.snapshot)
     changed()
   }
@@ -770,6 +890,24 @@ function movePoint(drag, world, free) {
       const other = partner && findRoad(partner.road)
       if (other && other !== road) other.points[endIndex(other, partner.end)] = [...target]
     }
+  }
+  drag.moved = true
+  rebuildSoon()
+  renderPanelsSoon()
+}
+
+/// Slides a surface feature along and across its road, by how far the pointer has
+/// moved in the road's own coordinates. A rut along a path takes its path along.
+function moveSurface(drag, world) {
+  const at = project(drag.road, world)
+  const feature = findRoad(drag.road)?.surface?.[drag.index]
+  if (!at || !drag.from || !feature) return
+  const [ds, dt] = [at.s - drag.from.s, at.t - drag.from.t]
+  if (feature.path) {
+    feature.path.knots = drag.original.path.knots.map(([s, t]) => [s + ds, t + dt])
+  } else {
+    feature.station = Math.max(0, drag.original.station + ds)
+    feature.offset = drag.original.offset + dt
   }
   drag.moved = true
   rebuildSoon()
@@ -868,6 +1006,11 @@ function pickLinkEnd(screen) {
 function deleteSelection() {
   const s = state.selection
   if (!s) return
+  if (s.kind === 'road' && state.surface != null) {
+    const index = state.surface
+    state.surface = null
+    return commit((doc) => doc.roads.find((r) => r.id === s.id).surface.splice(index, 1))
+  }
   if (s.kind === 'road' && state.point != null) {
     const road = findRoad(s.id)
     if (road.points.length <= 2) return toast('A road keeps two points at least')
@@ -1036,6 +1179,8 @@ function renderRoadInspector(tab, road) {
     ),
   )
 
+  renderSurfaceSection(tab, road)
+
   tab.append(h('h4', {}, 'Points (x, y, z metres)'))
   const table = h('table', { class: 'points' })
   road.points.forEach((point, index) => {
@@ -1066,6 +1211,157 @@ function renderRoadInspector(tab, road) {
   const links = state.doc.links.map((link, index) => ({ link, index })).filter(({ link }) => link.from === id || link.to === id)
   tab.append(h('h4', {}, `Links (${links.length})`), linkList(links))
   tab.append(h('h4', {}, ''), h('button', { onclick: deleteSelection }, 'Delete road'))
+}
+
+/// Where the middle of a lane is, metres to the left of the reference line, from
+/// the document's widths: what a new feature is centred on.
+function laneCentre(road, index) {
+  const handedness = state.doc.handedness ?? 'right'
+  const sideOf = (lane) =>
+    lane.side ?? ((lane.direction === 'forward') === (handedness === 'right') ? 'right' : 'left')
+  const reach = { left: 0, right: 0 }
+  for (let i = 0; i < road.lanes.length; i++) {
+    const lane = road.lanes[i]
+    const side = sideOf(lane)
+    if (i === index) {
+      const middle = reach[side] + lane.width / 2
+      return side === 'left' ? middle : -middle
+    }
+    reach[side] += lane.width
+  }
+  return 0
+}
+
+/// How far the carriageway reaches either side: [right edge, left edge].
+function carriageway(road) {
+  let [right, left] = [0, 0]
+  road.lanes.forEach((lane, i) => {
+    const centre = laneCentre(road, i)
+    right = Math.min(right, centre - lane.width / 2)
+    left = Math.max(left, centre + lane.width / 2)
+  })
+  return [right, left]
+}
+
+/// A new feature of `kind`, halfway along the road, sized like the real thing.
+function newSurface(road, kind) {
+  const length = state.built?.scene?.roads?.find((r) => r.id === `road/${road.id}`)?.length ?? 20
+  const middle = length / 2
+  const lane = laneCentre(road, 0)
+  const [right, left] = carriageway(road)
+  const across = { offset: (right + left) / 2, width: left - right }
+  const base = { kind, depth: 0.05, height: 0.075, track: 1.8, trough: 0.4, bump: 'hump', profile: '', ramp: 1, class: 'C', seed: 0 }
+  const footprint = {
+    rut: { station: Math.max(0, middle - 10), length: 20, offset: lane, width: 2.2, depth: 0.02 },
+    pothole: { station: middle, length: 1.2, offset: lane, width: 0.9, depth: 0.06 },
+    puddle: { station: middle, length: 3, offset: lane, width: 2, depth: 0.03 },
+    bump: { station: middle, length: 3.7, ...across },
+    roughness: { station: Math.max(0, middle - 10), length: 20, ...across },
+  }[kind]
+  return { ...base, ...footprint }
+}
+
+function renderSurfaceSection(tab, road) {
+  const id = road.id
+  const features = road.surface ?? []
+  tab.append(
+    h('h4', {}, `Surface (${features.length})`),
+    h('p', { class: 'muted' }, 'Where the road departs from its design. Station along the road, offset to the left of its reference line, in metres; drag one on the map to move it.'),
+  )
+  features.forEach((feature, index) => tab.append(surfaceCard(road, feature, index)))
+  tab.append(
+    h(
+      'div',
+      { class: 'row' },
+      SURFACE_KINDS.map((kind) =>
+        h(
+          'button',
+          {
+            onclick: () => {
+              editRoad(id, (r) => (r.surface = [...(r.surface ?? []), newSurface(r, kind)]))
+              state.surface = (findRoad(id).surface ?? []).length - 1
+              renderPanels()
+              render()
+            },
+          },
+          `+ ${kind}`,
+        ),
+      ),
+    ),
+  )
+}
+
+function surfaceCard(road, feature, index) {
+  const id = road.id
+  const edit = (change) => editRoad(id, (r) => change(r.surface[index]))
+  const number = (key, label, attributes = {}) => [
+    h('span', { class: 'muted' }, label),
+    numberInput(feature[key], (v) => v != null && edit((f) => (f[key] = v)), { step: 0.01, ...attributes }),
+  ]
+  const cm = (key, label) => [
+    h('span', { class: 'muted' }, `${label} cm`),
+    numberInput(Number(((feature[key] ?? 0) * 100).toFixed(2)), (v) => v != null && edit((f) => (f[key] = v / 100)), { step: 0.5, min: 0.1 }),
+  ]
+  const choose = (key, label, options) => [
+    h('span', { class: 'muted' }, label),
+    select(options, feature[key] ?? '', (v) => edit((f) => (f[key] = v))),
+  ]
+  const fields = {
+    rut: [...cm('depth', 'depth'), ...number('track', 'track m'), ...number('trough', 'trough m')],
+    pothole: [...cm('depth', 'depth'), ...number('seed', 'seed', { step: 1, min: 0 })],
+    puddle: [...cm('depth', 'depth')],
+    bump: [
+      ...choose('bump', 'kind', BUMP_KINDS),
+      ...cm('height', 'height'),
+      ...choose('profile', 'profile', BUMP_PROFILES),
+      ...(feature.profile === 'flat' ? number('ramp', 'ramp m') : []),
+    ],
+    roughness: [...choose('class', 'ISO 8608', ROUGHNESS_CLASSES), ...number('seed', 'seed', { step: 1, min: 0 })],
+  }[feature.kind] ?? []
+  const footprint = feature.path
+    ? [h('p', { class: 'muted' }, `Follows a path through lane ${feature.path.lane}; its footprint is fitted to the path.`)]
+    : [
+        h(
+          'div',
+          { class: 'grid' },
+          ...number('station', 'station'),
+          ...number('length', 'length', { min: 0.01 }),
+          ...number('offset', 'offset'),
+          ...number('width', 'width', { min: 0.01 }),
+        ),
+      ]
+  return h(
+    'div',
+    {
+      class: `lane${state.surface === index ? ' selected' : ''}`,
+      onclick: (event) => {
+        if (state.surface === index) return
+        state.surface = index
+        render()
+        for (const card of document.querySelectorAll('.lane')) card.classList.remove('selected')
+        event.currentTarget.classList.add('selected')
+      },
+    },
+    h(
+      'div',
+      { class: 'head' },
+      h('span', { class: 'row' }, h('strong', {}, `#${index}`), select(SURFACE_KINDS, feature.kind, (v) => edit((f) => (f.kind = v)))),
+      h(
+        'button',
+        {
+          title: 'Remove this feature',
+          onclick: (event) => {
+            event.stopPropagation()
+            state.surface = null
+            editRoad(id, (r) => r.surface.splice(index, 1))
+          },
+        },
+        '×',
+      ),
+    ),
+    ...footprint,
+    h('div', { class: 'grid' }, ...fields),
+  )
 }
 
 function laneCard(road, laneDoc, index) {
@@ -1254,7 +1550,14 @@ function renderProblems() {
           {
             class: problem.severity,
             onclick: () => {
-              if (problem.road) selectAndShow({ kind: 'road', id: problem.road })
+              if (problem.road) {
+                selectAndShow({ kind: 'road', id: problem.road })
+                if (problem.surface != null) {
+                  state.surface = problem.surface
+                  renderPanels()
+                  render()
+                }
+              }
               else if (problem.link != null) selectAndShow({ kind: 'link', index: problem.link })
             },
           },
@@ -1307,6 +1610,7 @@ function renderMapTab() {
 function selectAndShow(selection) {
   state.selection = selection
   state.point = null
+  state.surface = null
   showTab('inspect')
   renderPanels()
   render()

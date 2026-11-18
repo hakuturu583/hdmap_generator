@@ -66,6 +66,23 @@ try {
     return [box.x + x, box.y + y]
   }
 
+  // The example's worn road: every feature drawn, and a pothole dragged along.
+  const kinds = built.scene.surfaces.map((s) => s.kind).sort()
+  check(JSON.stringify(kinds) === JSON.stringify(['bump', 'pothole', 'puddle', 'rut']), `surface features drawn: ${kinds}`)
+  const pothole = built.scene.surfaces.find((s) => s.kind === 'pothole')
+  const centre = pothole.outline.reduce((sum, p) => [sum[0] + p[0] / pothole.outline.length, sum[1] + p[1] / pothole.outline.length], [0, 0])
+  const before = (await editor(() => window.roadgenEditor.document())).roads[0].surface[1].station
+  const grab = await at(centre)
+  await page.mouse.move(...grab)
+  await page.mouse.down()
+  await page.mouse.move(grab[0] + 40, grab[1], { steps: 6 })
+  await page.mouse.up()
+  const after = (await editor(() => window.roadgenEditor.document())).roads[0].surface[1].station
+  check(after > before + 2, `dragging the pothole moved it from station ${before} to ${after}`)
+  const dragged = (await editor(() => window.roadgenEditor.built())).scene.surfaces.find((s) => s.kind === 'pothole')
+  check(dragged.stations[0] > pothole.stations[0] + 2, 'the drawn pothole did not follow the document')
+  await page.keyboard.press('Control+z')
+
   // Select `west` by clicking one of its lanes, then drag its far end.
   const west = (await editor(() => window.roadgenEditor.document())).roads.find((r) => r.id === 'west')
   const [a, b] = west.points
@@ -121,6 +138,9 @@ try {
   for (const format of formats) {
     const files = await editor((f) => window.roadgenEditor.exportFormat(f), format)
     check(files.length > 0 && files.every((f) => f.size > 0), `${format} wrote ${JSON.stringify(files)}`)
+    if (format === 'opendrive') {
+      check(files.some((f) => f.name.endsWith('.crg')), `OpenDRIVE wrote no OpenCRG for the surface: ${JSON.stringify(files)}`)
+    }
     console.log(`  ${format}: ${files.map((f) => `${f.name} (${f.size} B)`).join(', ')}`)
   }
   await page.selectOption('#format', 'opendrive')

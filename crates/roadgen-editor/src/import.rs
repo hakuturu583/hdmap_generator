@@ -4,18 +4,21 @@
 //! A document says far less than the IR can, so this loses things, and says which:
 //! every road becomes its reference line as a polyline and the lanes of its first
 //! cross-section at their starting widths; every junction becomes the links its
-//! connectors were made from; furniture, rules, buildings and terrain are dropped.
+//! connectors were made from; surface features stay on their roads; furniture,
+//! rules, buildings and terrain are dropped.
 //! What comes back builds into a map with the same roads, lanes and movements, which
 //! is what the editor is for.
 
 use std::collections::BTreeSet;
 
 use roadgen_core::{
-    Direction, LateralSide, Map, Point3, RoadEnd, RoadEndpoint, RoadLinkTarget, TrafficHandedness,
+    BumpProfile, Direction, LateralSide, Map, Point3, RoadEnd, RoadEndpoint, RoadLinkTarget,
+    SurfaceFeature, SurfaceFeatureKind, TrafficHandedness,
 };
 
 use crate::document::{
-    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, Shape, Side, Travel,
+    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, RutPath, Shape, Side,
+    SurfaceDoc, Travel,
 };
 
 /// How far a simplified reference line may stray from the one it came from, metres.
@@ -94,6 +97,12 @@ pub fn from_map(map: &Map) -> (Document, Vec<String>) {
             lanes,
             road_type: road.road_type.as_str().to_owned(),
             speed_limit: road.speed_limit.map(|limit| limit.kph()),
+            surface: map
+                .surface_features
+                .iter()
+                .filter(|feature| feature.road == road.id)
+                .map(surface_doc)
+                .collect(),
         });
     }
 
@@ -174,6 +183,20 @@ pub fn from_map(map: &Map) -> (Document, Vec<String>) {
             "{unexplained} connector(s) do not run between two roads and were dropped"
         ));
     }
+    let in_junctions = map
+        .surface_features
+        .iter()
+        .filter(|feature| {
+            map.road(&feature.road)
+                .is_none_or(|road| road.is_connector())
+        })
+        .count();
+    if in_junctions > 0 {
+        notes.push(format!(
+            "{in_junctions} surface feature(s) on roads through junctions dropped: the editor \
+             generates those roads, and keeps nothing on them"
+        ));
+    }
     for (count, what) in [
         (map.objects.len(), "traffic object(s)"),
         (map.rules.len(), "traffic rule(s)"),
@@ -189,6 +212,64 @@ pub fn from_map(map: &Map) -> (Document, Vec<String>) {
         }
     }
     (document, notes)
+}
+
+/// A surface feature as the document says it: its footprint, and the parameters
+/// of its kind, the others left at their defaults.
+fn surface_doc(feature: &SurfaceFeature) -> SurfaceDoc {
+    let mut doc = SurfaceDoc::new(
+        feature.kind.as_str(),
+        feature.station,
+        feature.length,
+        feature.offset,
+        feature.width,
+    );
+    match &feature.kind {
+        SurfaceFeatureKind::Rut {
+            depth,
+            track,
+            trough,
+            path,
+        } => {
+            doc.depth = *depth;
+            doc.track = *track;
+            doc.trough = *trough;
+            doc.path = path.as_ref().map(|path| RutPath {
+                lane: lane_index(path.lane.as_str()),
+                knots: path.knots().iter().map(|&(s, t)| [s, t]).collect(),
+            });
+        }
+        SurfaceFeatureKind::Pothole { depth, seed } => {
+            doc.depth = *depth;
+            doc.seed = *seed;
+        }
+        SurfaceFeatureKind::Puddle { depth } => doc.depth = *depth,
+        SurfaceFeatureKind::Bump {
+            kind,
+            height,
+            profile,
+        } => {
+            doc.bump = kind.as_str().to_owned();
+            doc.height = *height;
+            doc.profile = profile.as_str().to_owned();
+            if let BumpProfile::Flat { ramp } = profile {
+                doc.ramp = *ramp;
+            }
+        }
+        SurfaceFeatureKind::Roughness { class, seed } => {
+            doc.class = class.as_str().to_owned();
+            doc.seed = *seed;
+        }
+    }
+    doc
+}
+
+/// A lane's position in its road's list, from its identifier `lane/<road>/<n>`.
+fn lane_index(id: &str) -> usize {
+    id.rsplit('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
 }
 
 fn document_end(end: RoadEnd) -> End {

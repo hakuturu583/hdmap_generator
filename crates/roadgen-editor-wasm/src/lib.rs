@@ -43,7 +43,7 @@ pub const FORMATS: &[Format] = &[
     },
     Format {
         id: "opendrive",
-        label: "OpenDRIVE (.xodr)",
+        label: "OpenDRIVE (.xodr, + OpenCRG for the surface)",
         needs_valid_map: true,
     },
     Format {
@@ -207,10 +207,26 @@ pub fn export_files(
         .map_err(|error| format!("the map cannot be written yet: {error}"))?;
     let error = |e: &dyn std::fmt::Display| format!("{}: {e}", format.label);
     Ok(match format.id {
-        "opendrive" => vec![file(
-            format!("{stem}.xodr"),
-            roadgen_opendrive::to_xml(&map).map_err(|e| error(&e))?,
-        )],
+        "opendrive" => {
+            // OpenDRIVE has no element for a rut or a pothole: they go in OpenCRG
+            // grids beside the document, which its roads' <surface> refers to by
+            // name — so they are part of the export, not an option of it.
+            let options = roadgen_opendrive::Options {
+                crg: (!map.surface_features.is_empty())
+                    .then(roadgen_opendrive::CrgOptions::default),
+                ..roadgen_opendrive::Options::default()
+            };
+            let (xml, _, grids) =
+                roadgen_opendrive::to_xml_with_crg(&map, &options).map_err(|e| error(&e))?;
+            let mut files = vec![file(format!("{stem}.xodr"), xml)];
+            for grid in grids {
+                files.push(file(
+                    grid.file_name.clone(),
+                    grid.text(map.as_map()).map_err(|e| error(&e))?,
+                ));
+            }
+            files
+        }
         "lanelet2" => vec![file(
             "lanelet2_map.osm".to_owned(),
             roadgen_lanelet2::to_osm_xml(&map).map_err(|e| error(&e))?,
@@ -416,6 +432,33 @@ mod tests {
                 assert!(!file.bytes.is_empty(), "{} {}", format.id, file.name);
             }
         }
+    }
+
+    #[test]
+    fn the_surface_goes_out_as_opencrg_beside_the_opendrive() {
+        let files = export_files(&example(), "opendrive", &ExportOptions::default()).unwrap();
+        let xodr = std::str::from_utf8(&files[0].bytes).unwrap();
+        let grids: Vec<&File> = files.iter().filter(|f| f.name.ends_with(".crg")).collect();
+        assert!(
+            !grids.is_empty(),
+            "{:?}",
+            files.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        for grid in grids {
+            assert!(
+                xodr.contains(&grid.name),
+                "{} is not referred to",
+                grid.name
+            );
+        }
+        // Without features, the document alone, as before.
+        let mut plain = Document::example();
+        for road in &mut plain.roads {
+            road.surface.clear();
+        }
+        let json = serde_json::to_string(&plain).unwrap();
+        let files = export_files(&json, "opendrive", &ExportOptions::default()).unwrap();
+        assert_eq!(files.len(), 1);
     }
 
     #[test]

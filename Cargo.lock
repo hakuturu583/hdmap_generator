@@ -1584,7 +1584,7 @@ version = "0.45.0"
 
 [[package]]
 name = "roadgen-editor"
-version = "0.44.1"
+version = "0.45.0"
 dependencies = [
  "roadgen-core",
  "serde",
@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-editor-wasm"
-version = "0.44.1"
+version = "0.45.0"
 dependencies = [
  "roadgen-commonroad",
  "roadgen-core",
@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "roadgen-irview"
-version = "0.44.1"
+version = "0.45.0"
 dependencies = [
  "roadgen-core",
  "serde",
