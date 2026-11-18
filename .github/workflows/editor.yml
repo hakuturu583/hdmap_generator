@@ -1,0 +1,122 @@
+name: Editor
+
+# Builds the browser editor — the engine compiled to WebAssembly, and the page — and
+# runs it in a browser. The engine's logic is tested natively here too; whether the
+# wasm build loads and writes every format is a question only a browser answers.
+#
+# It runs on any branch that touches the editor, not only on main and pull requests:
+# the wasm build is the one check of these crates that no local `cargo test` makes.
+
+on:
+  push:
+    paths:
+      - "editor/**"
+      - "crates/roadgen-irview/**"
+      - "crates/roadgen-editor/**"
+      - "crates/roadgen-editor-wasm/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/editor.yml"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: editor-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  editor:
+    # Pinned for the same reason as the demo page: Playwright 1.56 knows Chromium's
+    # system dependencies for Ubuntu 24.04.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: editor
+
+      # The lock file is what `wasm-bindgen` is matched against below, so a lock
+      # file that lags the manifests is reported, with the lines it lacks. The rest
+      # still runs against the updated lock; the last step fails the job.
+      - name: Lock file
+        id: lock
+        run: |
+          cargo metadata --format-version 1 >/dev/null
+          if ! git diff --exit-code Cargo.lock; then
+            echo "::warning::Cargo.lock is out of date; the diff above is what it lacks"
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Format
+        run: cargo fmt --check -p roadgen-irview -p roadgen-editor -p roadgen-editor-wasm
+
+      - name: Lint
+        run: >
+          cargo clippy -p roadgen-irview -p roadgen-editor -p roadgen-editor-wasm
+          --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: >
+          cargo test -p roadgen-irview -p roadgen-editor -p roadgen-editor-wasm
+          --all-features
+
+      - name: wasm-bindgen version
+        id: bindgen
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3 }' Cargo.lock)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache wasm-bindgen
+        id: bindgen-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-${{ steps.bindgen.outputs.version }}
+
+      - name: Install wasm-bindgen
+        if: steps.bindgen-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version "${{ steps.bindgen.outputs.version }}" --locked
+
+      - name: Build the editor
+        run: editor/build.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editor/package-lock.json
+
+      - name: Run the editor in a browser
+        working-directory: editor
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          node smoke.mjs
+
+      - name: Upload the editor
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: editor
+          path: |
+            editor/site
+            editor/smoke.png
+          if-no-files-found: ignore
+
+      - name: The lock file was current
+        if: steps.lock.outputs.stale == 'true'
+        run: |
+          echo "::error::Cargo.lock is out of date; see the Lock file step for the diff"
+          exit 1

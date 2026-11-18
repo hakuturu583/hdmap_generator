@@ -1,0 +1,17 @@
+[package]
+name = "roadgen-irview"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Draws the canonical road IR itself: a plan view of roads, lanes, markings and furniture, as data or as SVG"
+
+[dependencies]
+roadgen-core.workspace = true
+# Only so that a scene can cross into JavaScript as JSON; the crate draws without it.
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]

@@ -18,7 +18,9 @@ can be written and read as **Protocol Buffers**, losing nothing, to a
 **[Try it in a browser](https://hakuturu583.github.io/hdmap_generator/)** — the demo
 page runs this package, compiled for WebAssembly. Write a script, press Run, and flip
 between the formats it wrote. Nothing is uploaded and nothing is installed; see
-[the demo page](#the-demo-page).
+[the demo page](#the-demo-page). Or **[draw one](https://hakuturu583.github.io/hdmap_generator/editor/)**
+in [the editor](#the-editor): click out roads, drag them into shape, join them, and
+export.
 
 ```python
 import roadgen
@@ -2743,6 +2745,86 @@ tiles, and only for the two panels that have a place on the Earth to show.
 Publishing needs Pages enabled for the repository with **GitHub Actions** as the
 source. A pull request builds the page and runs it in a browser; only `main` deploys.
 
+## The editor
+
+<https://hakuturu583.github.io/hdmap_generator/editor/>
+
+The demo page asks for a script. The editor asks for a mouse: draw a road by clicking
+its points, drag a point and watch the lanes follow it, click two road ends to join
+them — directly, or through a named junction — and export. It is the same generator
+as everywhere else, compiled to WebAssembly (without Python this time: the engine is
+a plain `wasm32-unknown-unknown` build through `wasm-bindgen`), so what the canvas
+shows is what roadgen built and what the Export button writes is what `roadgen`
+would have written.
+
+It never edits the IR. It edits a small **document** — each road's control points
+and lane list, and which road ends meet — and rebuilds the IR from it after every
+change:
+
+```
+   document (JSON) ──▶ roadgen-editor::build ──▶ IR ──▶ roadgen-irview ──▶ canvas
+                                                 │
+                                                 └──▶ validate ──▶ every exporter ──▶ files
+   .xodr / .roadgen.pb ──▶ IR ──▶ roadgen-editor::from_map ──▶ document
+```
+
+| Crate | What it is |
+| --- | --- |
+| `roadgen-irview` | Draws the IR itself, before any format is involved: lanes, markings, junction hulls, furniture, buildings. As data (a `Scene`, JSON with the `serde` feature) or as SVG. Every shape keeps the IR identifier it came from, which is what lets a click on a lane select its road. |
+| `roadgen-editor` | The document, and `build`, which turns it into the IR. No dependencies beyond `roadgen-core`. |
+| `roadgen-editor-wasm` | The engine the page loads: `buildDocument`, `exportDocument`, `importFile`. |
+
+A few things the document does for you:
+
+- **Roads are smooth by default.** A road's reference line passes through its points
+  as cubic Béziers with Catmull-Rom tangents; set its shape to `polyline` for
+  straight segments.
+- **Direct joints have no corner.** Where two smooth roads are joined directly, both
+  ends are bent to one shared tangent, which is what the generator needs to join a
+  curve to a curve. Joining through a junction generates a connector per movement.
+- **A wrong document still draws.** In the middle of an edit something is usually
+  wrong. A road that cannot be built is left out and named, a link the generator
+  refuses is left out and named — found by putting the links back one at a time — and
+  the rest is drawn. The Problems tab lists each, and clicking one selects what it is
+  about. Exporting needs a map with nothing left out that validates; the document
+  itself, the IR and an SVG can be saved at any time.
+- **Opening a file makes it editable.** An OpenDRIVE file or an IR document opens as a
+  document: reference lines as polylines simplified to 2 cm, the first cross-section's
+  lanes at their starting widths, each junction as the links its connectors were made
+  from. What that leaves behind — furniture, rules, buildings, lane-count changes,
+  tapers — is listed under Map.
+
+The document is plain JSON (`*.roadgen.json`), saved in the browser between visits
+and downloadable from the Export menu:
+
+```json
+{
+  "version": 1, "name": "example", "handedness": "right",
+  "roads": [
+    { "id": "west", "points": [[-80, 0, 0], [-12, 0, 0]], "shape": "smooth",
+      "lanes": [ { "width": 3.5, "direction": "forward", "lane_type": "driving" },
+                 { "width": 3.5, "direction": "backward", "lane_type": "driving" } ],
+      "road_type": "town" }
+  ],
+  "links": [ { "from": "west", "from_end": "end", "to": "east", "to_end": "start",
+               "junction": "cross" } ]
+}
+```
+
+### Building it
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version <the wasm-bindgen version in Cargo.lock> --locked
+editor/build.sh                         # the engine and the page, in editor/site/
+python3 -m http.server -d editor/site   # any static server; open http://localhost:8000/
+cd editor && npm ci && node smoke.mjs   # the editor, driven in a browser
+```
+
+`build.sh` reads the version out of `Cargo.lock` and says which to install if the
+`wasm-bindgen` on the path is another; the library and the command have to agree to
+the patch release.
+
 ## Validation
 
 `validate()` reports everything wrong at once, rather than failing on the first
@@ -3113,10 +3195,14 @@ roadgen/
 │   │                        and a lossless writer and reader
 │   ├── roadgen-trace/       the IR dump, trace files, and lookups across them
 │   ├── roadgen-viewer/      reading the exports back, and drawing them as SVG
+│   ├── roadgen-irview/      drawing the IR itself, as a scene or as SVG
+│   ├── roadgen-editor/      the editor's document, and building it into the IR
+│   ├── roadgen-editor-wasm/ the editor's engine, for the browser
 │   └── roadgen-python/      PyO3 bindings
 ├── examples/                ClipGT/RDS-HQ and GPUDrive scenario files, and an IR importer
 │                            that knows only the Protocol Buffers schema
 ├── web/                     the demo page: roadgen in a browser, through Pyodide
+├── editor/                  the editor: draw a network in a browser, export it
 ├── python/roadgen/          the Python package
 ├── tests/
 │   ├── integration/         scenarios and cross-format checks
@@ -3137,6 +3223,7 @@ maturin develop                 # build and install the Python extension
 python -m pytest tests/python
 
 cd web && npm ci && node smoke.mjs   # the demo page, in a browser
+editor/build.sh && (cd editor && npm ci && node smoke.mjs)   # the editor, in a browser
 ```
 
 The SUMO tests run SUMO. `netconvert` builds the exported network and `sumo` loads

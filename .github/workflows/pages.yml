@@ -67,7 +67,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST }}
-          targets: wasm32-unknown-emscripten
+          # The second is the editor's: plain WebAssembly through wasm-bindgen, no
+          # Python and no Emscripten.
+          targets: wasm32-unknown-emscripten, wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -116,6 +118,15 @@ jobs:
         run: |
           npm ci
           node build.mjs --wheel ../dist/*.whl
+
+      # The editor is published beside the demo, at /editor/. Its own workflow
+      # (editor.yml) tests it; this only builds it into the site.
+      - name: Build the editor
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3 }' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$version" --locked
+          editor/build.sh
+          cp -r editor/site web/site/editor
 
       # The wheel is a wasm32 build: nothing on this runner can import it, so whether
       # it works is a question only a browser can answer. This asks one.

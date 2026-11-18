@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>roadgen editor</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="bar">
+    <strong class="brand">roadgen editor</strong>
+    <div class="group" role="toolbar" aria-label="Tools">
+      <button class="tool" data-tool="select" title="Select and drag (V)">Select</button>
+      <button class="tool" data-tool="road" title="Draw a road: click points, double-click or Enter to finish (R)">Road</button>
+      <button class="tool" data-tool="link" title="Join two road ends (L)">Link</button>
+    </div>
+    <label class="junction-field" title="Leave empty to join ends directly; name a junction to join them through it">
+      via junction <input id="junction-name" placeholder="direct" size="8">
+      <button id="new-junction" title="A fresh junction name">new</button>
+    </label>
+    <div class="group">
+      <button id="undo" title="Undo (Ctrl+Z)">Undo</button>
+      <button id="redo" title="Redo (Ctrl+Shift+Z)">Redo</button>
+      <button id="fit" title="Fit the map (F)">Fit</button>
+    </div>
+    <div class="group">
+      <button id="new-doc">New</button>
+      <button id="example-doc">Example</button>
+      <label class="button">Open…<input id="open-file" type="file" accept=".json,.xodr,.xml,.pb" hidden></label>
+    </div>
+    <div class="group">
+      <select id="format" aria-label="Export format"></select>
+      <button id="export" class="primary">Export</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="stage">
+      <canvas id="canvas" tabindex="0" aria-label="Map"></canvas>
+      <div id="hint" class="hint"></div>
+      <div id="loading" class="overlay">Loading the roadgen engine…</div>
+    </section>
+    <aside class="panel">
+      <nav class="tabs">
+        <button data-tab="inspect" class="active">Inspect</button>
+        <button data-tab="links">Links</button>
+        <button data-tab="problems">Problems <span id="problem-count" class="count"></span></button>
+        <button data-tab="map">Map</button>
+      </nav>
+      <div id="tab-inspect" class="tab active"></div>
+      <div id="tab-links" class="tab"></div>
+      <div id="tab-problems" class="tab"></div>
+      <div id="tab-map" class="tab"></div>
+    </aside>
+  </main>
+
+  <footer class="bar status">
+    <span id="validity" class="badge">…</span>
+    <span id="stats"></span>
+    <span id="cursor" class="right"></span>
+  </footer>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="editor.js"></script>
+</body>
+</html>

@@ -11,3 +11,6 @@ __pycache__/
 *.egg-info/
 /dist
 /.venv
+/editor/site
+/editor/node_modules
+/editor/smoke.png

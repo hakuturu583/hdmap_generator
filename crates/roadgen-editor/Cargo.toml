@@ -1,0 +1,18 @@
+[package]
+name = "roadgen-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "An editable road-network document for roadgen: roads drawn by their control points, built into the canonical IR on every change"
+
+[dependencies]
+roadgen-core.workspace = true
+# The document's file format is JSON, and the browser editor hands it across as
+# such; without the feature the model is plain Rust.
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]

@@ -16,6 +16,9 @@ members = [
     "crates/roadgen-sumo",
     "crates/roadgen-trace",
     "crates/roadgen-viewer",
+    "crates/roadgen-irview",
+    "crates/roadgen-editor",
+    "crates/roadgen-editor-wasm",
     "crates/roadgen-python",
     "tests/integration",
 ]
@@ -44,6 +47,8 @@ roadgen-proto = { path = "crates/roadgen-proto" }
 roadgen-sumo = { path = "crates/roadgen-sumo" }
 roadgen-trace = { path = "crates/roadgen-trace" }
 roadgen-viewer = { path = "crates/roadgen-viewer" }
+roadgen-irview = { path = "crates/roadgen-irview" }
+roadgen-editor = { path = "crates/roadgen-editor" }
 
 # OpenDRIVE 1.7 data model, parser and writer. MIT, which an Apache-2.0 project may
 # redistribute. Used so that neither the XML schema nor its serializer is rewritten

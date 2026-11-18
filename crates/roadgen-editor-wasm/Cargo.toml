@@ -1,0 +1,31 @@
+[package]
+name = "roadgen-editor-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The roadgen editor's engine for the browser: builds a document into the IR, draws it, and writes it in every format, compiled to WebAssembly"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+roadgen-core.workspace = true
+roadgen-editor = { workspace = true, features = ["serde"] }
+roadgen-irview = { workspace = true, features = ["serde"] }
+roadgen-opendrive.workspace = true
+roadgen-lanelet2.workspace = true
+roadgen-osm.workspace = true
+roadgen-sumo.workspace = true
+roadgen-gpudrive.workspace = true
+roadgen-commonroad.workspace = true
+roadgen-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The bridge to JavaScript. MIT/Apache-2.0. Unpinned beyond the minor version: the
+# build reads the exact version back out of Cargo.lock and installs the matching
+# `wasm-bindgen` command, which must agree with the library to the patch.
+wasm-bindgen = "0.2"
