@@ -117,6 +117,10 @@ fn point(value: (f64, f64, f64)) -> Point3 {
     Point3::new(value.0, value.1, value.2)
 }
 
+/// A surface feature as Python sees it: `(id, road, kind, station, length, offset,
+/// width)`.
+type SurfaceFeatureRow = (String, String, String, f64, f64, f64, f64);
+
 /// One lane of a road's cross-section.
 // `from_py_object` because a list of these is passed into `add_road`.
 #[pyclass(name = "Lane", module = "roadgen", from_py_object)]
@@ -1432,11 +1436,42 @@ impl PyMap {
     ///
     /// Also writes `<path>.trace.json`, the road, section and lane number each lane
     /// became, unless `trace` is false.
-    #[pyo3(signature = (path, trace = true))]
-    fn export_opendrive(&mut self, path: PathBuf, trace: bool) -> PyResult<()> {
+    ///
+    /// With `crg=True`, every road with surface features gets a `<surface>` whose
+    /// `<CRG>`s refer to ASAM OpenCRG files written beside `path`: an elevation
+    /// grid `crg_increment` by `crg_lateral_increment` metres (the same as along
+    /// when not given), and for a road with a puddle a friction grid too unless
+    /// `crg_friction` is false.
+    #[pyo3(signature = (
+        path,
+        trace = true,
+        crg = false,
+        crg_increment = 0.05,
+        crg_lateral_increment = None,
+        crg_friction = true,
+    ))]
+    fn export_opendrive(
+        &mut self,
+        path: PathBuf,
+        trace: bool,
+        crg: bool,
+        crg_increment: f64,
+        crg_lateral_increment: Option<f64>,
+        crg_friction: bool,
+    ) -> PyResult<()> {
         self.ensure_built()?;
         let map = self.built.as_ref().expect("just built");
-        let written = roadgen_opendrive::write_traced(map, &path).map_err(runtime_error)?;
+        let options = roadgen_opendrive::Options {
+            crg: crg.then(|| roadgen_opendrive::CrgOptions {
+                increment_u: crg_increment,
+                increment_v: crg_lateral_increment.unwrap_or(crg_increment),
+                friction: crg_friction,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let written =
+            roadgen_opendrive::write_with_traced(map, &path, &options).map_err(runtime_error)?;
         if trace {
             self.write_sidecar(&written, roadgen_trace::sidecar_path(&path))?;
         }
@@ -2449,6 +2484,180 @@ impl PyMap {
             .map_err(value_error)?;
         self.invalidate();
         Ok(id.to_string())
+    }
+
+    /// Puts a departure from the designed surface on a road: `kind` is `rut`,
+    /// `pothole`, `puddle`, `bump` or `roughness`. The footprint runs `length`
+    /// metres along the road from `station`, `width` metres across, centred
+    /// `offset` metres to the left of the reference line. Returns the feature's id.
+    ///
+    /// - `rut`: two troughs `track` apart, each `trough` wide and `depth` deep; the
+    ///   width is theirs, `track + trough`, unless given.
+    /// - `pothole`: a bowl `depth` deep in the footprint's ellipse, its rim made
+    ///   irregular by `seed`.
+    /// - `puddle`: a depression `depth` deep holding water level with the road.
+    /// - `bump`: `height` high at its crest; `bump` is `bump`, `hump`, `table`,
+    ///   `cushion` or `heave`, and `profile` `circular`, `parabolic`, `sinusoidal`
+    ///   or `flat` (with ramps `ramp` long), the kind's own when not given.
+    /// - `roughness`: ISO 8608 class `roughness_class` (`A`–`H`), from `seed`.
+    #[pyo3(signature = (
+        road,
+        kind,
+        station,
+        length,
+        offset = 0.0,
+        width = None,
+        depth = None,
+        height = None,
+        track = 1.8,
+        trough = 0.6,
+        bump = "hump",
+        profile = None,
+        ramp = 1.0,
+        roughness_class = "C",
+        seed = 0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_surface_feature(
+        &mut self,
+        road: &Bound<'_, PyAny>,
+        kind: &str,
+        station: f64,
+        length: f64,
+        offset: f64,
+        width: Option<f64>,
+        depth: Option<f64>,
+        height: Option<f64>,
+        track: f64,
+        trough: f64,
+        bump: &str,
+        profile: Option<&str>,
+        ramp: f64,
+        roughness_class: &str,
+        seed: u64,
+    ) -> PyResult<String> {
+        use roadgen_core::surface::{BumpKind, BumpProfile, RoughnessClass, SurfaceFeatureKind};
+        let road =
+            match road.extract::<PyRef<'_, PyRoad>>() {
+                Ok(road) => road.id.clone(),
+                Err(_) => RoadId::parse_printed(road.extract::<String>().map_err(|_| {
+                    PyValueError::new_err("a road is a Road or a road's identifier")
+                })?),
+            };
+        let kind = match kind.to_ascii_lowercase().as_str() {
+            "rut" | "ruts" | "rutting" => SurfaceFeatureKind::Rut {
+                depth: depth.unwrap_or(0.025),
+                track,
+                trough,
+                path: None,
+            },
+            "pothole" => SurfaceFeatureKind::Pothole {
+                depth: depth.unwrap_or(0.05),
+                seed,
+            },
+            "puddle" => SurfaceFeatureKind::Puddle {
+                depth: depth.unwrap_or(0.02),
+            },
+            "bump" | "hump" => {
+                let bump = BumpKind::parse(bump)
+                    .ok_or_else(|| PyValueError::new_err(format!("no such bump: {bump}")))?;
+                let profile = match profile {
+                    None => bump.default_profile(),
+                    Some(name) => BumpProfile::parse(name, ramp)
+                        .ok_or_else(|| PyValueError::new_err(format!("no such profile: {name}")))?,
+                };
+                SurfaceFeatureKind::Bump {
+                    kind: bump,
+                    height: height.unwrap_or(0.075),
+                    profile,
+                }
+            }
+            "roughness" | "rough" => SurfaceFeatureKind::Roughness {
+                class: RoughnessClass::parse(roughness_class).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "ISO 8608 has classes A to H, not {roughness_class}"
+                    ))
+                })?,
+                seed,
+            },
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "no such surface feature: {other}"
+                )))
+            }
+        };
+        let width = match kind {
+            SurfaceFeatureKind::Rut { track, trough, .. } => width.unwrap_or(track + trough),
+            _ => width.ok_or_else(|| {
+                PyValueError::new_err(format!("a {} needs a width", kind.as_str()))
+            })?,
+        };
+        let id = self
+            .builder_mut()?
+            .add_surface_feature(&road, station, length, offset, width, kind)
+            .map_err(value_error)?;
+        self.invalidate();
+        Ok(id.to_string())
+    }
+
+    /// Wears ruts into `lane` along a path in the lane's own coordinates: `path`
+    /// is `[(station, offset), ...]`, the offset metres to the left of the lane's
+    /// middle, joined smoothly (a monotone cubic), and free to leave the lane —
+    /// a truck cutting a bend, a lane change worn in. The troughs are `track`
+    /// apart and `trough` wide across the path, and `depth` deep. Returns the id.
+    #[pyo3(signature = (lane, path, depth = 0.025, track = 1.8, trough = 0.6))]
+    fn add_rut_along(
+        &mut self,
+        lane: &PyLaneRef,
+        path: Vec<(f64, f64)>,
+        depth: f64,
+        track: f64,
+        trough: f64,
+    ) -> PyResult<String> {
+        let id = self
+            .builder_mut()?
+            .add_rut_along(&lane.reference, path, depth, track, trough)
+            .map_err(value_error)?;
+        self.invalidate();
+        Ok(id.to_string())
+    }
+
+    /// Every surface feature as `(id, road, kind, station, length, offset, width)`.
+    fn surface_features(&mut self) -> PyResult<Vec<SurfaceFeatureRow>> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        Ok(map
+            .surface_features
+            .iter()
+            .map(|f| {
+                (
+                    f.id.to_string(),
+                    f.road.to_string(),
+                    f.kind.as_str().to_owned(),
+                    f.station,
+                    f.length,
+                    f.offset,
+                    f.width,
+                )
+            })
+            .collect())
+    }
+
+    /// How far a road's surface stands above its design at `(station, offset)`,
+    /// metres, every feature there summed; and how deep water stands on it.
+    fn surface_displacement(
+        &mut self,
+        road: String,
+        station: f64,
+        offset: f64,
+    ) -> PyResult<(f64, f64)> {
+        self.ensure_built()?;
+        let map = self.built.as_ref().expect("just built");
+        let relief = roadgen_core::surface::Relief::of(map, &RoadId::parse_printed(&road));
+        Ok((
+            relief.displacement(station, offset),
+            relief.water_depth(station, offset),
+        ))
     }
 
     /// Puts a bridge under stretches of road: `spans` is `[(road, from, to), ...]`,

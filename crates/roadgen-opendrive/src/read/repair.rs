@@ -90,6 +90,30 @@ fn repaired(
             );
             Some(with(element, "height", "0"))
         }
+        // A road's `<CRG>` in any mode the schema allows — the parser knows the
+        // junction surface's `global` only — and with the road CRG's orientation,
+        // `same` or `opposite`, where the parser expects an object's `+` or `-`.
+        // roadgen writes `attached` and `same` itself; see `crate::crg`. The IR
+        // reads no OpenCRG grid back, so the reference is passed over either way.
+        b"CRG" => {
+            approximations.count(
+                "{n} `<surface>/<CRG>`s are not read: the IR's surface features are not \
+                 recovered from an OpenCRG grid",
+            );
+            let mut fixed = element.to_owned();
+            match attribute(b"mode").as_deref() {
+                Some("global") => {}
+                Some(_) => fixed = replacing(&fixed, "mode", "global"),
+                None => fixed = with(&fixed, "mode", "global"),
+            }
+            match attribute(b"orientation").as_deref() {
+                Some("same") => fixed = replacing(&fixed, "orientation", "+"),
+                Some("opposite") => fixed = replacing(&fixed, "orientation", "-"),
+                Some(_) => {}
+                None => fixed = with(&fixed, "orientation", "+"),
+            }
+            Some(fixed)
+        }
         b"object" => {
             let kind = attribute(b"type")?;
             if ObjectType::from_str(&kind).is_ok() {

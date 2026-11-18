@@ -82,6 +82,7 @@ m.export_commonroad_map("map.pb")     # the map alone, CommonRoad's 2024 protobu
                 ValidatedMap
                      │
                      ├──▶ OpenDRIVE      map.xodr            `opendrive`
+                     │                 + *.crg (OpenCRG, opt.) surface features
                      ├──▶ Lanelet2       map.osm             `simple_lanelet2`
                      ├──▶ OpenStreetMap  plain .osm          `ll2-io`
                      ├──▶ SUMO           .nod/.edg/.con.xml  `quick-xml` + netconvert
@@ -283,7 +284,11 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `osm_warnings()` | what a plain OpenStreetMap export would lose |
 | `sumo_warnings()` | what a SUMO export would lose |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
+| `add_surface_feature(road, kind, station, length, offset=, width=, depth=, height=, ...)` | a rut, pothole, puddle, bump or roughness on a road's surface; see [What a wheel meets](#what-a-wheel-meets-ruts-potholes-puddles-humps) |
+| `add_rut_along(lane, path, depth=, track=, trough=)` | ruts along `[(station, offset from the lane's middle), ...]`, free to leave the lane |
+| `surface_features()` / `surface_displacement(road, station, offset)` | what is on the surface, and how far it stands off the design |
 | `export_opendrive(path)` / `export_lanelet2(path)` / `export_osm(path)` | write the files |
+| `export_opendrive(path, crg=True, crg_increment=0.05)` | OpenDRIVE with an ASAM OpenCRG file beside it for every road with surface features |
 | `export_sumo(directory)` | write a SUMO plain-XML network and its netconvert configuration; returns the prefix (`cycle_on_sidewalks=True` lets bicycles ride the sidewalks both ways) |
 | `sumo_lane_ids()` | where each lane of the map landed in the SUMO network |
 | `export_clipgt(directory, scenario=, clip_id=, frame_rate=, speed=, route=)` | write a ClipGT clip; returns the clip id |
@@ -482,6 +487,77 @@ an edge the two lanes lift differently — a kerb — a line each. A junction ca
 lane's lift across it, so a raised pavement turning a corner stays raised and meets
 both arms without a step, and validation refuses a lift that changes where two
 lanes meet end to end.
+
+## What a wheel meets: ruts, potholes, puddles, humps
+
+A road's design is the surface it was built to. The surface it is driven on
+departs from that by millimetres to centimetres, and the IR holds those
+departures as **surface features**, each a kind and a footprint in its road's own
+`(s, t)` — `length` metres along from `station`, `width` across, centred `offset`
+metres to the left of the reference line:
+
+```python
+m.add_surface_feature(road, "rut", station=10.0, length=40.0, offset=-1.75,
+                      depth=0.03, track=1.8, trough=0.6)       # two wheel-path troughs
+m.add_surface_feature(road, "pothole", station=60.0, length=0.9, offset=1.5,
+                      width=0.7, depth=0.07, seed=1)           # irregular rim from `seed`
+m.add_surface_feature(road, "puddle", station=70.0, length=2.5, offset=-2.0,
+                      width=1.6, depth=0.025)                  # water level with the road
+m.add_surface_feature(road, "bump", station=90.0, length=3.7, width=7.0,
+                      bump="hump", profile="circular", height=0.08)
+m.add_surface_feature(road, "roughness", station=100.0, length=15.0, width=7.0,
+                      roughness_class="C", seed=9)             # ISO 8608 class A–H
+m.export_opendrive("map.xodr", crg=True)                       # + main.elevation.crg, …
+```
+
+A rut need not run straight down the road. `add_rut_along` wears one along a path
+in its lane's own coordinates — `(station, offset from the lane's middle)` knots,
+joined by a monotone cubic (PCHIP) so it passes every knot, never overshoots one
+and stays level between two of one offset — and the path may leave the lane:
+
+```python
+m.add_rut_along(road.lane(1), [(150, 0.0), (180, 1.8), (205, -2.0), (225, -3.6), (260, 0.5)],
+                depth=0.15, track=5.5, trough=1.5)   # a haul truck wandering into the other lane
+```
+
+The path is stated against the lane, so it stays put when the lanes beside it
+change width; its footprint is fitted to it when the map is built, and the troughs
+keep `track` and `trough` across the path, so on a slant they stand wider apart
+across the road.
+
+Each kind is stated in the terms of the standard that measures it. A rut's
+`depth` is ASTM E1703's — the deepest point of each trough below a straightedge
+across it. A pothole is ASTM D6433's depth and diameters. A bump is one of
+OpenStreetMap's `traffic_calming` devices (`bump`, `hump`, `table`, `cushion`, and
+a `heave` nobody laid) built to a circular ("Watts"), parabolic, sinusoidal or
+flat-topped profile. Roughness is synthesised so its longitudinal profile follows
+**ISO 8608**'s displacement PSD for the class, `Gd(n) = Gd(n0)·(n/n0)^-2` at
+`n0 = 0.1` cycles/m, class A at `16·10⁻⁶ m³` and each class four times the last,
+reproducibly from its seed. Every kind meets the design at its footprint's edge
+without a step, and where two overlap they add.
+
+What a feature *is*, to every exporter, is one function: how far the surface
+stands off the design at `(s, t)`, and how deep water stands there. Two exports
+read it:
+
+- **OpenDRIVE**, with `crg=True` (`Options::crg` in Rust), writes an **ASAM
+  OpenCRG** file beside the document for every road with features — a regular
+  `crg_increment`-metre grid over all of them in `LRFI` text, its `u` the road's
+  own station `s` and its `v` the road's `t` — and refers to it from the road's `<surface>` as
+  `<CRG mode="attached" orientation="same" purpose="elevation">`, so a consumer
+  adds the grid to the road's own surface. A road with a puddle also gets a
+  `purpose="friction"` grid: the pavement's nominal friction, halved under water.
+  Without `crg`, nothing about the document changes, and `format_warnings()`
+  says the features were not written.
+- **CARLA** builds them into the road mesh: where a feature lies, the carriageway
+  is cut into a grid `relief_cell` (10 cm) fine, or finer where the feature is,
+  and every vertex is moved by the same function. The paint rides on the
+  displaced surface, and a puddle's water is a still-water sheet of its own. The
+  point-cloud map, sampled off the same meshes, has them too.
+
+The IR's Protocol Buffers document carries them field for field. No other format
+has a place for them. Reading an OpenDRIVE document back passes over its
+`<CRG>`s, and says so: a grid is not turned back into features.
 
 ## Junctions
 

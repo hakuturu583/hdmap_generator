@@ -225,3 +225,120 @@ message TrafficRule {
     SpeedLimitRule speed_limit = 3;
   }
 }
+
+// ---------------------------------------------------------------------------------
+// The condition of a road's surface
+// ---------------------------------------------------------------------------------
+
+// What a raised surface feature is for, in OpenStreetMap's `traffic_calming`
+// words where it was built on purpose.
+enum BumpKind {
+  BUMP_KIND_UNSPECIFIED = 0;
+  BUMP_KIND_SPEED_BUMP = 1;
+  BUMP_KIND_SPEED_HUMP = 2;
+  BUMP_KIND_SPEED_TABLE = 3;
+  BUMP_KIND_SPEED_CUSHION = 4;
+  // Pushed up from beneath, by frost or roots; laid by nobody.
+  BUMP_KIND_HEAVE = 5;
+}
+
+// The longitudinal shape of a raised feature.
+enum BumpProfile {
+  BUMP_PROFILE_UNSPECIFIED = 0;
+  // An arc of a circle: the "Watts" profile.
+  BUMP_PROFILE_CIRCULAR = 1;
+  BUMP_PROFILE_PARABOLIC = 2;
+  // One period of a raised cosine.
+  BUMP_PROFILE_SINUSOIDAL = 3;
+  // Raised-cosine ramps `Bump.ramp` long either end, flat between.
+  BUMP_PROFILE_FLAT = 4;
+}
+
+// ISO 8608's road classes. Class A has Gd(n0) = 16e-6 m^3 at n0 = 0.1 cycles/m,
+// and each class after it four times the one before.
+enum RoughnessClass {
+  ROUGHNESS_CLASS_UNSPECIFIED = 0;
+  ROUGHNESS_CLASS_A = 1;
+  ROUGHNESS_CLASS_B = 2;
+  ROUGHNESS_CLASS_C = 3;
+  ROUGHNESS_CLASS_D = 4;
+  ROUGHNESS_CLASS_E = 5;
+  ROUGHNESS_CLASS_F = 6;
+  ROUGHNESS_CLASS_G = 7;
+  ROUGHNESS_CLASS_H = 8;
+}
+
+// Two wheel-path troughs, `track` apart centre to centre, each `trough` wide and
+// `depth` deep (ASTM E1703's rut depth). Metres. Straight down the middle of the
+// footprint without a `path`; along it, measured across the path, with one.
+message Rut {
+  double depth = 1;
+  double track = 2;
+  double trough = 3;
+  optional LanePath path = 4;
+}
+
+// A line in a lane's own coordinates: at least two knots, stations strictly
+// ascending, each offset metres to the left of the lane's middle, joined by a
+// cubic Hermite curve whose slope at a knot is the chord's between its
+// neighbours.
+message LanePath {
+  // A `Lane.id`.
+  string lane = 1;
+  repeated LanePathKnot knots = 2;
+}
+
+message LanePathKnot {
+  double station = 1;
+  double offset = 2;
+}
+
+// A bowl inside the footprint's ellipse, `depth` deep; `seed` shapes its rim.
+message Pothole {
+  double depth = 1;
+  uint64 seed = 2;
+}
+
+// A depression filling the footprint's ellipse, `depth` deep at the middle, with
+// water standing in it level with the designed surface.
+message Puddle {
+  double depth = 1;
+}
+
+// A hump across the footprint, `height` above the design at its crest.
+message Bump {
+  BumpKind kind = 1;
+  double height = 2;
+  BumpProfile profile = 3;
+  // The ramp length of a `BUMP_PROFILE_FLAT` profile; unused for the others.
+  double ramp = 4;
+}
+
+// Unevenness whose longitudinal profile follows ISO 8608's spectrum for `class`,
+// synthesised reproducibly from `seed` by roadgen's own algorithm.
+message Roughness {
+  RoughnessClass class = 1;
+  uint64 seed = 2;
+}
+
+// A departure of one road's surface from its design. The footprint is a
+// rectangle in the road's own (s, t): from `station` for `length` metres along
+// it, `width` metres across, centred `offset` metres to the left of the
+// reference line.
+message SurfaceFeature {
+  // e.g. `surface/north/pothole/0`.
+  string id = 1;
+  // A `Road.id`.
+  string road = 2;
+  double station = 3;
+  double length = 4;
+  double offset = 5;
+  double width = 6;
+  oneof kind {
+    Rut rut = 7;
+    Pothole pothole = 8;
+    Puddle puddle = 9;
+    Bump bump = 10;
+    Roughness roughness = 11;
+  }
+}
