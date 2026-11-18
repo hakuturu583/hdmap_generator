@@ -463,11 +463,14 @@ fn joint_tangents(document: &Document) -> HashMap<(String, End), Vector3> {
         let (Ok(out_of_a), Ok(into_b)) = (out_of_a.normalize(), into_b.normalize()) else {
             continue;
         };
-        if out_of_a.get().dot(into_b.get()) <= 0.0 {
-            // A hairpin: no one direction serves both, so leave the corner.
+        // The mean of the two directions points forwards for both roads however
+        // sharp the turn — a road drawn off the end of another at 120° is bent
+        // to meet it, not refused — until they all but reverse into each other,
+        // where it is too short to say which way anything goes.
+        let through = out_of_a.get() + into_b.get();
+        if through.horizontal_norm() < 0.2 {
             continue;
         }
-        let through = out_of_a.get() + into_b.get();
         let a_key = (link.from.clone(), link.from_end);
         let b_key = (link.to.clone(), link.to_end);
         if held.contains_key(&a_key) || held.contains_key(&b_key) {

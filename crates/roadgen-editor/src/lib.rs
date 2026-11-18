@@ -162,6 +162,31 @@ mod tests {
     }
 
     #[test]
+    fn a_road_drawn_off_another_at_a_sharp_angle_is_bent_to_meet_it() {
+        // The editor's own smoke test: a road drawn back over the map from the
+        // end of the avenue, turning about 115° off it.
+        let mut document = Document::example();
+        let tip = *document.roads[4].points.last().unwrap();
+        document.roads.push(RoadDoc::two_way(
+            "back",
+            vec![
+                tip,
+                [tip[0] - 10.0, tip[1] + 15.0, 0.0],
+                [tip[0] - 25.0, tip[1] + 25.0, 0.0],
+            ],
+        ));
+        document.links.push(LinkDoc {
+            from: "avenue".into(),
+            from_end: End::End,
+            to: "back".into(),
+            to_end: End::Start,
+            junction: None,
+        });
+        let built = build(&document);
+        assert!(built.is_valid(), "{:#?}", built.problems);
+    }
+
+    #[test]
     fn duplicate_and_unknown_names_are_problems() {
         let mut document = Document::example();
         document.roads.push(document.roads[0].clone());
