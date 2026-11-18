@@ -137,6 +137,57 @@ impl Mesh {
         }
     }
 
+    /// Adds a ribbon cut across into columns: `rows` are its rungs, each the same
+    /// number of points from the left edge to the right. A strip of one column is
+    /// [`Mesh::strip`]; more than one lets the ribbon bend across as well as along,
+    /// which a road surface with a rut or a pothole in it has to.
+    ///
+    /// Texture coordinates follow the ribbon as [`Mesh::strip`]'s do: `u` along
+    /// its middle column, `v` across each rung by the distance from its left edge,
+    /// so a grid and a strip of the same road read the same.
+    pub fn grid(&mut self, rows: &[Vec<Point3>], slot: usize) {
+        self.grid_from(rows, slot, 0.0);
+    }
+
+    /// [`Mesh::grid`], with `u` starting `along` metres in rather than at zero, so
+    /// that grids laid end to end read as one ribbon. Returns how far along the
+    /// grid's last rung is.
+    pub fn grid_from(&mut self, rows: &[Vec<Point3>], slot: usize, along: f64) -> f64 {
+        let columns = rows.iter().map(Vec::len).min().unwrap_or(0);
+        if rows.len() < 2 || columns < 2 {
+            return along;
+        }
+        let base = self.positions.len() as u32;
+        let scale = self.texture_scale(slot);
+        let middle = columns / 2;
+        let mut along = along;
+        for (index, row) in rows.iter().enumerate() {
+            if index > 0 {
+                along += rows[index - 1][middle].distance_to(row[middle]);
+            }
+            let mut across = 0.0;
+            for column in 0..columns {
+                if column > 0 {
+                    across += row[column - 1].distance_to(row[column]);
+                }
+                self.positions.push(row[column]);
+                self.uvs.push([along / scale, across / scale]);
+            }
+        }
+        let at = |row: usize, column: usize| base + (row * columns + column) as u32;
+        for row in 0..rows.len() - 1 {
+            for column in 0..columns - 1 {
+                let (a, b) = (at(row, column), at(row, column + 1));
+                let (c, d) = (at(row + 1, column), at(row + 1, column + 1));
+                // The same winding as a strip's: anticlockwise from above when
+                // the first column is to the left.
+                self.push_triangle([a, d, c], slot);
+                self.push_triangle([a, b, d], slot);
+            }
+        }
+        along
+    }
+
     /// Adds one flat polygon with vertices of its own, fanned into triangles.
     ///
     /// The ring is taken in the order given: anticlockwise seen from the side the

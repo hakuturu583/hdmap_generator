@@ -21,3 +21,19 @@ pub fn nominal(pavement: Pavement) -> (f64, f64) {
         Pavement::Unpaved(UnpavedSurface::Rock) => (0.7, 0.08),
     }
 }
+
+/// The friction coefficient assumed of a road whose pavement nobody stated: dry
+/// asphalt's, as [`nominal`] gives it.
+pub fn default_friction() -> f64 {
+    nominal(Pavement::Paved(PavedSurface::Asphalt)).0
+}
+
+/// What share of its dry friction a surface keeps under `depth` metres of water:
+/// all of it when dry, falling to half once a film of two millimetres covers the
+/// texture — wet asphalt's coefficient against dry asphalt's, roughly — and no
+/// lower, since deeper water is aquaplaning, which a friction coefficient does not
+/// describe.
+pub fn wet_share(depth: f64) -> f64 {
+    const FILM: f64 = 0.002;
+    1.0 - 0.5 * (depth / FILM).clamp(0.0, 1.0)
+}

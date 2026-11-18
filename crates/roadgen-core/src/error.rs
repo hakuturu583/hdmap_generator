@@ -123,6 +123,9 @@ pub enum BuildError {
     },
     /// A bridge, tunnel or interchange could not be laid out.
     Structure(String),
+    /// A surface feature cannot be placed as asked: a rut's path leaves its lane,
+    /// say.
+    SurfaceFeature(String),
 }
 
 impl From<GeometryError> for BuildError {
@@ -189,6 +192,7 @@ impl fmt::Display for BuildError {
                  more room"
             ),
             BuildError::Structure(detail) => f.write_str(detail),
+            BuildError::SurfaceFeature(detail) => f.write_str(detail),
         }
     }
 }

@@ -17,7 +17,8 @@ use crate::geometry::{
 };
 use crate::id::{
     BuildingId, BuildingPartId, ConnectionId, GradeSeparationId, InterchangeId, JunctionId,
-    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
+    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, SurfaceFeatureId, TinBreaklineId,
+    TinSurfaceId,
 };
 use crate::land_cover::LandCover;
 use crate::semantics::{
@@ -26,6 +27,7 @@ use crate::semantics::{
 };
 use crate::site::Site;
 use crate::structure::{GradeSeparation, Interchange, Structure, StructureProfile};
+use crate::surface::SurfaceFeature;
 use crate::terrain::{TinBreakline, TinSurface};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLink, RoadLinkTarget,
@@ -546,6 +548,10 @@ pub struct Map {
     pub grade_separations: Arena<GradeSeparationId, GradeSeparation>,
     /// The grade-separated junctions, each as one feature.
     pub interchanges: Arena<InterchangeId, Interchange>,
+    /// Where a road's surface departs from its design: ruts, potholes, puddles,
+    /// humps and roughness, each in its road's own `(s, t)`. Empty unless the
+    /// caller added some; see [`crate::surface`].
+    pub surface_features: Arena<SurfaceFeatureId, SurfaceFeature>,
 }
 
 impl Map {
@@ -567,6 +573,7 @@ impl Map {
             structures: Arena::new(),
             grade_separations: Arena::new(),
             interchanges: Arena::new(),
+            surface_features: Arena::new(),
         }
     }
 
@@ -741,6 +748,37 @@ impl Map {
             }
         }
         limits
+    }
+
+    /// Where the middle of `lane` is at `station`, metres to the left of its road's
+    /// reference line: the road's lane offset, the widths of the lanes between it
+    /// and the cross-section's origin, and half its own. `None` for a lane the map
+    /// does not hold.
+    ///
+    /// Read off the widths rather than off the lane's centreline, so that it is
+    /// exact at any station and costs no search along a curve.
+    pub fn lane_centre_offset(&self, lane: &LaneId, station: f64) -> Option<f64> {
+        self.lane_centre(lane).map(|centre| centre(station))
+    }
+
+    /// [`Self::lane_centre_offset`] as a function of station, with the lane, its
+    /// road and the lanes inside it looked up once: for asking at many stations.
+    pub fn lane_centre(&self, lane: &LaneId) -> Option<impl Fn(f64) -> f64 + '_> {
+        let lane = self.lanes.get(lane)?;
+        let road = self.roads.get(&lane.road)?;
+        let inner: Vec<&Lane> = self
+            .lanes_of_section(&lane.road, lane.section)
+            .into_iter()
+            .filter(|other| other.side == lane.side && other.ordinal < lane.ordinal)
+            .collect();
+        let sign = match lane.side {
+            LateralSide::Left => 1.0,
+            LateralSide::Right => -1.0,
+        };
+        Some(move |station: f64| {
+            let inner: f64 = inner.iter().map(|other| other.width_at(station)).sum();
+            road.lane_offset.evaluate(station) + sign * (inner + lane.width_at(station) / 2.0)
+        })
     }
 
     /// Lanes of a road, in cross-section order.

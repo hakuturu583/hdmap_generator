@@ -191,4 +191,7 @@ message Map {
   repeated Structure structures = 15;
   repeated GradeSeparation grade_separations = 16;
   repeated Interchange interchanges = 17;
+  // Where a road's surface departs from its design: ruts, potholes, puddles,
+  // humps and roughness.
+  repeated SurfaceFeature surface_features = 18;
 }

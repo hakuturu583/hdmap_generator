@@ -26,6 +26,10 @@ pub struct Options {
     /// place the file's `(0, 0)` stands — CARLA's GNSS sensor does — is given
     /// [`crate::origin_proj_string`] here instead.
     pub geo_reference: Option<String>,
+    /// Whether, and how, the map's surface features are written as OpenCRG files
+    /// that the roads' `<surface>`s refer to. `None` writes no `<surface>`, which is
+    /// what the exporter always did. See [`crate::crg`].
+    pub crg: Option<crate::crg::CrgOptions>,
 }
 
 /// Where one signal stands and what it is called.

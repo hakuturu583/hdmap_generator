@@ -11,9 +11,14 @@
 //! A stop line is a line across one lane in the IR, and is painted as a bar
 //! [`STOP_LINE_DEPTH`] deep on the traffic's side of it — the side a driver stops
 //! on — so that where CARLA halts a vehicle has a line on the road to be halted at.
+//!
+//! Both lie on the road as its [surface features](roadgen_core::surface) leave
+//! it: a crossing on a speed table is painted over the table, ramps and all, and
+//! a stop line across a rut dips into it.
 
 use roadgen_core::map::{Map, Road};
 use roadgen_core::semantics::{MapObject, MapObjectKind, ObjectGeometry};
+use roadgen_core::surface::Relief;
 use roadgen_core::topology::Direction;
 use roadgen_opendrive::road_coordinates;
 
@@ -82,36 +87,23 @@ fn stop_line(
         Direction::Backward => STOP_LINE_DEPTH,
     };
     let length = road.horizontal_length().ok()?;
-    let sampling = map.metadata.sampling;
     let (at, behind) = (
-        road.frame_at(station.clamp(0.0, length), sampling).ok()?,
-        road.frame_at((station + back).clamp(0.0, length), sampling)
-            .ok()?,
+        station.clamp(0.0, length),
+        (station + back).clamp(0.0, length),
     );
-    let rise = config.marking_rise;
     let mut mesh = Mesh::new(
         mesh_name(map_name, Role::Marking, ordinals.take(Role::Marking)),
         Role::Marking,
         materials::MARKING_WHITE,
     );
-    // Rails run along the road so the strip faces up whichever way the lane goes:
-    // the left rail on the left of the right rail, seen from above, is the one at
-    // the greater lateral offset.
-    let (first, second) = if back < 0.0 {
-        (behind, at)
-    } else {
-        (at, behind)
-    };
-    mesh.strip(
-        &[
-            first.to_global([0.0, outer, rise]),
-            second.to_global([0.0, outer, rise]),
-        ],
-        &[
-            first.to_global([0.0, inner, rise]),
-            second.to_global([0.0, inner, rise]),
-        ],
-        0,
+    patch(
+        map,
+        road,
+        &Relief::of(map, &road.id),
+        (at.min(behind), at.max(behind)),
+        (outer, inner),
+        config,
+        &mut mesh,
     );
     (!mesh.is_empty()).then_some(mesh)
 }
@@ -140,13 +132,7 @@ fn bars(
     let layout = Layout::of(map, road, road.section_at(station)?, config)?;
     let (outer_left, outer_right) = layout.carriageway(station)?;
 
-    let sampling = map.metadata.sampling;
-    let (start, end) = (
-        road.frame_at(from, sampling).ok()?,
-        road.frame_at(to, sampling).ok()?,
-    );
-    let rise = config.marking_rise;
-
+    let relief = Relief::of(map, &road.id);
     let mut mesh = Mesh::new(
         mesh_name(map_name, Role::Marking, ordinals.take(Role::Marking)),
         Role::Marking,
@@ -159,16 +145,132 @@ fn bars(
     let margin = (span - (count as f64 * (BAR + GAP) - GAP)) / 2.0;
     for index in 0..count {
         let outer = outer_left - margin - index as f64 * (BAR + GAP);
-        let inner = outer - BAR;
-        let left_rail = [
-            start.to_global([0.0, outer, rise]),
-            end.to_global([0.0, outer, rise]),
-        ];
-        let right_rail = [
-            start.to_global([0.0, inner, rise]),
-            end.to_global([0.0, inner, rise]),
-        ];
-        mesh.strip(&left_rail, &right_rail, 0);
+        patch(
+            map,
+            road,
+            &relief,
+            (from, to),
+            (outer, outer - BAR),
+            config,
+            &mut mesh,
+        );
     }
     (!mesh.is_empty()).then_some(mesh)
+}
+
+/// Paints a rectangle of the road onto `mesh`: from station `from` to `to`, and
+/// from `outer` across to `inner` (left to right), the paint's rise above the
+/// surface as the road's features leave it there. One quad where no feature
+/// reaches it; where one does, a grid as fine as the features ask, so that the
+/// paint follows a hump's ramp or a rut's trough rather than cutting through it.
+fn patch(
+    map: &Map,
+    road: &Road,
+    relief: &Relief,
+    (from, to): (f64, f64),
+    (outer, inner): (f64, f64),
+    config: &SurfaceConfig,
+    mesh: &mut Mesh,
+) {
+    let displaced = relief.touches_area((from, to), (inner, outer));
+    let (mut stations, columns) = if displaced {
+        let step = relief.lateral_step(from, to, config.relief_cell);
+        (
+            relief.stations(from, to, config.relief_cell),
+            (((outer - inner) / step).ceil() as usize).max(1),
+        )
+    } else {
+        (Vec::new(), 1)
+    };
+    stations.extend([from, to]);
+    stations.sort_by(f64::total_cmp);
+    stations.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    let sampling = map.metadata.sampling;
+    let Some(rows) = stations
+        .iter()
+        .map(|&station| {
+            let frame = road.frame_at(station, sampling).ok()?;
+            Some(
+                (0..=columns)
+                    .map(|k| {
+                        let lateral = outer + (inner - outer) * k as f64 / columns as f64;
+                        let lift = if displaced {
+                            relief.displacement(station, lateral)
+                        } else {
+                            0.0
+                        };
+                        frame.to_global([0.0, lateral, config.marking_rise + lift])
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<Option<Vec<Vec<_>>>>()
+    else {
+        return;
+    };
+    mesh.grid(&rows, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use roadgen_core::prelude::*;
+
+    use crate::mesh::Mesh;
+    use crate::surfaces::{build, SurfaceConfig};
+    use crate::tags::Role;
+
+    #[test]
+    fn a_crossing_on_a_speed_table_is_painted_over_the_table() {
+        // A 100 m two-lane road at 10 m, a crossing 4 m wide at its middle, and
+        // a table 10 cm high under it with 1.5 m ramps either side.
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 10.0),
+                    Point3::new(100.0, 0.0, 10.0),
+                    vec![
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        builder.add_crosswalk(&road, 0.5, 4.0).unwrap();
+        builder
+            .add_surface_feature(
+                &road,
+                46.0,
+                8.0,
+                0.0,
+                7.0,
+                SurfaceFeatureKind::Bump {
+                    kind: BumpKind::SpeedTable,
+                    height: 0.1,
+                    profile: BumpProfile::Flat { ramp: 1.5 },
+                },
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let meshes = build(&map, "t", &SurfaceConfig::default());
+        let paint: Vec<&Mesh> = meshes
+            .iter()
+            .filter(|mesh| mesh.role == Role::Marking)
+            .collect();
+        // The crossing's bars are on the table's flat top, 48..52 m: every
+        // vertex of paint there stands above the table, none buried in it.
+        let on_table: Vec<f64> = paint
+            .iter()
+            .flat_map(|mesh| mesh.positions.iter())
+            .filter(|p| p.x > 48.0 && p.x < 52.0 && p.y.abs() < 3.0)
+            .map(|p| p.z)
+            .collect();
+        assert!(!on_table.is_empty());
+        assert!(
+            on_table.iter().all(|&z| z > 10.1),
+            "paint at {:?}",
+            on_table.iter().copied().fold(f64::INFINITY, f64::min)
+        );
+    }
 }

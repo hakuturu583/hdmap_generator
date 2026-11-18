@@ -20,7 +20,8 @@ use std::path::PathBuf;
 
 use crate::id::{
     BuildingId, BuildingPartId, ConnectionId, GradeSeparationId, InterchangeId, JunctionId,
-    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
+    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, SurfaceFeatureId, TinBreaklineId,
+    TinSurfaceId,
 };
 
 /// Any element of the IR, by its identifier.
@@ -46,6 +47,8 @@ pub enum IrRef {
     Structure(StructureId),
     GradeSeparation(GradeSeparationId),
     Interchange(InterchangeId),
+    /// A rut, a pothole, a puddle, a hump or a stretch of roughness.
+    SurfaceFeature(SurfaceFeatureId),
 }
 
 impl IrRef {
@@ -75,6 +78,7 @@ impl IrRef {
             StructureId::PREFIX => IrRef::Structure(StructureId::from_raw(text)),
             GradeSeparationId::PREFIX => IrRef::GradeSeparation(GradeSeparationId::from_raw(text)),
             InterchangeId::PREFIX => IrRef::Interchange(InterchangeId::from_raw(text)),
+            SurfaceFeatureId::PREFIX => IrRef::SurfaceFeature(SurfaceFeatureId::from_raw(text)),
             _ => return None,
         })
     }
@@ -98,10 +102,16 @@ impl fmt::Display for IrRef {
             IrRef::Structure(id) => f.write_str(id.as_str()),
             IrRef::GradeSeparation(id) => f.write_str(id.as_str()),
             IrRef::Interchange(id) => f.write_str(id.as_str()),
+            IrRef::SurfaceFeature(id) => f.write_str(id.as_str()),
         }
     }
 }
 
+impl From<SurfaceFeatureId> for IrRef {
+    fn from(id: SurfaceFeatureId) -> Self {
+        IrRef::SurfaceFeature(id)
+    }
+}
 impl From<RoadId> for IrRef {
     fn from(id: RoadId) -> Self {
         IrRef::Road(id)

@@ -116,6 +116,10 @@ pub struct IrCatalog {
     pub grade_separations: Vec<GradeSeparationEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interchanges: Vec<InterchangeEntry>,
+    /// Left out when empty: a map whose surface is as designed dumps as it did
+    /// before surface features existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surface_features: Vec<SurfaceFeatureEntry>,
     /// `sha256:<hex>` of the whole IR — geometry, sampling, footprints and every
     /// other field the entries above leave out — so the fingerprint covers what the
     /// exports are written from, and not only what a lookup reads.
@@ -248,6 +252,17 @@ pub struct LandCoverEntry {
     pub site: Option<String>,
     pub kind: String,
     pub draped_on: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceFeatureEntry {
+    pub id: String,
+    pub road: String,
+    pub kind: String,
+    pub station: f64,
+    pub length: f64,
+    pub offset: f64,
+    pub width: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -571,6 +586,19 @@ impl IrCatalog {
                         .collect(),
                 })
                 .collect(),
+            surface_features: map
+                .surface_features
+                .iter()
+                .map(|feature| SurfaceFeatureEntry {
+                    id: feature.id.to_string(),
+                    road: feature.road.to_string(),
+                    kind: feature.kind.as_str().into(),
+                    station: feature.station,
+                    length: feature.length,
+                    offset: feature.offset,
+                    width: feature.width,
+                })
+                .collect(),
             geometry: geometry_digest(map),
         }
     }
@@ -619,6 +647,7 @@ fn geometry_digest(map: &Map) -> String {
     map.structures.iter().for_each(|x| feed(x));
     map.grade_separations.iter().for_each(|x| feed(x));
     map.interchanges.iter().for_each(|x| feed(x));
+    map.surface_features.iter().for_each(|x| feed(x));
     sha256_tag(&digest.0.finalize())
 }
 
