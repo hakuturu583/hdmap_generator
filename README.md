@@ -2885,11 +2885,19 @@ A few things the document does for you:
   inspector, edited there, and dragged along and across the road on the canvas. The
   OpenDRIVE export writes them as the OpenCRG grids the `.xodr` refers to, alongside
   it.
+- **Bridges and tunnels sit on stretches of road.** Each road lists the
+  [structures](#motorways) it runs on or through — a bridge,
+  viaduct or overpass; a bored, cut-and-cover or underpass tunnel — from one station
+  to another. A bridge is drawn under its road with its piers, a tunnel over it with
+  its portals. Drag one along its road, or the cyan knobs at its ends to move them;
+  its form, material, deck, clear height, lining, lighting and walkway are in the
+  inspector. The generator lays out the deck, supports and portals, and checks them.
 - **Opening a file makes it editable.** An OpenDRIVE file or an IR document opens as a
   document: reference lines as polylines simplified to 2 cm, the first cross-section's
   lanes at their starting widths, each junction as the links its connectors were made
-  from, each road's surface features with it. What that leaves behind — furniture,
-  rules, buildings, lane-count changes, tapers — is listed under Map.
+  from, each road's surface features, bridges and tunnels with it. What that leaves
+  behind — furniture, rules, buildings, terrain, lane-count changes, tapers — is
+  listed under Map.
 
 The document is plain JSON (`*.roadgen.json`), saved in the browser between visits
 and downloadable from the Export menu:

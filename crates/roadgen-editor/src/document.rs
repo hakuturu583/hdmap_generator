@@ -219,6 +219,77 @@ pub struct RoadDoc {
     /// humps, roughness.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
     pub surface: Vec<SurfaceDoc>,
+    /// The bridges and tunnels the road runs on or through.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
+    pub structures: Vec<StructureDoc>,
+}
+
+/// A bridge or a tunnel over a stretch of one road.
+///
+/// Which of the fields count depends on `kind`; the rest are kept, so switching a
+/// structure from one kind to the other and back loses nothing.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct StructureDoc {
+    /// `bridge` or `tunnel`.
+    pub kind: String,
+    /// Where it starts and ends, metres of station along the road.
+    pub from: f64,
+    pub to: f64,
+    /// What it is called, if anything.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "String::is_empty"))]
+    pub name: String,
+    /// A bridge: `bridge`, `viaduct` or `overpass`; a tunnel: `bored`,
+    /// `cut_and_cover` or `underpass`. Empty for the first of each.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "String::is_empty"))]
+    pub form: String,
+    /// A bridge's: `concrete`, `steel`, `masonry` or `timber`.
+    pub material: String,
+    /// A bridge's deck depth, longest span between supports, and the kerb its
+    /// parapet stands on past the road's edge, metres.
+    pub deck_depth: f64,
+    pub pier_spacing: f64,
+    pub curb: f64,
+    /// A tunnel's clear height and lining thickness, metres.
+    pub clear_height: f64,
+    pub lining: f64,
+    /// Whether a tunnel is lit.
+    pub lighting: bool,
+    /// A tunnel's inspection walkway beside the road, metres.
+    pub walkway: f64,
+}
+
+impl Default for StructureDoc {
+    fn default() -> Self {
+        StructureDoc {
+            kind: "bridge".to_owned(),
+            from: 0.0,
+            to: 0.0,
+            name: String::new(),
+            form: String::new(),
+            material: "concrete".to_owned(),
+            deck_depth: 2.5,
+            pier_spacing: 40.0,
+            curb: 0.6,
+            clear_height: 5.0,
+            lining: 0.6,
+            lighting: true,
+            walkway: 0.75,
+        }
+    }
+}
+
+impl StructureDoc {
+    /// A structure of `kind` from `from` to `to` along its road, as built usually.
+    pub fn new(kind: &str, from: f64, to: f64) -> Self {
+        StructureDoc {
+            kind: kind.to_owned(),
+            from,
+            to,
+            ..StructureDoc::default()
+        }
+    }
 }
 
 /// A rut worn along a path through one lane rather than straight down the road.
@@ -329,6 +400,7 @@ impl Default for RoadDoc {
             road_type: "town".to_owned(),
             speed_limit: None,
             surface: Vec::new(),
+            structures: Vec::new(),
         }
     }
 }
@@ -426,8 +498,8 @@ impl Document {
     }
 
     /// A small town to start from: a crossroads, one arm of it bending away and
-    /// carrying on past a straight joint into a road with a pavement, and another
-    /// worn, with a hump before the crossing.
+    /// carrying on past a straight joint into a road with a pavement over a bridge,
+    /// another worn, with a hump before the crossing, and a third through a tunnel.
     pub fn example() -> Document {
         let z = 0.0;
         let mut east = RoadDoc::two_way(
@@ -448,6 +520,17 @@ impl Document {
         // A worn approach: a pothole and a puddle in its lanes, ruts in the
         // eastbound lane's wheel paths, and a hump to slow traffic before the
         // crossroads. Right-hand traffic: eastbound is to the right, at -1.75.
+        // The southern approach dips through a short tunnel; the avenue leaves on a
+        // bridge.
+        let mut south = RoadDoc::two_way("south", vec![[0.0, -80.0, z], [0.0, -12.0, z]]);
+        south.structures = vec![StructureDoc {
+            name: "south tunnel".to_owned(),
+            ..StructureDoc::new("tunnel", 15.0, 45.0)
+        }];
+        avenue.structures = vec![StructureDoc {
+            name: "avenue bridge".to_owned(),
+            ..StructureDoc::new("bridge", 12.0, 48.0)
+        }];
         let mut west = RoadDoc::two_way("west", vec![[-80.0, 0.0, z], [-12.0, 0.0, z]]);
         west.surface = vec![
             SurfaceDoc {
@@ -474,7 +557,7 @@ impl Document {
             roads: vec![
                 west,
                 east,
-                RoadDoc::two_way("south", vec![[0.0, -80.0, z], [0.0, -12.0, z]]),
+                south,
                 RoadDoc::two_way("north", vec![[0.0, 12.0, z], [0.0, 70.0, z]]),
                 avenue,
             ],

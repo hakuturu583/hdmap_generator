@@ -32,7 +32,7 @@ pub mod import;
 pub use build::{build, Built, Problem, Severity};
 pub use document::{
     Document, ElementDoc, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, RutPath, Shape,
-    Side, SurfaceDoc, Travel,
+    Side, StructureDoc, SurfaceDoc, Travel,
 };
 pub use import::{alignment_of, from_map};
 
@@ -437,6 +437,71 @@ mod tests {
                 .distance_to(now.reference_line.end_point())
                 < 1e-6
         );
+    }
+
+    #[test]
+    fn bridges_and_tunnels_go_on_their_roads() {
+        let map = build(&Document::example()).validated().unwrap();
+        let kinds: Vec<(&str, &str)> = map
+            .structures
+            .iter()
+            .map(|s| (s.kind.as_str(), s.carries[0].road.as_str()))
+            .collect();
+        assert!(kinds.contains(&("tunnel", "road/south")), "{kinds:?}");
+        assert!(kinds.contains(&("bridge", "road/avenue")), "{kinds:?}");
+        let south = map.road(&roadgen_core::RoadId::new("south")).unwrap();
+        assert!(!south.structure.spans().is_empty());
+    }
+
+    #[test]
+    fn a_bad_structure_is_named_and_the_rest_builds() {
+        let mut document = Document::example();
+        document.roads[2].structures[0].to = 5.0; // ends before it starts
+        let avenue = document
+            .roads
+            .iter_mut()
+            .find(|r| r.id == "avenue")
+            .unwrap();
+        avenue.structures[0].form = "drawbridge".to_owned();
+        let built = build(&document);
+        let named: Vec<(Option<&str>, Option<usize>)> = built
+            .problems
+            .iter()
+            .filter(|p| p.structure.is_some())
+            .map(|p| (p.road.as_deref(), p.structure))
+            .collect();
+        assert_eq!(
+            named,
+            vec![(Some("south"), Some(0)), (Some("avenue"), Some(0))],
+            "{:#?}",
+            built.problems
+        );
+        assert!(built.map.unwrap().as_map().structures.is_empty());
+    }
+
+    #[test]
+    fn bridges_and_tunnels_come_back_from_the_ir() {
+        let mut original = Document::example();
+        original.roads[2].structures[0].form = "cut_and_cover".to_owned();
+        original.roads[2].structures[0].clear_height = 4.8;
+        let map = build(&original).validated().unwrap();
+        let (document, notes) = from_map(&map);
+        assert!(notes.is_empty(), "{notes:?}");
+        for road in &original.roads {
+            let back = &document.road(&road.id).unwrap().structures;
+            assert_eq!(back.len(), road.structures.len(), "{}", road.id);
+            for (a, b) in road.structures.iter().zip(back) {
+                assert_eq!(
+                    (a.kind.as_str(), a.name.as_str()),
+                    (b.kind.as_str(), b.name.as_str())
+                );
+                assert!((a.from - b.from).abs() < 1e-9 && (a.to - b.to).abs() < 1e-9);
+            }
+        }
+        let tunnel = &document.road("south").unwrap().structures[0];
+        assert_eq!(tunnel.form, "cut_and_cover");
+        assert!((tunnel.clear_height - 4.8).abs() < 1e-9);
+        assert!(build(&document).is_valid());
     }
 
     #[test]

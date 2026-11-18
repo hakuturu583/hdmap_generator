@@ -223,6 +223,27 @@ try {
   check(restored.roads.find((r) => r.id === 'north').shape === 'smooth' && !restored.roads.find((r) => r.id === 'east').handles?.length, 'undo did not take the handle and the alignment back')
   await page.keyboard.press('f')
 
+  // Bridges and tunnels: the example's are drawn; slide the tunnel 8 m along.
+  const kindsBuilt = built.scene.structures.map((s) => s.kind).sort()
+  check(JSON.stringify(kindsBuilt) === JSON.stringify(['bridge', 'tunnel']), `structures drawn: ${kindsBuilt}`)
+  await editor(() => window.roadgenEditor.view(0, -40, 8))
+  const tunnel = () => editor(() => window.roadgenEditor.document().roads.find((r) => r.id === 'south').structures[0])
+  const original = await tunnel()
+  const tunnelGrip = await at([1.5, -80 + (original.from + original.to) / 2])
+  await page.mouse.move(...tunnelGrip)
+  await page.mouse.down()
+  await page.mouse.move(...(await at([1.5, -80 + (original.from + original.to) / 2 + 8])), { steps: 8 })
+  await page.mouse.up()
+  const slid = await tunnel()
+  check(Math.abs(slid.from - original.from - 8) < 0.2 && Math.abs(slid.to - slid.from - (original.to - original.from)) < 1e-6, `sliding the tunnel gave ${JSON.stringify(slid)}`)
+  built = await editor(() => window.roadgenEditor.built())
+  check(built.valid, `the slid tunnel does not validate: ${JSON.stringify(built.problems)}`)
+  const mouth = built.scene.structures.find((s) => s.kind === 'tunnel').portals[0]
+  check(Math.abs(mouth[0][1] - (-80 + slid.from)) < 1e-6, `the tunnel's portal is at ${JSON.stringify(mouth)}`)
+  await shoot('structures')
+  await page.keyboard.press('Control+z')
+  await page.keyboard.press('f')
+
   // Every tab draws without throwing.
   for (const tab of ['Links', 'Problems', 'Map', 'Inspect']) await page.locator('.tabs button', { hasText: tab }).click()
 

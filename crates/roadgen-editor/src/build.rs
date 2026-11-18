@@ -17,10 +17,14 @@ use roadgen_core::{
     ValidatedMap, ValidationConfig, Vector3,
 };
 
-use roadgen_core::{Alignment, BumpKind, BumpProfile, LaneRef, RoughnessClass, SurfaceFeatureKind};
+use roadgen_core::{
+    Alignment, BridgeForm, BridgeSpec, BumpKind, BumpProfile, LaneRef, RoadSpan, RoughnessClass,
+    StructureMaterial, SurfaceFeatureKind, TunnelForm, TunnelSpec,
+};
 
 use crate::document::{
-    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, Shape, Side, SurfaceDoc, Travel,
+    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, Shape, Side, StructureDoc,
+    SurfaceDoc, Travel,
 };
 
 /// How bad a problem is.
@@ -46,6 +50,9 @@ pub struct Problem {
     /// The surface feature the problem is about, by its position in its road's
     /// list; `road` says which road.
     pub surface: Option<usize>,
+    /// The bridge or tunnel the problem is about, by its position in its road's
+    /// list; `road` says which road.
+    pub structure: Option<usize>,
     pub message: String,
 }
 
@@ -56,6 +63,7 @@ impl Problem {
             road: None,
             link: None,
             surface: None,
+            structure: None,
             message: message.into(),
         }
     }
@@ -183,6 +191,7 @@ pub fn build(document: &Document) -> Built {
                 road: None,
                 link: None,
                 surface: None,
+                structure: None,
                 message: issue.to_string(),
             });
         }
@@ -230,6 +239,21 @@ fn assemble(
         }
     }
 
+    for road in document
+        .roads
+        .iter()
+        .filter(|road| built.contains(road.id.as_str()))
+    {
+        for (index, structure) in road.structures.iter().enumerate() {
+            if let Err(message) = add_structure(&mut builder, road, structure) {
+                let mut problem =
+                    Problem::error(format!("structure {index}: {message}")).on_road(&road.id);
+                problem.structure = Some(index);
+                report(problem);
+            }
+        }
+    }
+
     let mut accepted = Vec::new();
     for &index in links {
         let link = &document.links[index];
@@ -254,6 +278,67 @@ fn assemble(
         }
     }
     (builder.finish(), accepted)
+}
+
+/// Puts a bridge or a tunnel over its stretch of road.
+fn add_structure(
+    builder: &mut MapBuilder,
+    road: &RoadDoc,
+    structure: &StructureDoc,
+) -> Result<(), String> {
+    if !(structure.from.is_finite() && structure.to.is_finite()) || structure.to <= structure.from {
+        return Err(format!(
+            "it has to end further along the road than it starts, and runs {}–{}",
+            structure.from, structure.to
+        ));
+    }
+    let span = vec![RoadSpan::new(
+        RoadId::new(&road.id),
+        structure.from,
+        structure.to,
+    )];
+    let name = Some(structure.name.trim().to_owned()).filter(|name| !name.is_empty());
+    let form = structure.form.trim();
+    match structure.kind.to_ascii_lowercase().as_str() {
+        "bridge" => {
+            let form = if form.is_empty() {
+                BridgeForm::Bridge
+            } else {
+                BridgeForm::parse(form)
+                    .ok_or_else(|| format!("'{form}' is not a kind of bridge"))?
+            };
+            let spec = BridgeSpec {
+                name,
+                material: StructureMaterial::parse(&structure.material)
+                    .ok_or_else(|| format!("'{}' is not a material", structure.material))?,
+                deck_depth: structure.deck_depth,
+                pier_spacing: structure.pier_spacing,
+                curb: structure.curb,
+                ..BridgeSpec::for_form(form)
+            };
+            builder.add_bridge(span, spec)
+        }
+        "tunnel" => {
+            let form = if form.is_empty() {
+                TunnelForm::Bored
+            } else {
+                TunnelForm::parse(form)
+                    .ok_or_else(|| format!("'{form}' is not a kind of tunnel"))?
+            };
+            let spec = TunnelSpec {
+                name,
+                form,
+                clear_height: structure.clear_height,
+                lining: structure.lining,
+                lighting: structure.lighting,
+                walkway: structure.walkway,
+                ..TunnelSpec::default()
+            };
+            builder.add_tunnel(span, spec)
+        }
+        other => return Err(format!("'{other}' is not a bridge or a tunnel")),
+    }
+    .map_err(|error| error.to_string())
 }
 
 /// Puts one of a road's surface features on the map.

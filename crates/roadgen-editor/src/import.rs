@@ -5,21 +5,22 @@
 //! every road becomes its reference line — an alignment where it is straights, arcs
 //! and clothoids, a polyline otherwise — and the lanes of its first
 //! cross-section at their starting widths; every junction becomes the links its
-//! connectors were made from; surface features stay on their roads; furniture,
-//! rules, buildings and terrain are dropped.
+//! connectors were made from; surface features, bridges and tunnels stay on their
+//! roads; furniture, rules, buildings and terrain are dropped.
 //! What comes back builds into a map with the same roads, lanes and movements, which
 //! is what the editor is for.
 
 use std::collections::BTreeSet;
 
 use roadgen_core::{
-    BumpProfile, Curve3, Direction, LateralSide, Map, Point3, RoadEnd, RoadEndpoint,
-    RoadLinkTarget, SurfaceFeature, SurfaceFeatureKind, TrafficHandedness,
+    BumpProfile, Curve3, Direction, LateralSide, Map, MapObjectKind, Point3, RoadEnd, RoadEndpoint,
+    RoadLinkTarget, Structure, StructureKind, SurfaceFeature, SurfaceFeatureKind,
+    TrafficHandedness,
 };
 
 use crate::document::{
     Document, ElementDoc, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, RutPath, Shape,
-    Side, SurfaceDoc, Travel,
+    Side, StructureDoc, SurfaceDoc, Travel,
 };
 
 /// How far a simplified reference line may stray from the one it came from, metres.
@@ -115,6 +116,17 @@ pub fn from_map(map: &Map) -> (Document, Vec<String>) {
                 .filter(|feature| feature.road == road.id)
                 .map(surface_doc)
                 .collect(),
+            structures: map
+                .structures
+                .iter()
+                .flat_map(|structure| {
+                    structure
+                        .carries
+                        .iter()
+                        .filter(|span| span.road == road.id)
+                        .map(move |span| structure_doc(structure, span.from, span.to))
+                })
+                .collect(),
         });
     }
 
@@ -209,12 +221,36 @@ pub fn from_map(map: &Map) -> (Document, Vec<String>) {
              generates those roads, and keeps nothing on them"
         ));
     }
+    let shared = map
+        .structures
+        .iter()
+        .filter(|structure| structure.carries.len() > 1)
+        .count();
+    if shared > 0 {
+        notes.push(format!(
+            "{shared} bridge(s) or tunnel(s) carry several roads; each road now has its own"
+        ));
+    }
     for (count, what) in [
-        (map.objects.len(), "traffic object(s)"),
+        (
+            // A bridge's parapets are its own: built again with it.
+            map.objects
+                .iter()
+                .filter(|object| {
+                    !matches!(
+                        object.kind,
+                        MapObjectKind::Barrier {
+                            structure: Some(_),
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            "traffic object(s)",
+        ),
         (map.rules.len(), "traffic rule(s)"),
         (map.buildings.len(), "building(s)"),
         (map.land_covers.len(), "land cover(s)"),
-        (map.structures.len(), "bridge(s) and tunnel(s)"),
         (map.tin_surfaces.len(), "terrain surface(s)"),
     ] {
         if count > 0 {
@@ -291,6 +327,28 @@ pub fn alignment_of(curve: &Curve3) -> Option<(f64, Vec<ElementDoc>)> {
         .iter()
         .any(|element| element.kind != "line")
         .then(|| (start.to_degrees(), elements))
+}
+
+/// A bridge or a tunnel as the document says it, over `from`–`to` of one road.
+fn structure_doc(structure: &Structure, from: f64, to: f64) -> StructureDoc {
+    let mut doc = StructureDoc::new(structure.kind.as_str(), from, to);
+    doc.name = structure.name.clone().unwrap_or_default();
+    match &structure.kind {
+        StructureKind::Bridge(bridge) => {
+            doc.form = bridge.form.as_str().to_owned();
+            doc.material = bridge.material.as_str().to_owned();
+            doc.deck_depth = bridge.deck_depth;
+            doc.curb = bridge.curb;
+        }
+        StructureKind::Tunnel(tunnel) => {
+            doc.form = tunnel.form.as_str().to_owned();
+            doc.clear_height = tunnel.clear_height;
+            doc.lining = tunnel.lining;
+            doc.lighting = tunnel.lighting;
+            doc.walkway = tunnel.walkway;
+        }
+    }
+    doc
 }
 
 /// A surface feature as the document says it: its footprint, and the parameters

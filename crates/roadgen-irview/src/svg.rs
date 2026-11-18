@@ -129,6 +129,25 @@ impl Scene {
             );
         }
 
+        // A bridge's deck is wider than the road it carries, so it goes under it.
+        for structure in self.structures.iter().filter(|s| s.kind == "bridge") {
+            for support in &structure.supports {
+                let _ = write!(
+                    out,
+                    r##"<polygon points="{}" fill="#1f2328"/>"##,
+                    points(support),
+                );
+            }
+            let _ = write!(
+                out,
+                r##"<polygon data-id="{}" points="{}" fill="#8a96a3" stroke="#d0d7de" stroke-width="{}"><title>{}</title></polygon>"##,
+                escape(&structure.id),
+                points(&structure.outline),
+                num(2.0 * px),
+                escape(&structure.label),
+            );
+        }
+
         // Ordinary roads first, then the connectors that cross them.
         let mut lanes: Vec<_> = self.lanes.iter().collect();
         lanes.sort_by_key(|lane| lane.connector);
@@ -180,6 +199,28 @@ impl Scene {
                     r##"<polyline points="{}" fill="none" stroke="#1d2024" stroke-width="{}" stroke-linecap="round"/>"##,
                     points(trough),
                     num(0.3f64.max(px)),
+                );
+            }
+        }
+
+        // A tunnel goes over the road it holds: a shade with its portals drawn hard.
+        for structure in self.structures.iter().filter(|s| s.kind == "tunnel") {
+            let _ = write!(
+                out,
+                r##"<polygon data-id="{}" points="{}" fill="#0b0d10" fill-opacity="0.45" stroke="#9aa3ad" stroke-width="{}" stroke-dasharray="{} {}"><title>{}</title></polygon>"##,
+                escape(&structure.id),
+                points(&structure.outline),
+                num(1.5 * px),
+                num(6.0 * px),
+                num(4.0 * px),
+                escape(&structure.label),
+            );
+            for portal in &structure.portals {
+                let _ = write!(
+                    out,
+                    r##"<polyline points="{}" fill="none" stroke="#d0d7de" stroke-width="{}"/>"##,
+                    points(portal),
+                    num(0.8f64.max(3.0 * px)),
                 );
             }
         }

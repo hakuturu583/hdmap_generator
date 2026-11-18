@@ -55,6 +55,7 @@ const state = {
   selection: null, // {kind: 'road', id} | {kind: 'junction', id} | {kind: 'link', index}
   point: null, // index of the selected control point of the selected road
   surface: null, // index of the selected surface feature of the selected road
+  structure: null, // index of the selected bridge or tunnel of the selected road
   lane: null, // index of the lane being edited in the inspector
   tool: 'select',
   view: { cx: 0, cy: 0, scale: 3 },
@@ -216,6 +217,7 @@ function validateSelection() {
   const road = state.selection?.kind === 'road' && findRoad(state.selection.id)
   if (road && state.point != null && state.point >= road.points.length) state.point = null
   if (!road || state.surface >= (road.surface?.length ?? 0)) state.surface = null
+  if (!road || state.structure >= (road.structures?.length ?? 0)) state.structure = null
 }
 
 let saveTimer = null
@@ -363,6 +365,21 @@ function render() {
     }
   }
 
+  // A bridge's deck is wider than its road, so it goes under it, piers first.
+  for (const structure of (scene.structures ?? []).filter((s) => s.kind === 'bridge')) {
+    for (const support of structure.supports) {
+      polygon(support)
+      ctx.fillStyle = '#1f2328'
+      ctx.fill()
+    }
+    polygon(structure.outline)
+    ctx.fillStyle = '#8a96a3'
+    ctx.fill()
+    ctx.strokeStyle = isSelectedStructure(structure) ? '#4ea1ff' : '#d0d7de'
+    ctx.lineWidth = (isSelectedStructure(structure) ? 3 : 2) * px
+    ctx.stroke()
+  }
+
   const lanes = [...(scene.lanes ?? [])].sort((a, b) => a.connector - b.connector)
   for (const lane of lanes) {
     polygon(lane.outline)
@@ -381,6 +398,24 @@ function render() {
   }
 
   for (const line of scene.lines ?? []) drawMarking(line, px)
+
+  // A tunnel goes over the road it holds: a shade, its portals drawn hard.
+  for (const structure of (scene.structures ?? []).filter((s) => s.kind === 'tunnel')) {
+    polygon(structure.outline)
+    ctx.fillStyle = '#0b0d1073'
+    ctx.fill()
+    ctx.setLineDash([6 * px, 4 * px])
+    ctx.strokeStyle = isSelectedStructure(structure) ? '#4ea1ff' : '#9aa3ad'
+    ctx.lineWidth = (isSelectedStructure(structure) ? 3 : 1.5) * px
+    ctx.stroke()
+    ctx.setLineDash([])
+    for (const portal of structure.portals) {
+      path(portal, false)
+      ctx.strokeStyle = '#d0d7de'
+      ctx.lineWidth = Math.max(0.8, 3 * px)
+      ctx.stroke()
+    }
+  }
 
   for (const surface of scene.surfaces ?? []) {
     const [fill, alpha] = SURFACE_FILL[surface.kind] ?? SURFACE_FILL.roughness
@@ -558,6 +593,31 @@ function render() {
       ctx.fill()
       ctx.strokeStyle = '#c084fc'
       ctx.stroke()
+    }
+  }
+  if (chosen) {
+    // Each bridge and tunnel of the selected road ends in a knob either end, to
+    // drag along the road.
+    const moving = ['structureEnd', 'structure'].includes(state.drag?.kind) && state.drag.road === chosen.id ? state.drag.index : null
+    for (const knob of structureKnobs(chosen)) {
+      const [qx, qy] = toScreen(knob.point)
+      ctx.beginPath()
+      ctx.rect(qx - 5, qy - 5, 10, 10)
+      ctx.fillStyle = knob.index === moving ? '#ffffff' : '#22d3ee'
+      ctx.fill()
+      ctx.strokeStyle = '#0d1117'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+      if (knob.index === moving && knob.which === 'from') {
+        const structure = chosen.structures[knob.index]
+        const label = `#${knob.index} ${structure.kind} ${structure.from.toFixed(1)}–${structure.to.toFixed(1)} m (${(structure.to - structure.from).toFixed(1)} m)`
+        ctx.font = '12px system-ui, sans-serif'
+        const width = ctx.measureText(label).width
+        ctx.fillStyle = '#000000cc'
+        ctx.fillRect(qx + 10, qy - 22, width + 10, 18)
+        ctx.fillStyle = '#ffffff'
+        ctx.fillText(label, qx + 15, qy - 9)
+      }
     }
   }
   for (const road of state.doc.roads) {
@@ -942,6 +1002,44 @@ function surfaceIndex(view) {
   return null
 }
 
+/// Which of its road's document structures a drawn structure is: the one over the
+/// same stretch of the same road.
+function structureIndex(view) {
+  const span = view.carries[0]
+  const road = span && findRoad(roadKey(span.road))
+  if (!road) return null
+  const index = (road.structures ?? []).findIndex(
+    (s) => s.kind === view.kind && Math.abs(s.from - span.from) < 1e-6 && Math.abs(s.to - span.to) < 1e-6,
+  )
+  return index < 0 ? null : { road: road.id, index }
+}
+
+function isSelectedStructure(view) {
+  if (state.selection?.kind !== 'road' || state.structure == null) return false
+  const found = structureIndex(view)
+  return found?.road === state.selection.id && found.index === state.structure
+}
+
+/// The bridge or tunnel under a world point.
+function structureAt(world) {
+  for (const view of state.built?.scene?.structures ?? []) {
+    if (inside(view.outline, world)) return structureIndex(view)
+  }
+  return null
+}
+
+/// The two ends of each of a road's structures, on the built road.
+function structureKnobs(road) {
+  const line = builtRoad(road.id)?.reference_line
+  if (!line) return []
+  return (road.structures ?? []).flatMap((structure, index) =>
+    ['from', 'to'].flatMap((which) => {
+      const at = alongLine(line, structure[which])
+      return at ? [{ index, which, point: [at[0], at[1]] }] : []
+    }),
+  )
+}
+
 function isSelectedSurface(view) {
   if (state.selection?.kind !== 'road' || state.surface == null) return false
   const found = surfaceIndex(view)
@@ -1059,12 +1157,31 @@ canvas.addEventListener('pointerdown', (event) => {
     render()
     return
   }
+  const chosen = state.selection?.kind === 'road' && findRoad(state.selection.id)
+  const knob = chosen && structureKnobs(chosen).find((knob) => screenDistance(knob.point, screen) <= HANDLE_PX)
+  if (knob) {
+    state.structure = knob.index
+    state.drag = {
+      kind: 'structureEnd',
+      road: chosen.id,
+      index: knob.index,
+      which: knob.which,
+      line: builtRoad(chosen.id).reference_line,
+      snapshot: JSON.stringify(state.doc),
+      moved: false,
+    }
+    canvas.setPointerCapture(event.pointerId)
+    renderPanels()
+    render()
+    return
+  }
   const end = endAt(screen, null, HANDLE_PX)
   const hit = !end && surfaceAt(world)
   if (hit) {
     const feature = findRoad(hit.road).surface[hit.index]
     state.selection = { kind: 'road', id: hit.road }
     state.surface = hit.index
+    state.structure = null
     state.point = null
     state.drag = {
       kind: 'surface',
@@ -1080,6 +1197,29 @@ canvas.addEventListener('pointerdown', (event) => {
     render()
     return
   }
+  const held = !end && structureAt(world)
+  if (held) {
+    const structure = findRoad(held.road).structures[held.index]
+    const line = builtRoad(held.road).reference_line
+    state.selection = { kind: 'road', id: held.road }
+    state.structure = held.index
+    state.surface = null
+    state.point = null
+    state.drag = {
+      kind: 'structure',
+      road: held.road,
+      index: held.index,
+      line,
+      grab: stationOn(line, world),
+      original: { from: structure.from, to: structure.to },
+      snapshot: JSON.stringify(state.doc),
+      moved: false,
+    }
+    canvas.setPointerCapture(event.pointerId)
+    renderPanels()
+    render()
+    return
+  }
   const lane = laneAt(world)
   const selection = end ? { kind: 'road', id: end.road } : selectionForLane(lane)
   if (selection) {
@@ -1087,6 +1227,7 @@ canvas.addEventListener('pointerdown', (event) => {
     state.selection = selection
     state.point = null
     state.surface = null
+    state.structure = null
     if (lane && selection.kind === 'road' && roadKey(lane.road) === selection.id) state.lane = lane.index
     else if (!same) state.lane = null
     renderPanels()
@@ -1096,6 +1237,7 @@ canvas.addEventListener('pointerdown', (event) => {
   state.selection = null
   state.point = null
   state.surface = null
+  state.structure = null
   renderPanels()
   render()
   startPan(event, screen)
@@ -1127,6 +1269,10 @@ canvas.addEventListener('pointermove', (event) => {
     moveSurface(drag, world)
     return
   }
+  if (drag?.kind === 'structure' || drag?.kind === 'structureEnd') {
+    moveStructure(drag, world)
+    return
+  }
   if (['tangent', 'heading', 'length', 'radius'].includes(drag?.kind)) {
     turnHandle(drag, world)
     return
@@ -1138,7 +1284,7 @@ canvas.addEventListener('pointerup', (event) => {
   const drag = state.drag
   state.drag = null
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
-  if (['point', 'surface', 'tangent', 'heading', 'length', 'radius'].includes(drag?.kind) && drag.moved) {
+  if (['point', 'surface', 'tangent', 'heading', 'length', 'radius', 'structure', 'structureEnd'].includes(drag?.kind) && drag.moved) {
     checkpoint(drag.snapshot)
     changed()
   } else if (drag) {
@@ -1219,6 +1365,29 @@ function movePoint(drag, world, free) {
       const other = partner && findRoad(partner.road)
       if (other && other !== road && !isAligned(other)) setEndPoint(other, partner.end, point)
     }
+  }
+  drag.moved = true
+  rebuildSoon()
+  renderPanelsSoon()
+}
+
+/// Slides a bridge or tunnel along its road, or one of its ends, by the station
+/// the pointer is at on the road as it was when the drag began. Lengths keep to a
+/// metre at least, and stations to the decimetre.
+function moveStructure(drag, world) {
+  const structure = findRoad(drag.road)?.structures?.[drag.index]
+  if (!structure) return
+  const station = stationOn(drag.line, world)
+  const round = (v) => Math.round(v * 10) / 10
+  if (drag.kind === 'structure') {
+    const shift = round(station - drag.grab)
+    const from = Math.max(0, drag.original.from + shift)
+    structure.to = round(from + drag.original.to - drag.original.from)
+    structure.from = round(from)
+  } else if (drag.which === 'from') {
+    structure.from = round(Math.max(0, Math.min(station, structure.to - 1)))
+  } else {
+    structure.to = round(Math.max(station, structure.from + 1))
   }
   drag.moved = true
   rebuildSoon()
@@ -1368,6 +1537,11 @@ function pickLinkEnd(screen) {
 function deleteSelection() {
   const s = state.selection
   if (!s) return
+  if (s.kind === 'road' && state.structure != null) {
+    const index = state.structure
+    state.structure = null
+    return commit((doc) => doc.roads.find((r) => r.id === s.id).structures.splice(index, 1))
+  }
   if (s.kind === 'road' && state.surface != null) {
     const index = state.surface
     state.surface = null
@@ -1560,6 +1734,7 @@ function renderRoadInspector(tab, road) {
   )
 
   renderSurfaceSection(tab, road)
+  renderStructureSection(tab, road)
 
   const links = state.doc.links.map((link, index) => ({ link, index })).filter(({ link }) => link.from === id || link.to === id)
   tab.append(h('h4', {}, `Links (${links.length})`), linkList(links))
@@ -1819,6 +1994,99 @@ function renderSurfaceSection(tab, road) {
         ),
       ),
     ),
+  )
+}
+
+const BRIDGE_FORMS = [['', 'bridge'], 'viaduct', 'overpass']
+const TUNNEL_FORMS = [['', 'bored'], ['cut_and_cover', 'cut and cover'], 'underpass']
+const MATERIALS = ['concrete', 'steel', 'masonry', 'timber']
+
+function renderStructureSection(tab, road) {
+  const id = road.id
+  const structures = road.structures ?? []
+  tab.append(
+    h('h4', {}, `Bridges and tunnels (${structures.length})`),
+    h('p', { class: 'muted' }, 'Over a stretch of the road, from and to in metres along it. Drag one on the map to slide it, or its cyan knobs to move an end.'),
+  )
+  structures.forEach((structure, index) => tab.append(structureCard(road, structure, index)))
+  const add = (kind) => {
+    const length = builtRoad(id)?.length ?? 60
+    const from = Math.round(length * 0.3 * 10) / 10
+    const to = Math.round(length * 0.7 * 10) / 10
+    const base = { kind, from, to, material: 'concrete', deck_depth: 2.5, pier_spacing: 40, curb: 0.6, clear_height: 5, lining: 0.6, lighting: true, walkway: 0.75 }
+    editRoad(id, (r) => (r.structures = [...(r.structures ?? []), base]))
+    state.structure = (findRoad(id).structures ?? []).length - 1
+    renderPanels()
+    render()
+  }
+  tab.append(h('div', { class: 'row' }, h('button', { onclick: () => add('bridge') }, '+ bridge'), h('button', { onclick: () => add('tunnel') }, '+ tunnel')))
+}
+
+function structureCard(road, structure, index) {
+  const id = road.id
+  const edit = (change) => editRoad(id, (r) => change(r.structures[index]))
+  const number = (key, label, attributes = {}) => [
+    h('span', { class: 'muted' }, label),
+    numberInput(structure[key], (v) => v != null && edit((s) => (s[key] = v)), { step: 0.1, ...attributes }),
+  ]
+  const bridge = structure.kind === 'bridge'
+  const fields = bridge
+    ? [
+        h('span', { class: 'muted' }, 'material'),
+        select(MATERIALS, structure.material ?? 'concrete', (v) => edit((s) => (s.material = v))),
+        ...number('deck_depth', 'deck m', { min: 0.1 }),
+        ...number('pier_spacing', 'pier spacing m', { min: 1, step: 1 }),
+        ...number('curb', 'kerb m', { min: 0 }),
+      ]
+    : [
+        ...number('clear_height', 'clear height m', { min: 0.1 }),
+        ...number('lining', 'lining m', { min: 0.01 }),
+        ...number('walkway', 'walkway m', { min: 0 }),
+        h('span', { class: 'muted' }, 'lit'),
+        h('input', { type: 'checkbox', checked: structure.lighting !== false, onchange: (e) => edit((s) => (s.lighting = e.target.checked)) }),
+      ]
+  return h(
+    'div',
+    {
+      class: `lane${state.structure === index ? ' selected' : ''}`,
+      onclick: (event) => {
+        if (state.structure === index) return
+        state.structure = index
+        render()
+        for (const card of document.querySelectorAll('.lane')) card.classList.remove('selected')
+        event.currentTarget.classList.add('selected')
+      },
+    },
+    h(
+      'div',
+      { class: 'head' },
+      h(
+        'span',
+        { class: 'row' },
+        h('strong', {}, `#${index}`),
+        select(['bridge', 'tunnel'], structure.kind, (v) =>
+          edit((s) => {
+            s.kind = v
+            s.form = ''
+          }),
+        ),
+        select(bridge ? BRIDGE_FORMS : TUNNEL_FORMS, structure.form ?? '', (v) => edit((s) => (v ? (s.form = v) : delete s.form))),
+      ),
+      h(
+        'button',
+        {
+          title: 'Remove this structure',
+          onclick: (event) => {
+            event.stopPropagation()
+            state.structure = null
+            editRoad(id, (r) => r.structures.splice(index, 1))
+          },
+        },
+        '×',
+      ),
+    ),
+    field('name', h('input', { value: structure.name ?? '', placeholder: 'none', onchange: (e) => edit((s) => (e.target.value.trim() ? (s.name = e.target.value.trim()) : delete s.name)) })),
+    h('div', { class: 'grid' }, ...number('from', 'from m', { min: 0 }), ...number('to', 'to m', { min: 0 }), ...fields),
   )
 }
 
@@ -2083,8 +2351,9 @@ function renderProblems() {
             onclick: () => {
               if (problem.road) {
                 selectAndShow({ kind: 'road', id: problem.road })
-                if (problem.surface != null) {
-                  state.surface = problem.surface
+                if (problem.surface != null || problem.structure != null) {
+                  state.surface = problem.surface ?? null
+                  state.structure = problem.structure ?? null
                   renderPanels()
                   render()
                 }
@@ -2142,6 +2411,7 @@ function selectAndShow(selection) {
   state.selection = selection
   state.point = null
   state.surface = null
+  state.structure = null
   showTab('inspect')
   renderPanels()
   render()

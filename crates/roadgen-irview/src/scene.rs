@@ -2,7 +2,7 @@
 
 use roadgen_core::{
     Curve3, Direction, GeometryError, LateralSide, Map, MarkingColor, ObjectGeometry, Point3, Road,
-    RoadMarking, SamplingConfig, SurfaceFeature, SurfaceFeatureKind,
+    RoadMarking, SamplingConfig, StructureKind, SurfaceFeature, SurfaceFeatureKind,
 };
 
 /// A point in plan: x east, y north, metres.
@@ -186,6 +186,39 @@ pub struct SurfaceView {
     pub troughs: Vec<Vec<Xy>>,
 }
 
+/// One stretch of road a structure carries.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct SpanView {
+    pub road: String,
+    pub from: f64,
+    pub to: f64,
+}
+
+/// A bridge or a tunnel, drawn as its outline in plan.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct StructureView {
+    /// The IR identifier, `structure/<…>`.
+    pub id: String,
+    /// `bridge` or `tunnel`.
+    pub kind: String,
+    /// `bridge`, `viaduct`, `overpass`, `bored`, `cut_and_cover` or `underpass`.
+    pub form: String,
+    pub name: Option<String>,
+    /// The structure in a few words: `viaduct, steel, 120 m`.
+    pub label: String,
+    /// What the structure covers in plan: a bridge's deck, a tunnel's bore.
+    pub outline: Vec<Xy>,
+    pub carries: Vec<SpanView>,
+    /// A bridge's supports — abutments at the ends, piers between — each as its
+    /// footprint; empty for a tunnel.
+    pub supports: Vec<Vec<Xy>>,
+    /// A tunnel's two portals, each as the line across its mouth; empty for a
+    /// bridge.
+    pub portals: Vec<[Xy; 2]>,
+}
+
 /// Everything in a map that can be drawn in plan.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -198,6 +231,7 @@ pub struct Scene {
     pub objects: Vec<ObjectView>,
     pub areas: Vec<AreaView>,
     pub surfaces: Vec<SurfaceView>,
+    pub structures: Vec<StructureView>,
     /// What could not be drawn and why, one entry each. A scene is drawn from maps
     /// that failed validation too, so a broken element is skipped, not fatal.
     pub warnings: Vec<String>,
@@ -404,6 +438,64 @@ impl Scene {
                 Ok(view) => scene.surfaces.push(view),
                 Err(error) => warnings.push(warn(feature.id.as_str(), error)),
             }
+        }
+
+        for structure in map.structures.iter() {
+            let length: f64 = structure.carries.iter().map(|span| span.length()).sum();
+            let (form, label, supports, portals) = match &structure.kind {
+                StructureKind::Bridge(bridge) => (
+                    bridge.form.as_str(),
+                    format!(
+                        "{}, {}, {:.0} m",
+                        bridge.form.as_str(),
+                        bridge.material.as_str(),
+                        length
+                    ),
+                    bridge
+                        .supports
+                        .iter()
+                        .map(|support| support.footprint.points().iter().map(|p| xy(*p)).collect())
+                        .collect(),
+                    Vec::new(),
+                ),
+                StructureKind::Tunnel(tunnel) => (
+                    tunnel.form.as_str(),
+                    format!(
+                        "tunnel, {}, {:.0} m, {:.1} m clear",
+                        tunnel.form.as_str().replace('_', " "),
+                        length,
+                        tunnel.clear_height
+                    ),
+                    Vec::new(),
+                    tunnel
+                        .portals
+                        .iter()
+                        .map(|portal| [xy(portal.left), xy(portal.right)])
+                        .collect(),
+                ),
+            };
+            scene.structures.push(StructureView {
+                id: structure.id.as_str().to_owned(),
+                kind: structure.kind.as_str().to_owned(),
+                form: form.to_owned(),
+                name: structure.name.clone(),
+                label: match &structure.name {
+                    Some(name) => format!("{name}: {label}"),
+                    None => label,
+                },
+                outline: structure.outline.points().iter().map(|p| xy(*p)).collect(),
+                carries: structure
+                    .carries
+                    .iter()
+                    .map(|span| SpanView {
+                        road: span.road.as_str().to_owned(),
+                        from: span.from,
+                        to: span.to,
+                    })
+                    .collect(),
+                supports,
+                portals,
+            });
         }
 
         scene.warnings = warnings;
@@ -827,6 +919,61 @@ mod tests {
         assert!(scene
             .to_svg(&Default::default())
             .contains("pothole 8 cm deep"));
+    }
+
+    #[test]
+    fn a_bridge_and_a_tunnel_are_drawn_over_their_roads() {
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(300.0, 0.0, 0.0),
+                    two_lanes(),
+                )
+                .unwrap()
+                .with_name("r"),
+            )
+            .unwrap();
+        builder
+            .add_bridge(
+                vec![roadgen_core::RoadSpan::new(road.clone(), 20.0, 140.0)],
+                roadgen_core::BridgeSpec::for_form(roadgen_core::BridgeForm::Viaduct),
+            )
+            .unwrap();
+        builder
+            .add_tunnel(
+                vec![roadgen_core::RoadSpan::new(road, 180.0, 260.0)],
+                roadgen_core::TunnelSpec::default(),
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().into_map();
+        let scene = Scene::from_map(&map);
+        assert_eq!(scene.structures.len(), 2);
+        let bridge = scene
+            .structures
+            .iter()
+            .find(|s| s.kind == "bridge")
+            .unwrap();
+        assert_eq!(bridge.form, "viaduct");
+        assert!(
+            bridge.label.starts_with("viaduct, concrete, 120 m"),
+            "{}",
+            bridge.label
+        );
+        assert!(contains(&bridge.outline, [80.0, 0.0]));
+        assert!(!contains(&bridge.outline, [160.0, 0.0]));
+        // Abutments at both ends and piers no further apart than 40 m.
+        assert!(bridge.supports.len() >= 4, "{}", bridge.supports.len());
+        let tunnel = scene
+            .structures
+            .iter()
+            .find(|s| s.kind == "tunnel")
+            .unwrap();
+        assert_eq!(tunnel.portals.len(), 2);
+        assert!((tunnel.portals[0][0][0] - 180.0).abs() < 1e-6);
+        assert!(contains(&tunnel.outline, [220.0, 0.0]));
+        assert_eq!(tunnel.carries[0].road, "road/r");
     }
 
     #[test]
