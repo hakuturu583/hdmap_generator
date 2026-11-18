@@ -31,10 +31,10 @@ pub mod import;
 
 pub use build::{build, Built, Problem, Severity};
 pub use document::{
-    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, RutPath, Shape, Side,
-    SurfaceDoc, Travel,
+    Document, ElementDoc, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, RutPath, Shape,
+    Side, SurfaceDoc, Travel,
 };
-pub use import::from_map;
+pub use import::{alignment_of, from_map};
 
 #[cfg(test)]
 mod tests {
@@ -264,6 +264,179 @@ mod tests {
         }
         let rebuilt = build(&document).validated().unwrap();
         assert_eq!(rebuilt.surface_features.len(), map.surface_features.len());
+    }
+
+    /// A road that leaves the origin eastwards, eases into a 60 m bend to the left,
+    /// holds it, eases out and runs on straight.
+    fn bend() -> RoadDoc {
+        RoadDoc::aligned(
+            "bend",
+            [0.0, 0.0, 0.0],
+            0.0,
+            vec![
+                ElementDoc::line(40.0),
+                ElementDoc::spiral(20.0, Some(60.0)),
+                ElementDoc::arc(30.0, 60.0),
+                ElementDoc::spiral(20.0, None),
+                ElementDoc::line(30.0),
+            ],
+        )
+    }
+
+    #[test]
+    fn an_alignment_is_its_pieces_end_to_end() {
+        let road = bend();
+        let curve = build::reference_line(&road).unwrap();
+        let expected = roadgen_core::Alignment::new(roadgen_core::Point3::ORIGIN, 0.0)
+            .line(40.0, 0.0)
+            .and_then(|a| a.spiral(20.0, 1.0 / 60.0, 0.0))
+            .and_then(|a| a.arc(30.0, 1.0 / 60.0, 0.0))
+            .and_then(|a| a.spiral(20.0, 0.0, 0.0))
+            .and_then(|a| a.line(30.0, 0.0))
+            .and_then(|a| a.finish())
+            .unwrap();
+        assert_eq!(curve, expected);
+        assert!((curve.horizontal_length().unwrap() - 140.0).abs() < 1e-6);
+        // Turned left by the arc and both spirals: 30/60 + 2 * 20/(2*60) radians.
+        let turned = curve.end_tangent().unwrap().heading();
+        assert!((turned - (0.5 + 1.0 / 3.0)).abs() < 1e-6, "{turned}");
+
+        let document = Document {
+            roads: vec![road],
+            ..Document::default()
+        };
+        assert!(
+            build(&document).is_valid(),
+            "{:#?}",
+            build(&document).problems
+        );
+    }
+
+    #[test]
+    fn a_bad_alignment_says_which_piece() {
+        let mut road = bend();
+        road.elements[2].radius = None;
+        let error = build::reference_line(&road).unwrap_err();
+        assert!(error.contains("piece 2"), "{error}");
+        road.elements.clear();
+        assert!(build::reference_line(&road).is_err());
+    }
+
+    #[test]
+    fn a_smooth_road_meets_an_alignment_on_the_alignment_s_terms() {
+        let road = bend();
+        let curve = build::reference_line(&road).unwrap();
+        let end = curve.end_point();
+        let along = curve.end_tangent().unwrap().get();
+        // Drawn off the end at an angle: the alignment cannot bend, so this does.
+        let next = RoadDoc::two_way(
+            "next",
+            vec![
+                end.as_array(),
+                [end.x + 20.0, end.y + 40.0, 0.0],
+                [end.x + 10.0, end.y + 80.0, 0.0],
+            ],
+        );
+        let document = Document {
+            roads: vec![road, next],
+            links: vec![LinkDoc {
+                from: "bend".into(),
+                from_end: End::End,
+                to: "next".into(),
+                to_end: End::Start,
+                junction: None,
+            }],
+            ..Document::default()
+        };
+        let built = build(&document);
+        assert!(built.is_valid(), "{:#?}", built.problems);
+        let map = built.validated().unwrap();
+        let next = map.road(&roadgen_core::RoadId::new("next")).unwrap();
+        let leaving = next.reference_line.start_tangent().unwrap().get();
+        assert!(leaving.dot(along) > 1.0 - 1e-9, "{leaving:?} vs {along:?}");
+    }
+
+    #[test]
+    fn a_handle_sets_the_direction_and_the_reach_at_its_point() {
+        let mut road = RoadDoc::two_way(
+            "h",
+            vec![[0.0, 0.0, 0.0], [50.0, 0.0, 2.0], [100.0, 0.0, 4.0]],
+        );
+        let straight = build::reference_line(&road).unwrap();
+        road.handles = vec![None, Some([12.0, 9.0])];
+        let curve = build::reference_line(&road).unwrap();
+        assert_ne!(curve, straight);
+        let Curve3::Composite(pieces) = &curve else {
+            panic!("{curve:?}")
+        };
+        // Through the point, along the handle, the same either side of it.
+        assert!(
+            pieces[0]
+                .end_point()
+                .distance_to(roadgen_core::Point3::new(50.0, 0.0, 2.0))
+                < 1e-9
+        );
+        let out = pieces[0].end_tangent().unwrap().get();
+        let into = pieces[1].start_tangent().unwrap().get();
+        assert!(out.dot(into) > 1.0 - 1e-9);
+        let plan = (out.y).atan2(out.x);
+        assert!((plan - 9f64.atan2(12.0)).abs() < 1e-9, "{plan}");
+        // A handle bends the road in plan, not in height: the grade is the chord's.
+        let Curve3::Bezier(bezier) = &pieces[0] else {
+            panic!("{:?}", pieces[0])
+        };
+        let [_, a, b, _] = *bezier.control();
+        assert!(
+            (b.x - 38.0).abs() < 1e-9 && (b.y + 9.0).abs() < 1e-9,
+            "{b:?}"
+        );
+        assert!(
+            (a.z - (50.0 / 3.0) * 0.04).abs() < 1e-9 && (b.z - (2.0 - 15.0 * 0.04)).abs() < 1e-9
+        );
+
+        let document = Document {
+            roads: vec![road],
+            ..Document::default()
+        };
+        assert!(
+            build(&document).is_valid(),
+            "{:#?}",
+            build(&document).problems
+        );
+    }
+
+    #[test]
+    fn an_alignment_comes_back_from_the_ir_as_one() {
+        let mut original = Document::example();
+        let mut aligned = bend();
+        aligned.points[0] = [0.0, -200.0, 0.0];
+        original.roads.push(aligned.clone());
+        let map = build(&original).validated().unwrap();
+        let (document, _) = from_map(&map);
+        let back = document.road("bend").unwrap();
+        assert_eq!(back.shape, Shape::Alignment);
+        assert!(back.heading.abs() < 1e-9);
+        assert_eq!(back.elements.len(), aligned.elements.len());
+        for (a, b) in aligned.elements.iter().zip(&back.elements) {
+            assert_eq!(a.kind, b.kind);
+            assert!((a.length - b.length).abs() < 1e-9);
+            match (a.radius, b.radius) {
+                (Some(x), Some(y)) => assert!((x - y).abs() < 1e-6, "{x} vs {y}"),
+                (x, y) => assert_eq!(x, y),
+            }
+        }
+        // Roads drawn through points stay drawn through points.
+        assert_ne!(document.road("east").unwrap().shape, Shape::Alignment);
+        assert_ne!(document.road("west").unwrap().shape, Shape::Alignment);
+        let rebuilt = build(&document).validated().unwrap();
+        let id = roadgen_core::RoadId::new("bend");
+        let (was, now) = (map.road(&id).unwrap(), rebuilt.road(&id).unwrap());
+        assert!(
+            was.reference_line
+                .end_point()
+                .distance_to(now.reference_line.end_point())
+                < 1e-6
+        );
     }
 
     #[test]

@@ -111,3 +111,5 @@ li.invalid .what::before { content: "●"; color: var(--warn); margin-right: 6px
   main { grid-template-columns: 1fr; grid-template-rows: 1fr 45vh; }
   .panel { border-left: 0; border-top: 1px solid var(--line); }
 }
+table.points tr.selected td { background: #4ea1ff22; }
+table.points td:first-child { cursor: pointer; }

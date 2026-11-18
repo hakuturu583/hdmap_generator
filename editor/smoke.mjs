@@ -136,6 +136,45 @@ try {
   check(lanes.length === 3, `the new road has ${lanes.length} lanes after adding one`)
   await page.keyboard.press('Control+z')
 
+  // A tangent handle: select east's middle point and bend the road there.
+  await editor(() => window.roadgenEditor.view(60, 10, 7))
+  let east = (await editor(() => window.roadgenEditor.document())).roads.find((r) => r.id === 'east')
+  const mid = east.points[1]
+  await page.mouse.click(...(await at([36, -1.75])))
+  await page.mouse.click(...(await at(mid)))
+  check((await editor(() => window.roadgenEditor.state.point)) === 1, 'clicking east\'s middle point did not select it')
+  const [p0, p2] = [east.points[0], east.points[2]]
+  const chord = Math.hypot(p2[0] - p0[0], p2[1] - p0[1])
+  const reach = Math.min(Math.hypot(mid[0] - p0[0], mid[1] - p0[1]), Math.hypot(p2[0] - mid[0], p2[1] - mid[1])) / 3
+  const knob = await at([mid[0] + ((p2[0] - p0[0]) / chord) * reach, mid[1] + ((p2[1] - p0[1]) / chord) * reach])
+  const bentBefore = JSON.stringify((await editor(() => window.roadgenEditor.built())).scene.roads.find((r) => r.id === 'road/east').reference_line)
+  await page.mouse.move(...knob)
+  await page.mouse.down()
+  await page.mouse.move(knob[0] + 10, knob[1] + 70, { steps: 8 })
+  await page.mouse.up()
+  east = (await editor(() => window.roadgenEditor.document())).roads.find((r) => r.id === 'east')
+  check(east.handles?.[1], `dragging the handle set none: ${JSON.stringify(east.handles)}`)
+  built = await editor(() => window.roadgenEditor.built())
+  check(built.valid, `the bent road does not validate: ${JSON.stringify(built.problems)}`)
+  check(JSON.stringify(built.scene.roads.find((r) => r.id === 'road/east').reference_line) !== bentBefore, 'the handle did not bend east')
+
+  // An alignment: north, as a straight, then given a curve set.
+  await editor(() => window.roadgenEditor.view(0, 60, 4))
+  await page.mouse.click(...(await at([1.75, 40])))
+  await page.locator('#tab-inspect select').first().selectOption('alignment')
+  const north = (await editor(() => window.roadgenEditor.document())).roads.find((r) => r.id === 'north')
+  check(north.shape === 'alignment' && north.elements.length === 1 && Math.abs(north.heading - 90) < 1e-6, `north as an alignment: ${JSON.stringify(north)}`)
+  await page.getByRole('button', { name: '+ curve set' }).click()
+  built = await editor(() => window.roadgenEditor.built())
+  check(built.valid, `the aligned road does not validate: ${JSON.stringify(built.problems)}`)
+  const aligned = built.scene.roads.find((r) => r.id === 'road/north')
+  check(Math.abs(aligned.length - 128) < 0.01 && aligned.end.point[0] < -20, `north's alignment ends at ${aligned.end.point}, ${aligned.length} m`)
+  await shoot('alignment')
+  for (let i = 0; i < 3; i++) await page.keyboard.press('Control+z')
+  const restored = await editor(() => window.roadgenEditor.document())
+  check(restored.roads.find((r) => r.id === 'north').shape === 'smooth' && !restored.roads.find((r) => r.id === 'east').handles?.length, 'undo did not take the handle and the alignment back')
+  await page.keyboard.press('f')
+
   // Every tab draws without throwing.
   for (const tab of ['Links', 'Problems', 'Map', 'Inspect']) await page.locator('.tabs button', { hasText: tab }).click()
 

@@ -2,7 +2,8 @@
 //! edited.
 //!
 //! A document says far less than the IR can, so this loses things, and says which:
-//! every road becomes its reference line as a polyline and the lanes of its first
+//! every road becomes its reference line — an alignment where it is straights, arcs
+//! and clothoids, a polyline otherwise — and the lanes of its first
 //! cross-section at their starting widths; every junction becomes the links its
 //! connectors were made from; surface features stay on their roads; furniture,
 //! rules, buildings and terrain are dropped.
@@ -12,13 +13,13 @@
 use std::collections::BTreeSet;
 
 use roadgen_core::{
-    BumpProfile, Direction, LateralSide, Map, Point3, RoadEnd, RoadEndpoint, RoadLinkTarget,
-    SurfaceFeature, SurfaceFeatureKind, TrafficHandedness,
+    BumpProfile, Curve3, Direction, LateralSide, Map, Point3, RoadEnd, RoadEndpoint,
+    RoadLinkTarget, SurfaceFeature, SurfaceFeatureKind, TrafficHandedness,
 };
 
 use crate::document::{
-    Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, RutPath, Shape, Side,
-    SurfaceDoc, Travel,
+    Document, ElementDoc, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, RutPath, Shape,
+    Side, SurfaceDoc, Travel,
 };
 
 /// How far a simplified reference line may stray from the one it came from, metres.
@@ -90,10 +91,21 @@ pub fn from_map(map: &Map) -> (Document, Vec<String>) {
                 }
             })
             .collect();
+        // Straights, arcs and clothoids come back as the alignment they are, and
+        // anything else as its line through the simplified points — which an
+        // alignment keeps too, for switching to drawing it by hand.
+        let aligned = alignment_of(&road.reference_line);
         document.roads.push(RoadDoc {
             id,
             points: points.iter().map(|p| p.as_array()).collect(),
-            shape: Shape::Polyline,
+            shape: if aligned.is_some() {
+                Shape::Alignment
+            } else {
+                Shape::Polyline
+            },
+            handles: Vec::new(),
+            heading: aligned.as_ref().map_or(0.0, |(heading, _)| *heading),
+            elements: aligned.map(|(_, elements)| elements).unwrap_or_default(),
             lanes,
             road_type: road.road_type.as_str().to_owned(),
             speed_limit: road.speed_limit.map(|limit| limit.kph()),
@@ -212,6 +224,73 @@ pub fn from_map(map: &Map) -> (Document, Vec<String>) {
         }
     }
     (document, notes)
+}
+
+/// A reference line as an alignment — its heading at the start, degrees, and its
+/// pieces — when it is a chain of straights, arcs and clothoids that
+/// [`roadgen_core::Alignment`] would build again: each piece starting where the
+/// last ended, pointing the way it pointed, and a clothoid starting at the
+/// curvature the piece before it ended with. `None` for anything else, and for a
+/// chain of straights alone, which is drawn as well by its points.
+pub fn alignment_of(curve: &Curve3) -> Option<(f64, Vec<ElementDoc>)> {
+    fn flatten<'a>(curve: &'a Curve3, into: &mut Vec<&'a Curve3>) {
+        match curve {
+            Curve3::Composite(pieces) => pieces.iter().for_each(|piece| flatten(piece, into)),
+            piece => into.push(piece),
+        }
+    }
+    let mut pieces = Vec::new();
+    flatten(curve, &mut pieces);
+
+    let start = curve.start_tangent().ok()?.heading();
+    let mut heading = start;
+    let mut point = curve.start_point();
+    let mut curvature = 0.0;
+    let mut elements = Vec::new();
+    let turned = |a: f64, b: f64| {
+        let d = (a - b).rem_euclid(std::f64::consts::TAU);
+        d.min(std::f64::consts::TAU - d)
+    };
+    for piece in pieces {
+        let (begin, direction, element, ends_curving) = match piece {
+            Curve3::Line(line) => {
+                let (from, to) = (line.start(), line.end());
+                let mut element = ElementDoc::line(from.horizontal_distance_to(to));
+                element.rise = to.z - from.z;
+                (from, (to.y - from.y).atan2(to.x - from.x), element, 0.0)
+            }
+            Curve3::Arc(arc) => {
+                if arc.curvature() == 0.0 {
+                    return None;
+                }
+                let mut element = ElementDoc::arc(arc.horizontal_length(), 1.0 / arc.curvature());
+                element.rise = arc.end_z() - arc.start().z;
+                (arc.start(), arc.heading(), element, arc.curvature())
+            }
+            Curve3::Clothoid(spiral) => {
+                if (spiral.curvature_start() - curvature).abs() > 1e-9 {
+                    return None;
+                }
+                let end = spiral.curvature_end();
+                let mut element =
+                    ElementDoc::spiral(spiral.horizontal_length(), (end != 0.0).then(|| 1.0 / end));
+                element.rise = spiral.end_z() - spiral.start().z;
+                (spiral.start(), spiral.heading(), element, end)
+            }
+            _ => return None,
+        };
+        if begin.distance_to(point) > 1e-3 || turned(direction, heading) > 1e-6 {
+            return None;
+        }
+        elements.push(element);
+        point = piece.end_point();
+        heading = piece.end_tangent().ok()?.heading();
+        curvature = ends_curving;
+    }
+    elements
+        .iter()
+        .any(|element| element.kind != "line")
+        .then(|| (start.to_degrees(), elements))
 }
 
 /// A surface feature as the document says it: its footprint, and the parameters

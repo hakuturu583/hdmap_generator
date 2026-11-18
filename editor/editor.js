@@ -77,8 +77,56 @@ const clone = (value) => JSON.parse(JSON.stringify(value))
 const roadKey = (irId) => (irId?.startsWith('road/') ? irId.slice(5) : irId)
 const junctionKey = (irId) => (irId?.startsWith('junction/') ? irId.slice(9) : irId)
 const findRoad = (id) => state.doc.roads.find((road) => road.id === id)
-const endPoint = (road, end) => (end === 'start' ? road.points[0] : road.points[road.points.length - 1])
-const endIndex = (road, end) => (end === 'start' ? 0 : road.points.length - 1)
+const isAligned = (road) => road.shape === 'alignment'
+const endIndex = (road, end) => (end === 'start' || isAligned(road) ? 0 : road.points.length - 1)
+const builtRoad = (id) => state.built?.scene?.roads?.find((r) => r.id === `road/${id}`)
+
+/// Where one end of a road is. An alignment's far end is wherever its pieces take
+/// it, which only the built road knows.
+function endPoint(road, end) {
+  if (end === 'start') return road.points[0]
+  if (!isAligned(road)) return road.points[road.points.length - 1]
+  return builtRoad(road.id)?.end?.point ?? road.points[0]
+}
+
+/// Puts one end of a road at `point`. An alignment's far end cannot be put
+/// anywhere by itself, so the whole road moves to bring it there.
+function setEndPoint(road, end, point) {
+  if (!isAligned(road) || end === 'start') {
+    road.points[endIndex(road, end)] = [...point]
+    return
+  }
+  const now = endPoint(road, 'end')
+  const start = road.points[0]
+  road.points[0] = [start[0] + point[0] - now[0], start[1] + point[1] - now[1], start[2] + point[2] - now[2]]
+}
+
+/// The direction an alignment starts in, as a unit vector in plan.
+const headingVector = (road) => [Math.cos(((road.heading ?? 0) * Math.PI) / 180), Math.sin(((road.heading ?? 0) * Math.PI) / 180)]
+const HEADING_PX = 46
+
+/// A smooth road's handle at point `i`: the one set there, or the one the curve
+/// works out — along the chord between the neighbours, a third of the shorter
+/// chord either side long. `[x, y, set]`.
+function handleOf(road, i) {
+  const set = road.handles?.[i]
+  if (set) return [set[0], set[1], true]
+  const p = road.points
+  const [a, b] = [p[Math.max(0, i - 1)], p[Math.min(p.length - 1, i + 1)]]
+  const [dx, dy] = [b[0] - a[0], b[1] - a[1]]
+  const norm = Math.hypot(dx, dy) || 1
+  const chords = [i > 0 ? dist(p[i - 1], p[i]) : Infinity, i < p.length - 1 ? dist(p[i], p[i + 1]) : Infinity]
+  const reach = Math.min(...chords) / 3
+  return [(dx / norm) * reach, (dy / norm) * reach, false]
+}
+
+/// Keeps a road's handles in step with its points when one is put in or taken out.
+function spliceHandles(road, index, removed, ...added) {
+  if (!road.handles?.length) return
+  while (road.handles.length < index) road.handles.push(null)
+  road.handles.splice(index, removed, ...added.map(() => null))
+  while (road.handles.length && road.handles[road.handles.length - 1] == null) road.handles.pop()
+}
 
 function uniqueId(prefix, taken) {
   for (let i = 1; ; i++) {
@@ -392,6 +440,7 @@ function render() {
     ctx.lineWidth = (selected ? 2 : 1) * px
     ctx.stroke()
     ctx.setLineDash([])
+    if (selected && isAligned(road) && irRoad) drawElementTicks(road, line, px)
   }
 
   const selectedLink = state.selection?.kind === 'link' ? state.selection.index : null
@@ -421,10 +470,58 @@ function render() {
 
   // Back to screen space for handles, which keep their size at any zoom.
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  const chosen = selectedRoad && findRoad(selectedRoad)
+  if (chosen && isAligned(chosen)) {
+    // The heading: a line out of the start, its knob to turn the road by.
+    const [sx, sy] = toScreen(chosen.points[0])
+    const [ux, uy] = headingVector(chosen)
+    const [kx, ky] = [sx + ux * HEADING_PX, sy - uy * HEADING_PX]
+    ctx.beginPath()
+    ctx.moveTo(sx, sy)
+    ctx.lineTo(kx, ky)
+    ctx.strokeStyle = '#ffd33d'
+    ctx.lineWidth = 2
+    ctx.stroke()
+    ctx.beginPath()
+    ctx.arc(kx, ky, 5.5, 0, Math.PI * 2)
+    ctx.fillStyle = '#ffd33d'
+    ctx.fill()
+  } else if (chosen && chosen.shape !== 'polyline' && state.point != null && chosen.points[state.point]) {
+    // The selected point's tangent handle, either side of it: solid where it was
+    // set, hollow where the curve works it out.
+    const [hx, hy, set] = handleOf(chosen, state.point)
+    const [sx, sy] = toScreen(chosen.points[state.point])
+    const p = chosen.points[state.point]
+    for (const sign of [1, -1]) {
+      const [kx, ky] = toScreen([p[0] + sign * hx, p[1] + sign * hy])
+      ctx.beginPath()
+      ctx.moveTo(sx, sy)
+      ctx.lineTo(kx, ky)
+      ctx.strokeStyle = '#c084fc'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+      ctx.beginPath()
+      ctx.arc(kx, ky, 5, 0, Math.PI * 2)
+      ctx.fillStyle = set ? '#c084fc' : '#1d2127'
+      ctx.fill()
+      ctx.strokeStyle = '#c084fc'
+      ctx.stroke()
+    }
+  }
   for (const road of state.doc.roads) {
     const selected = road.id === selectedRoad
-    road.points.forEach((point, i) => {
-      const isEnd = i === 0 || i === road.points.length - 1
+    const ends = isAligned(road) ? [road.points[0], endPoint(road, 'end')] : road.points
+    ends.forEach((point, i) => {
+      const isEnd = i === 0 || i === ends.length - 1
+      if (isAligned(road) && i > 0 && selected) {
+        // An alignment's far end is where its pieces take it: shown, not held.
+        const [sx, sy] = toScreen(point)
+        ctx.beginPath()
+        ctx.arc(sx, sy, 4, 0, Math.PI * 2)
+        ctx.fillStyle = '#c9d1d9'
+        ctx.fill()
+        return
+      }
       if (!selected && !(isEnd && (state.tool !== 'select' || scale > 0.8))) return
       const [sx, sy] = toScreen(point)
       ctx.beginPath()
@@ -490,6 +587,42 @@ function render() {
     ctx.lineWidth = 2
     ctx.stroke()
   }
+}
+
+/// A tick across an alignment where each piece gives way to the next, so its
+/// pieces can be told apart on the map.
+function drawElementTicks(road, line, px) {
+  let station = 0
+  ctx.strokeStyle = '#ffd33d'
+  ctx.lineWidth = 2 * px
+  for (const element of road.elements ?? []) {
+    station += element.length
+    const at = alongLine(line, station)
+    if (!at) continue
+    const [x, y, ux, uy] = at
+    const half = 6 * px
+    ctx.beginPath()
+    ctx.moveTo(x - uy * half, y + ux * half)
+    ctx.lineTo(x + uy * half, y - ux * half)
+    ctx.stroke()
+  }
+}
+
+/// The point `station` metres along a polyline, and the direction there.
+function alongLine(line, station) {
+  let travelled = 0
+  for (let i = 1; i < line.length; i++) {
+    const [a, b] = [line[i - 1], line[i]]
+    const length = dist(a, b)
+    if (length === 0) continue
+    if (travelled + length >= station - 1e-9 || i === line.length - 1) {
+      const t = Math.max(0, Math.min(1, (station - travelled) / length))
+      const [ux, uy] = [(b[0] - a[0]) / length, (b[1] - a[1]) / length]
+      return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, ux, uy]
+    }
+    travelled += length
+  }
+  return null
 }
 
 function drawGrid(px) {
@@ -576,13 +709,35 @@ function screenDistance(world, screen) {
   return Math.hypot(sx - screen[0], sy - screen[1])
 }
 
+/// The tangent or heading handle of the selected road under the pointer.
+function tangentAt(screen) {
+  if (state.selection?.kind !== 'road') return null
+  const road = findRoad(state.selection.id)
+  if (!road) return null
+  if (isAligned(road)) {
+    const [sx, sy] = toScreen(road.points[0])
+    const [ux, uy] = headingVector(road)
+    const hit = Math.hypot(sx + ux * HEADING_PX - screen[0], sy - uy * HEADING_PX - screen[1]) <= HANDLE_PX
+    return hit ? { kind: 'heading', road: road.id } : null
+  }
+  if (road.shape === 'polyline' || state.point == null || !road.points[state.point]) return null
+  const [hx, hy] = handleOf(road, state.point)
+  const p = road.points[state.point]
+  for (const sign of [1, -1]) {
+    if (screenDistance([p[0] + sign * hx, p[1] + sign * hy], screen) <= HANDLE_PX) {
+      return { kind: 'tangent', road: road.id, index: state.point, sign }
+    }
+  }
+  return null
+}
+
 /// The control point of the selected road under the pointer.
 function handleAt(screen) {
   if (state.selection?.kind !== 'road') return null
   const road = findRoad(state.selection.id)
   if (!road) return null
   let best = null
-  road.points.forEach((point, index) => {
+  ;(isAligned(road) ? road.points.slice(0, 1) : road.points).forEach((point, index) => {
     const d = screenDistance(point, screen)
     if (d <= HANDLE_PX && (!best || d < best.d)) best = { road: road.id, index, d }
   })
@@ -730,6 +885,12 @@ canvas.addEventListener('pointerdown', (event) => {
   if (state.tool === 'road') return addDrawingPoint(world)
   if (state.tool === 'link') return pickLinkEnd(screen)
 
+  const tangent = tangentAt(screen)
+  if (tangent) {
+    state.drag = { ...tangent, snapshot: JSON.stringify(state.doc), moved: false }
+    canvas.setPointerCapture(event.pointerId)
+    return
+  }
   const handle = handleAt(screen)
   if (handle) {
     state.point = handle.index
@@ -813,6 +974,10 @@ canvas.addEventListener('pointermove', (event) => {
     moveSurface(drag, world)
     return
   }
+  if (drag?.kind === 'tangent' || drag?.kind === 'heading') {
+    turnHandle(drag, world)
+    return
+  }
   if (state.tool !== 'select') render()
 })
 
@@ -820,7 +985,7 @@ canvas.addEventListener('pointerup', (event) => {
   const drag = state.drag
   state.drag = null
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
-  if ((drag?.kind === 'point' || drag?.kind === 'surface') && drag.moved) {
+  if (['point', 'surface', 'tangent', 'heading'].includes(drag?.kind) && drag.moved) {
     checkpoint(drag.snapshot)
     changed()
   }
@@ -836,10 +1001,13 @@ canvas.addEventListener('dblclick', (event) => {
   }
   if (state.tool !== 'select' || state.selection?.kind !== 'road') return
   const road = findRoad(state.selection.id)
-  const segment = road && nearestSegment(road, world)
+  if (!road || isAligned(road)) return
+  const segment = nearestSegment(road, world)
   if (!segment || segment.d * state.view.scale > 25) return
   commit((doc) => {
-    doc.roads.find((r) => r.id === road.id).points.splice(segment.index, 0, segment.point)
+    const r = doc.roads.find((r) => r.id === road.id)
+    r.points.splice(segment.index, 0, segment.point)
+    spliceHandles(r, segment.index, 0, null)
   })
   state.point = segment.index
   renderPanels()
@@ -876,9 +1044,15 @@ function movePoint(drag, world, free) {
     const snap = snapped(world, road.id)
     if (snap.end) target = snap.point
   }
+  // An alignment moves whole when its start does, so its far end moves too —
+  // by as much as the start has since the drag began, because the built road
+  // the far end is read from lags a frame behind.
+  drag.origin = drag.origin ?? { start: [...old], far: isAligned(road) ? [...endPoint(road, 'end')] : null }
   road.points[drag.index] = target
-  if (isEnd) {
-    const end = drag.index === 0 ? 'start' : 'end'
+  const moved = isEnd ? [[drag.index === 0 ? 'start' : 'end', target]] : []
+  const { start, far } = drag.origin
+  if (far) moved.push(['end', far.map((v, k) => v + target[k] - start[k])])
+  for (const [end, point] of moved) {
     for (const link of state.doc.links) {
       if (link.junction) continue
       const partner =
@@ -888,8 +1062,31 @@ function movePoint(drag, world, free) {
             ? { road: link.from, end: link.from_end }
             : null
       const other = partner && findRoad(partner.road)
-      if (other && other !== road) other.points[endIndex(other, partner.end)] = [...target]
+      if (other && other !== road && !isAligned(other)) setEndPoint(other, partner.end, point)
     }
+  }
+  drag.moved = true
+  rebuildSoon()
+  renderPanelsSoon()
+}
+
+/// Turns a handle: a tangent handle sets its point's handle to the pointer
+/// (mirrored for the one behind the point), the heading knob points the
+/// alignment at the pointer.
+function turnHandle(drag, world) {
+  const road = findRoad(drag.road)
+  if (!road) return
+  if (drag.kind === 'heading') {
+    const start = road.points[0]
+    const degrees = (Math.atan2(world[1] - start[1], world[0] - start[0]) * 180) / Math.PI
+    road.heading = Math.round(degrees * 10) / 10
+  } else {
+    const p = road.points[drag.index]
+    const handle = [drag.sign * (world[0] - p[0]), drag.sign * (world[1] - p[1])]
+    if (Math.hypot(...handle) < 0.05) return
+    road.handles = road.handles ?? []
+    while (road.handles.length <= drag.index) road.handles.push(null)
+    road.handles[drag.index] = handle.map((v) => Math.round(v * 1000) / 1000)
   }
   drag.moved = true
   rebuildSoon()
@@ -995,7 +1192,8 @@ function pickLinkEnd(screen) {
         // A direct joint is one point: bring the second end onto the first.
         const a = doc.roads.find((r) => r.id === from.road)
         const b = doc.roads.find((r) => r.id === end.road)
-        b.points[endIndex(b, end.end)] = [...endPoint(a, from.end)]
+        if (isAligned(b) && !isAligned(a)) setEndPoint(a, from.end, endPoint(b, end.end))
+        else setEndPoint(b, end.end, endPoint(a, from.end))
       }
       doc.links.push({ from: from.road, from_end: from.end, to: end.road, to_end: end.end, junction })
     },
@@ -1016,7 +1214,11 @@ function deleteSelection() {
     if (road.points.length <= 2) return toast('A road keeps two points at least')
     const index = state.point
     state.point = null
-    return commit((doc) => doc.roads.find((r) => r.id === s.id).points.splice(index, 1))
+    return commit((doc) => {
+      const r = doc.roads.find((r) => r.id === s.id)
+      r.points.splice(index, 1)
+      spliceHandles(r, index, 1)
+    })
   }
   if (s.kind === 'road') {
     return commit(
@@ -1159,13 +1361,27 @@ function renderRoadInspector(tab, road) {
         onchange: (event) => renameRoad(id, event.target.value.trim()),
       }),
     ),
-    field('shape', select([['smooth', 'smooth curve'], ['polyline', 'straight segments']], road.shape ?? 'smooth', (v) => editRoad(id, (r) => (r.shape = v)))),
+    field(
+      'shape',
+      select(
+        [['smooth', 'smooth curve through points'], ['polyline', 'straight segments'], ['alignment', 'alignment: straights, arcs, clothoids']],
+        road.shape ?? 'smooth',
+        (v) => editRoad(id, (r) => changeShape(r, v)),
+      ),
+    ),
     field('road type', select(ROAD_TYPES, road.road_type ?? 'town', (v) => editRoad(id, (r) => (r.road_type = v)))),
     field(
       'speed limit km/h',
       numberInput(road.speed_limit, (v) => editRoad(id, (r) => (v == null ? delete r.speed_limit : (r.speed_limit = v))), { min: 1, placeholder: 'none' }),
     ),
   )
+
+  // The shape first: it is what the road is.
+  if (isAligned(road)) {
+    renderAlignmentSection(tab, road)
+  } else {
+    renderPointsSection(tab, road)
+  }
 
   tab.append(h('h4', {}, `Lanes (${road.lanes.length})`), h('p', { class: 'muted' }, 'Listed outwards from the reference line on each side.'))
   road.lanes.forEach((lane, index) => tab.append(laneCard(road, lane, index)))
@@ -1181,7 +1397,140 @@ function renderRoadInspector(tab, road) {
 
   renderSurfaceSection(tab, road)
 
-  tab.append(h('h4', {}, 'Points (x, y, z metres)'))
+  const links = state.doc.links.map((link, index) => ({ link, index })).filter(({ link }) => link.from === id || link.to === id)
+  tab.append(h('h4', {}, `Links (${links.length})`), linkList(links))
+  tab.append(h('h4', {}, ''), h('button', { onclick: deleteSelection }, 'Delete road'))
+}
+
+/// Switches how a road's shape is said. Into an alignment, the road starts where
+/// it did, the way it did, as one straight as long as it was — ready to be given
+/// its bends. Out of one, its points are taken off the built road.
+function changeShape(road, shape) {
+  const built = builtRoad(road.id)
+  if (shape === 'alignment' && !isAligned(road)) {
+    const [a, b] = road.points
+    road.heading = Math.round((Math.atan2(b[1] - a[1], b[0] - a[0]) * 1800) / Math.PI) / 10
+    if (!road.elements?.length) {
+      const length = built?.length ?? road.points.slice(1).reduce((sum, p, i) => sum + dist(road.points[i], p), 0)
+      road.elements = [{ kind: 'line', length: Math.round(length * 100) / 100, rise: 0 }]
+    }
+  } else if (shape !== 'alignment' && isAligned(road) && built) {
+    const line = built.reference_line
+    const count = Math.min(line.length, Math.max(2, Math.round(built.length / 25) + 1))
+    const z = road.points[0][2]
+    road.points = Array.from({ length: count }, (_, i) => {
+      const [x, y] = line[Math.round((i * (line.length - 1)) / (count - 1))]
+      return [x, y, z]
+    })
+    road.handles = []
+  }
+  road.shape = shape
+}
+
+const ELEMENT_KINDS = [['line', 'straight'], ['arc', 'arc'], ['spiral', 'clothoid']]
+
+function renderAlignmentSection(tab, road) {
+  const id = road.id
+  const start = road.points[0]
+  const total = (road.elements ?? []).reduce((sum, e) => sum + (e.length || 0), 0)
+  tab.append(
+    h('h4', {}, `Alignment (${(road.elements ?? []).length} pieces, ${total.toFixed(1)} m)`),
+    h('p', { class: 'muted' }, 'From its start, at its heading, each piece where the last one ended. Radius in metres: positive turns left, negative right. A clothoid eases from the curvature before it to the radius it ends at — blank for straight. Drag the square to move the road, the yellow knob to turn it.'),
+    ...['x', 'y', 'z'].map((axis, k) =>
+      field(`start ${axis} m`, numberInput(start[k].toFixed(3), (v) => v != null && editRoad(id, (r) => (r.points[0][k] = v)))),
+    ),
+    field('heading °', numberInput(road.heading ?? 0, (v) => v != null && editRoad(id, (r) => (r.heading = v)), { step: 0.1 })),
+  )
+  ;(road.elements ?? []).forEach((element, index) => tab.append(elementCard(road, element, index)))
+  const add = (element) => editRoad(id, (r) => (r.elements = [...(r.elements ?? []), element]))
+  tab.append(
+    h(
+      'div',
+      { class: 'row' },
+      h('button', { onclick: () => add({ kind: 'line', length: 30, rise: 0 }) }, '+ straight'),
+      h('button', { onclick: () => add({ kind: 'arc', length: 30, radius: 60, rise: 0 }) }, '+ arc'),
+      h('button', { onclick: () => add({ kind: 'spiral', length: 20, radius: 60, rise: 0 }) }, '+ clothoid'),
+      h(
+        'button',
+        {
+          title: 'Ease in, bend, ease out: a clothoid into an arc and a clothoid back to straight',
+          onclick: () =>
+            editRoad(id, (r) => {
+              r.elements = [
+                ...(r.elements ?? []),
+                { kind: 'spiral', length: 20, radius: 60, rise: 0 },
+                { kind: 'arc', length: 30, radius: 60, rise: 0 },
+                { kind: 'spiral', length: 20, rise: 0 },
+              ]
+            }),
+        },
+        '+ curve set',
+      ),
+    ),
+  )
+}
+
+function elementCard(road, element, index) {
+  const id = road.id
+  const edit = (change) => editRoad(id, (r) => change(r.elements[index]))
+  const move = (delta) =>
+    editRoad(id, (r) => {
+      const [moved] = r.elements.splice(index, 1)
+      r.elements.splice(index + delta, 0, moved)
+    })
+  const radius = element.kind === 'line'
+    ? []
+    : [
+        h('span', { class: 'muted' }, element.kind === 'arc' ? 'radius m' : 'end radius m'),
+        numberInput(element.radius ?? '', (v) => edit((e) => (v == null || v === 0 ? delete e.radius : (e.radius = v))), {
+          placeholder: element.kind === 'arc' ? 'required' : 'straight',
+        }),
+      ]
+  return h(
+    'div',
+    { class: 'lane' },
+    h(
+      'div',
+      { class: 'head' },
+      h(
+        'span',
+        { class: 'row' },
+        h('strong', {}, `#${index}`),
+        select(ELEMENT_KINDS, element.kind, (v) =>
+          edit((e) => {
+            e.kind = v
+            if (v === 'arc' && !e.radius) e.radius = 60
+          }),
+        ),
+      ),
+      h(
+        'span',
+        { class: 'row' },
+        h('button', { title: 'Earlier', disabled: index === 0, onclick: () => move(-1) }, '↑'),
+        h('button', { title: 'Later', disabled: index === road.elements.length - 1, onclick: () => move(1) }, '↓'),
+        h('button', { title: 'Remove this piece', disabled: road.elements.length <= 1, onclick: () => editRoad(id, (r) => r.elements.splice(index, 1)) }, '×'),
+      ),
+    ),
+    h(
+      'div',
+      { class: 'grid' },
+      h('span', { class: 'muted' }, 'length m'),
+      numberInput(element.length, (v) => v != null && v > 0 && edit((e) => (e.length = v)), { min: 0.1, step: 1 }),
+      ...radius,
+      h('span', { class: 'muted' }, 'rise m'),
+      numberInput(element.rise ?? 0, (v) => edit((e) => (e.rise = v ?? 0)), { step: 0.1 }),
+    ),
+  )
+}
+
+function renderPointsSection(tab, road) {
+  const id = road.id
+  tab.append(
+    h('h4', {}, 'Points (x, y, z metres)'),
+    road.shape === 'polyline'
+      ? null
+      : h('p', { class: 'muted' }, 'Select a point to see its tangent handles and drag them to bend the road there; “auto” is the handle the curve works out by itself.'),
+  )
   const table = h('table', { class: 'points' })
   road.points.forEach((point, index) => {
     const coordinate = (axis) =>
@@ -1189,28 +1538,46 @@ function renderRoadInspector(tab, road) {
     table.append(
       h(
         'tr',
-        { class: index === state.point ? 'selected' : '' },
+        {
+          class: index === state.point ? 'selected' : '',
+          title: 'Select this point',
+          onclick: (event) => {
+            if (event.target.tagName !== 'TD' || state.point === index) return
+            state.point = index
+            renderPanels()
+            render()
+          },
+        },
         h('td', { class: 'muted' }, index),
         h('td', {}, coordinate(0)),
         h('td', {}, coordinate(1)),
         h('td', {}, coordinate(2)),
+        road.shape === 'polyline'
+          ? null
+          : h(
+              'td',
+              {},
+              road.handles?.[index]
+                ? h('button', { title: 'Let the curve work this handle out again', onclick: () => editRoad(id, (r) => (r.handles[index] = null)) }, 'reset')
+                : h('span', { class: 'muted' }, 'auto'),
+            ),
         h(
           'td',
           {},
           h('button', {
             title: 'Remove this point',
             disabled: road.points.length <= 2,
-            onclick: () => editRoad(id, (r) => r.points.splice(index, 1)),
+            onclick: () =>
+              editRoad(id, (r) => {
+                r.points.splice(index, 1)
+                spliceHandles(r, index, 1)
+              }),
           }, '×'),
         ),
       ),
     )
   })
   tab.append(table)
-
-  const links = state.doc.links.map((link, index) => ({ link, index })).filter(({ link }) => link.from === id || link.to === id)
-  tab.append(h('h4', {}, `Links (${links.length})`), linkList(links))
-  tab.append(h('h4', {}, ''), h('button', { onclick: deleteSelection }, 'Delete road'))
 }
 
 /// Where the middle of a lane is, metres to the left of the reference line, from

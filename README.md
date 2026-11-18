@@ -2852,12 +2852,22 @@ change:
 
 A few things the document does for you:
 
-- **Roads are smooth by default.** A road's reference line passes through its points
-  as cubic Béziers with Catmull-Rom tangents; set its shape to `polyline` for
-  straight segments.
+- **A road is drawn three ways.** By default its reference line passes through
+  the points you clicked, as cubic Béziers with Catmull-Rom tangents. Select a point
+  and its **tangent handles** appear: drag one to set the direction and reach of the
+  curve there, mirrored either side so the road stays smooth through the point
+  (`reset` in the points table gives the curve back its own). Set the shape to
+  `polyline` for straight segments. Or set it to **`alignment`**, the way a road
+  designer writes one: a start point, a heading, and a chain of straights, arcs and
+  clothoids, each with its length, radius (positive left) and rise — `+ curve set`
+  adds the usual clothoid–arc–clothoid bend. Ticks on the map mark where each piece
+  gives way to the next; the square moves the road and the yellow knob turns it.
+  An OpenDRIVE or IR file whose roads are straights, arcs and clothoids opens as
+  alignments, exactly, rather than as points sampled along them.
 - **Direct joints have no corner.** Where two smooth roads are joined directly, both
   ends are bent to one shared tangent, which is what the generator needs to join a
-  curve to a curve. Joining through a junction generates a connector per movement.
+  curve to a curve. An alignment, or an end whose handle you set, is not bent: the
+  smooth road on the other side meets it on its terms. Joining through a junction generates a connector per movement.
 - **A wrong document still draws.** In the middle of an edit something is usually
   wrong. A road that cannot be built is left out and named, a link the generator
   refuses is left out and named — found by putting the links back one at a time — and

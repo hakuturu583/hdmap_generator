@@ -17,7 +17,7 @@ use roadgen_core::{
     ValidatedMap, ValidationConfig, Vector3,
 };
 
-use roadgen_core::{BumpKind, BumpProfile, LaneRef, RoughnessClass, SurfaceFeatureKind};
+use roadgen_core::{Alignment, BumpKind, BumpProfile, LaneRef, RoughnessClass, SurfaceFeatureKind};
 
 use crate::document::{
     Document, End, Handedness, LaneDoc, LinkDoc, Marking, RoadDoc, Shape, Side, SurfaceDoc, Travel,
@@ -440,28 +440,35 @@ fn marking(marking: &Marking) -> Result<BoundaryMarking, String> {
 /// increasing station.
 type Tangents = (Option<Vector3>, Option<Vector3>);
 
-/// The reference line through a road's control points.
+/// The reference line a road's document describes.
 pub fn reference_line(road: &RoadDoc) -> Result<Curve3, String> {
     reference_line_with(road, (None, None))
 }
 
-/// The control points with the doubled ones dropped: a point dropped on top of the
-/// last one is a double click, not a shape.
-fn control_points(road: &RoadDoc) -> Result<Vec<Point3>, String> {
-    let mut points: Vec<Point3> = Vec::with_capacity(road.points.len());
-    for &[x, y, z] in &road.points {
+/// A control point and the tangent handle set at it, if one is.
+type Control = (Point3, Option<[f64; 2]>);
+
+/// The control points with the doubled ones dropped — a point dropped on top of
+/// the last one is a double click, not a shape — each with the tangent handle set
+/// at it.
+fn control_points(road: &RoadDoc) -> Result<Vec<Control>, String> {
+    let mut points: Vec<Control> = Vec::with_capacity(road.points.len());
+    for (index, &[x, y, z]) in road.points.iter().enumerate() {
         if !(x.is_finite() && y.is_finite() && z.is_finite()) {
             return Err(format!(
                 "road '{}' has a point that is not a number",
                 road.id
             ));
         }
+        let handle = road
+            .handle(index)
+            .filter(|[hx, hy]| hx.is_finite() && hy.is_finite() && hx.hypot(*hy) > 1e-3);
         let point = Point3::new(x, y, z);
         if points
             .last()
-            .is_none_or(|last| last.horizontal_distance_to(point) > 1e-3)
+            .is_none_or(|(last, _)| last.horizontal_distance_to(point) > 1e-3)
         {
-            points.push(point);
+            points.push((point, handle));
         }
     }
     if points.len() < 2 {
@@ -474,15 +481,59 @@ fn control_points(road: &RoadDoc) -> Result<Vec<Point3>, String> {
 }
 
 fn reference_line_with(road: &RoadDoc, ends: Tangents) -> Result<Curve3, String> {
-    let points = control_points(road)?;
-    let held = ends.0.is_some() || ends.1.is_some();
+    if road.shape == Shape::Alignment {
+        return alignment(road);
+    }
+    let controls = control_points(road)?;
+    let points: Vec<Point3> = controls.iter().map(|(point, _)| *point).collect();
+    let handles: Vec<Option<[f64; 2]>> = controls.iter().map(|(_, handle)| *handle).collect();
+    let held = ends.0.is_some() || ends.1.is_some() || handles.iter().any(Option::is_some);
     let curve = match (road.shape, points.len()) {
         (Shape::Polyline, 2) => Curve3::line(points[0], points[1]),
         (Shape::Smooth, 2) if !held => Curve3::line(points[0], points[1]),
         (Shape::Polyline, _) => Curve3::polyline(points),
-        (Shape::Smooth, _) => smooth(&points, ends),
+        _ => smooth(&points, &handles, ends),
     };
     curve.map_err(|error| format!("road '{}': {error}", road.id))
+}
+
+/// An alignment's reference line: its pieces chained from its first point.
+fn alignment(road: &RoadDoc) -> Result<Curve3, String> {
+    let fail = |what: String| format!("road '{}': {what}", road.id);
+    let &[x, y, z] = road
+        .points
+        .first()
+        .ok_or_else(|| fail("an alignment needs a point to start from".to_owned()))?;
+    if road.elements.is_empty() {
+        return Err(fail("an alignment needs one piece at least".to_owned()));
+    }
+    if !road.heading.is_finite() {
+        return Err(fail("its heading is not a number".to_owned()));
+    }
+    let curvature = |radius: Option<f64>| match radius {
+        Some(radius) if radius.is_finite() && radius != 0.0 => Some(1.0 / radius),
+        _ => None,
+    };
+    let mut chain = Alignment::new(Point3::new(x, y, z), road.heading.to_radians());
+    for (index, element) in road.elements.iter().enumerate() {
+        let piece = |what: &str| fail(format!("piece {index}: {what}"));
+        chain = match element.kind.to_ascii_lowercase().as_str() {
+            "line" => chain.line(element.length, element.rise),
+            "arc" => {
+                let k = curvature(element.radius)
+                    .ok_or_else(|| piece("an arc needs a radius, and not zero"))?;
+                chain.arc(element.length, k, element.rise)
+            }
+            "spiral" | "clothoid" => chain.spiral(
+                element.length,
+                curvature(element.radius).unwrap_or(0.0),
+                element.rise,
+            ),
+            other => return Err(piece(&format!("'{other}' is not line, arc or spiral"))),
+        }
+        .map_err(|error| piece(&error.to_string()))?;
+    }
+    chain.finish().map_err(|error| fail(error.to_string()))
 }
 
 /// The natural direction of a smooth curve through `points` at control point `i`:
@@ -493,26 +544,69 @@ fn chord_at(points: &[Point3], i: usize) -> Vector3 {
 }
 
 /// Cubic Bézier pieces through every point, each meeting the next with the same
-/// tangent; the two ends held to `ends` where given.
-fn smooth(points: &[Point3], ends: Tangents) -> Result<Curve3, roadgen_core::GeometryError> {
+/// tangent.
+///
+/// A point's direction is its handle's where it has one, the chord between its
+/// neighbours where it does not, and at either end the direction a joint holds it
+/// to, which wins over both. Between two points without handles, each control
+/// point stands a third of the chord off its end — the Catmull-Rom curve the road
+/// had before handles existed. A handle sets its own length instead, the same
+/// either side of its point, so the curve stays smooth through it; and the
+/// control points climb with the chord, so a handle bends the road in plan and
+/// never in height.
+fn smooth(
+    points: &[Point3],
+    handles: &[Option<[f64; 2]>],
+    ends: Tangents,
+) -> Result<Curve3, roadgen_core::GeometryError> {
     let last = points.len() - 1;
-    let tangents = (0..=last)
+    let directions: Vec<Vector3> = (0..=last)
         .map(|i| {
             let held = match i {
                 0 => ends.0,
                 i if i == last => ends.1,
                 _ => None,
             };
-            held.unwrap_or_else(|| chord_at(points, i)).normalize()
+            held.or_else(|| handles[i].map(|[x, y]| Vector3::new(x, y, 0.0)))
+                .unwrap_or_else(|| chord_at(points, i))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
     let pieces = (0..last)
         .map(|i| {
-            roadgen_core::geometry::Bezier3::hermite(
-                points[i],
-                tangents[i],
-                points[i + 1],
-                tangents[i + 1],
+            let (from, to) = (points[i], points[i + 1]);
+            if handles[i].is_none() && handles[i + 1].is_none() {
+                return roadgen_core::geometry::Bezier3::hermite(
+                    from,
+                    directions[i].normalize()?,
+                    to,
+                    directions[i + 1].normalize()?,
+                    SamplingConfig::default(),
+                )
+                .map(Curve3::Bezier);
+            }
+            let chord = from.horizontal_distance_to(to);
+            let climb = (to.z - from.z) / chord;
+            // A control point `length` metres off `point` in plan along `direction`,
+            // forwards (`sign` 1) or back (-1), at the height the chord has there.
+            let control = |point: Point3, direction: Vector3, length: f64, sign: f64| {
+                let plan = direction.horizontal_norm();
+                if plan < 1e-12 {
+                    return Err(roadgen_core::GeometryError::NoHorizontalExtent);
+                }
+                Ok(Point3::new(
+                    point.x + sign * direction.x / plan * length,
+                    point.y + sign * direction.y / plan * length,
+                    point.z + sign * climb * length,
+                ))
+            };
+            let reach = |handle: Option<[f64; 2]>| handle.map_or(chord / 3.0, |[x, y]| x.hypot(y));
+            roadgen_core::geometry::Bezier3::new(
+                [
+                    from,
+                    control(from, directions[i], reach(handles[i]), 1.0)?,
+                    control(to, directions[i + 1], reach(handles[i + 1]), -1.0)?,
+                    to,
+                ],
                 SamplingConfig::default(),
             )
             .map(Curve3::Bezier)
@@ -521,44 +615,89 @@ fn smooth(points: &[Point3], ends: Tangents) -> Result<Curve3, roadgen_core::Geo
     Curve3::composite(pieces)
 }
 
-/// One tangent for both roads at every direct joint between two smooth roads whose
-/// ends meet, so that the joint has no corner in it.
+/// One end of a road as a joint sees it: where it is, the way the reference line
+/// runs there, and whether the joint may bend it.
+struct JointEnd {
+    point: Point3,
+    along: Vector3,
+    bendable: bool,
+}
+
+fn joint_end(road: &RoadDoc, end: End) -> Option<JointEnd> {
+    match road.shape {
+        Shape::Polyline => None,
+        Shape::Alignment => {
+            // An alignment's direction is what its pieces make it; a joint meets
+            // it as it is.
+            let curve = alignment(road).ok()?;
+            let (point, tangent) = match end {
+                End::Start => (curve.start_point(), curve.start_tangent().ok()?),
+                End::End => (curve.end_point(), curve.end_tangent().ok()?),
+            };
+            Some(JointEnd {
+                point,
+                along: tangent.get(),
+                bendable: false,
+            })
+        }
+        Shape::Smooth => {
+            let controls = control_points(road).ok()?;
+            let points: Vec<Point3> = controls.iter().map(|(point, _)| *point).collect();
+            let index = match end {
+                End::Start => 0,
+                End::End => points.len() - 1,
+            };
+            // A handle the user set at the end says which way the road leaves it.
+            Some(match controls[index].1 {
+                Some([x, y]) => JointEnd {
+                    point: points[index],
+                    along: Vector3::new(x, y, 0.0),
+                    bendable: false,
+                },
+                None => JointEnd {
+                    point: points[index],
+                    along: chord_at(&points, index),
+                    bendable: true,
+                },
+            })
+        }
+    }
+}
+
+/// One tangent for both roads at every direct joint whose ends meet, so that the
+/// joint has no corner in it.
 ///
 /// The generator can round the corner where two straight roads meet, but not where
 /// a curve arrives, and a road drawn by hand arrives at an angle whatever is done.
-/// So a direct link between smooth roads bends both ends to the mean of their
-/// directions there. A polyline road keeps its corner: the user drew one.
+/// So a smooth road joined directly to another is bent at the joint: to the mean
+/// of the two directions where both may bend, and to the other road's direction
+/// where that one is fixed — an alignment, or an end with a handle set. A polyline
+/// road keeps its corner: the user drew one.
 fn joint_tangents(document: &Document) -> HashMap<(String, End), Vector3> {
     let mut held: HashMap<(String, End), Vector3> = HashMap::new();
     for link in document.links.iter().filter(|link| link.junction.is_none()) {
         let (Some(a), Some(b)) = (document.road(&link.from), document.road(&link.to)) else {
             continue;
         };
-        if a.shape != Shape::Smooth || b.shape != Shape::Smooth {
-            continue;
-        }
-        let (Ok(pa), Ok(pb)) = (control_points(a), control_points(b)) else {
+        let (Some(end_a), Some(end_b)) = (joint_end(a, link.from_end), joint_end(b, link.to_end))
+        else {
             continue;
         };
-        let at = |points: &[Point3], end: End| match end {
-            End::Start => (points[0], chord_at(points, 0)),
-            End::End => (points[points.len() - 1], chord_at(points, points.len() - 1)),
-        };
-        let (joint_a, along_a) = at(&pa, link.from_end);
-        let (joint_b, along_b) = at(&pb, link.to_end);
-        if joint_a.horizontal_distance_to(joint_b) > 0.01 {
+        if !(end_a.bendable || end_b.bendable)
+            || end_a.point.horizontal_distance_to(end_b.point) > 0.01
+        {
             continue;
         }
         // Both as the direction traffic passes through the joint, from a into b.
         let out_of_a = if link.from_end == End::End {
-            along_a
+            end_a.along
         } else {
-            -along_a
+            -end_a.along
         };
         let into_b = if link.to_end == End::Start {
-            along_b
+            end_b.along
         } else {
-            -along_b
+            -end_b.along
         };
         let (Ok(out_of_a), Ok(into_b)) = (out_of_a.normalize(), into_b.normalize()) else {
             continue;
@@ -567,7 +706,11 @@ fn joint_tangents(document: &Document) -> HashMap<(String, End), Vector3> {
         // sharp the turn — a road drawn off the end of another at 120° is bent
         // to meet it, not refused — until they all but reverse into each other,
         // where it is too short to say which way anything goes.
-        let through = out_of_a.get() + into_b.get();
+        let through = match (end_a.bendable, end_b.bendable) {
+            (true, true) => out_of_a.get() + into_b.get(),
+            (true, false) => into_b.get(),
+            _ => out_of_a.get(),
+        };
         if through.horizontal_norm() < 0.2 {
             continue;
         }
@@ -576,22 +719,22 @@ fn joint_tangents(document: &Document) -> HashMap<(String, End), Vector3> {
         if held.contains_key(&a_key) || held.contains_key(&b_key) {
             continue;
         }
-        held.insert(
-            a_key,
-            if link.from_end == End::End {
+        if end_a.bendable {
+            let along = if link.from_end == End::End {
                 through
             } else {
                 -through
-            },
-        );
-        held.insert(
-            b_key,
-            if link.to_end == End::Start {
+            };
+            held.insert(a_key, along);
+        }
+        if end_b.bendable {
+            let along = if link.to_end == End::Start {
                 through
             } else {
                 -through
-            },
-        );
+            };
+            held.insert(b_key, along);
+        }
     }
     held
 }

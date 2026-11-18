@@ -29,6 +29,62 @@ pub enum Shape {
     Smooth,
     /// Straight segments between the points.
     Polyline,
+    /// Not drawn through points at all: from the first point, at `heading`, a
+    /// chain of straights, arcs and clothoids — the road's [`ElementDoc`]s — each
+    /// starting where the last one ended, pointing the way it pointed. What a road
+    /// designer writes, and what OpenDRIVE holds.
+    Alignment,
+}
+
+/// One piece of an alignment.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct ElementDoc {
+    /// `line`, `arc`, or `spiral` (a clothoid).
+    pub kind: String,
+    /// Plan length, metres.
+    pub length: f64,
+    /// For an arc, its radius; for a spiral, the radius it ends at, whatever it
+    /// started at. Metres, positive turning left and negative right. Unset for a
+    /// spiral that ends straight; ignored for a line.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub radius: Option<f64>,
+    /// How far the road climbs over the piece, metres.
+    pub rise: f64,
+}
+
+impl Default for ElementDoc {
+    fn default() -> Self {
+        ElementDoc::line(50.0)
+    }
+}
+
+impl ElementDoc {
+    pub fn line(length: f64) -> Self {
+        ElementDoc {
+            kind: "line".to_owned(),
+            length,
+            radius: None,
+            rise: 0.0,
+        }
+    }
+
+    pub fn arc(length: f64, radius: f64) -> Self {
+        ElementDoc {
+            kind: "arc".to_owned(),
+            radius: Some(radius),
+            ..ElementDoc::line(length)
+        }
+    }
+
+    pub fn spiral(length: f64, radius: Option<f64>) -> Self {
+        ElementDoc {
+            kind: "spiral".to_owned(),
+            radius,
+            ..ElementDoc::line(length)
+        }
+    }
 }
 
 /// The way a lane runs against its road's reference line.
@@ -137,9 +193,22 @@ impl LaneDoc {
 pub struct RoadDoc {
     /// The road's key; the IR names it `road/<id>`.
     pub id: String,
-    /// x, y, z in metres, at least two.
+    /// x, y, z in metres, at least two. An alignment uses only the first, where it
+    /// starts, and keeps the rest for switching back.
     pub points: Vec<[f64; 3]>,
     pub shape: Shape,
+    /// A smooth road's tangent handle at each point, by position: the vector in
+    /// plan, metres, from the point to its forward control point, mirrored behind
+    /// it. Unset, or short of the point, the handle is worked out from the
+    /// neighbouring points.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
+    pub handles: Vec<Option<[f64; 2]>>,
+    /// An alignment's direction at its start, degrees counter-clockwise from east.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "is_zero"))]
+    pub heading: f64,
+    /// An alignment's pieces, in order.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
+    pub elements: Vec<ElementDoc>,
     pub lanes: Vec<LaneDoc>,
     /// `town`, `rural`, `motorway`, `low_speed` or `pedestrian`.
     pub road_type: String,
@@ -239,12 +308,20 @@ impl SurfaceDoc {
     }
 }
 
+#[cfg(feature = "serde")]
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
 impl Default for RoadDoc {
     fn default() -> Self {
         RoadDoc {
             id: String::new(),
             points: Vec::new(),
             shape: Shape::Smooth,
+            handles: Vec::new(),
+            heading: 0.0,
+            elements: Vec::new(),
             lanes: vec![
                 LaneDoc::driving(3.5, Travel::Forward),
                 LaneDoc::driving(3.5, Travel::Backward),
@@ -257,6 +334,23 @@ impl Default for RoadDoc {
 }
 
 impl RoadDoc {
+    /// The tangent handle set at point `index`, if one is.
+    pub fn handle(&self, index: usize) -> Option<[f64; 2]> {
+        self.handles.get(index).copied().flatten()
+    }
+
+    /// A two-way road laid out as an alignment from `start`.
+    pub fn aligned(id: &str, start: [f64; 3], heading: f64, elements: Vec<ElementDoc>) -> Self {
+        RoadDoc {
+            id: id.to_owned(),
+            points: vec![start],
+            shape: Shape::Alignment,
+            heading,
+            elements,
+            ..RoadDoc::default()
+        }
+    }
+
     /// A two-lane, two-way town road through `points`.
     pub fn two_way(id: &str, points: Vec<[f64; 3]>) -> Self {
         RoadDoc {
