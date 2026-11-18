@@ -185,8 +185,40 @@ try {
   check(Math.abs(pieces[3].length - 40) < 0.5 && pieces[0].length === 58, `dragging north's end gave pieces ${JSON.stringify(pieces.map((p) => p.length))}`)
   built = await editor(() => window.roadgenEditor.built())
   check(built.valid, `the lengthened road does not validate: ${JSON.stringify(built.problems)}`)
+  // Drag the arc's R knob a metre outwards: the bend widens and passes through
+  // the pointer.
+  const bendLine = (await editor(() => window.roadgenEditor.built())).scene.roads.find((r) => r.id === 'road/north').reference_line
+  const middle = (station) => {
+    let travelled = 0
+    for (let i = 1; i < bendLine.length; i++) {
+      const [a, b] = [bendLine[i - 1], bendLine[i]]
+      const length = Math.hypot(b[0] - a[0], b[1] - a[1])
+      if (travelled + length >= station) {
+        const t = (station - travelled) / length
+        return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, (b[0] - a[0]) / length, (b[1] - a[1]) / length]
+      }
+      travelled += length
+    }
+  }
+  const [mx, my, ux, uy] = middle(pieces[0].length + pieces[1].length + pieces[2].length / 2)
+  const target = [mx + uy, my - ux]
+  await page.mouse.move(...(await at([mx, my])))
+  await page.mouse.down()
+  await page.mouse.move(...(await at(target)), { steps: 8 })
+  await page.mouse.up()
+  const widened = (await editor(() => window.roadgenEditor.document())).roads.find((r) => r.id === 'north').elements[2]
+  check(widened.radius > 80, `dragging the arc's R knob outwards gave radius ${widened.radius}`)
+  built = await editor(() => window.roadgenEditor.built())
+  check(built.valid, `the widened bend does not validate: ${JSON.stringify(built.problems)}`)
+  const passes = built.scene.roads.find((r) => r.id === 'road/north').reference_line.slice(1).reduce((best, b, i, line) => {
+    const a = i ? line[i - 1] : built.scene.roads.find((r) => r.id === 'road/north').reference_line[0]
+    const [dx, dy] = [b[0] - a[0], b[1] - a[1]]
+    const t = Math.max(0, Math.min(1, ((target[0] - a[0]) * dx + (target[1] - a[1]) * dy) / (dx * dx + dy * dy)))
+    return Math.min(best, Math.hypot(target[0] - a[0] - t * dx, target[1] - a[1] - t * dy))
+  }, Infinity)
+  check(passes < 0.05, `the widened arc misses the pointer by ${passes} m`)
   await shoot('alignment')
-  for (let i = 0; i < 4; i++) await page.keyboard.press('Control+z')
+  for (let i = 0; i < 5; i++) await page.keyboard.press('Control+z')
   const restored = await editor(() => window.roadgenEditor.document())
   check(restored.roads.find((r) => r.id === 'north').shape === 'smooth' && !restored.roads.find((r) => r.id === 'east').handles?.length, 'undo did not take the handle and the alignment back')
   await page.keyboard.press('f')

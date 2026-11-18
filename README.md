@@ -2862,8 +2862,11 @@ A few things the document does for you:
   clothoids, each with its length, radius (positive left) and rise — `+ curve set`
   adds the usual clothoid–arc–clothoid bend. A diamond on the map marks where each
   piece ends: drag it along the road to change that piece's length (the last one is
-  the road's end, and drags past it to lengthen the road). The square moves the road
-  and the round knob turns it.
+  the road's end, and drags past it to lengthen the road). An R knob in the middle of
+  each bend sets its radius: drag it sideways and an arc becomes the circle that
+  leaves its start the way it did and passes through the pointer, a clothoid the one
+  whose end radius puts the pointer on it; across the start line it turns the other
+  way. The square moves the road and the round knob turns it.
   An OpenDRIVE or IR file whose roads are straights, arcs and clothoids opens as
   alignments, exactly, rather than as points sampled along them.
 - **Direct joints have no corner.** Where two smooth roads are joined directly, both

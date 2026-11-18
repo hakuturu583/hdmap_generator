@@ -512,6 +512,32 @@ function render() {
         ctx.fillText(label, ex + 15, ey - 9)
       }
     }
+    // The middle of each bend: a knob to drag sideways to change its radius.
+    const bending = state.drag?.kind === 'radius' && state.drag.road === chosen.id ? state.drag.index : null
+    for (const knob of radiusKnobs(chosen)) {
+      const [rx, ry] = toScreen(knob.point)
+      ctx.beginPath()
+      ctx.arc(rx, ry, 6, 0, Math.PI * 2)
+      ctx.fillStyle = knob.index === bending ? '#ffffff' : '#fb923c'
+      ctx.fill()
+      ctx.strokeStyle = '#0d1117'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+      ctx.fillStyle = '#0d1117'
+      ctx.font = 'bold 8px system-ui, sans-serif'
+      ctx.fillText('R', rx - 2.6, ry + 3)
+      if (knob.index === bending) {
+        const element = chosen.elements[knob.index]
+        const radius = element.radius ? `${element.radius > 0 ? 'left' : 'right'} R ${Math.abs(element.radius).toFixed(1)} m` : 'to straight'
+        const label = `#${knob.index} ${element.kind === 'arc' ? 'arc' : 'clothoid, ends'} ${radius}`
+        ctx.font = '12px system-ui, sans-serif'
+        const width = ctx.measureText(label).width
+        ctx.fillStyle = '#000000cc'
+        ctx.fillRect(rx + 10, ry - 22, width + 10, 18)
+        ctx.fillStyle = '#ffffff'
+        ctx.fillText(label, rx + 15, ry - 9)
+      }
+    }
   } else if (chosen && chosen.shape !== 'polyline' && state.point != null && chosen.points[state.point]) {
     // The selected point's tangent handle, either side of it: solid where it was
     // set, hollow where the curve works it out.
@@ -638,6 +664,61 @@ function elementEnds(road) {
     const at = alongLine(line, station)
     return at ? [{ index, station, point: [at[0], at[1]] }] : []
   })
+}
+
+/// The curvature a piece of an alignment ends with: an arc's, a clothoid's end
+/// radius's, nothing for a straight. Positive turns left.
+function curvatureAfter(element) {
+  if (element.kind === 'line') return 0
+  return element.radius ? 1 / element.radius : 0
+}
+
+/// Where each bending piece of an alignment is grabbed by its radius: its middle,
+/// with where the piece starts — point, direction and the curvature it starts
+/// with — for working the new radius out from the pointer.
+function radiusKnobs(road) {
+  const line = builtRoad(road.id)?.reference_line
+  if (!line) return []
+  let station = 0
+  let curvature = 0
+  // The heading where each piece starts, exactly: the alignment's own, turned
+  // by every piece before — a straight not at all, an arc by L·k, a clothoid by
+  // L·(k0 + k1)/2. Read off the drawn line instead it would be a chord's.
+  let heading = ((road.heading ?? 0) * Math.PI) / 180
+  const knobs = []
+  ;(road.elements ?? []).forEach((element, index) => {
+    const begins = station
+    const middle = alongLine(line, begins + element.length / 2)
+    const start = alongLine(line, begins)
+    if (element.kind !== 'line' && middle && start) {
+      knobs.push({ index, point: [middle[0], middle[1]], start: [start[0], start[1]], along: [Math.cos(heading), Math.sin(heading)], curvature })
+    }
+    const after = curvatureAfter(element)
+    heading += element.kind === 'line' ? 0 : element.kind === 'arc' ? element.length * after : (element.length * (curvature + after)) / 2
+    station += element.length
+    curvature = after
+  })
+  return knobs
+}
+
+/// The radius a bending piece takes for the pointer at `world`, from where it
+/// starts: for an arc, the circle leaving the start in its direction through the
+/// pointer — exactly; for a clothoid, the end curvature that puts the pointer on
+/// it, by the clothoid's small-angle offset `k0·u²/2 + (k1−k0)·u³/(6L)`. `null`
+/// for straight, `undefined` when the pointer says nothing (behind the start).
+function radiusFor(drag, element, world) {
+  const [dx, dy] = [world[0] - drag.start[0], world[1] - drag.start[1]]
+  const [ax, ay] = drag.along
+  const u = dx * ax + dy * ay
+  const v = ax * dy - ay * dx
+  if (u < 0.5) return undefined
+  const k =
+    element.kind === 'arc'
+      ? (2 * v) / (u * u + v * v)
+      : drag.curvature + ((v - (drag.curvature * u * u) / 2) * 6 * element.length) / (u * u * u)
+  if (Math.abs(k) < 1e-4) return element.kind === 'arc' ? Math.sign(k || 1) * 10000 : null
+  const radius = Math.round((1 / k) * 10) / 10
+  return Math.abs(radius) < 1 ? Math.sign(radius) : radius
 }
 
 /// How far along a polyline a point is, metres: the station of the nearest point
@@ -771,6 +852,12 @@ function tangentAt(screen) {
     const [ux, uy] = headingVector(road)
     if (Math.hypot(sx + ux * HEADING_PX - screen[0], sy - uy * HEADING_PX - screen[1]) <= HANDLE_PX) {
       return { kind: 'heading', road: road.id }
+    }
+    const knob = radiusKnobs(road).find((knob) => screenDistance(knob.point, screen) <= HANDLE_PX)
+    if (knob) {
+      // Measured from where the piece starts as it was when the drag began; the
+      // pieces before it do not change, so neither does that.
+      return { kind: 'radius', road: road.id, index: knob.index, start: knob.start, along: knob.along, curvature: knob.curvature }
     }
     const end = elementEnds(road).find((end) => screenDistance(end.point, screen) <= HANDLE_PX)
     if (!end) return null
@@ -1040,7 +1127,7 @@ canvas.addEventListener('pointermove', (event) => {
     moveSurface(drag, world)
     return
   }
-  if (drag?.kind === 'tangent' || drag?.kind === 'heading' || drag?.kind === 'length') {
+  if (['tangent', 'heading', 'length', 'radius'].includes(drag?.kind)) {
     turnHandle(drag, world)
     return
   }
@@ -1051,7 +1138,7 @@ canvas.addEventListener('pointerup', (event) => {
   const drag = state.drag
   state.drag = null
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
-  if (['point', 'surface', 'tangent', 'heading', 'length'].includes(drag?.kind) && drag.moved) {
+  if (['point', 'surface', 'tangent', 'heading', 'length', 'radius'].includes(drag?.kind) && drag.moved) {
     checkpoint(drag.snapshot)
     changed()
   } else if (drag) {
@@ -1144,7 +1231,13 @@ function movePoint(drag, world, free) {
 function turnHandle(drag, world) {
   const road = findRoad(drag.road)
   if (!road) return
-  if (drag.kind === 'length') {
+  if (drag.kind === 'radius') {
+    const element = road.elements[drag.index]
+    const radius = radiusFor(drag, element, world)
+    if (radius === undefined) return
+    if (radius === null) delete element.radius
+    else element.radius = radius
+  } else if (drag.kind === 'length') {
     const length = Math.round((stationOn(drag.line, world) - drag.begins) * 10) / 10
     road.elements[drag.index].length = Math.max(0.5, length)
   } else if (drag.kind === 'heading') {
@@ -1506,7 +1599,7 @@ function renderAlignmentSection(tab, road) {
   const total = (road.elements ?? []).reduce((sum, e) => sum + (e.length || 0), 0)
   tab.append(
     h('h4', {}, `Alignment (${(road.elements ?? []).length} pieces, ${total.toFixed(1)} m)`),
-    h('p', { class: 'muted' }, 'From its start, at its heading, each piece where the last one ended. Radius in metres: positive turns left, negative right. A clothoid eases from the curvature before it to the radius it ends at — blank for straight. Drag the square to move the road, the round knob to turn it, and a diamond along the road to change the length of the piece that ends there.'),
+    h('p', { class: 'muted' }, 'From its start, at its heading, each piece where the last one ended. Radius in metres: positive turns left, negative right. A clothoid eases from the curvature before it to the radius it ends at — blank for straight. Drag the square to move the road, the round knob to turn it, a diamond along the road to change the length of the piece that ends there, and an R knob sideways to change the radius of a bend.'),
     ...['x', 'y', 'z'].map((axis, k) =>
       field(`start ${axis} m`, numberInput(start[k].toFixed(3), (v) => v != null && editRoad(id, (r) => (r.points[0][k] = v)))),
     ),
