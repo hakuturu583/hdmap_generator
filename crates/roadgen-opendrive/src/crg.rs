@@ -19,9 +19,13 @@
 //!
 //! The `<CRG>` is written in `attached` mode with `orientation="same"`: the CRG
 //! reference line is replaced by the road's own, and its values are *added* to the
-//! road's surface, which is exactly what a displacement from the design is. `u` is
-//! measured from the `<CRG>`'s `sStart` (`u = s − sStart`, `sOffset` and
-//! `tOffset` zero) and `v` is the road's own `t`, positive to the left.
+//! road's surface, which is exactly what a displacement from the design is. The
+//! grid's `u` *is* the road's station — `REFERENCE_LINE_START_U` is the
+//! `<CRG>`'s `sStart` and `_END_U` its `sEnd`, with `sOffset` and `tOffset` zero —
+//! and `v` is the road's own `t`, positive to the left. With `u = s` there is
+//! nothing for a consumer to offset: one that reads `u` as `s − sOffset` and one
+//! that reads it as `sStart` plus the distance from `sStart` land on the same
+//! cross section.
 //!
 //! # The file
 //!
@@ -292,7 +296,7 @@ impl CrgDocument {
             }
             CrgPurpose::Friction => "values: tyre-on-surface friction coefficient".into(),
         });
-        line("u = s - sStart along the road, v = t (left positive), metres".into());
+        line("u = s along the road, v = t (left positive), metres".into());
         for feature in relief
             .features
             .iter()
@@ -310,11 +314,8 @@ impl CrgDocument {
         }
         line("$".into());
         line("$ROAD_CRG".into());
-        line(format!("REFERENCE_LINE_START_U   = {:.6}", 0.0));
-        line(format!(
-            "REFERENCE_LINE_END_U     = {:.6}",
-            self.s_end - self.s_start
-        ));
+        line(format!("REFERENCE_LINE_START_U   = {:.6}", self.s_start));
+        line(format!("REFERENCE_LINE_END_U     = {:.6}", self.s_end));
         line(format!(
             "REFERENCE_LINE_INCREMENT = {:.6}",
             self.increment_u
@@ -328,7 +329,10 @@ impl CrgDocument {
         line("$".into());
         line("$KD_Definition".into());
         line("#:LRFI".into());
-        line(format!("U:reference line u,m,0,{:.6}", self.increment_u));
+        line(format!(
+            "U:reference line u,m,{:.6},{:.6}",
+            self.s_start, self.increment_u
+        ));
         for column in 0..self.columns {
             line(format!("D:long section {},m", column + 1));
         }

@@ -213,6 +213,15 @@ fn the_grid_holds_the_irs_displacement_cell_for_cell() {
     assert!(text.starts_with("$CT\n"));
     assert!(text.contains("#:LRFI"));
     assert!(text.contains("REFERENCE_LINE_INCREMENT = 0.100000"));
+    // The grid's u is the road's own station, so no consumer has to offset it.
+    assert!(text.contains(&format!(
+        "REFERENCE_LINE_START_U   = {:.6}",
+        elevation.s_start
+    )));
+    assert!(text.contains(&format!(
+        "REFERENCE_LINE_END_U     = {:.6}",
+        elevation.s_end
+    )));
     for line in text.split("$$$$").next().unwrap().lines() {
         assert!(
             line.len() <= 72,

@@ -540,8 +540,8 @@ read it:
 
 - **OpenDRIVE**, with `crg=True` (`Options::crg` in Rust), writes an **ASAM
   OpenCRG** file beside the document for every road with features — a regular
-  `crg_increment`-metre grid over all of them in `LRFI` text, `u = s − sStart`,
-  `v = t` — and refers to it from the road's `<surface>` as
+  `crg_increment`-metre grid over all of them in `LRFI` text, its `u` the road's
+  own station `s` and its `v` the road's `t` — and refers to it from the road's `<surface>` as
   `<CRG mode="attached" orientation="same" purpose="elevation">`, so a consumer
   adds the grid to the road's own surface. A road with a puddle also gets a
   `purpose="friction"` grid: the pavement's nominal friction, halved under water.
