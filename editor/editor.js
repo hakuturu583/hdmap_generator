@@ -213,6 +213,7 @@ function validateSelection() {
   if (s.kind === 'road' && !findRoad(s.id)) state.selection = null
   if (s.kind === 'junction' && !junctionNames().includes(s.id)) state.selection = null
   if (s.kind === 'link' && !state.doc.links[s.index]) state.selection = null
+  if (s.kind === 'land' && !state.doc.terrain?.[s.group]?.[s.index]) state.selection = null
   if (state.selection?.kind !== 'road') state.point = null
   const road = state.selection?.kind === 'road' && findRoad(state.selection.id)
   if (road && state.point != null && state.point >= road.points.length) state.point = null
@@ -244,9 +245,20 @@ function restore() {
 
 // --- Building ----------------------------------------------------------------------
 
-function rebuild() {
+/// Builds the document. With `land` false — while something is dragged — the
+/// land is not generated again, and the land last generated stays on the map.
+function rebuild(land = true) {
+  const before = state.built
   try {
-    state.built = JSON.parse(buildDocument(JSON.stringify(state.doc)))
+    state.built = JSON.parse(buildDocument(JSON.stringify(state.doc), land))
+    if (land) {
+      state.landCache = landCache(state.built.scene)
+    } else if (state.doc.terrain && before?.scene) {
+      state.built.scene.terrain = before.scene.terrain
+      state.built.scene.contours = before.scene.contours
+      state.built.land_notes = before.land_notes
+    }
+    if (!state.doc.terrain) state.landCache = null
   } catch (error) {
     state.built = {
       scene: { lanes: [], lines: [], roads: [], junctions: [], objects: [], areas: [] },
@@ -264,7 +276,7 @@ function rebuildSoon() {
   if (pendingFrame) return
   pendingFrame = requestAnimationFrame(() => {
     pendingFrame = 0
-    rebuild()
+    rebuild(false)
     render()
   })
 }
@@ -346,6 +358,7 @@ function render() {
   const selectedJunction = state.selection?.kind === 'junction' ? state.selection.id : null
   const broken = problemRoads()
 
+  drawLand(px)
   drawGrid(px)
 
   for (const area of scene.areas ?? []) {
@@ -503,6 +516,8 @@ function render() {
     }
   })
 
+  drawLandShapes(px)
+
   // Back to screen space for handles, which keep their size at any zoom.
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   const chosen = selectedRoad && findRoad(selectedRoad)
@@ -593,6 +608,22 @@ function render() {
       ctx.fill()
       ctx.strokeStyle = '#c084fc'
       ctx.stroke()
+    }
+  }
+  if (state.selection?.kind === 'land') {
+    const shape = state.doc.terrain?.[state.selection.group]?.[state.selection.index]
+    if (shape) {
+      landPoints(state.selection.group, shape).forEach((point, i, all) => {
+        const [sx, sy] = toScreen(point)
+        ctx.beginPath()
+        if (state.selection.group === 'heaps' && i === 1) ctx.arc(sx, sy, 5.5, 0, Math.PI * 2)
+        else ctx.rect(sx - 4.5, sy - 4.5, 9, 9)
+        ctx.fillStyle = all.length > 1 && state.selection.group === 'heaps' && i === 1 ? '#f0e2c0' : '#ffffff'
+        ctx.fill()
+        ctx.strokeStyle = '#0d1117'
+        ctx.lineWidth = 1.5
+        ctx.stroke()
+      })
     }
   }
   if (chosen) {
@@ -815,6 +846,157 @@ function alongLine(line, station) {
     }
     travelled += length
   }
+  return null
+}
+
+/// The land as a few paths to fill — its triangles gathered into bands of
+/// height, each one colour — and its contours as two, minor and major: drawn
+/// every frame, built once a build.
+function landCache(scene) {
+  const terrain = scene?.terrain ?? []
+  if (!terrain.length) return null
+  const low = Math.min(...terrain.map((t) => t.heights[0]))
+  const high = Math.max(...terrain.map((t) => t.heights[1]))
+  const BANDS = 24
+  const bands = Array.from({ length: BANDS }, (_, i) => ({ color: landColor((i + 0.5) / BANDS), path: new Path2D() }))
+  for (const surface of terrain) {
+    for (const [a, b, c] of surface.triangles) {
+      const [p, q, r] = [surface.nodes[a], surface.nodes[b], surface.nodes[c]]
+      const share = high > low ? ((p[2] + q[2] + r[2]) / 3 - low) / (high - low) : 0
+      const band = bands[Math.min(BANDS - 1, Math.floor(share * BANDS))]
+      band.path.moveTo(p[0], p[1])
+      band.path.lineTo(q[0], q[1])
+      band.path.lineTo(r[0], r[1])
+      band.path.closePath()
+    }
+  }
+  const minor = new Path2D()
+  const major = new Path2D()
+  for (const contour of scene.contours ?? []) {
+    const into = contour.major ? major : minor
+    for (const [a, b] of contour.segments) {
+      into.moveTo(a[0], a[1])
+      into.lineTo(b[0], b[1])
+    }
+  }
+  return { bands, minor, major, low, high, interval: scene.contour_interval }
+}
+
+/// Green low ground through olive to pale brown high ground: the same ramp the
+/// SVG uses.
+function landColor(share) {
+  const stops = [
+    [0, [44, 70, 42]],
+    [0.4, [86, 104, 56]],
+    [0.75, [134, 118, 78]],
+    [1, [190, 176, 150]],
+  ]
+  let i = 0
+  while (i < stops.length - 2 && stops[i + 1][0] <= share) i++
+  const [[a, from], [b, to]] = [stops[i], stops[i + 1]]
+  const t = Math.max(0, Math.min(1, (share - a) / (b - a)))
+  return `rgb(${from.map((v, k) => Math.round(v + (to[k] - v) * t)).join(',')})`
+}
+
+function drawLand(px) {
+  const land = state.landCache
+  if (!land) return
+  for (const band of land.bands) {
+    ctx.fillStyle = band.color
+    ctx.fill(band.path)
+    // Hairline seams between triangles of one band are the fill's own edges.
+    ctx.strokeStyle = band.color
+    ctx.lineWidth = px
+    ctx.stroke(band.path)
+  }
+  ctx.strokeStyle = '#1b241455'
+  ctx.lineWidth = 0.8 * px
+  ctx.stroke(land.minor)
+  ctx.strokeStyle = '#1b2414aa'
+  ctx.lineWidth = 1.4 * px
+  ctx.stroke(land.major)
+}
+
+/// The document's land shapes, over the land they make: a hill's crest, a
+/// river's course at its width, a heap's toe, a pad's outline. The selected
+/// one's points are drawn later, as handles.
+function drawLandShapes(px) {
+  const terrain = state.doc.terrain
+  if (!terrain) return
+  const chosen = state.selection?.kind === 'land' ? state.selection : null
+  const is = (group, index) => chosen?.group === group && chosen.index === index
+  ;(terrain.rivers ?? []).forEach((river, index) => {
+    path(river.centre, false)
+    ctx.strokeStyle = '#3b82c466'
+    ctx.lineWidth = river.width
+    ctx.lineCap = 'round'
+    ctx.stroke()
+    ctx.lineCap = 'butt'
+    ctx.strokeStyle = is('rivers', index) ? '#4ea1ff' : '#9cc8f0'
+    ctx.lineWidth = (is('rivers', index) ? 2.5 : 1.5) * px
+    ctx.stroke()
+  })
+  ;(terrain.hills ?? []).forEach((hill, index) => {
+    if (hill.crest.length > 1) {
+      path(hill.crest, false)
+    } else if (hill.crest.length === 1) {
+      ctx.beginPath()
+      ctx.arc(hill.crest[0][0], hill.crest[0][1], 3 * px, 0, Math.PI * 2)
+    }
+    ctx.setLineDash([5 * px, 3 * px])
+    ctx.strokeStyle = is('hills', index) ? '#4ea1ff' : '#f0e2c0'
+    ctx.lineWidth = (is('hills', index) ? 2.5 : 1.5) * px
+    ctx.stroke()
+    ctx.setLineDash([])
+  })
+  ;(terrain.heaps ?? []).forEach((heap, index) => {
+    ctx.beginPath()
+    ctx.arc(heap.centre[0], heap.centre[1], heap.radius, 0, Math.PI * 2)
+    ctx.setLineDash([5 * px, 3 * px])
+    ctx.strokeStyle = is('heaps', index) ? '#4ea1ff' : '#f0e2c0'
+    ctx.lineWidth = (is('heaps', index) ? 2.5 : 1.5) * px
+    ctx.stroke()
+    ctx.setLineDash([])
+  })
+  ;(terrain.pads ?? []).forEach((pad, index) => {
+    if (pad.outline.length < 2) return
+    polygon(pad.outline)
+    ctx.setLineDash([5 * px, 3 * px])
+    ctx.strokeStyle = is('pads', index) ? '#4ea1ff' : '#f0e2c0'
+    ctx.lineWidth = (is('pads', index) ? 2.5 : 1.5) * px
+    ctx.stroke()
+    ctx.setLineDash([])
+  })
+}
+
+/// The points of a land shape a user drags: a crest's, a course's, an outline's,
+/// a heap's centre and the point on its toe that sets its radius.
+function landPoints(group, shape) {
+  if (group === 'hills') return shape.crest
+  if (group === 'rivers') return shape.centre
+  if (group === 'pads') return shape.outline
+  return [shape.centre, [shape.centre[0] + shape.radius, shape.centre[1], shape.centre[2]]]
+}
+
+/// The land shape under a world point: near a crest or a course, inside a heap's
+/// toe or a pad's outline.
+function landAt(world, screen) {
+  const terrain = state.doc.terrain
+  if (!terrain) return null
+  const nearLine = (line, reach) => {
+    for (let i = 1; i < line.length; i++) {
+      const [a, b] = [line[i - 1], line[i]]
+      const [dx, dy] = [b[0] - a[0], b[1] - a[1]]
+      const t = Math.max(0, Math.min(1, ((world[0] - a[0]) * dx + (world[1] - a[1]) * dy) / (dx * dx + dy * dy || 1)))
+      if (Math.hypot(world[0] - a[0] - t * dx, world[1] - a[1] - t * dy) <= reach) return true
+    }
+    return line.length === 1 && screenDistance(line[0], screen) <= SNAP_PX
+  }
+  const px = 1 / state.view.scale
+  for (const [index, river] of (terrain.rivers ?? []).entries()) if (nearLine(river.centre, Math.max(river.width / 2, 6 * px))) return { kind: 'land', group: 'rivers', index }
+  for (const [index, hill] of (terrain.hills ?? []).entries()) if (nearLine(hill.crest, 8 * px)) return { kind: 'land', group: 'hills', index }
+  for (const [index, pad] of (terrain.pads ?? []).entries()) if (pad.outline.length > 2 && inside(pad.outline, world)) return { kind: 'land', group: 'pads', index }
+  for (const [index, heap] of (terrain.heaps ?? []).entries()) if (dist(heap.centre, world) <= heap.radius) return { kind: 'land', group: 'heaps', index }
   return null
 }
 
@@ -1136,6 +1318,16 @@ canvas.addEventListener('pointerdown', (event) => {
   if (state.tool === 'road') return addDrawingPoint(world)
   if (state.tool === 'link') return pickLinkEnd(screen)
 
+  if (state.selection?.kind === 'land') {
+    const { group, index } = state.selection
+    const shape = state.doc.terrain?.[group]?.[index]
+    const at = shape && landPoints(group, shape).findIndex((point) => screenDistance(point, screen) <= HANDLE_PX)
+    if (at != null && at >= 0) {
+      state.drag = { kind: 'landPoint', group, index, point: at, snapshot: JSON.stringify(state.doc), moved: false }
+      canvas.setPointerCapture(event.pointerId)
+      return
+    }
+  }
   const tangent = tangentAt(screen)
   if (tangent) {
     state.drag = { ...tangent, snapshot: JSON.stringify(state.doc), moved: false }
@@ -1221,6 +1413,18 @@ canvas.addEventListener('pointerdown', (event) => {
     return
   }
   const lane = laneAt(world)
+  const shape = !end && !lane && landAt(world, screen)
+  if (shape) {
+    state.selection = shape
+    state.point = null
+    state.surface = null
+    state.structure = null
+    showTab('inspect')
+    renderPanels()
+    render()
+    startPan(event, screen)
+    return
+  }
   const selection = end ? { kind: 'road', id: end.road } : selectionForLane(lane)
   if (selection) {
     const same = JSON.stringify(selection) === JSON.stringify(state.selection)
@@ -1269,6 +1473,20 @@ canvas.addEventListener('pointermove', (event) => {
     moveSurface(drag, world)
     return
   }
+  if (drag?.kind === 'landPoint') {
+    const shape = state.doc.terrain[drag.group][drag.index]
+    if (drag.group === 'heaps') {
+      if (drag.point === 0) shape.centre = [world[0], world[1], shape.centre[2]]
+      else shape.radius = Math.max(1, Math.round(dist(shape.centre, world) * 10) / 10)
+    } else {
+      const points = landPoints(drag.group, shape)
+      points[drag.point] = [world[0], world[1], points[drag.point][2] ?? 0]
+    }
+    drag.moved = true
+    rebuildSoon()
+    renderPanelsSoon()
+    return
+  }
   if (drag?.kind === 'structure' || drag?.kind === 'structureEnd') {
     moveStructure(drag, world)
     return
@@ -1284,7 +1502,7 @@ canvas.addEventListener('pointerup', (event) => {
   const drag = state.drag
   state.drag = null
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
-  if (['point', 'surface', 'tangent', 'heading', 'length', 'radius', 'structure', 'structureEnd'].includes(drag?.kind) && drag.moved) {
+  if (['point', 'surface', 'tangent', 'heading', 'length', 'radius', 'structure', 'structureEnd', 'landPoint'].includes(drag?.kind) && drag.moved) {
     checkpoint(drag.snapshot)
     changed()
   } else if (drag) {
@@ -1537,6 +1755,9 @@ function pickLinkEnd(screen) {
 function deleteSelection() {
   const s = state.selection
   if (!s) return
+  if (s.kind === 'land') {
+    return commit((doc) => doc.terrain[s.group].splice(s.index, 1), { select: null })
+  }
   if (s.kind === 'road' && state.structure != null) {
     const index = state.structure
     state.structure = null
@@ -1681,6 +1902,7 @@ function renderInspector() {
   if (s.kind === 'road') return renderRoadInspector(tab, findRoad(s.id))
   if (s.kind === 'junction') return renderJunctionInspector(tab, s.id)
   if (s.kind === 'link') return renderLinkInspector(tab, s.index)
+  if (s.kind === 'land') return renderLandInspector(tab, s.group, s.index)
 }
 
 function editRoad(id, change) {
@@ -1712,6 +1934,16 @@ function renderRoadInspector(tab, road) {
       'speed limit km/h',
       numberInput(road.speed_limit, (v) => editRoad(id, (r) => (v == null ? delete r.speed_limit : (r.speed_limit = v))), { min: 1, placeholder: 'none' }),
     ),
+    state.doc.terrain
+      ? field(
+          'with the land',
+          select(
+            [['', 'land meets the road'], ['fitted', 'land cut and filled to it'], ['structured', 'bridges and tunnels from the land']],
+            road.ground ?? '',
+            (v) => editRoad(id, (r) => (v ? (r.ground = v) : delete r.ground)),
+          ),
+        )
+      : null,
   )
 
   // The shape first: it is what the road is.
@@ -2393,6 +2625,7 @@ function renderMapTab() {
       `${stats.roads ?? 0} roads, ${stats.connectors ?? 0} connectors, ${stats.lanes ?? 0} lanes, ` +
         `${stats.junctions ?? 0} junctions, ${stats.connections ?? 0} lane connections.`,
     ),
+    ...landSection(),
     importNotes ? h('h4', {}, 'Last import') : null,
     importNotes ? h('p', { class: 'muted notes' }, importNotes) : null,
     h('h4', {}, 'Keys'),
@@ -2405,6 +2638,135 @@ function renderMapTab() {
         'Ctrl+Z undo · Ctrl+Shift+Z redo',
     ),
   )
+}
+
+const LAND_GROUPS = [
+  ['hills', 'hill', 'A swell of the country along its crest: one point for a hill, more for a ridge.'],
+  ['rivers', 'river', 'A channel along its course.'],
+  ['heaps', 'heap', 'A cone of tipped material.'],
+  ['pads', 'pad', 'Land levelled flat inside its outline.'],
+]
+
+/// A new land shape of `group`, in the middle of the view, sized like the real thing.
+function newLandShape(group, taken) {
+  const [x, y] = [state.view.cx, state.view.cy]
+  const name = uniqueId(group.slice(0, -1), new Set(taken.map((shape) => shape.name)))
+  if (group === 'hills') return { name, crest: [[x, y, 0]], width: 120, height: 20 }
+  if (group === 'rivers') return { name, centre: [[x - 80, y, 0], [x + 80, y, 0]], width: 20, depth: 3, bank_slope: 2 }
+  if (group === 'heaps') return { name, kind: 'stockpile', centre: [x, y, 0], radius: 40, height: 12, repose: 37 }
+  return { name, outline: [[x - 20, y - 20, 0], [x + 20, y - 20, 0], [x + 20, y + 20, 0], [x - 20, y + 20, 0]] }
+}
+
+function landSection() {
+  const terrain = state.doc.terrain
+  const ground = (key, label, attributes = {}) =>
+    field(label, numberInput(terrain[key], (v) => v != null && commit((d) => (d.terrain[key] = v)), { step: 1, ...attributes }))
+  const header = [
+    h('h4', {}, 'Land'),
+    h(
+      'label',
+      { class: 'row' },
+      h('input', {
+        type: 'checkbox',
+        checked: Boolean(terrain),
+        onchange: (e) => commit((d) => (e.target.checked ? (d.terrain = d.terrain ?? { margin: 150, cell: 10, spacing: 5, relief: 6, wavelength: 180, seed: 0, hills: [], rivers: [], heaps: [], pads: [] }) : delete d.terrain)),
+      }),
+      'generate land round the roads',
+    ),
+  ]
+  if (!terrain) return [...header, h('p', { class: 'muted' }, 'Without it the map states no land, and each format lays its own ground, if any.')]
+  const notes = state.built?.land_notes ?? []
+  return [
+    ...header,
+    h('p', { class: 'muted' }, `Contours every ${state.landCache?.interval ?? '—'} m, from ${state.landCache ? state.landCache.low.toFixed(1) : '—'} to ${state.landCache ? state.landCache.high.toFixed(1) : '—'} m. Each road says how it meets the land in its inspector.`),
+    ground('relief', 'country relief m', { step: 0.5, min: 0 }),
+    ground('wavelength', 'over m', { min: 1 }),
+    ground('seed', 'seed', { min: 0 }),
+    ground('margin', 'margin m', { min: 0 }),
+    ground('cell', 'cell m', { min: 1 }),
+    ground('spacing', 'spacing m', { min: 0.5, step: 0.5 }),
+    ...LAND_GROUPS.flatMap(([group, noun]) => [
+      h('h4', {}, `${group} (${(terrain[group] ?? []).length})`),
+      (terrain[group] ?? []).length
+        ? h(
+            'ul',
+            { class: 'list' },
+            terrain[group].map((shape, index) =>
+              h('li', { onclick: () => selectAndShow({ kind: 'land', group, index }) }, h('span', { class: 'what' }, shape.name || `${noun} ${index}`)),
+            ),
+          )
+        : null,
+      h(
+        'button',
+        {
+          onclick: () => {
+            const shape = newLandShape(group, terrain[group] ?? [])
+            commit((d) => (d.terrain[group] = [...(d.terrain[group] ?? []), shape]), { select: { kind: 'land', group, index: (terrain[group] ?? []).length } })
+            showTab('inspect')
+          },
+        },
+        `+ ${noun}`,
+      ),
+    ]),
+    notes.length ? h('h4', {}, 'The generator noted') : null,
+    notes.length ? h('p', { class: 'muted notes' }, notes.join('\n')) : null,
+  ]
+}
+
+function renderLandInspector(tab, group, index) {
+  const shape = state.doc.terrain?.[group]?.[index]
+  if (!shape) return
+  const [, noun, about] = LAND_GROUPS.find(([g]) => g === group)
+  const edit = (change) => commit((d) => change(d.terrain[group][index]))
+  const number = (key, label, attributes = {}) =>
+    field(label, numberInput(shape[key], (v) => v != null && edit((s) => (s[key] = v)), { step: 0.5, ...attributes }))
+  tab.append(
+    h('h3', {}, `${noun[0].toUpperCase()}${noun.slice(1)} ${shape.name}`),
+    h('p', { class: 'muted' }, `${about} Drag its square handles on the map.`),
+    field('name', h('input', { value: shape.name ?? '', onchange: (e) => edit((s) => (s.name = e.target.value.trim() || s.name)) })),
+    ...{
+      hills: [number('height', 'height m', { min: 0.5 }), number('width', 'width at foot m', { min: 1, step: 5 })],
+      rivers: [number('width', 'width m', { min: 0.5 }), number('depth', 'depth m', { min: 0.1 }), number('bank_slope', 'bank slope (h:v)', { min: 0.1 })],
+      heaps: [number('height', 'height m', { min: 0.5 }), number('radius', 'radius m', { min: 1 }), number('repose', 'repose °', { min: 5, max: 60 }), field('kind', h('input', { value: shape.kind ?? '', onchange: (e) => edit((s) => (s.kind = e.target.value.trim() || s.kind)) }))],
+      pads: [],
+    }[group],
+  )
+  if (group !== 'heaps') {
+    const key = { hills: 'crest', rivers: 'centre', pads: 'outline' }[group]
+    const points = shape[key]
+    tab.append(h('h4', {}, `Points (${points.length})`))
+    const table = h('table', { class: 'points' })
+    points.forEach((point, i) =>
+      table.append(
+        h(
+          'tr',
+          {},
+          h('td', { class: 'muted' }, i),
+          h('td', {}, numberInput(point[0].toFixed(2), (v) => v != null && edit((s) => (s[key][i][0] = v)))),
+          h('td', {}, numberInput(point[1].toFixed(2), (v) => v != null && edit((s) => (s[key][i][1] = v)))),
+          group === 'pads' ? h('td', {}, numberInput(point[2].toFixed(2), (v) => v != null && edit((s) => (s[key][i][2] = v)))) : null,
+          h('td', {}, h('button', { title: 'Remove this point', disabled: points.length <= (group === 'pads' ? 3 : group === 'rivers' ? 2 : 1), onclick: () => edit((s) => s[key].splice(i, 1)) }, '×')),
+        ),
+      ),
+    )
+    tab.append(
+      table,
+      h(
+        'button',
+        {
+          onclick: () =>
+            edit((s) => {
+              const last = s[key][s[key].length - 1]
+              const before = s[key][s[key].length - 2] ?? [last[0] - 30, last[1], last[2]]
+              s[key].push([2 * last[0] - before[0], 2 * last[1] - before[1], last[2]])
+            }),
+        },
+        '+ point',
+      ),
+      group === 'pads' ? h('p', { class: 'muted' }, 'A pad is levelled at the mean height of its points.') : null,
+    )
+  }
+  tab.append(h('h4', {}, ''), h('button', { onclick: deleteSelection }, `Delete ${noun}`))
 }
 
 function selectAndShow(selection) {

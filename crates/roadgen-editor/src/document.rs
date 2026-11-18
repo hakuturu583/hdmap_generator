@@ -222,6 +222,138 @@ pub struct RoadDoc {
     /// The bridges and tunnels the road runs on or through.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
     pub structures: Vec<StructureDoc>,
+    /// How the road and the land meet, where the document has land: empty for the
+    /// land taking its height from the road; `fitted` for the land cut and filled
+    /// to meet it; `structured` for bridges and tunnels chosen from the land where
+    /// the road runs far above or below it.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "String::is_empty"))]
+    pub ground: String,
+}
+
+/// The land round the roads: generated from a few shapes, not drawn triangle by
+/// triangle.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct TerrainDoc {
+    /// How far the land reaches past the roads, and how finely it is laid out,
+    /// metres.
+    pub margin: f64,
+    pub cell: f64,
+    pub spacing: f64,
+    /// The roll of the country where nothing else shapes it: how high, metres,
+    /// and over what distance.
+    pub relief: f64,
+    pub wavelength: f64,
+    /// What makes one country unlike another of the same relief.
+    pub seed: u64,
+    pub hills: Vec<HillDoc>,
+    pub rivers: Vec<RiverDoc>,
+    pub heaps: Vec<HeapDoc>,
+    pub pads: Vec<PadDoc>,
+}
+
+impl Default for TerrainDoc {
+    fn default() -> Self {
+        TerrainDoc {
+            margin: 150.0,
+            cell: 10.0,
+            spacing: 5.0,
+            relief: 6.0,
+            wavelength: 180.0,
+            seed: 0,
+            hills: Vec::new(),
+            rivers: Vec::new(),
+            heaps: Vec::new(),
+            pads: Vec::new(),
+        }
+    }
+}
+
+/// A hill or a ridge: a swell of the country along its crest, `height` metres
+/// above the land round it, `width` metres across at its foot.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct HillDoc {
+    pub name: String,
+    /// One point for a hill, more for a ridge. Heights are ignored.
+    pub crest: Vec<[f64; 3]>,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Default for HillDoc {
+    fn default() -> Self {
+        HillDoc {
+            name: "hill".to_owned(),
+            crest: Vec::new(),
+            width: 120.0,
+            height: 20.0,
+        }
+    }
+}
+
+/// A river: a channel along its centre line, `width` across at the water and
+/// `depth` deep, banks rising at `bank_slope` (horizontal over vertical).
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct RiverDoc {
+    pub name: String,
+    pub centre: Vec<[f64; 3]>,
+    pub width: f64,
+    pub depth: f64,
+    pub bank_slope: f64,
+}
+
+impl Default for RiverDoc {
+    fn default() -> Self {
+        RiverDoc {
+            name: "river".to_owned(),
+            centre: Vec::new(),
+            width: 20.0,
+            depth: 3.0,
+            bank_slope: 2.0,
+        }
+    }
+}
+
+/// A heap: a cone of tipped material, its toe a circle of `radius`, `height`
+/// tall, its sides at the material's angle of `repose`, degrees.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct HeapDoc {
+    pub name: String,
+    /// `waste_dump`, `stockpile` — the generator's word, passed on.
+    pub kind: String,
+    pub centre: [f64; 3],
+    pub radius: f64,
+    pub height: f64,
+    pub repose: f64,
+}
+
+impl Default for HeapDoc {
+    fn default() -> Self {
+        HeapDoc {
+            name: "heap".to_owned(),
+            kind: "stockpile".to_owned(),
+            centre: [0.0; 3],
+            radius: 40.0,
+            height: 12.0,
+            repose: 37.0,
+        }
+    }
+}
+
+/// A pad: land levelled flat inside its outline, at the outline's mean height.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct PadDoc {
+    pub name: String,
+    pub outline: Vec<[f64; 3]>,
 }
 
 /// A bridge or a tunnel over a stretch of one road.
@@ -401,6 +533,7 @@ impl Default for RoadDoc {
             speed_limit: None,
             surface: Vec::new(),
             structures: Vec::new(),
+            ground: String::new(),
         }
     }
 }
@@ -475,6 +608,9 @@ pub struct Document {
     pub origin: Option<[f64; 3]>,
     pub roads: Vec<RoadDoc>,
     pub links: Vec<LinkDoc>,
+    /// The land, when the document has any; none, and the map states no land.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub terrain: Option<TerrainDoc>,
 }
 
 impl Default for Document {
@@ -486,6 +622,7 @@ impl Default for Document {
             origin: None,
             roads: Vec::new(),
             links: Vec::new(),
+            terrain: None,
         }
     }
 }

@@ -219,6 +219,28 @@ pub struct StructureView {
     pub portals: Vec<[Xy; 2]>,
 }
 
+/// One surface of the land: its triangles, by index into its nodes.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct TerrainView {
+    pub id: String,
+    /// x, y and height, metres.
+    pub nodes: Vec<[f64; 3]>,
+    pub triangles: Vec<[u32; 3]>,
+    /// The lowest and the highest node.
+    pub heights: [f64; 2],
+}
+
+/// The land's contour lines at one height: segments, not joined into lines.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ContourView {
+    pub height: f64,
+    /// Every fifth line, drawn heavier.
+    pub major: bool,
+    pub segments: Vec<[Xy; 2]>,
+}
+
 /// Everything in a map that can be drawn in plan.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -232,6 +254,12 @@ pub struct Scene {
     pub areas: Vec<AreaView>,
     pub surfaces: Vec<SurfaceView>,
     pub structures: Vec<StructureView>,
+    /// The land, where the map states any. It is left out of [`Scene::bounds`]: it
+    /// reaches well past the roads, which are what the scene is about.
+    pub terrain: Vec<TerrainView>,
+    /// The land's contour lines, every [`Scene::contour_interval`] metres.
+    pub contours: Vec<ContourView>,
+    pub contour_interval: f64,
     /// What could not be drawn and why, one entry each. A scene is drawn from maps
     /// that failed validation too, so a broken element is skipped, not fatal.
     pub warnings: Vec<String>,
@@ -498,6 +526,27 @@ impl Scene {
             });
         }
 
+        for surface in map.tin_surfaces.iter() {
+            let nodes: Vec<[f64; 3]> = surface.tin.nodes().iter().map(|p| p.as_array()).collect();
+            if nodes.is_empty() {
+                continue;
+            }
+            let (low, high) = nodes
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                    (lo.min(p[2]), hi.max(p[2]))
+                });
+            scene.terrain.push(TerrainView {
+                id: surface.id.as_str().to_owned(),
+                nodes,
+                triangles: surface.tin.triangles().to_vec(),
+                heights: [low, high],
+            });
+        }
+        let (contours, interval) = contours(&scene.terrain);
+        scene.contours = contours;
+        scene.contour_interval = interval;
+
         scene.warnings = warnings;
         scene.bounds = Bounds::of(
             scene
@@ -649,6 +698,71 @@ fn surface_view(
         outline,
         troughs,
     })
+}
+
+/// A contour interval for a height range: the first of 0.5, 1, 2, 5, 10, 20, 50
+/// and 100 m that gives no more than thirty lines.
+pub fn contour_interval(low: f64, high: f64) -> f64 {
+    const STEPS: [f64; 8] = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0];
+    let range = (high - low).max(0.0);
+    STEPS
+        .into_iter()
+        .find(|step| range / step <= 30.0)
+        .unwrap_or(100.0)
+}
+
+/// The contour lines of every surface, at one interval for all of them: where
+/// each level crosses each triangle, a segment.
+fn contours(terrain: &[TerrainView]) -> (Vec<ContourView>, f64) {
+    let (low, high) = terrain
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), t| {
+            (lo.min(t.heights[0]), hi.max(t.heights[1]))
+        });
+    if !(low.is_finite() && high.is_finite()) || high - low < 1e-6 {
+        return (Vec::new(), 0.0);
+    }
+    let interval = contour_interval(low, high);
+    let first = (low / interval).ceil() as i64;
+    let last = (high / interval).floor() as i64;
+    let mut levels: Vec<ContourView> = (first..=last)
+        .map(|n| ContourView {
+            height: n as f64 * interval,
+            major: n % 5 == 0,
+            segments: Vec::new(),
+        })
+        .collect();
+    for surface in terrain {
+        for triangle in &surface.triangles {
+            let corners = triangle.map(|i| surface.nodes[i as usize]);
+            let (lo, hi) = corners
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                    (lo.min(p[2]), hi.max(p[2]))
+                });
+            for level in levels.iter_mut() {
+                let z = level.height;
+                if z < lo || z > hi || hi - lo < 1e-9 {
+                    continue;
+                }
+                // Where the level crosses each edge whose ends straddle it; a
+                // corner exactly on the level counts on the side above.
+                let mut cut: Vec<Xy> = Vec::with_capacity(2);
+                for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+                    let (p, q) = (corners[a], corners[b]);
+                    if (p[2] >= z) != (q[2] >= z) {
+                        let t = (z - p[2]) / (q[2] - p[2]);
+                        cut.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]);
+                    }
+                }
+                if let [a, b] = cut[..] {
+                    level.segments.push([a, b]);
+                }
+            }
+        }
+    }
+    levels.retain(|level| !level.segments.is_empty());
+    (levels, interval)
 }
 
 fn xy(point: Point3) -> Xy {
@@ -974,6 +1088,59 @@ mod tests {
         assert!((tunnel.portals[0][0][0] - 180.0).abs() < 1e-6);
         assert!(contains(&tunnel.outline, [220.0, 0.0]));
         assert_eq!(tunnel.carries[0].road, "road/r");
+    }
+
+    #[test]
+    fn the_land_is_drawn_with_its_contours() {
+        // A pyramid 10 m high on a 40 m square: four triangles round its top.
+        let nodes = vec![
+            Point3::new(-20.0, -20.0, 0.0),
+            Point3::new(20.0, -20.0, 0.0),
+            Point3::new(20.0, 20.0, 0.0),
+            Point3::new(-20.0, 20.0, 0.0),
+            Point3::new(0.0, 0.0, 10.0),
+        ];
+        let triangles = vec![[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]];
+        let mut map = Map::new(MapMetadata::default());
+        let id = roadgen_core::TinSurfaceId::new("ground");
+        map.tin_surfaces
+            .insert(
+                id.clone(),
+                roadgen_core::TinSurface {
+                    id,
+                    site: None,
+                    breaklines: Vec::new(),
+                    tin: roadgen_core::Tin::new(nodes, triangles).unwrap(),
+                },
+            )
+            .unwrap();
+        let scene = Scene::from_map(&map);
+        assert_eq!(scene.terrain.len(), 1);
+        assert_eq!(scene.terrain[0].heights, [0.0, 10.0]);
+        assert_eq!(scene.contour_interval, 0.5);
+        // The land is not what the view is fitted to.
+        assert!(scene.bounds.is_none());
+        // The 5 m contour is a square half the base's size: four segments, one per
+        // face, each of whose ends is 10 m out from the middle along one axis.
+        let five = scene.contours.iter().find(|c| c.height == 5.0).unwrap();
+        assert!(five.major);
+        assert_eq!(five.segments.len(), 4);
+        for segment in &five.segments {
+            for [x, y] in segment {
+                assert!((x.abs().max(y.abs()) - 10.0).abs() < 1e-9, "{x}, {y}");
+            }
+        }
+        assert!(scene
+            .contours
+            .iter()
+            .all(|c| c.height > 0.0 && c.height <= 10.0));
+    }
+
+    #[test]
+    fn contour_intervals_keep_the_lines_few() {
+        assert_eq!(contour_interval(0.0, 10.0), 0.5);
+        assert_eq!(contour_interval(0.0, 25.0), 1.0);
+        assert_eq!(contour_interval(100.0, 400.0), 10.0);
     }
 
     #[test]

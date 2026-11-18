@@ -45,7 +45,7 @@ pub mod scene;
 pub mod svg;
 
 pub use scene::{
-    AreaView, Bounds, EndView, JunctionView, LaneView, LineView, ObjectView, RoadView, Scene,
-    SpanView, StructureView, SurfaceView,
+    AreaView, Bounds, ContourView, EndView, JunctionView, LaneView, LineView, ObjectView, RoadView,
+    Scene, SpanView, StructureView, SurfaceView, TerrainView,
 };
 pub use svg::SvgOptions;

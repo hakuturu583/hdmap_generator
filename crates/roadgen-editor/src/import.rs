@@ -116,6 +116,7 @@ pub fn from_map(map: &Map) -> (Document, Vec<String>) {
                 .filter(|feature| feature.road == road.id)
                 .map(surface_doc)
                 .collect(),
+            ground: String::new(),
             structures: map
                 .structures
                 .iter()

@@ -2892,6 +2892,14 @@ A few things the document does for you:
   its portals. Drag one along its road, or the cyan knobs at its ends to move them;
   its form, material, deck, clear height, lining, lighting and walkway are in the
   inspector. The generator lays out the deck, supports and portals, and checks them.
+- **The land is generated, not drawn.** Turn it on under Map and the editor puts
+  land round the roads with the same generator the CARLA export uses: the roll of
+  the country, and the hills, rivers, heaps and pads you add there — each a shape on
+  the map whose points you drag, and whose height, width, depth or slope is in the
+  inspector. It is drawn coloured by height with contour lines. Each road says how
+  it meets the land: the land takes its height from the road (the default), the land
+  is cut and filled to meet it, or the generator chooses bridges and tunnels for it
+  from the land — over a river, through a hill. The land goes out with the map.
 - **Opening a file makes it editable.** An OpenDRIVE file or an IR document opens as a
   document: reference lines as polylines simplified to 2 cm, the first cross-section's
   lanes at their starting widths, each junction as the links its connectors were made

@@ -24,6 +24,8 @@ use roadgen_irview::{Scene, SvgOptions};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
+pub mod terrain;
+
 /// A format the editor can write.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Format {
@@ -92,6 +94,8 @@ pub struct BuildResult {
     /// Whether every format can be written.
     pub valid: bool,
     pub stats: Stats,
+    /// What the land generator noted: where a rule could not be kept.
+    pub land_notes: Vec<String>,
 }
 
 /// How big the generated map is.
@@ -124,10 +128,24 @@ pub fn parse_document(json: &str) -> Result<Document, String> {
 }
 
 /// Builds and draws a document: the JSON of a [`BuildResult`].
-pub fn build_json(document: &str) -> Result<String, String> {
-    let built = build(&parse_document(document)?);
-    let result = build_result(&built);
+pub fn build_json(document: &str, land: bool) -> Result<String, String> {
+    let document = parse_document(document)?;
+    let (built, notes) = if land {
+        build_with_land(&document)
+    } else {
+        (build(&document), Vec::new())
+    };
+    let mut result = build_result(&built);
+    result.land_notes = notes;
     serde_json::to_string(&result).map_err(|error| error.to_string())
+}
+
+/// The document built, and its land put round it — what every export is written
+/// from — with what the land generator noted.
+pub fn build_with_land(document: &Document) -> (Built, Vec<String>) {
+    let mut built = build(document);
+    let notes = terrain::apply(&mut built, document);
+    (built, notes)
 }
 
 fn build_result(built: &Built) -> BuildResult {
@@ -153,6 +171,7 @@ fn build_result(built: &Built) -> BuildResult {
         problems: built.problems.clone(),
         valid: built.is_valid(),
         stats,
+        land_notes: Vec::new(),
     }
 }
 
@@ -182,7 +201,7 @@ pub fn export_files(
         return Ok(vec![file(format!("{stem}.roadgen.json"), json)]);
     }
 
-    let built = build(&document);
+    let (built, _) = build_with_land(&document);
     if !format.needs_valid_map {
         let map = built
             .map
@@ -335,8 +354,11 @@ pub fn formats() -> String {
 /// Builds and draws a document. Returns the JSON of the scene, the problems and
 /// whether the map is valid.
 #[wasm_bindgen(js_name = buildDocument)]
-pub fn build_document(document: &str) -> Result<String, JsError> {
-    build_json(document).map_err(|e| JsError::new(&e))
+///
+/// `land` says whether to generate the document's land too: the page leaves it
+/// out while something is being dragged, and keeps the land it last had.
+pub fn build_document(document: &str, land: bool) -> Result<String, JsError> {
+    build_json(document, land).map_err(|e| JsError::new(&e))
 }
 
 /// The files of one export.
@@ -397,7 +419,7 @@ mod tests {
     #[test]
     fn the_example_builds_into_a_scene() {
         let json: serde_json::Value =
-            serde_json::from_str(&build_json(&example()).unwrap()).unwrap();
+            serde_json::from_str(&build_json(&example(), true).unwrap()).unwrap();
         assert_eq!(json["valid"], true, "{}", json["problems"]);
         assert!(json["scene"]["lanes"].as_array().unwrap().len() > 10);
         assert_eq!(json["stats"]["roads"], 5);
@@ -409,7 +431,8 @@ mod tests {
         let mut document = Document::example();
         document.roads[0].points.truncate(1);
         let json = serde_json::to_string(&document).unwrap();
-        let result: serde_json::Value = serde_json::from_str(&build_json(&json).unwrap()).unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(&build_json(&json, true).unwrap()).unwrap();
         assert_eq!(result["valid"], false);
         assert!(!result["scene"]["lanes"].as_array().unwrap().is_empty());
         assert!(result["problems"]
@@ -498,7 +521,81 @@ mod tests {
     fn unknown_formats_and_files_are_refused() {
         assert!(export_files(&example(), "dwg", &ExportOptions::default()).is_err());
         assert!(import_file("map.dwg", b"").is_err());
-        assert!(build_json("{not json").is_err());
+        assert!(build_json("{not json", true).is_err());
+    }
+
+    fn with_land(document: &mut Document) {
+        let mut terrain = roadgen_editor::TerrainDoc {
+            seed: 3,
+            ..Default::default()
+        };
+        terrain.hills.push(roadgen_editor::HillDoc {
+            crest: vec![[-60.0, 90.0, 0.0], [-20.0, 120.0, 0.0]],
+            ..Default::default()
+        });
+        terrain.heaps.push(roadgen_editor::HeapDoc {
+            centre: [120.0, -90.0, 0.0],
+            ..Default::default()
+        });
+        document.terrain = Some(terrain);
+    }
+
+    #[test]
+    fn the_land_is_generated_round_the_roads_and_drawn() {
+        let mut document = Document::example();
+        with_land(&mut document);
+        let json = serde_json::to_string(&document).unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(&build_json(&json, true).unwrap()).unwrap();
+        assert_eq!(result["valid"], true, "{}", result["problems"]);
+        assert!(!result["scene"]["terrain"].as_array().unwrap().is_empty());
+        assert!(!result["scene"]["contours"].as_array().unwrap().is_empty());
+        // Without the land, as while dragging: none.
+        let bare: serde_json::Value =
+            serde_json::from_str(&build_json(&json, false).unwrap()).unwrap();
+        assert!(bare["scene"]["terrain"].as_array().unwrap().is_empty());
+        // And it goes out with the map: the IR keeps the surface.
+        let pb = &export_files(&json, "ir", &ExportOptions::default()).unwrap()[0];
+        let back = roadgen_proto::from_bytes(&pb.bytes).unwrap();
+        assert!(!back.as_map().tin_surfaces.is_empty());
+    }
+
+    #[test]
+    fn a_structured_road_is_bridged_over_a_river() {
+        let mut document = Document {
+            roads: vec![roadgen_editor::RoadDoc {
+                ground: "structured".to_owned(),
+                ..roadgen_editor::RoadDoc::two_way("r", vec![[0.0, 0.0, 0.0], [400.0, 0.0, 0.0]])
+            }],
+            ..Document::default()
+        };
+        let mut terrain = roadgen_editor::TerrainDoc::default();
+        terrain.rivers.push(roadgen_editor::RiverDoc {
+            centre: vec![[200.0, -150.0, 0.0], [200.0, 150.0, 0.0]],
+            ..Default::default()
+        });
+        document.terrain = Some(terrain);
+        let (built, notes) = build_with_land(&document);
+        let map = built.map.as_ref().unwrap().as_map();
+        assert!(
+            map.structures.iter().any(|s| s.kind.as_str() == "bridge"),
+            "no bridge over the river: {notes:?} {:#?}",
+            built.problems
+        );
+    }
+
+    #[test]
+    fn land_the_generator_refuses_is_a_problem_not_a_failure() {
+        let mut document = Document::example();
+        with_land(&mut document);
+        document.terrain.as_mut().unwrap().hills[0].height = -5.0;
+        let (built, _) = build_with_land(&document);
+        assert!(built.map.is_some());
+        assert!(built
+            .problems
+            .iter()
+            .any(|p| p.message.starts_with("the land could not be generated")));
+        assert!(built.map.unwrap().as_map().tin_surfaces.is_empty());
     }
 
     #[test]

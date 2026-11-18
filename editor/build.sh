@@ -22,7 +22,9 @@ if [ "$wanted" != "$installed" ]; then
   exit 1
 fi
 
-cargo build --manifest-path "$root/Cargo.toml" --release \
+# getrandom's browser backend is chosen by a cfg as well as by its feature.
+RUSTFLAGS="${RUSTFLAGS:-} --cfg getrandom_backend=\"wasm_js\"" \
+  cargo build --manifest-path "$root/Cargo.toml" --release \
   -p roadgen-editor-wasm --target wasm32-unknown-unknown
 
 rm -rf "$site"

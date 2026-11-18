@@ -42,6 +42,27 @@ pub fn lane_fill(lane_type: &str, connector: bool) -> &'static str {
     }
 }
 
+/// The land's colour at `share` of the way from its lowest to its highest: green
+/// low ground through olive to pale brown high ground.
+pub fn land_fill(share: f64) -> String {
+    const STOPS: [(f64, [f64; 3]); 4] = [
+        (0.0, [44.0, 70.0, 42.0]),
+        (0.4, [86.0, 104.0, 56.0]),
+        (0.75, [134.0, 118.0, 78.0]),
+        (1.0, [190.0, 176.0, 150.0]),
+    ];
+    let share = share.clamp(0.0, 1.0);
+    let i = STOPS
+        .iter()
+        .rposition(|(at, _)| *at <= share)
+        .unwrap_or(0)
+        .min(STOPS.len() - 2);
+    let ((a, from), (b, to)) = (STOPS[i], STOPS[i + 1]);
+    let t = (share - a) / (b - a);
+    let c = |k: usize| (from[k] + (to[k] - from[k]) * t).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", c(0), c(1), c(2))
+}
+
 /// Fill of a surface feature, and how opaque: water blue, a bump amber, a hole
 /// dark, roughness a light wash over the lane.
 pub fn surface_fill(kind: &str) -> (&'static str, f64) {
@@ -100,6 +121,46 @@ impl Scene {
         // Map y is north; SVG y is down. One flip on a group keeps every
         // coordinate below the map's own.
         out.push_str(r#"<g transform="scale(1,-1)">"#);
+
+        // The land first, under everything: each triangle by its mean height, and
+        // the contours over it.
+        let (low, high) = self
+            .terrain
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), t| {
+                (lo.min(t.heights[0]), hi.max(t.heights[1]))
+            });
+        for surface in &self.terrain {
+            for triangle in &surface.triangles {
+                let corners = triangle.map(|i| surface.nodes[i as usize]);
+                let mean = corners.iter().map(|p| p[2]).sum::<f64>() / 3.0;
+                let share = if high > low {
+                    (mean - low) / (high - low)
+                } else {
+                    0.0
+                };
+                let _ = write!(
+                    out,
+                    r#"<polygon points="{}" fill="{}"/>"#,
+                    points(&corners.map(|p| [p[0], p[1]])),
+                    land_fill(share),
+                );
+            }
+        }
+        for contour in &self.contours {
+            for [a, b] in &contour.segments {
+                let _ = write!(
+                    out,
+                    r##"<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#1b2414" stroke-opacity="{}" stroke-width="{}"/>"##,
+                    num(a[0]),
+                    num(a[1]),
+                    num(b[0]),
+                    num(b[1]),
+                    if contour.major { "0.55" } else { "0.3" },
+                    num(px * if contour.major { 1.4 } else { 0.8 }),
+                );
+            }
+        }
 
         for area in &self.areas {
             let fill = if area.category == "building" {
@@ -393,6 +454,13 @@ mod tests {
     fn an_empty_scene_is_still_a_document() {
         let svg = Scene::default().to_svg(&SvgOptions::default());
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
+    }
+
+    #[test]
+    fn the_land_runs_green_to_brown() {
+        assert_eq!(land_fill(0.0), "#2c462a");
+        assert_eq!(land_fill(1.0), "#beb096");
+        assert_eq!(land_fill(-1.0), land_fill(0.0));
     }
 
     #[test]

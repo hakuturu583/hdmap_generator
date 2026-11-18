@@ -244,6 +244,34 @@ try {
   await page.keyboard.press('Control+z')
   await page.keyboard.press('f')
 
+  // The land: turned on, a hill added, generated round the roads by the real
+  // generator, drawn with contours; the map still valid; then off again.
+  await page.locator('.tabs button', { hasText: 'Map' }).click()
+  await page.locator('#tab-map input[type=checkbox]').check()
+  await editor(() => window.roadgenEditor.view(-60, 80, 3))
+  await page.locator('#tab-map button', { hasText: '+ hill' }).click()
+  await page.waitForFunction(() => (window.roadgenEditor.built().scene.terrain ?? []).length > 0, null, { timeout: 60_000 })
+  built = await editor(() => window.roadgenEditor.built())
+  check(built.valid, `the map with land does not validate: ${JSON.stringify(built.problems)}`)
+  check(built.scene.contours.length > 3, `only ${built.scene.contours.length} contour levels`)
+  const [lowest, highest] = built.scene.terrain[0].heights
+  check(highest - lowest > 10, `the land with a 20 m hill on it spans ${lowest}–${highest} m`)
+  const crest = (await editor(() => window.roadgenEditor.document())).terrain.hills[0].crest[0]
+  const grabHill = await at(crest)
+  await page.mouse.move(...grabHill)
+  await page.mouse.down()
+  await page.mouse.move(grabHill[0] + 40, grabHill[1], { steps: 6 })
+  await page.mouse.up()
+  const shifted = (await editor(() => window.roadgenEditor.document())).terrain.hills[0].crest[0]
+  check(shifted[0] > crest[0] + 5, `dragging the hill's crest left it at ${shifted}`)
+  await page.waitForTimeout(200)
+  await shoot('land')
+  await page.locator('.tabs button', { hasText: 'Map' }).click()
+  await page.locator('#tab-map input[type=checkbox]').uncheck()
+  built = await editor(() => window.roadgenEditor.built())
+  check(!built.scene.terrain.length && built.valid, 'turning the land off did not take it away')
+  await page.keyboard.press('f')
+
   // Every tab draws without throwing.
   for (const tab of ['Links', 'Problems', 'Map', 'Inspect']) await page.locator('.tabs button', { hasText: tab }).click()
 
