@@ -91,8 +91,9 @@ try {
   const tip = avenue.points[avenue.points.length - 1]
   await page.keyboard.press('r')
   await page.mouse.click(...(await at(tip)))
-  await page.mouse.click(...(await at([tip[0] + 30, tip[1] + 5])))
-  await page.mouse.dblclick(...(await at([tip[0] + 60, tip[1] - 5])))
+  // Back over the map rather than past its edge: the avenue ends at the right of it.
+  await page.mouse.click(...(await at([tip[0] - 10, tip[1] + 15])))
+  await page.mouse.dblclick(...(await at([tip[0] - 25, tip[1] + 25])))
   const doc = await editor(() => window.roadgenEditor.document())
   const drawn = doc.roads.find((r) => r.id === 'road1')
   check(drawn && drawn.points.length === 3, `drawing made ${JSON.stringify(drawn)}`)

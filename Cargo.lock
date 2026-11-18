@@ -1583,6 +1583,33 @@ name = "roadgen-core"
 version = "0.44.1"
 
 [[package]]
+name = "roadgen-editor"
+version = "0.44.1"
+dependencies = [
+ "roadgen-core",
+ "serde",
+]
+
+[[package]]
+name = "roadgen-editor-wasm"
+version = "0.44.1"
+dependencies = [
+ "roadgen-commonroad",
+ "roadgen-core",
+ "roadgen-editor",
+ "roadgen-gpudrive",
+ "roadgen-irview",
+ "roadgen-lanelet2",
+ "roadgen-opendrive",
+ "roadgen-osm",
+ "roadgen-proto",
+ "roadgen-sumo",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "roadgen-gpudrive"
 version = "0.44.1"
 dependencies = [
@@ -1624,6 +1651,14 @@ dependencies = [
  "tar",
  "tempfile",
  "uom",
+]
+
+[[package]]
+name = "roadgen-irview"
+version = "0.44.1"
+dependencies = [
+ "roadgen-core",
+ "serde",
 ]
 
 [[package]]
