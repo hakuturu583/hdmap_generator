@@ -66,57 +66,87 @@ macro_rules! define_id {
 
 define_id!(
     /// Identifies a road, e.g. `road/north`.
-    RoadId, "road");
+    RoadId,
+    "road"
+);
 define_id!(
     /// Identifies a lane, e.g. `lane/north/0`.
-    LaneId, "lane");
+    LaneId,
+    "lane"
+);
 define_id!(
     /// Identifies a junction, e.g. `junction/j0`.
-    JunctionId, "junction");
+    JunctionId,
+    "junction"
+);
 define_id!(
     /// Identifies a lane-to-lane connection, e.g.
     /// `connection/j0/north_0/east_0`.
-    ConnectionId, "connection");
+    ConnectionId,
+    "connection"
+);
 define_id!(
     /// Identifies a map object such as a traffic light or a stop line.
-    ObjectId, "object");
+    ObjectId,
+    "object"
+);
 define_id!(
     /// Identifies a building, e.g. `building/north/left/3`.
-    BuildingId, "building");
+    BuildingId,
+    "building"
+);
 define_id!(
     /// Identifies one massing part of a building, e.g. `part/north/left/3/0`.
-    BuildingPartId, "part");
+    BuildingPartId,
+    "part"
+);
 define_id!(
     /// Identifies a site: a complex feature that gathers the features one place is
     /// made of, e.g. `site/north_pit`.
-    SiteId, "site");
+    SiteId,
+    "site"
+);
 define_id!(
     /// Identifies a TIN surface of the terrain, e.g. `tin/north_pit`.
-    TinSurfaceId, "tin");
+    TinSurfaceId,
+    "tin"
+);
 define_id!(
     /// Identifies a breakline of a TIN surface, e.g.
     /// `breakline/north_pit/bench/3/crest`.
-    TinBreaklineId, "breakline");
+    TinBreaklineId,
+    "breakline"
+);
 define_id!(
     /// Identifies a land cover feature, e.g. `landcover/north_pit/pit`.
-    LandCoverId, "landcover");
+    LandCoverId,
+    "landcover"
+);
 
 define_id!(
     /// Identifies a departure of a road's surface from its design — a rut, a
     /// pothole, a puddle, a hump, a stretch of roughness — e.g.
     /// `surface/north/pothole/0`.
-    SurfaceFeatureId, "surface");
+    SurfaceFeatureId,
+    "surface"
+);
 
 define_id!(
     /// Identifies a bridge or a tunnel, e.g. `structure/arakawa_bridge`.
-    StructureId, "structure");
+    StructureId,
+    "structure"
+);
 define_id!(
     /// Identifies a grade separation: one road passing over another, e.g.
     /// `separation/e1_north/avenue/0`.
-    GradeSeparationId, "separation");
+    GradeSeparationId,
+    "separation"
+);
 define_id!(
     /// Identifies an interchange, e.g. `interchange/kita_ic`.
-    InterchangeId, "interchange");
+    InterchangeId,
+    "interchange"
+);
 
 impl LaneId {
     /// The identifier of lane number `index` of `road`.
