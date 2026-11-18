@@ -17,7 +17,8 @@ use crate::geometry::{
 };
 use crate::id::{
     BuildingId, BuildingPartId, ConnectionId, GradeSeparationId, InterchangeId, JunctionId,
-    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
+    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, SurfaceFeatureId, TinBreaklineId,
+    TinSurfaceId,
 };
 use crate::land_cover::LandCover;
 use crate::semantics::{
@@ -26,6 +27,7 @@ use crate::semantics::{
 };
 use crate::site::Site;
 use crate::structure::{GradeSeparation, Interchange, Structure, StructureProfile};
+use crate::surface::SurfaceFeature;
 use crate::terrain::{TinBreakline, TinSurface};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLink, RoadLinkTarget,
@@ -546,6 +548,10 @@ pub struct Map {
     pub grade_separations: Arena<GradeSeparationId, GradeSeparation>,
     /// The grade-separated junctions, each as one feature.
     pub interchanges: Arena<InterchangeId, Interchange>,
+    /// Where a road's surface departs from its design: ruts, potholes, puddles,
+    /// humps and roughness, each in its road's own `(s, t)`. Empty unless the
+    /// caller added some; see [`crate::surface`].
+    pub surface_features: Arena<SurfaceFeatureId, SurfaceFeature>,
 }
 
 impl Map {
@@ -567,6 +573,7 @@ impl Map {
             structures: Arena::new(),
             grade_separations: Arena::new(),
             interchanges: Arena::new(),
+            surface_features: Arena::new(),
         }
     }
 

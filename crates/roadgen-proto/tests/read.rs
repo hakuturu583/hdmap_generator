@@ -293,3 +293,67 @@ fn however_long_a_curve_its_samples_are_bounded() {
         .unwrap();
     assert_eq!(samples.len(), SamplingConfig::MAX_SEGMENTS + 1);
 }
+
+#[test]
+fn every_kind_of_surface_feature_comes_back_as_it_went() {
+    let mut builder = MapBuilder::default();
+    let road = builder
+        .add_road(
+            RoadSpec::line(
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(100.0, 0.0, 0.0),
+                vec![
+                    LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+                    LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+                ],
+            )
+            .unwrap()
+            .with_name("worn"),
+        )
+        .unwrap();
+    let kinds = [
+        SurfaceFeatureKind::Rut {
+            depth: 0.03,
+            track: 1.8,
+            trough: 0.6,
+        },
+        SurfaceFeatureKind::Pothole {
+            depth: 0.05,
+            seed: u64::MAX,
+        },
+        SurfaceFeatureKind::Puddle { depth: 0.02 },
+        SurfaceFeatureKind::Bump {
+            kind: BumpKind::SpeedTable,
+            height: 0.1,
+            profile: BumpProfile::Flat { ramp: 1.2 },
+        },
+        SurfaceFeatureKind::Bump {
+            kind: BumpKind::Heave,
+            height: 0.04,
+            profile: BumpProfile::Sinusoidal,
+        },
+        SurfaceFeatureKind::Roughness {
+            class: RoughnessClass::H,
+            seed: 12,
+        },
+    ];
+    for (index, kind) in kinds.into_iter().enumerate() {
+        builder
+            .add_surface_feature(&road, 10.0 * index as f64 + 5.0, 3.0, 0.0, 2.4, kind)
+            .unwrap();
+    }
+    let map = builder.finish().unwrap().validate().unwrap();
+    let back = roadgen_proto::from_bytes(&roadgen_proto::to_bytes(&map).unwrap())
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(back.surface_features.len(), 6);
+    assert_eq!(back.as_map(), map.as_map());
+
+    // A kind of bump the schema leaves unset is refused, not guessed.
+    let mut message = roadgen_proto::to_message(&map).unwrap();
+    if let Some(v1::surface_feature::Kind::Bump(bump)) = &mut message.surface_features[3].kind {
+        bump.kind = 0;
+    }
+    assert!(refused_at(&message).contains("surface_features"));
+}

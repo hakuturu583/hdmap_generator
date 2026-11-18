@@ -102,6 +102,12 @@ define_id!(
     LandCoverId, "landcover");
 
 define_id!(
+    /// Identifies a departure of a road's surface from its design — a rut, a
+    /// pothole, a puddle, a hump, a stretch of roughness — e.g.
+    /// `surface/north/pothole/0`.
+    SurfaceFeatureId, "surface");
+
+define_id!(
     /// Identifies a bridge or a tunnel, e.g. `structure/arakawa_bridge`.
     StructureId, "structure");
 define_id!(

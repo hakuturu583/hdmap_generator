@@ -39,6 +39,24 @@
 //! vertex for vertex — and it is one surface rather than a strip per road so that
 //! there is no seam for a wheel or a lidar to find.
 //!
+//! # What the road's surface has on it
+//!
+//! A road with [surface features](roadgen_core::surface) on it — ruts, potholes,
+//! puddles, humps, roughness — is not the smooth ribbon its design is. Where a
+//! feature lies, the section gets extra rungs [`SurfaceConfig::relief_cell`] apart
+//! (finer where the feature is finer), the carriageway and gutter bands there are
+//! cut across into columns as fine, and every vertex is moved off the design by
+//! [`Relief::displacement`] at its own `(s, t)`: the same function the OpenCRG
+//! grids are written from, so the mesh CARLA drives on and the grid a vehicle
+//! model reads describe one surface. The paint is laid on the displaced surface,
+//! and a puddle's water is a sheet of its own, level with the design over its
+//! depression, named as [`Role::Water`] and surfaced as still water.
+//!
+//! Only the bands are refined. The land still meets the road at the section's own
+//! rungs, so a feature reaching the very edge of the road leaves the land's edge
+//! where the design put it — which is why a feature is best kept inside the
+//! carriageway it is on.
+//!
 //! There is no landscape in it, and there should not be. A road network says nothing
 //! about the shape of the country it runs through, and a generator that produced
 //! hills here would be inventing a terrain model rather than deriving one.
@@ -49,6 +67,7 @@ use std::collections::HashMap;
 use roadgen_core::geometry::{Frame3, Point3, Vector3};
 use roadgen_core::map::{Map, Road};
 use roadgen_core::semantics::{LaneType, MarkingColor, RoadMarking};
+use roadgen_core::surface::Relief;
 use roadgen_core::topology::LateralSide;
 
 use crate::facades;
@@ -82,6 +101,10 @@ pub struct SurfaceConfig {
     pub ground_extent: f64,
     /// How far apart the land's vertices are past the verges.
     pub ground_cell: f64,
+    /// How far apart the road surface's vertices are where a surface feature
+    /// displaces it, along the road and across it, at most: a feature finer than
+    /// this is sampled at its own resolution instead.
+    pub relief_cell: f64,
 }
 
 impl Default for SurfaceConfig {
@@ -100,6 +123,7 @@ impl Default for SurfaceConfig {
             // past the last road keeps every return it makes on something.
             ground_extent: 150.0,
             ground_cell: 10.0,
+            relief_cell: 0.1,
         }
     }
 }
@@ -162,8 +186,13 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             if within.len() < 2 {
                 continue;
             }
-            layout.surfaces(&within, map_name, &mut ordinal, &mut meshes);
-            layout.markings(&within, map_name, config, &mut ordinal, &mut meshes);
+            // Finer where the surface departs from its design, for the bands and
+            // the paint on them; the land below meets the section's own rungs.
+            let extra = layout.relief_rungs(map, road, &within);
+            let refined = refine(&within, &extra, &layout);
+            let surface: &[Cross] = refined.as_deref().unwrap_or(&within);
+            layout.surfaces(surface, map_name, &mut ordinal, &mut meshes);
+            layout.markings(surface, map_name, config, &mut ordinal, &mut meshes);
             // The land meets the road only where the road is on the ground: a
             // stretch on a bridge has the land under it, one in a tunnel the land
             // over it, and neither has a verge.
@@ -195,6 +224,7 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
         meshes.push(terrain);
     }
     meshes.extend(crate::water::meshes(map, map_name, &mut ordinal));
+    meshes.extend(puddles(map, map_name, &mut ordinal));
     meshes.extend(crate::structures::meshes(
         map,
         ground.as_ref(),
@@ -479,6 +509,9 @@ pub(crate) struct Layout<'a> {
     config: SurfaceConfig,
     /// What the road is surfaced with along its length.
     pavement: &'a roadgen_core::semantics::PavementProfile,
+    /// The road's surface features, which displace its carriageway and the paint
+    /// on it.
+    relief: Relief<'a>,
 }
 
 impl<'a> Layout<'a> {
@@ -515,7 +548,43 @@ impl<'a> Layout<'a> {
             lanes: left,
             config: *config,
             pavement: &road.pavement,
+            relief: Relief::of(map, &road.id),
         })
+    }
+
+    /// The rungs a section needs beyond its own where surface features lie on
+    /// it: every station [`Relief::stations`] asks for within the section that
+    /// is not one of `within`'s already. Empty for a road with no features.
+    fn relief_rungs(&self, map: &Map, road: &Road, within: &[Cross]) -> Vec<Rung> {
+        if self.relief.is_empty() || within.len() < 2 {
+            return Vec::new();
+        }
+        let (first, last) = (
+            within[0].rung.station,
+            within[within.len() - 1].rung.station,
+        );
+        self.relief
+            .stations(first, last, self.config.relief_cell)
+            .into_iter()
+            .filter(|&station| {
+                station > first + 1e-6
+                    && station < last - 1e-6
+                    && !within
+                        .iter()
+                        .any(|cross| (cross.rung.station - station).abs() < 1e-6)
+            })
+            .filter_map(|station| {
+                let sample = road
+                    .reference_line
+                    .sample_at(station, map.metadata.sampling)
+                    .ok()?;
+                let frame = sample.frame().ok()?;
+                Some(Rung {
+                    station,
+                    frame: frame.banked(road.superelevation.evaluate(station)),
+                })
+            })
+            .collect()
     }
 
     /// The lateral extent of the carriageway at `station`: the outer edges of the
@@ -880,6 +949,51 @@ impl<'a> Layout<'a> {
         ordinals: &mut Ordinals,
         out: &mut Vec<Mesh>,
     ) {
+        if matches!(role, Role::Road | Role::Gutter) {
+            let first = rungs.first().map_or(0.0, |cross| cross.rung.station);
+            let last = rungs.last().map_or(0.0, |cross| cross.rung.station);
+            let (mut right_most, mut left_most) = (f64::INFINITY, f64::NEG_INFINITY);
+            for cross in rungs {
+                let (a, b) = (left(&cross.cuts), right(&cross.cuts));
+                left_most = left_most.max(a.max(b));
+                right_most = right_most.min(a.min(b));
+            }
+            if self
+                .relief
+                .touches_area((first, last), (right_most, left_most))
+            {
+                let step = self
+                    .relief
+                    .lateral_step(first, last, self.config.relief_cell);
+                let columns = (((left_most - right_most) / step).ceil() as usize).max(1);
+                let grid: Vec<Vec<Point3>> = rungs
+                    .iter()
+                    .map(|cross| {
+                        let station = cross.rung.station;
+                        let (from, to) = (left(&cross.cuts), right(&cross.cuts));
+                        let (rise_from, rise_to) = (left_rise(station), right_rise(station));
+                        (0..=columns)
+                            .map(|k| {
+                                let share = k as f64 / columns as f64;
+                                let lateral = from + (to - from) * share;
+                                let rise = rise_from + (rise_to - rise_from) * share;
+                                cross
+                                    .rung
+                                    .at(lateral, rise + self.relief.displacement(station, lateral))
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let mut mesh = Mesh::new(
+                    mesh_name(map_name, role, ordinals.take(role)),
+                    role,
+                    material,
+                );
+                mesh.grid(&grid, 0);
+                out.push(mesh);
+                return;
+            }
+        }
         let mut left_rail = Vec::with_capacity(rungs.len());
         let mut right_rail = Vec::with_capacity(rungs.len());
         for cross in rungs {
@@ -1076,15 +1190,112 @@ impl<'a> Layout<'a> {
         rungs
             .iter()
             .map(|cross| {
+                let station = cross.rung.station;
+                let lateral = cross.cuts[cut] + shift;
                 (
-                    cross
-                        .rung
-                        .at(cross.cuts[cut] + shift, rise(cross.rung.station)),
+                    cross.rung.at(
+                        lateral,
+                        rise(station) + self.relief.displacement(station, lateral),
+                    ),
                     cross.rung.frame.left.get(),
                 )
             })
             .collect()
     }
+}
+
+/// `within` with `extra` rungs merged in by station, each with the section's cuts
+/// at it; `None` when there is nothing to merge.
+fn refine<'r>(within: &[Cross<'r>], extra: &'r [Rung], layout: &Layout) -> Option<Vec<Cross<'r>>> {
+    if extra.is_empty() {
+        return None;
+    }
+    let mut out: Vec<Cross<'r>> = within
+        .iter()
+        .map(|cross| Cross {
+            rung: cross.rung,
+            cuts: cross.cuts.clone(),
+        })
+        .chain(extra.iter().map(|rung| Cross {
+            rung,
+            cuts: layout.cuts(rung.station),
+        }))
+        .collect();
+    out.sort_by(|a, b| a.rung.station.total_cmp(&b.rung.station));
+    Some(out)
+}
+
+/// How far below the designed surface a puddle's water stands, metres: a
+/// millimetre, so that it hides under the road wherever the depression does not
+/// reach rather than fighting it for the same depth value.
+const PUDDLE_FREEBOARD: f64 = 0.001;
+
+/// How far out a puddle's water sheet reaches, as a share of its footprint's
+/// ellipse: short of the rim, where the depression is shallower than the
+/// freeboard and the road would show through the water anyway.
+const PUDDLE_REACH: f64 = 0.97;
+
+/// The water standing in every puddle on the map, each a mesh of its own: a disc
+/// over the footprint's ellipse, a millimetre below the designed surface, in the
+/// road's banked frame so it lies on the road as the road lies.
+fn puddles(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh> {
+    const RINGS: usize = 6;
+    const SPOKES: usize = 32;
+    let mut out = Vec::new();
+    for feature in map.surface_features.iter().filter(|f| f.holds_water()) {
+        let Some(road) = map.roads.get(&feature.road) else {
+            continue;
+        };
+        let centre_s = feature.station + feature.length / 2.0;
+        let (half_s, half_t) = (feature.length / 2.0, feature.width / 2.0);
+        let point = |r: f64, angle: f64| -> Option<Point3> {
+            let s = centre_s + r * half_s * angle.cos();
+            let t = feature.offset + r * half_t * angle.sin();
+            let frame = road.frame_at(s, map.metadata.sampling).ok()?;
+            Some(frame.to_global([0.0, t, -PUDDLE_FREEBOARD]))
+        };
+        let Some(middle) = point(0.0, 0.0) else {
+            continue;
+        };
+        let mut positions = vec![middle];
+        let mut ok = true;
+        for ring in 1..=RINGS {
+            let r = PUDDLE_REACH * ring as f64 / RINGS as f64;
+            for spoke in 0..SPOKES {
+                let angle = 2.0 * std::f64::consts::PI * spoke as f64 / SPOKES as f64;
+                match point(r, angle) {
+                    Some(p) => positions.push(p),
+                    None => ok = false,
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // Anticlockwise from above: `t` is to the left of `s`, so the angle runs
+        // anticlockwise in plan.
+        let index = |ring: usize, spoke: usize| (1 + (ring - 1) * SPOKES + spoke % SPOKES) as u32;
+        let mut triangles = Vec::new();
+        for spoke in 0..SPOKES {
+            triangles.push([0, index(1, spoke), index(1, spoke + 1)]);
+        }
+        for ring in 1..RINGS {
+            for spoke in 0..SPOKES {
+                let (a, b) = (index(ring, spoke), index(ring, spoke + 1));
+                let (c, d) = (index(ring + 1, spoke), index(ring + 1, spoke + 1));
+                triangles.push([a, c, d]);
+                triangles.push([a, d, b]);
+            }
+        }
+        let mut mesh = Mesh::new(
+            mesh_name(map_name, Role::Water, ordinals.take(Role::Water)),
+            Role::Water,
+            materials::STILL_WATER,
+        );
+        mesh.sheet(&positions, &triangles, 0);
+        out.push(mesh);
+    }
+    out
 }
 
 /// Two gutters out of one lane, cut back until they leave some lane behind them.
@@ -1545,6 +1756,150 @@ mod tests {
                 normal.z > 0.0,
                 "a land triangle {a:?} {b:?} {c:?} faces down"
             );
+        }
+    }
+
+    /// A two-lane road at 10 m with a pothole in the right lane, a puddle beside
+    /// it, a speed hump across both lanes and ruts in the left lane.
+    fn worn() -> roadgen_core::validation::ValidatedMap {
+        use roadgen_core::prelude::*;
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 10.0),
+                    Point3::new(100.0, 0.0, 10.0),
+                    vec![
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let add = |builder: &mut MapBuilder, station, length, offset, width, kind| {
+            builder
+                .add_surface_feature(&road, station, length, offset, width, kind)
+                .unwrap();
+        };
+        add(
+            &mut builder,
+            20.0,
+            1.0,
+            -1.75,
+            0.8,
+            SurfaceFeatureKind::Pothole {
+                depth: 0.08,
+                seed: 4,
+            },
+        );
+        add(
+            &mut builder,
+            30.0,
+            2.0,
+            -1.75,
+            1.4,
+            SurfaceFeatureKind::Puddle { depth: 0.03 },
+        );
+        add(
+            &mut builder,
+            50.0,
+            3.7,
+            0.0,
+            6.5,
+            SurfaceFeatureKind::Bump {
+                kind: BumpKind::SpeedHump,
+                height: 0.1,
+                profile: BumpProfile::Circular,
+            },
+        );
+        add(
+            &mut builder,
+            60.0,
+            30.0,
+            1.75,
+            2.4,
+            SurfaceFeatureKind::Rut {
+                depth: 0.03,
+                track: 1.8,
+                trough: 0.6,
+            },
+        );
+        builder.finish().unwrap().validate().unwrap()
+    }
+
+    #[test]
+    fn the_road_surface_takes_the_shape_of_its_features() {
+        let map = worn();
+        let meshes = build(&map, "w", &SurfaceConfig::default());
+        let road: Vec<&Mesh> = meshes.iter().filter(|m| m.role == Role::Road).collect();
+        let points = || road.iter().flat_map(|mesh| mesh.positions.iter());
+        // The pothole's floor, the hump's crest, the ruts' troughs.
+        let lowest_near = |x: f64, y: f64| {
+            points()
+                .filter(|p| (p.x - x).abs() < 0.3 && (p.y - y).abs() < 0.3)
+                .map(|p| p.z)
+                .fold(f64::INFINITY, f64::min)
+        };
+        assert!((lowest_near(20.5, -1.75) - (10.0 - 0.08)).abs() < 1e-6);
+        assert!(lowest_near(75.0, 1.75 + 0.9) < 10.0 - 0.025);
+        let crest = points()
+            .filter(|p| (p.x - 51.85).abs() < 0.1)
+            .map(|p| p.z)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((crest - 10.1).abs() < 1e-3, "crest at {crest}");
+        // Nothing is displaced where there is no feature.
+        assert!(points()
+            .filter(|p| p.x > 5.0 && p.x < 15.0)
+            .all(|p| (p.z - 10.0).abs() < 1e-9));
+        // And the surface is still a surface: every triangle faces up.
+        for mesh in &road {
+            for triangle in &mesh.triangles {
+                let [a, b, c] = triangle.map(|index| mesh.positions[index as usize]);
+                let normal = (b - a).cross(c - a);
+                assert!(normal.z >= 0.0, "a road triangle faces down at {a:?}");
+            }
+        }
+        // The paint rides over the hump rather than under it.
+        let paint_crest = meshes
+            .iter()
+            .filter(|m| m.role == Role::Marking)
+            .flat_map(|m| m.positions.iter())
+            .filter(|p| (p.x - 51.85).abs() < 0.2 && p.y.abs() < 0.5)
+            .map(|p| p.z)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(paint_crest > 10.1, "paint at {paint_crest}");
+    }
+
+    #[test]
+    fn a_puddle_is_a_sheet_of_still_water_in_its_depression() {
+        let map = worn();
+        let meshes = build(&map, "w", &SurfaceConfig::default());
+        let water: Vec<&Mesh> = meshes.iter().filter(|m| m.role == Role::Water).collect();
+        assert_eq!(water.len(), 1);
+        let sheet = water[0];
+        assert_eq!(sheet.materials, vec![materials::STILL_WATER]);
+        for p in &sheet.positions {
+            assert!((p.z - (10.0 - PUDDLE_FREEBOARD)).abs() < 1e-9);
+            // Inside the footprint's ellipse.
+            let (du, dv) = ((p.x - 31.0) / 1.0, (p.y + 1.75) / 0.7);
+            assert!(du.hypot(dv) <= 1.0 + 1e-9);
+        }
+        for triangle in &sheet.triangles {
+            let [a, b, c] = triangle.map(|index| sheet.positions[index as usize]);
+            assert!((b - a).cross(c - a).z > 0.0, "the water faces down");
+        }
+    }
+
+    #[test]
+    fn a_road_with_no_features_is_built_as_it_was() {
+        let map = straight(false);
+        let meshes = build(&map, "s", &SurfaceConfig::default());
+        let road: Vec<&Mesh> = meshes.iter().filter(|m| m.role == Role::Road).collect();
+        // A strip: two vertices a rung.
+        for mesh in road {
+            assert_eq!(mesh.positions.len() % 2, 0);
+            assert_eq!(mesh.triangles.len(), mesh.positions.len() - 2);
         }
     }
 

@@ -281,7 +281,17 @@ class Map:
     def export_proto(self, path: str, curve_samples: bool = True) -> None:
         """The map as the IR itself, in Protocol Buffers: nothing lost, and readable
         by `read_proto` or by any program compiled against `proto_schema()`."""
-    def export_opendrive(self, path: str, trace: bool = True) -> None: ...
+    def export_opendrive(
+        self,
+        path: str,
+        trace: bool = True,
+        crg: bool = False,
+        crg_increment: float = 0.05,
+        crg_lateral_increment: float | None = None,
+        crg_friction: bool = True,
+    ) -> None:
+        """Writes OpenDRIVE; with `crg=True`, OpenCRG files beside it for every
+        road with surface features."""
     def export_lanelet2(self, path: str, trace: bool = True) -> None: ...
     def export_osm(self, path: str, trace: bool = True) -> None: ...
     def export_sumo(
@@ -481,6 +491,31 @@ class Map:
         on lots along the roads beside it; returns its land cover's id."""
     def add_barrier(self, lane: LaneRef, kind: str = "berm", height: float = 1.5) -> str:
         """Stands a barrier along the whole of `lane`; returns the object's id."""
+    def add_surface_feature(
+        self,
+        road: Road | str,
+        kind: str,
+        station: float,
+        length: float,
+        offset: float = 0.0,
+        width: float | None = None,
+        depth: float | None = None,
+        height: float | None = None,
+        track: float = 1.8,
+        trough: float = 0.6,
+        bump: str = "hump",
+        profile: str | None = None,
+        ramp: float = 1.0,
+        roughness_class: str = "C",
+        seed: int = 0,
+    ) -> str:
+        """Puts a rut, pothole, puddle, bump or roughness on a road; returns its id."""
+    def surface_features(
+        self,
+    ) -> list[tuple[str, str, str, float, float, float, float]]: ...
+    def surface_displacement(
+        self, road: str, station: float, offset: float
+    ) -> tuple[float, float]: ...
     def generate_land(
         self,
         enabled: bool = True,

@@ -13,7 +13,9 @@ use crate::geometry::{
     Arc3, Bezier3, Curve3, LaneHeight, Point3, Poly3Piece, Poly3Profile, Polyline3, SamplingConfig,
     Taper, UnitVector3, Vector3, VerticalProfile, WidthProfile,
 };
-use crate::id::{ConnectionId, InterchangeId, JunctionId, LaneId, ObjectId, RoadId};
+use crate::id::{
+    ConnectionId, InterchangeId, JunctionId, LaneId, ObjectId, RoadId, SurfaceFeatureId,
+};
 use crate::layout::{self, RoadGeometry, SectionLayout};
 use crate::map::{CrossSection, Lane, Map, MapMetadata, Road};
 use crate::semantics::{
@@ -23,6 +25,7 @@ use crate::semantics::{
 use crate::structure::{
     self, BridgeSpec, Interchange, RoadSpan, StructureProfile, StructureSpec, TunnelSpec,
 };
+use crate::surface::{SurfaceFeature, SurfaceFeatureKind};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
     RoadLink, RoadLinkTarget,
@@ -352,6 +355,7 @@ pub struct MapBuilder {
     rules: Vec<RuleSpec>,
     structures: Vec<(Vec<RoadSpan>, StructureSpec)>,
     interchanges: Vec<InterchangeSpec>,
+    surface_features: Vec<SurfaceFeature>,
     auto_road: usize,
     auto_junction: usize,
     auto_object: usize,
@@ -377,6 +381,7 @@ impl MapBuilder {
             rules: Vec::new(),
             structures: Vec::new(),
             interchanges: Vec::new(),
+            surface_features: Vec::new(),
             auto_road: 0,
             auto_junction: 0,
             auto_object: 0,
@@ -920,6 +925,56 @@ impl MapBuilder {
         )
     }
 
+    /// Puts a departure from the designed surface on `road`: a rut, a pothole, a
+    /// puddle, a hump or a stretch of roughness, over a footprint `length` metres
+    /// along the road from `station` and `width` metres across it, centred `offset`
+    /// metres to the left of the reference line. See [`crate::surface`].
+    ///
+    /// The identifier is `surface/<road>/<kind>/<n>`, `n` counting the features of
+    /// that kind already on the road.
+    pub fn add_surface_feature(
+        &mut self,
+        road: &RoadId,
+        station: f64,
+        length: f64,
+        offset: f64,
+        width: f64,
+        kind: SurfaceFeatureKind,
+    ) -> Result<SurfaceFeatureId, BuildError> {
+        let count = self
+            .surface_features
+            .iter()
+            .filter(|feature| feature.road == *road && feature.kind.as_str() == kind.as_str())
+            .count();
+        let id = SurfaceFeatureId::new(format!("{}/{}/{count}", road.local_name(), kind.as_str()));
+        self.add_surface_feature_as(SurfaceFeature {
+            id: id.clone(),
+            road: road.clone(),
+            station,
+            length,
+            offset,
+            width,
+            kind,
+        })?;
+        Ok(id)
+    }
+
+    /// Puts a surface feature on the map under the identifier it already has.
+    pub fn add_surface_feature_as(&mut self, feature: SurfaceFeature) -> Result<(), BuildError> {
+        if !self.road_index.contains_key(&feature.road) {
+            return Err(BuildError::UnknownRoad(feature.road.clone()));
+        }
+        if self
+            .surface_features
+            .iter()
+            .any(|held| held.id == feature.id)
+        {
+            return Err(BuildError::DuplicateId(feature.id.to_string()));
+        }
+        self.surface_features.push(feature);
+        Ok(())
+    }
+
     fn push_object(&mut self, key: String, spec: ObjectSpec) -> Result<ObjectId, BuildError> {
         let id = ObjectId::new(key);
         if self.object_index.contains_key(&id) {
@@ -1090,6 +1145,12 @@ impl Generator {
         self.place_structures()?;
         self.build_interchanges()?;
         structure::derive_separations(&mut self.map);
+        for feature in &self.builder.surface_features {
+            self.map
+                .surface_features
+                .insert(feature.id.clone(), feature.clone())
+                .map_err(|duplicate| BuildError::DuplicateId(duplicate.0.to_string()))?;
+        }
         Ok(UnvalidatedMap::from_map(self.map))
     }
 

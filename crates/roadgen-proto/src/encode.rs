@@ -19,6 +19,7 @@ use roadgen_core::structure::{
     BridgeForm, GradeSeparation, Interchange, RoadSpan, Structure, StructureKind,
     StructureMaterial, SupportKind, TunnelForm, Underneath,
 };
+use roadgen_core::surface::{BumpKind, BumpProfile, SurfaceFeature, SurfaceFeatureKind};
 use roadgen_core::terrain::{TinBreakline, TinSurface};
 use roadgen_core::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LateralSide, RoadEnd, RoadLinkTarget,
@@ -60,6 +61,7 @@ pub(crate) fn map(map: &Map, options: &WriteOptions) -> Result<v1::Map> {
         structures: map.structures.iter().map(structure).collect(),
         grade_separations: map.grade_separations.iter().map(grade_separation).collect(),
         interchanges: map.interchanges.iter().map(interchange).collect(),
+        surface_features: map.surface_features.iter().map(surface_feature).collect(),
     })
 }
 
@@ -343,6 +345,61 @@ fn form(form: FormOfWay) -> i32 {
         FormOfWay::ServiceRoad => v1::FormOfWay::ServiceRoad,
         FormOfWay::Roundabout => v1::FormOfWay::Roundabout,
     })
+}
+
+fn surface_feature(feature: &SurfaceFeature) -> v1::SurfaceFeature {
+    use v1::surface_feature::Kind;
+    let kind = match feature.kind {
+        SurfaceFeatureKind::Rut {
+            depth,
+            track,
+            trough,
+        } => Kind::Rut(v1::Rut {
+            depth,
+            track,
+            trough,
+        }),
+        SurfaceFeatureKind::Pothole { depth, seed } => Kind::Pothole(v1::Pothole { depth, seed }),
+        SurfaceFeatureKind::Puddle { depth } => Kind::Puddle(v1::Puddle { depth }),
+        SurfaceFeatureKind::Bump {
+            kind,
+            height,
+            profile,
+        } => {
+            let (profile, ramp) = match profile {
+                BumpProfile::Circular => (v1::BumpProfile::Circular, 0.0),
+                BumpProfile::Parabolic => (v1::BumpProfile::Parabolic, 0.0),
+                BumpProfile::Sinusoidal => (v1::BumpProfile::Sinusoidal, 0.0),
+                BumpProfile::Flat { ramp } => (v1::BumpProfile::Flat, ramp),
+            };
+            Kind::Bump(v1::Bump {
+                kind: i32::from(match kind {
+                    BumpKind::SpeedBump => v1::BumpKind::SpeedBump,
+                    BumpKind::SpeedHump => v1::BumpKind::SpeedHump,
+                    BumpKind::SpeedTable => v1::BumpKind::SpeedTable,
+                    BumpKind::SpeedCushion => v1::BumpKind::SpeedCushion,
+                    BumpKind::Heave => v1::BumpKind::Heave,
+                }),
+                height,
+                profile: i32::from(profile),
+                ramp,
+            })
+        }
+        SurfaceFeatureKind::Roughness { class, seed } => Kind::Roughness(v1::Roughness {
+            // The schema's classes count from 1, after UNSPECIFIED.
+            class: class as i32 + 1,
+            seed,
+        }),
+    };
+    v1::SurfaceFeature {
+        id: feature.id.to_string(),
+        road: feature.road.to_string(),
+        station: feature.station,
+        length: feature.length,
+        offset: feature.offset,
+        width: feature.width,
+        kind: Some(kind),
+    }
 }
 
 fn surface(pavement: Pavement) -> i32 {

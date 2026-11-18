@@ -19,6 +19,8 @@
 //!   Right of way      → <junction>/<priority>
 //!   Bridge, viaduct   → <objects>/<bridge> on each road it carries
 //!   Tunnel, underpass → <objects>/<tunnel> on each road it carries
+//!   SurfaceFeature    → <surface>/<CRG> and an OpenCRG file beside the document,
+//!                       when `Options::crg` asks for them; see [`crg`]
 //! ```
 //!
 //! The same table is read the other way by [`read()`]: an OpenDRIVE document becomes
@@ -83,6 +85,8 @@ use opendrive::core::OpenDrive;
 use opendrive::junction::connection::Connection;
 use opendrive::junction::contact_point::ContactPoint;
 use opendrive::junction::controller::Controller as JunctionController;
+use opendrive::junction::crg_mode::CrgMode;
+use opendrive::junction::crg_purpose::CrgPurpose as OdCrgPurpose;
 use opendrive::junction::junction_type::JunctionType;
 use opendrive::junction::lane_link::LaneLink as JunctionLaneLink;
 use opendrive::junction::priority::Priority;
@@ -122,6 +126,7 @@ use opendrive::object::tunnel::Tunnel as OdTunnel;
 use opendrive::object::tunnel_type::TunnelType;
 use opendrive::object::Object;
 use opendrive::road::country_code::CountryCode;
+use opendrive::road::crg::Crg;
 use opendrive::road::element_type::ElementType;
 use opendrive::road::geometry::arc::Arc as OdArc;
 use opendrive::road::geometry::geometry_type::GeometryType;
@@ -141,6 +146,7 @@ use opendrive::road::road_type::RoadType as OdRoadType;
 use opendrive::road::road_type_e::RoadTypeE;
 use opendrive::road::rule::Rule;
 use opendrive::road::speed::{MaxSpeed, Speed as RoadSpeed};
+use opendrive::road::surface::Surface;
 use opendrive::road::unit::SpeedUnit;
 use opendrive::road::unit::Unit;
 use opendrive::road::Road as OdRoad;
@@ -175,6 +181,7 @@ use roadgen_core::GeometryError;
 
 mod bulbs;
 pub mod controllers;
+pub mod crg;
 mod error;
 mod materials;
 pub mod options;
@@ -183,6 +190,7 @@ pub mod road_coordinates;
 
 pub use bulbs::BULB_CODE;
 pub use controllers::{signal_groups, SignalGroup};
+pub use crg::{CrgDocument, CrgOptions, CrgPurpose};
 pub use error::{ExportError, ImportError};
 pub use options::{Options, SignalCatalogue, SignalPlacement};
 pub use read::{from_xml, from_xml_with, read, read_with, Imported, ReadOptions};
@@ -291,6 +299,9 @@ pub fn to_opendrive_with(map: &ValidatedMap, options: &Options) -> Result<OpenDr
 ///   controller:<id>                         ← traffic light, merged, role "controller"
 ///   bridge:<id>, tunnel:<id>                ← Structure, exact, or part when it
 ///                                             carries several stretches
+///   crg:<file name>                         ← SurfaceFeature, exact, or merged
+///                                             when the file holds several; role
+///                                             "elevation" or "friction"
 /// ```
 ///
 /// A lane's number is unique only within its `<laneSection>`, which is why the
@@ -299,7 +310,29 @@ pub fn to_opendrive_traced(
     map: &ValidatedMap,
     options: &Options,
 ) -> Result<(OpenDrive, Trace), ExportError> {
-    Exporter::new(map, options).run()
+    export(map, options).map(|(drive, trace, _)| (drive, trace))
+}
+
+/// The document, its trace and the OpenCRG files its `<CRG>`s refer to.
+fn export(
+    map: &ValidatedMap,
+    options: &Options,
+) -> Result<(OpenDrive, Trace, Vec<CrgDocument>), ExportError> {
+    let documents = match &options.crg {
+        Some(crg) => crg::documents(map.as_map(), crg)?,
+        None => Vec::new(),
+    };
+    let (drive, trace) = Exporter::new(map, options, &documents).run()?;
+    Ok((drive, trace, documents))
+}
+
+/// The OpenCRG files a map's surface features become, without the OpenDRIVE
+/// document that refers to them. See [`crg`].
+pub fn crg_documents(
+    map: &ValidatedMap,
+    options: &CrgOptions,
+) -> Result<Vec<CrgDocument>, ExportError> {
+    crg::documents(map.as_map(), options)
 }
 
 /// Which element of the document each element of the IR becomes, without keeping
@@ -327,11 +360,26 @@ pub fn to_xml_traced(
     map: &ValidatedMap,
     options: &Options,
 ) -> Result<(String, Trace), ExportError> {
-    let (drive, trace) = to_opendrive_traced(map, options)?;
+    to_xml_with_crg(map, options).map(|(xml, trace, _)| (xml, trace))
+}
+
+/// Turns a validated map into OpenDRIVE XML with its [`Trace`], and the OpenCRG
+/// files its `<CRG>`s refer to — none unless [`Options::crg`] asks for them. The
+/// caller writes the files beside the document, under their own names.
+pub fn to_xml_with_crg(
+    map: &ValidatedMap,
+    options: &Options,
+) -> Result<(String, Trace, Vec<CrgDocument>), ExportError> {
+    let (drive, trace, documents) = export(map, options)?;
     let xml = drive
         .to_xml_string()
         .map_err(|error| ExportError::Serialization(error.to_string()))?;
-    Ok((xml, trace))
+    let xml = if documents.is_empty() {
+        xml
+    } else {
+        crg::patch_xml(&xml)
+    };
+    Ok((xml, trace, documents))
 }
 
 /// Writes a validated map to an `.xodr` file.
@@ -360,10 +408,22 @@ pub fn write_with_traced(
     path: impl AsRef<Path>,
     options: &Options,
 ) -> Result<Trace, ExportError> {
-    let (xml, mut trace) = to_xml_traced(map, options)?;
+    let (xml, mut trace, documents) = to_xml_with_crg(map, options)?;
     std::fs::write(path.as_ref(), xml)
         .map_err(|error| ExportError::Io(format!("{}: {error}", path.as_ref().display())))?;
     trace.files.push(path.as_ref().to_path_buf());
+    // Beside the document, which refers to them by bare name.
+    let directory = path
+        .as_ref()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    for document in documents {
+        let file = directory.join(&document.file_name);
+        std::fs::write(&file, &document.text)
+            .map_err(|error| ExportError::Io(format!("{}: {error}", file.display())))?;
+        trace.files.push(file);
+    }
     Ok(trace)
 }
 
@@ -470,6 +530,14 @@ pub fn lane_id(map: &ValidatedMap, lane: &LaneId) -> Option<(String, i64)> {
 /// the boundary.
 pub fn check(map: &ValidatedMap) -> Vec<String> {
     let mut problems = Vec::new();
+    if !map.surface_features.is_empty() {
+        problems.push(format!(
+            "OpenDRIVE has no element for a rut, a pothole, a puddle, a hump or roughness, so \
+             the map's {} surface features are written only as OpenCRG files beside the \
+             document, which an export writes when `Options::crg` asks for them",
+            map.surface_features.len()
+        ));
+    }
     if !map.tin_surfaces.is_empty() || !map.land_covers.is_empty() {
         problems.push(format!(
             "OpenDRIVE describes the road's own elevation and nothing of the ground beside it, so \
@@ -633,10 +701,12 @@ struct Exporter<'a> {
     /// most of them are `&self` for it; a cell lets each one note what it wrote
     /// without threading a `&mut Trace` through every one of them.
     trace: RefCell<Trace>,
+    /// The OpenCRG files the roads' `<surface>`s refer to.
+    crg: &'a [CrgDocument],
 }
 
 impl<'a> Exporter<'a> {
-    fn new(map: &'a ValidatedMap, options: &'a Options) -> Self {
+    fn new(map: &'a ValidatedMap, options: &'a Options, crg: &'a [CrgDocument]) -> Self {
         let map = map.as_map();
         let mut buildings: HashMap<RoadId, Vec<&Building>> = HashMap::new();
         for building in map.buildings.iter() {
@@ -651,7 +721,55 @@ impl<'a> Exporter<'a> {
             options,
             map,
             trace: RefCell::new(Trace::new(TRACE_FORMAT)),
+            crg,
         }
+    }
+
+    /// A road's `<surface>`: a `<CRG>` for each OpenCRG file written for it, or
+    /// nothing when none was.
+    fn surface(&self, road: &Road) -> Option<Surface> {
+        let crg: Vec<Crg> = self
+            .crg
+            .iter()
+            .filter(|document| document.road == road.id)
+            .map(|document| {
+                let relation = if document.features.len() == 1 {
+                    Relation::Exact
+                } else {
+                    Relation::Merged
+                };
+                for feature in &document.features {
+                    self.record_as(
+                        feature.clone(),
+                        format!("crg:{}", document.file_name),
+                        relation,
+                        document.purpose.as_str(),
+                    );
+                }
+                Crg {
+                    file: document.file_name.clone(),
+                    h_offset: None,
+                    // Written `attached`; see `crg::patch_xml`.
+                    mode: CrgMode::Global,
+                    // Written `same`.
+                    orientation: Orientation::Plus,
+                    purpose: Some(match document.purpose {
+                        CrgPurpose::Elevation => OdCrgPurpose::Elevation,
+                        CrgPurpose::Friction => OdCrgPurpose::Friction,
+                    }),
+                    s_end: Length::new::<meter>(document.s_end),
+                    s_offset: Some(Length::new::<meter>(0.0)),
+                    s_start: Length::new::<meter>(document.s_start),
+                    t_offset: Some(Length::new::<meter>(0.0)),
+                    z_offset: None,
+                    z_scale: None,
+                }
+            })
+            .collect();
+        (!crg.is_empty()).then(|| Surface {
+            crg,
+            additional_data: AdditionalData::default(),
+        })
     }
 
     /// Notes that `ir` was written as `local`.
@@ -823,7 +941,7 @@ impl<'a> Exporter<'a> {
             lanes: self.lanes(road)?,
             objects: self.objects(road)?,
             signals: self.signals(road)?,
-            surface: None,
+            surface: self.surface(road),
             railroad: None,
             additional_data: AdditionalData::default(),
         })

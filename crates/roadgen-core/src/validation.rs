@@ -83,6 +83,7 @@ impl UnvalidatedMap {
         check_barriers(&self.0, &mut issues);
         check_terrain(&self.0, config, &mut issues);
         check_land_covers(&self.0, &mut issues);
+        check_surface_features(&self.0, &mut issues);
         check_sites(&self.0, &mut issues);
         crate::structure::check(
             &self.0,
@@ -530,6 +531,58 @@ fn check_land_covers(map: &Map, issues: &mut Vec<ValidationIssue>) {
                 |entry| entry.land_covers.contains(&cover.id),
                 issues,
             );
+        }
+    }
+}
+
+/// A surface feature has to lie on a road that exists, inside the stations that
+/// road has, with a footprint and magnitudes that are lengths.
+fn check_surface_features(map: &Map, issues: &mut Vec<ValidationIssue>) {
+    for surface in map.surface_features.iter() {
+        let feature = surface.id.to_string();
+        let mut implausible = |detail: String| {
+            issues.push(ValidationIssue::ImplausibleFeature {
+                feature: feature.clone(),
+                detail,
+            })
+        };
+        for (name, value) in [("station", surface.station), ("offset", surface.offset)] {
+            if !value.is_finite() {
+                implausible(format!("its {name} is {value}"));
+            }
+        }
+        for (name, value) in [("length", surface.length), ("width", surface.width)]
+            .into_iter()
+            .chain(surface.kind.magnitudes())
+        {
+            if !(value.is_finite() && value > 0.0) {
+                implausible(format!(
+                    "its {name} is {value}; it has to be more than nothing"
+                ));
+            }
+        }
+        if let crate::surface::SurfaceFeatureKind::Rut { track, trough, .. } = surface.kind {
+            if trough > track {
+                implausible(format!(
+                    "its troughs are {trough} m wide and only {track} m apart, so they overlap"
+                ));
+            }
+        }
+        let Some(road) = map.roads.get(&surface.road) else {
+            issues.push(ValidationIssue::DanglingFeatureReference {
+                referrer: feature.clone(),
+                feature: surface.road.to_string(),
+            });
+            continue;
+        };
+        if let Ok(length) = road.horizontal_length() {
+            let (from, to) = surface.stations();
+            if from < -1e-6 || to > length + 1e-6 {
+                implausible(format!(
+                    "it runs from station {from:.3} to {to:.3}, and {} is {length:.3} m long",
+                    road.id
+                ));
+            }
         }
     }
 }

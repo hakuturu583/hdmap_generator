@@ -68,6 +68,7 @@ pub mod map;
 pub mod semantics;
 pub mod site;
 pub mod structure;
+pub mod surface;
 pub mod terrain;
 pub mod topology;
 pub mod trace;
@@ -84,7 +85,8 @@ pub use geometry::{
 };
 pub use id::{
     BuildingId, BuildingPartId, ConnectionId, GradeSeparationId, InterchangeId, JunctionId,
-    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
+    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, SurfaceFeatureId, TinBreaklineId,
+    TinSurfaceId,
 };
 pub use land_cover::LandCover;
 pub use map::{
@@ -101,6 +103,9 @@ pub use structure::{
     Bridge, BridgeForm, BridgeSpec, GradeSeparation, Interchange, Portal, RoadSpan, Structure,
     StructureKind, StructureMaterial, StructureProfile, StructureSpec, Support, SupportKind,
     Tunnel, TunnelForm, TunnelSpec, Underneath,
+};
+pub use surface::{
+    BumpKind, BumpProfile, Relief, RoughnessClass, SurfaceFeature, SurfaceFeatureKind,
 };
 pub use terrain::{Tin, TinBreakline, TinError, TinLocator, TinSurface};
 pub use topology::{
@@ -123,7 +128,7 @@ pub mod prelude {
     };
     pub use crate::id::{
         BuildingId, BuildingPartId, ConnectionId, JunctionId, LandCoverId, LaneId, ObjectId,
-        RoadId, SiteId, TinBreaklineId, TinSurfaceId,
+        RoadId, SiteId, SurfaceFeatureId, TinBreaklineId, TinSurfaceId,
     };
     pub use crate::land_cover::LandCover;
     pub use crate::map::{Map, MapMetadata, Projection, Route, TrafficHandedness};
@@ -132,6 +137,9 @@ pub mod prelude {
         MarkingColor, ObjectGeometry, RoadMarking, RoadType, TrafficRule,
     };
     pub use crate::site::Site;
+    pub use crate::surface::{
+        BumpKind, BumpProfile, RoughnessClass, SurfaceFeature, SurfaceFeatureKind,
+    };
     pub use crate::terrain::{Tin, TinBreakline, TinSurface};
     pub use crate::topology::{Direction, LaneEnd, LateralSide, RoadEnd};
     pub use crate::units::{GeoOrigin, PositiveWidth, SpeedLimit};

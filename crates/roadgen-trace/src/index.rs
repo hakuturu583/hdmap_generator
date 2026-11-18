@@ -625,6 +625,13 @@ fn neighbour_table(catalog: &IrCatalog) -> HashMap<String, Vec<String>> {
             });
         }
     }
+    for feature in &catalog.surface_features {
+        if is(&feature.id, |r| matches!(r, IrRef::SurfaceFeature(_))) {
+            table
+                .entry(feature.id.clone())
+                .or_insert_with(|| vec![feature.road.clone()]);
+        }
+    }
     table
 }
 

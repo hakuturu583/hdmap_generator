@@ -19,7 +19,8 @@ use roadgen_core::geometry::{
 };
 use roadgen_core::id::{
     BuildingId, BuildingPartId, ConnectionId, GradeSeparationId, InterchangeId, JunctionId,
-    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, TinBreaklineId, TinSurfaceId,
+    LandCoverId, LaneId, ObjectId, RoadId, SiteId, StructureId, SurfaceFeatureId, TinBreaklineId,
+    TinSurfaceId,
 };
 use roadgen_core::land_cover::LandCover;
 use roadgen_core::map::{
@@ -35,6 +36,9 @@ use roadgen_core::structure::{
     Bridge, BridgeForm, GradeSeparation, Interchange, Portal, RoadSpan, Structure, StructureKind,
     StructureMaterial, StructureProfile, StructureSpan, Support, SupportKind, Tunnel, TunnelForm,
     Underneath,
+};
+use roadgen_core::surface::{
+    BumpKind, BumpProfile, RoughnessClass, SurfaceFeature, SurfaceFeatureKind,
 };
 use roadgen_core::terrain::{Tin, TinBreakline, TinSurface};
 use roadgen_core::topology::{
@@ -83,6 +87,7 @@ pub(crate) fn map(message: &v1::Map) -> Result<Map> {
         structures => structure,
         grade_separations => grade_separation,
         interchanges => interchange,
+        surface_features => surface_feature,
     }
     Ok(map)
 }
@@ -173,7 +178,8 @@ raw!(
     SiteId,
     StructureId,
     TinBreaklineId,
-    TinSurfaceId
+    TinSurfaceId,
+    SurfaceFeatureId
 );
 
 fn ids<T: Raw>(raw: &[String]) -> Vec<T> {
@@ -453,6 +459,65 @@ fn speed_limit(mps: Option<f64>, name: &str) -> Result<Option<SpeedLimit>> {
         .transpose()
         .map_err(invalid)
         .within(name)
+}
+
+fn surface_feature(message: &v1::SurfaceFeature) -> Result<SurfaceFeature> {
+    use v1::surface_feature::Kind;
+    let kind = match required(&message.kind).within("kind")? {
+        Kind::Rut(rut) => SurfaceFeatureKind::Rut {
+            depth: rut.depth,
+            track: rut.track,
+            trough: rut.trough,
+        },
+        Kind::Pothole(hole) => SurfaceFeatureKind::Pothole {
+            depth: hole.depth,
+            seed: hole.seed,
+        },
+        Kind::Puddle(puddle) => SurfaceFeatureKind::Puddle {
+            depth: puddle.depth,
+        },
+        Kind::Bump(bump) => SurfaceFeatureKind::Bump {
+            kind: match enumerated(bump.kind, "bump.kind")? {
+                v1::BumpKind::SpeedBump => BumpKind::SpeedBump,
+                v1::BumpKind::SpeedHump => BumpKind::SpeedHump,
+                v1::BumpKind::SpeedTable => BumpKind::SpeedTable,
+                v1::BumpKind::SpeedCushion => BumpKind::SpeedCushion,
+                v1::BumpKind::Heave => BumpKind::Heave,
+                v1::BumpKind::Unspecified => return unspecified("bump.kind"),
+            },
+            height: bump.height,
+            profile: match enumerated(bump.profile, "bump.profile")? {
+                v1::BumpProfile::Circular => BumpProfile::Circular,
+                v1::BumpProfile::Parabolic => BumpProfile::Parabolic,
+                v1::BumpProfile::Sinusoidal => BumpProfile::Sinusoidal,
+                v1::BumpProfile::Flat => BumpProfile::Flat { ramp: bump.ramp },
+                v1::BumpProfile::Unspecified => return unspecified("bump.profile"),
+            },
+        },
+        Kind::Roughness(rough) => SurfaceFeatureKind::Roughness {
+            class: match enumerated(rough.class, "roughness.class")? {
+                v1::RoughnessClass::A => RoughnessClass::A,
+                v1::RoughnessClass::B => RoughnessClass::B,
+                v1::RoughnessClass::C => RoughnessClass::C,
+                v1::RoughnessClass::D => RoughnessClass::D,
+                v1::RoughnessClass::E => RoughnessClass::E,
+                v1::RoughnessClass::F => RoughnessClass::F,
+                v1::RoughnessClass::G => RoughnessClass::G,
+                v1::RoughnessClass::H => RoughnessClass::H,
+                v1::RoughnessClass::Unspecified => return unspecified("roughness.class"),
+            },
+            seed: rough.seed,
+        },
+    };
+    Ok(SurfaceFeature {
+        id: SurfaceFeatureId::from_raw(&message.id),
+        road: RoadId::from_raw(&message.road),
+        station: message.station,
+        length: message.length,
+        offset: message.offset,
+        width: message.width,
+        kind,
+    })
 }
 
 fn surface(raw: i32) -> Result<Pavement> {
