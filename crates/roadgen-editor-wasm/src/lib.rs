@@ -563,19 +563,31 @@ mod tests {
 
     #[test]
     fn a_structured_road_is_bridged_over_a_river() {
-        let mut document = Document {
-            roads: vec![roadgen_editor::RoadDoc {
-                ground: "structured".to_owned(),
-                ..roadgen_editor::RoadDoc::two_way("r", vec![[0.0, 0.0, 0.0], [400.0, 0.0, 0.0]])
-            }],
-            ..Document::default()
-        };
+        // As the generator's own test has it: a road 12 m up across a river's
+        // valley, down to the country either side.
+        let mut road = roadgen_editor::RoadDoc::two_way(
+            "pass",
+            vec![
+                [-600.0, 0.0, 0.0],
+                [-200.0, 0.0, 12.0],
+                [200.0, 0.0, 12.0],
+                [600.0, 0.0, 0.0],
+            ],
+        );
+        road.shape = roadgen_editor::Shape::Polyline;
+        road.ground = "structured".to_owned();
         let mut terrain = roadgen_editor::TerrainDoc::default();
         terrain.rivers.push(roadgen_editor::RiverDoc {
-            centre: vec![[200.0, -150.0, 0.0], [200.0, 150.0, 0.0]],
+            centre: vec![[0.0, -400.0, 0.0], [0.0, 400.0, 0.0]],
+            width: 60.0,
+            depth: 6.0,
             ..Default::default()
         });
-        document.terrain = Some(terrain);
+        let document = Document {
+            roads: vec![road],
+            terrain: Some(terrain),
+            ..Document::default()
+        };
         let (built, notes) = build_with_land(&document);
         let map = built.map.as_ref().unwrap().as_map();
         assert!(

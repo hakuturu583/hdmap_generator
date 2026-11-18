@@ -667,8 +667,8 @@ impl Document {
     }
 
     /// A small town to start from: a crossroads, one arm of it bending away and
-    /// carrying on past a straight joint into a road with a pavement over a bridge,
-    /// another worn, with a hump before the crossing, and a third through a tunnel.
+    /// carrying on past a straight joint into a road with a pavement, another worn,
+    /// with a hump before the crossing, and a third through a tunnel.
     pub fn example() -> Document {
         let z = 0.0;
         let mut east = RoadDoc::two_way(
@@ -689,16 +689,13 @@ impl Document {
         // A worn approach: a pothole and a puddle in its lanes, ruts in the
         // eastbound lane's wheel paths, and a hump to slow traffic before the
         // crossroads. Right-hand traffic: eastbound is to the right, at -1.75.
-        // The southern approach dips through a short tunnel; the avenue leaves on a
-        // bridge.
+        // The southern approach runs through a short tunnel. (No bridge: one at the
+        // level of the ground it stands on spans nothing, which the land, once it
+        // is generated, says.)
         let mut south = RoadDoc::two_way("south", vec![[0.0, -80.0, z], [0.0, -12.0, z]]);
         south.structures = vec![StructureDoc {
             name: "south tunnel".to_owned(),
             ..StructureDoc::new("tunnel", 15.0, 45.0)
-        }];
-        avenue.structures = vec![StructureDoc {
-            name: "avenue bridge".to_owned(),
-            ..StructureDoc::new("bridge", 12.0, 48.0)
         }];
         let mut west = RoadDoc::two_way("west", vec![[-80.0, 0.0, z], [-12.0, 0.0, z]]);
         west.surface = vec![

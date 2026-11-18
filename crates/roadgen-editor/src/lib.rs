@@ -440,9 +440,24 @@ mod tests {
         );
     }
 
+    /// The example, with a bridge on the avenue as well as its tunnel.
+    fn bridged() -> Document {
+        let mut document = Document::example();
+        let avenue = document
+            .roads
+            .iter_mut()
+            .find(|r| r.id == "avenue")
+            .unwrap();
+        avenue.structures = vec![StructureDoc {
+            name: "avenue bridge".to_owned(),
+            ..StructureDoc::new("bridge", 12.0, 48.0)
+        }];
+        document
+    }
+
     #[test]
     fn bridges_and_tunnels_go_on_their_roads() {
-        let map = build(&Document::example()).validated().unwrap();
+        let map = build(&bridged()).validated().unwrap();
         let kinds: Vec<(&str, &str)> = map
             .structures
             .iter()
@@ -456,7 +471,7 @@ mod tests {
 
     #[test]
     fn a_bad_structure_is_named_and_the_rest_builds() {
-        let mut document = Document::example();
+        let mut document = bridged();
         document.roads[2].structures[0].to = 5.0; // ends before it starts
         let avenue = document
             .roads
@@ -482,7 +497,7 @@ mod tests {
 
     #[test]
     fn bridges_and_tunnels_come_back_from_the_ir() {
-        let mut original = Document::example();
+        let mut original = bridged();
         original.roads[2].structures[0].form = "cut_and_cover".to_owned();
         original.roads[2].structures[0].clear_height = 4.8;
         let map = build(&original).validated().unwrap();
