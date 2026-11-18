@@ -1752,6 +1752,10 @@ async function start() {
       return files
     },
     toScreen,
+    view: (cx, cy, scale) => {
+      state.view = { cx, cy, scale }
+      render()
+    },
   }
   document.body.dataset.ready = 'true'
 }

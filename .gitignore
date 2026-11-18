@@ -13,4 +13,4 @@ __pycache__/
 /.venv
 /editor/site
 /editor/node_modules
-/editor/smoke.png
+/editor/smoke-*.png

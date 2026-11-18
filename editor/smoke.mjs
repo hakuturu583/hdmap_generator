@@ -60,6 +60,8 @@ try {
   check(built.scene.lanes.length > 10, `only ${built.scene.lanes.length} lanes were drawn`)
   check((await page.locator('#validity').textContent()) === 'valid', 'the status bar does not say valid')
 
+  await shoot('overview')
+
   const box = await page.locator('#canvas').boundingBox()
   const at = async (world) => {
     const [x, y] = await editor((p) => window.roadgenEditor.toScreen(p), world)
@@ -82,6 +84,13 @@ try {
   const dragged = (await editor(() => window.roadgenEditor.built())).scene.surfaces.find((s) => s.kind === 'pothole')
   check(dragged.stations[0] > pothole.stations[0] + 2, 'the drawn pothole did not follow the document')
   await page.keyboard.press('Control+z')
+
+  // A close look at the worn road, with its surface in the inspector.
+  await page.mouse.click(...(await at([-70, -1.75])))
+  await editor(() => window.roadgenEditor.view(-46, 0, 16))
+  await page.locator('#tab-inspect h4', { hasText: 'Surface' }).scrollIntoViewIfNeeded()
+  await shoot('surface')
+  await page.keyboard.press('f')
 
   // Select `west` by clicking one of its lanes, then drag its far end.
   const west = (await editor(() => window.roadgenEditor.document())).roads.find((r) => r.id === 'west')
@@ -157,7 +166,7 @@ try {
   const reopened = await editor(() => window.roadgenEditor.document())
   check(reopened.roads.length === 6, `the OpenDRIVE file opened with ${reopened.roads.length} roads`)
 
-  await page.screenshot({ path: path.join(here, 'smoke.png') })
+  await shoot('final')
 } catch (error) {
   thrown.push(String(error?.stack ?? error))
 } finally {
@@ -167,6 +176,19 @@ try {
 
 if (thrown.length) fail(thrown.join('\n'))
 console.log('editor smoke test passed')
+
+/// Saves what the page looks like now as `smoke-<name>.png`. With
+/// EDITOR_PRINT_SCREENSHOTS set, also prints it to the log as base64 JPEG between
+/// marker lines, for a reader who can see the log but not the artifacts.
+async function shoot(name) {
+  await page.screenshot({ path: path.join(here, `smoke-${name}.png`) })
+  if (!process.env.EDITOR_PRINT_SCREENSHOTS) return
+  const jpeg = await page.screenshot({ type: 'jpeg', quality: 70 })
+  const text = jpeg.toString('base64')
+  console.log(`--- screenshot ${name} begin ---`)
+  for (let i = 0; i < text.length; i += 4000) console.log(text.slice(i, i + 4000))
+  console.log(`--- screenshot ${name} end ---`)
+}
 
 function check(condition, message) {
   if (!condition) throw new Error(message)
