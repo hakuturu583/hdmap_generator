@@ -113,3 +113,4 @@ li.invalid .what::before { content: "●"; color: var(--warn); margin-right: 6px
 }
 table.points tr.selected td { background: #4ea1ff22; }
 table.points td:first-child { cursor: pointer; }
+textarea.grammar { width: 100%; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 6px; }

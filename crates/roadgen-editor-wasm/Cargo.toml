@@ -26,6 +26,9 @@ roadgen-proto.workspace = true
 # The land: hills, rivers, heaps and pads generated round the roads, as the CARLA
 # export and the Python package generate it.
 roadgen-carla.workspace = true
+# The buildings along the roads, from a shape grammar; the land's generator uses
+# it for its town, and without land it lines the roads directly.
+roadgen-buildings.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The bridge to JavaScript. MIT/Apache-2.0. Unpinned beyond the minor version: the

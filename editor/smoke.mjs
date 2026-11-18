@@ -272,6 +272,21 @@ try {
   check(!built.scene.terrain.length && built.valid, 'turning the land off did not take it away')
   await page.keyboard.press('f')
 
+  // Buildings along the roads, from the town preset; then a second street of
+  // them from another seed; then off.
+  await page.locator('.tabs button', { hasText: 'Map' }).click()
+  await page.locator('#tab-map label', { hasText: 'buildings along the roads' }).locator('input').check()
+  await page.waitForFunction(() => window.roadgenEditor.built().scene.areas.some((a) => a.category === 'building'), null, { timeout: 60_000 })
+  built = await editor(() => window.roadgenEditor.built())
+  check(built.valid, `the map with buildings does not validate: ${JSON.stringify(built.problems)}`)
+  const town = built.scene.areas.filter((a) => a.category === 'building')
+  check(town.every((a) => a.height > 2 && a.levels >= 1), 'a building part without a height or storeys')
+  await editor(() => window.roadgenEditor.view(0, 0, 3))
+  await shoot('buildings')
+  await page.locator('#tab-map label', { hasText: 'buildings along the roads' }).locator('input').uncheck()
+  check(!(await editor(() => window.roadgenEditor.built())).scene.areas.some((a) => a.category === 'building'), 'turning the buildings off left some')
+  await page.keyboard.press('f')
+
   // Every tab draws without throwing.
   for (const tab of ['Links', 'Problems', 'Map', 'Inspect']) await page.locator('.tabs button', { hasText: tab }).click()
 

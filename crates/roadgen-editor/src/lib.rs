@@ -31,8 +31,9 @@ pub mod import;
 
 pub use build::{build, Built, Problem, Severity};
 pub use document::{
-    Document, ElementDoc, End, Handedness, HeapDoc, HillDoc, LaneDoc, LinkDoc, Marking, PadDoc,
-    RiverDoc, RoadDoc, RutPath, Shape, Side, StructureDoc, SurfaceDoc, TerrainDoc, Travel,
+    BuildingsDoc, Document, ElementDoc, End, Handedness, HeapDoc, HillDoc, LaneDoc, LinkDoc,
+    Marking, PadDoc, RiverDoc, RoadDoc, RutPath, Shape, Side, StructureDoc, SurfaceDoc, TerrainDoc,
+    Travel,
 };
 pub use import::{alignment_of, from_map};
 

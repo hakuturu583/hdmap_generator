@@ -354,6 +354,34 @@ impl Default for HeapDoc {
 pub struct PadDoc {
     pub name: String,
     pub outline: Vec<[f64; 3]>,
+    /// Whether the document's buildings go on the pad too: a yard's sheds.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "std::ops::Not::not"))]
+    pub buildings: bool,
+}
+
+/// The buildings along the roads: generated from a shape grammar, lot by lot along
+/// every frontage, not placed one by one.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct BuildingsDoc {
+    /// `town`, `suburban`, `downtown` or `industrial`; or `custom` for `grammar`.
+    pub preset: String,
+    /// CGA rules written out in full, used when `preset` is `custom`.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "String::is_empty"))]
+    pub grammar: String,
+    /// What makes one street unlike another under the same rules.
+    pub seed: u64,
+}
+
+impl Default for BuildingsDoc {
+    fn default() -> Self {
+        BuildingsDoc {
+            preset: "town".to_owned(),
+            grammar: String::new(),
+            seed: 0,
+        }
+    }
 }
 
 /// A bridge or a tunnel over a stretch of one road.
@@ -611,6 +639,9 @@ pub struct Document {
     /// The land, when the document has any; none, and the map states no land.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub terrain: Option<TerrainDoc>,
+    /// The buildings, when the document has any.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub buildings: Option<BuildingsDoc>,
 }
 
 impl Default for Document {
@@ -623,6 +654,7 @@ impl Default for Document {
             roads: Vec::new(),
             links: Vec::new(),
             terrain: None,
+            buildings: None,
         }
     }
 }

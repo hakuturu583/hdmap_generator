@@ -214,6 +214,7 @@ function validateSelection() {
   if (s.kind === 'junction' && !junctionNames().includes(s.id)) state.selection = null
   if (s.kind === 'link' && !state.doc.links[s.index]) state.selection = null
   if (s.kind === 'land' && !state.doc.terrain?.[s.group]?.[s.index]) state.selection = null
+  if (s.kind === 'building' && !state.doc.buildings) state.selection = null
   if (state.selection?.kind !== 'road') state.point = null
   const road = state.selection?.kind === 'road' && findRoad(state.selection.id)
   if (road && state.point != null && state.point >= road.points.length) state.point = null
@@ -253,9 +254,11 @@ function rebuild(land = true) {
     state.built = JSON.parse(buildDocument(JSON.stringify(state.doc), land))
     if (land) {
       state.landCache = landCache(state.built.scene)
-    } else if (state.doc.terrain && before?.scene) {
+    } else if ((state.doc.terrain || state.doc.buildings) && before?.scene) {
+      // Keep what was generated last: the land, and the buildings along the roads.
       state.built.scene.terrain = before.scene.terrain
       state.built.scene.contours = before.scene.contours
+      state.built.scene.areas = before.scene.areas
       state.built.land_notes = before.land_notes
     }
     if (!state.doc.terrain) state.landCache = null
@@ -361,10 +364,22 @@ function render() {
   drawLand(px)
   drawGrid(px)
 
+  const tallest = Math.max(10, ...(scene.areas ?? []).map((area) => area.height ?? 0))
+  const selectedBuilding = state.selection?.kind === 'building' ? state.selection.id : null
   for (const area of scene.areas ?? []) {
     polygon(area.outline)
-    ctx.fillStyle = area.category === 'building' ? '#9c8f80' : '#5b5040'
-    ctx.fill()
+    if (area.category === 'building') {
+      // Lighter the taller: a plan that reads as a skyline.
+      const share = Math.min(1, (area.height ?? 0) / tallest)
+      ctx.fillStyle = `rgb(${[120, 108, 96].map((v) => Math.round(v + (225 - v) * share)).join(',')})`
+      ctx.fill()
+      ctx.strokeStyle = area.building === selectedBuilding ? '#4ea1ff' : '#2b2722'
+      ctx.lineWidth = (area.building === selectedBuilding ? 2.5 : 1) * px
+      ctx.stroke()
+    } else {
+      ctx.fillStyle = area.kind === 'water' ? '#2f5f8a' : '#5b5040'
+      ctx.fill()
+    }
   }
   for (const junction of scene.junctions ?? []) {
     if (junction.outline.length < 3) continue
@@ -1413,6 +1428,18 @@ canvas.addEventListener('pointerdown', (event) => {
     return
   }
   const lane = laneAt(world)
+  const building = !end && !lane && (state.built?.scene?.areas ?? []).find((area) => area.category === 'building' && inside(area.outline, world))
+  if (building) {
+    state.selection = { kind: 'building', id: building.building }
+    state.point = null
+    state.surface = null
+    state.structure = null
+    showTab('inspect')
+    renderPanels()
+    render()
+    startPan(event, screen)
+    return
+  }
   const shape = !end && !lane && landAt(world, screen)
   if (shape) {
     state.selection = shape
@@ -1903,6 +1930,7 @@ function renderInspector() {
   if (s.kind === 'junction') return renderJunctionInspector(tab, s.id)
   if (s.kind === 'link') return renderLinkInspector(tab, s.index)
   if (s.kind === 'land') return renderLandInspector(tab, s.group, s.index)
+  if (s.kind === 'building') return renderBuildingInspector(tab, s.id)
 }
 
 function editRoad(id, change) {
@@ -2626,6 +2654,7 @@ function renderMapTab() {
         `${stats.junctions ?? 0} junctions, ${stats.connections ?? 0} lane connections.`,
     ),
     ...landSection(),
+    ...buildingsSection(),
     importNotes ? h('h4', {}, 'Last import') : null,
     importNotes ? h('p', { class: 'muted notes' }, importNotes) : null,
     h('h4', {}, 'Keys'),
@@ -2713,6 +2742,58 @@ function landSection() {
   ]
 }
 
+/// A generated building: what it is, read-only — the document says the rules, not
+/// the buildings.
+function renderBuildingInspector(tab, id) {
+  const parts = (state.built?.scene?.areas ?? []).filter((area) => area.building === id)
+  if (!parts.length) return
+  const tallest = Math.max(...parts.map((p) => p.height ?? 0))
+  tab.append(
+    h('h3', {}, id.replace(/^building\//, 'Building ')),
+    h('p', { class: 'muted' }, 'Generated from the buildings’ rules along this frontage. Change the rules or the seed under Map to change it.'),
+    field('kind', h('span', {}, parts[0].kind || '—')),
+    field('parts', h('span', {}, String(parts.length))),
+    field('height', h('span', {}, `${tallest.toFixed(1)} m`)),
+    field('storeys', h('span', {}, String(Math.max(...parts.map((p) => p.levels ?? 0))))),
+  )
+}
+
+const BUILDING_PRESETS = [['town', 'town street'], ['suburban', 'suburban'], ['downtown', 'downtown'], ['industrial', 'industrial'], ['custom', 'custom rules (CGA)']]
+
+function buildingsSection() {
+  const buildings = state.doc.buildings
+  const header = [
+    h('h4', {}, 'Buildings'),
+    h(
+      'label',
+      { class: 'row' },
+      h('input', {
+        type: 'checkbox',
+        checked: Boolean(buildings),
+        onchange: (e) => commit((d) => (e.target.checked ? (d.buildings = d.buildings ?? { preset: 'town', seed: 0 }) : delete d.buildings)),
+      }),
+      'buildings along the roads',
+    ),
+  ]
+  if (!buildings) return header
+  const count = new Set((state.built?.scene?.areas ?? []).filter((a) => a.category === 'building').map((a) => a.building)).size
+  return [
+    ...header,
+    h('p', { class: 'muted' }, `${count} buildings, lot by lot along every frontage, from a shape grammar.${state.doc.terrain ? ' With the land on, they keep off its shapes and stand on it.' : ''}`),
+    field('rules', select(BUILDING_PRESETS, buildings.preset ?? 'town', (v) => commit((d) => (d.buildings.preset = v)))),
+    field('seed', numberInput(buildings.seed ?? 0, (v) => v != null && commit((d) => (d.buildings.seed = v)), { min: 0, step: 1 })),
+    buildings.preset === 'custom'
+      ? h('textarea', {
+          rows: 10,
+          class: 'grammar',
+          value: buildings.grammar ?? '',
+          placeholder: 'Lot --> extrude(9) Mass …',
+          onchange: (e) => commit((d) => (d.buildings.grammar = e.target.value)),
+        })
+      : null,
+  ]
+}
+
 function renderLandInspector(tab, group, index) {
   const shape = state.doc.terrain?.[group]?.[index]
   if (!shape) return
@@ -2728,7 +2809,14 @@ function renderLandInspector(tab, group, index) {
       hills: [number('height', 'height m', { min: 0.5 }), number('width', 'width at foot m', { min: 1, step: 5 })],
       rivers: [number('width', 'width m', { min: 0.5 }), number('depth', 'depth m', { min: 0.1 }), number('bank_slope', 'bank slope (h:v)', { min: 0.1 })],
       heaps: [number('height', 'height m', { min: 0.5 }), number('radius', 'radius m', { min: 1 }), number('repose', 'repose °', { min: 5, max: 60 }), field('kind', h('input', { value: shape.kind ?? '', onchange: (e) => edit((s) => (s.kind = e.target.value.trim() || s.kind)) }))],
-      pads: [],
+      pads: [
+        h(
+          'label',
+          { class: 'row' },
+          h('input', { type: 'checkbox', checked: Boolean(shape.buildings), onchange: (e) => edit((s) => (e.target.checked ? (s.buildings = true) : delete s.buildings)) }),
+          'buildings on it too, from the buildings’ rules',
+        ),
+      ],
     }[group],
   )
   if (group !== 'heaps') {

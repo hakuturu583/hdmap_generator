@@ -355,8 +355,9 @@ pub fn formats() -> String {
 /// whether the map is valid.
 #[wasm_bindgen(js_name = buildDocument)]
 ///
-/// `land` says whether to generate the document's land too: the page leaves it
-/// out while something is being dragged, and keeps the land it last had.
+/// `land` says whether to generate the document's land and buildings too: the
+/// page leaves them out while something is being dragged, and keeps what it last
+/// had.
 pub fn build_document(document: &str, land: bool) -> Result<String, JsError> {
     build_json(document, land).map_err(|e| JsError::new(&e))
 }
@@ -596,6 +597,47 @@ mod tests {
             .iter()
             .any(|p| p.message.starts_with("the land could not be generated")));
         assert!(built.map.unwrap().as_map().tin_surfaces.is_empty());
+    }
+
+    #[test]
+    fn buildings_line_the_roads_with_or_without_land() {
+        for land in [false, true] {
+            let mut document = Document::example();
+            if land {
+                with_land(&mut document);
+            }
+            document.buildings = Some(roadgen_editor::BuildingsDoc::default());
+            let (built, notes) = build_with_land(&document);
+            let map = built.map.as_ref().unwrap().as_map();
+            assert!(
+                !map.buildings.is_empty(),
+                "no buildings (land {land}): {notes:?} {:#?}",
+                built.problems
+            );
+            assert!(built.is_valid(), "land {land}: {:#?}", built.problems);
+            let json = serde_json::to_string(&document).unwrap();
+            let result: serde_json::Value =
+                serde_json::from_str(&build_json(&json, true).unwrap()).unwrap();
+            let areas = result["scene"]["areas"].as_array().unwrap();
+            assert!(areas
+                .iter()
+                .any(|a| a["category"] == "building" && a["height"].as_f64().unwrap() > 2.0));
+        }
+    }
+
+    #[test]
+    fn rules_that_do_not_parse_are_a_problem() {
+        let mut document = Document::example();
+        document.buildings = Some(roadgen_editor::BuildingsDoc {
+            preset: "cathedral".to_owned(),
+            ..Default::default()
+        });
+        let (built, _) = build_with_land(&document);
+        assert!(built.map.unwrap().as_map().buildings.is_empty());
+        assert!(built
+            .problems
+            .iter()
+            .any(|p| p.message.starts_with("the buildings' rules")));
     }
 
     #[test]

@@ -2900,6 +2900,12 @@ A few things the document does for you:
   it meets the land: the land takes its height from the road (the default), the land
   is cut and filled to meet it, or the generator chooses bridges and tunnels for it
   from the land — over a river, through a hill. The land goes out with the map.
+- **Buildings are generated too.** Turn them on under Map and every road frontage is
+  cut into lots and built up from a [shape grammar](#buildings) — the `town`,
+  `suburban`, `downtown` or `industrial` preset, or CGA rules written in the page —
+  with a seed to vary the street. With the land on, they keep off its shapes, stand
+  on it, and a pad can have its own. They are drawn lighter the taller they are;
+  click one for its height and storeys.
 - **Opening a file makes it editable.** An OpenDRIVE file or an IR document opens as a
   document: reference lines as polylines simplified to 2 cm, the first cross-section's
   lanes at their starting widths, each junction as the links its connectors were made

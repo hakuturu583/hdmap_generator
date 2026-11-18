@@ -157,6 +157,14 @@ pub struct AreaView {
     /// The IR's own word for it: `house`, `pit`…
     pub kind: String,
     pub outline: Vec<Xy>,
+    /// A building part's: the building it belongs to, how tall it stands from its
+    /// lowest point to the top of its roof, metres, and its storeys.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub building: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub height: Option<f64>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub levels: Option<u32>,
 }
 
 /// A departure of a road's surface from its design: a rut, a pothole, a puddle, a
@@ -443,6 +451,9 @@ impl Scene {
                     .iter()
                     .map(|p| xy(*p))
                     .collect(),
+                building: Some(part.building.as_str().to_owned()),
+                height: Some(part.solid.height()),
+                levels: Some(part.levels),
             });
         }
         for cover in map.land_covers.iter() {
@@ -451,6 +462,9 @@ impl Scene {
                 category: "land_cover".to_owned(),
                 kind: cover.kind.clone(),
                 outline: cover.area.points().iter().map(|p| xy(*p)).collect(),
+                building: None,
+                height: None,
+                levels: None,
             });
         }
 
