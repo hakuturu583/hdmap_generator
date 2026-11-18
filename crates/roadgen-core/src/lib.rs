@@ -105,7 +105,8 @@ pub use structure::{
     Tunnel, TunnelForm, TunnelSpec, Underneath,
 };
 pub use surface::{
-    BumpKind, BumpProfile, Relief, RoughnessClass, SurfaceFeature, SurfaceFeatureKind,
+    BumpKind, BumpProfile, LanePath, PathCentre, Relief, RoughnessClass, SurfaceFeature,
+    SurfaceFeatureKind,
 };
 pub use terrain::{Tin, TinBreakline, TinError, TinLocator, TinSurface};
 pub use topology::{
@@ -138,7 +139,7 @@ pub mod prelude {
     };
     pub use crate::site::Site;
     pub use crate::surface::{
-        BumpKind, BumpProfile, RoughnessClass, SurfaceFeature, SurfaceFeatureKind,
+        BumpKind, BumpProfile, LanePath, RoughnessClass, SurfaceFeature, SurfaceFeatureKind,
     };
     pub use crate::terrain::{Tin, TinBreakline, TinSurface};
     pub use crate::topology::{Direction, LaneEnd, LateralSide, RoadEnd};

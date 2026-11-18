@@ -167,19 +167,37 @@ fn mine(out: &str) -> Result<()> {
     let (from, to) = (150.0, 260.0);
     // A large haul truck's wheels are about 5.5 m apart; each trough as wide as a
     // dual tyre set, and deep: 15 cm.
+    // Downhill, the trucks keep to their lane: straight ruts down its middle.
+    builder.add_surface_feature(
+        &ramp,
+        from,
+        to - from,
+        -5.25,
+        7.0,
+        SurfaceFeatureKind::Rut {
+            depth: 0.15,
+            track: 5.5,
+            trough: 1.5,
+            path: None,
+        },
+    )?;
+    // Uphill, they wander: one line drifts to the berm side and back, cuts in
+    // towards the downhill lane and settles, in the lane's own coordinates.
+    builder.add_rut_along(
+        &LaneRef::new(ramp.clone(), 1),
+        vec![
+            (from, 0.0),
+            (180.0, 1.8),
+            (205.0, -2.0),
+            (225.0, -3.6),
+            (245.0, -0.5),
+            (to, 0.5),
+        ],
+        0.15,
+        5.5,
+        1.5,
+    )?;
     for (lateral, seed) in [(-5.25, 1), (5.25, 2)] {
-        builder.add_surface_feature(
-            &ramp,
-            from,
-            to - from,
-            lateral,
-            7.0,
-            SurfaceFeatureKind::Rut {
-                depth: 0.15,
-                track: 5.5,
-                trough: 1.5,
-            },
-        )?;
         // Water standing in the troughs, here and there.
         for (k, station) in [175.0, 205.0, 232.0].into_iter().enumerate() {
             let side = if (k + seed) % 2 == 0 { 2.75 } else { -2.75 };
@@ -242,6 +260,13 @@ fn mine(out: &str) -> Result<()> {
                 target: (192.0, -2.0, 0.0),
                 radius: 70.0,
                 fov: 55.0,
+            },
+            Shot {
+                name: "mine_ruts_top",
+                eye: (196.0, 0.0, 95.0),
+                target: (206.0, 0.0, 0.0),
+                radius: 90.0,
+                fov: 42.0,
             },
             Shot {
                 name: "mine_ruts_wide",
@@ -325,6 +350,7 @@ fn potholes(out: &str) -> Result<()> {
             depth: 0.035,
             track: 1.8,
             trough: 0.6,
+            path: None,
         },
     )?;
     let map = builder.finish()?.validate()?;

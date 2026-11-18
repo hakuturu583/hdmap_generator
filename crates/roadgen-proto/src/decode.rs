@@ -38,7 +38,7 @@ use roadgen_core::structure::{
     Underneath,
 };
 use roadgen_core::surface::{
-    BumpKind, BumpProfile, RoughnessClass, SurfaceFeature, SurfaceFeatureKind,
+    BumpKind, BumpProfile, LanePath, RoughnessClass, SurfaceFeature, SurfaceFeatureKind,
 };
 use roadgen_core::terrain::{Tin, TinBreakline, TinSurface};
 use roadgen_core::topology::{
@@ -468,6 +468,18 @@ fn surface_feature(message: &v1::SurfaceFeature) -> Result<SurfaceFeature> {
             depth: rut.depth,
             track: rut.track,
             trough: rut.trough,
+            path: rut
+                .path
+                .as_ref()
+                .map(|path| {
+                    LanePath::new(
+                        LaneId::from_raw(&path.lane),
+                        path.knots.iter().map(|k| (k.station, k.offset)).collect(),
+                    )
+                    .map_err(invalid)
+                })
+                .transpose()
+                .within("rut.path")?,
         },
         Kind::Pothole(hole) => SurfaceFeatureKind::Pothole {
             depth: hole.depth,

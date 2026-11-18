@@ -354,10 +354,19 @@ fn surface_feature(feature: &SurfaceFeature) -> v1::SurfaceFeature {
             depth,
             track,
             trough,
+            ref path,
         } => Kind::Rut(v1::Rut {
             depth,
             track,
             trough,
+            path: path.as_ref().map(|path| v1::LanePath {
+                lane: path.lane.to_string(),
+                knots: path
+                    .knots()
+                    .iter()
+                    .map(|&(station, offset)| v1::LanePathKnot { station, offset })
+                    .collect(),
+            }),
         }),
         SurfaceFeatureKind::Pothole { depth, seed } => Kind::Pothole(v1::Pothole { depth, seed }),
         SurfaceFeatureKind::Puddle { depth } => Kind::Puddle(v1::Puddle { depth }),

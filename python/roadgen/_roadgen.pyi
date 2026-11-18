@@ -510,6 +510,15 @@ class Map:
         seed: int = 0,
     ) -> str:
         """Puts a rut, pothole, puddle, bump or roughness on a road; returns its id."""
+    def add_rut_along(
+        self,
+        lane: LaneRef,
+        path: list[tuple[float, float]],
+        depth: float = 0.025,
+        track: float = 1.8,
+        trough: float = 0.6,
+    ) -> str:
+        """Ruts along `[(station, offset from the lane's middle), ...]`; returns the id."""
     def surface_features(
         self,
     ) -> list[tuple[str, str, str, float, float, float, float]]: ...

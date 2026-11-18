@@ -269,11 +269,28 @@ enum RoughnessClass {
 }
 
 // Two wheel-path troughs, `track` apart centre to centre, each `trough` wide and
-// `depth` deep (ASTM E1703's rut depth). Metres.
+// `depth` deep (ASTM E1703's rut depth). Metres. Straight down the middle of the
+// footprint without a `path`; along it, measured across the path, with one.
 message Rut {
   double depth = 1;
   double track = 2;
   double trough = 3;
+  optional LanePath path = 4;
+}
+
+// A line in a lane's own coordinates: at least two knots, stations strictly
+// ascending, each offset metres to the left of the lane's middle, joined by a
+// cubic Hermite curve whose slope at a knot is the chord's between its
+// neighbours.
+message LanePath {
+  // A `Lane.id`.
+  string lane = 1;
+  repeated LanePathKnot knots = 2;
+}
+
+message LanePathKnot {
+  double station = 1;
+  double offset = 2;
 }
 
 // A bowl inside the footprint's ellipse, `depth` deep; `seed` shapes its rim.

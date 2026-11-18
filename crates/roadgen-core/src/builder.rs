@@ -25,7 +25,7 @@ use crate::semantics::{
 use crate::structure::{
     self, BridgeSpec, Interchange, RoadSpan, StructureProfile, StructureSpec, TunnelSpec,
 };
-use crate::surface::{SurfaceFeature, SurfaceFeatureKind};
+use crate::surface::{LanePath, SurfaceFeature, SurfaceFeatureKind};
 use crate::topology::{
     Direction, Junction, LaneConnection, LaneEnd, LaneEndpoint, LateralSide, RoadEnd, RoadEndpoint,
     RoadLink, RoadLinkTarget,
@@ -959,6 +959,39 @@ impl MapBuilder {
         Ok(id)
     }
 
+    /// Wears ruts into `lane` along a path in the lane's own coordinates: `knots`
+    /// are `(station, offset)` pairs, the offset metres to the left of the lane's
+    /// middle, joined smoothly. The troughs are `track` apart and `trough` wide
+    /// across the path, and `depth` deep. The footprint is fitted to the path when
+    /// the map is built. See [`crate::surface::LanePath`].
+    pub fn add_rut_along(
+        &mut self,
+        lane: &LaneRef,
+        knots: Vec<(f64, f64)>,
+        depth: f64,
+        track: f64,
+        trough: f64,
+    ) -> Result<SurfaceFeatureId, BuildError> {
+        self.lane_spec(lane)?;
+        let path = LanePath::new(LaneId::of_road(&lane.road, lane.index), knots)
+            .map_err(BuildError::SurfaceFeature)?;
+        let count = self
+            .surface_features
+            .iter()
+            .filter(|feature| feature.road == lane.road && feature.kind.as_str() == "rut")
+            .count();
+        let id = SurfaceFeatureId::new(format!("{}/rut/{count}", lane.road.local_name()));
+        self.add_surface_feature_as(SurfaceFeature::rut_along(
+            id.clone(),
+            lane.road.clone(),
+            path,
+            depth,
+            track,
+            trough,
+        ))?;
+        Ok(id)
+    }
+
     /// Puts a surface feature on the map under the identifier it already has.
     pub fn add_surface_feature_as(&mut self, feature: SurfaceFeature) -> Result<(), BuildError> {
         if !self.road_index.contains_key(&feature.road) {
@@ -1146,9 +1179,14 @@ impl Generator {
         self.build_interchanges()?;
         structure::derive_separations(&mut self.map);
         for feature in &self.builder.surface_features {
+            // A rut along a path is fitted to it now that its lane exists.
+            let mut feature = feature.clone();
+            feature
+                .fit_to_path(&self.map)
+                .map_err(BuildError::SurfaceFeature)?;
             self.map
                 .surface_features
-                .insert(feature.id.clone(), feature.clone())
+                .insert(feature.id.clone(), feature)
                 .map_err(|duplicate| BuildError::DuplicateId(duplicate.0.to_string()))?;
         }
         Ok(UnvalidatedMap::from_map(self.map))

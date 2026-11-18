@@ -751,6 +751,29 @@ impl Map {
     }
 
     /// Lanes of a road, in cross-section order.
+    /// Where the middle of `lane` is at `station`, metres to the left of its road's
+    /// reference line: the road's lane offset, the widths of the lanes between it
+    /// and the cross-section's origin, and half its own. `None` for a lane the map
+    /// does not hold.
+    ///
+    /// Read off the widths rather than off the lane's centreline, so that it is
+    /// exact at any station and costs no search along a curve.
+    pub fn lane_centre_offset(&self, lane: &LaneId, station: f64) -> Option<f64> {
+        let lane = self.lanes.get(lane)?;
+        let road = self.roads.get(&lane.road)?;
+        let inner: f64 = self
+            .lanes_of_section(&lane.road, lane.section)
+            .into_iter()
+            .filter(|other| other.side == lane.side && other.ordinal < lane.ordinal)
+            .map(|other| other.width_at(station))
+            .sum();
+        let sign = match lane.side {
+            LateralSide::Left => 1.0,
+            LateralSide::Right => -1.0,
+        };
+        Some(road.lane_offset.evaluate(station) + sign * (inner + lane.width_at(station) / 2.0))
+    }
+
     pub fn lanes_of(&self, road: &RoadId) -> Vec<&Lane> {
         self.roads
             .get(road)

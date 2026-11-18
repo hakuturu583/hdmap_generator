@@ -283,6 +283,7 @@ carry identifiers, not state: there is one model of the map and it is in Rust.
 | `sumo_warnings()` | what a SUMO export would lose |
 | `mgrs_grid()` | the grid square an MGRS map is reported in |
 | `add_surface_feature(road, kind, station, length, offset=, width=, depth=, height=, ...)` | a rut, pothole, puddle, bump or roughness on a road's surface; see [What a wheel meets](#what-a-wheel-meets-ruts-potholes-puddles-humps) |
+| `add_rut_along(lane, path, depth=, track=, trough=)` | ruts along `[(station, offset from the lane's middle), ...]`, free to leave the lane |
 | `surface_features()` / `surface_displacement(road, station, offset)` | what is on the surface, and how far it stands off the design |
 | `export_opendrive(path)` / `export_lanelet2(path)` / `export_osm(path)` | write the files |
 | `export_opendrive(path, crg=True, crg_increment=0.05)` | OpenDRIVE with an ASAM OpenCRG file beside it for every road with surface features |
@@ -506,6 +507,21 @@ m.add_surface_feature(road, "roughness", station=100.0, length=15.0, width=7.0,
                       roughness_class="C", seed=9)             # ISO 8608 class A–H
 m.export_opendrive("map.xodr", crg=True)                       # + main.elevation.crg, …
 ```
+
+A rut need not run straight down the road. `add_rut_along` wears one along a path
+in its lane's own coordinates — `(station, offset from the lane's middle)` knots,
+joined by a monotone cubic (PCHIP) so it passes every knot, never overshoots one
+and stays level between two of one offset — and the path may leave the lane:
+
+```python
+m.add_rut_along(road.lane(1), [(150, 0.0), (180, 1.8), (205, -2.0), (225, -3.6), (260, 0.5)],
+                depth=0.15, track=5.5, trough=1.5)   # a haul truck wandering into the other lane
+```
+
+The path is stated against the lane, so it stays put when the lanes beside it
+change width; its footprint is fitted to it when the map is built, and the troughs
+keep `track` and `trough` across the path, so on a slant they stand wider apart
+across the road.
 
 Each kind is stated in the terms of the standard that measures it. A rut's
 `depth` is ASTM E1703's — the deepest point of each trough below a straightedge

@@ -54,6 +54,7 @@ fn rough_road() -> (ValidatedMap, RoadId) {
                 depth: 0.03,
                 track: 1.8,
                 trough: 0.6,
+                path: None,
             },
         )
         .unwrap();

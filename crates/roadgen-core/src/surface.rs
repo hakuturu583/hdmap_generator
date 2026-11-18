@@ -63,7 +63,7 @@
 
 use std::f64::consts::PI;
 
-use crate::id::{RoadId, SurfaceFeatureId};
+use crate::id::{LaneId, RoadId, SurfaceFeatureId};
 
 /// A departure of one road's surface from its design, over a footprint in the
 /// road's own coordinates. See the [module documentation](self).
@@ -89,9 +89,22 @@ pub struct SurfaceFeature {
 pub enum SurfaceFeatureKind {
     /// Wheel-path rutting: two troughs, `track` apart centre to centre, each
     /// `trough` wide and `depth` deep at its deepest, running the footprint's
-    /// length and easing in and out over its first and last few metres. The
-    /// footprint is as wide as the two troughs together, `track + trough`.
-    Rut { depth: f64, track: f64, trough: f64 },
+    /// length and easing in and out over its first and last few metres.
+    ///
+    /// With no `path`, the troughs run straight along the road down the middle of
+    /// the footprint, which is as wide as the two of them, `track + trough`. With
+    /// one, they follow it: a line in a lane's own coordinates that may wander
+    /// across the lane and out of it — a truck cutting the inside of a bend, a
+    /// lane change worn into the surface — and the footprint is whatever bounds
+    /// it, which the builder works out once the lane exists. Where the path runs
+    /// at an angle to the road, the troughs keep `track` and `trough` across the
+    /// *path*, so they stand wider apart across the road.
+    Rut {
+        depth: f64,
+        track: f64,
+        trough: f64,
+        path: Option<LanePath>,
+    },
     /// A hole where the pavement has broken out: an irregular bowl inside the
     /// footprint's ellipse, steep-sided and flat-bottomed, `depth` deep. `seed`
     /// decides the irregularity of its rim, so that two potholes of one size do not
@@ -111,6 +124,172 @@ pub enum SurfaceFeatureKind {
     /// Unevenness over the whole footprint, synthesised so that its longitudinal
     /// profile has ISO 8608's spectrum for `class`, reproducibly from `seed`.
     Roughness { class: RoughnessClass, seed: u64 },
+}
+
+/// A line along a lane, in the lane's own coordinates: knots of station along
+/// the road and offset from the lane's middle, metres to the left, joined by a
+/// monotone cubic Hermite curve (PCHIP) — through every knot, smooth, never past
+/// one, level between two knots of one offset, and straight between two knots
+/// alone.
+///
+/// Stated against the lane rather than the road so that it stays where it was put
+/// when the lanes beside it change width, and so that "a metre in from the lane's
+/// edge" is a number a caller can write without laying the road out first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanePath {
+    pub lane: LaneId,
+    knots: Vec<(f64, f64)>,
+}
+
+impl LanePath {
+    /// Fails unless there are at least two knots, every number is finite and the
+    /// stations strictly ascend.
+    pub fn new(lane: LaneId, knots: Vec<(f64, f64)>) -> Result<LanePath, String> {
+        if knots.len() < 2 {
+            return Err(format!(
+                "a path needs two knots at least, and has {}",
+                knots.len()
+            ));
+        }
+        for pair in knots.windows(2) {
+            if pair[1].0 <= pair[0].0 {
+                return Err(format!(
+                    "a path's stations must ascend, and {} follows {}",
+                    pair[1].0, pair[0].0
+                ));
+            }
+        }
+        if let Some(bad) = knots
+            .iter()
+            .find(|(s, t)| !(s.is_finite() && t.is_finite()))
+        {
+            return Err(format!("a path has a knot at {bad:?}"));
+        }
+        Ok(LanePath { lane, knots })
+    }
+
+    pub fn knots(&self) -> &[(f64, f64)] {
+        &self.knots
+    }
+
+    /// The first station and the last.
+    pub fn stations(&self) -> (f64, f64) {
+        (self.knots[0].0, self.knots[self.knots.len() - 1].0)
+    }
+
+    /// The slope the curve has at knot `i`: PCHIP's (Fritsch and Butland's
+    /// weighted harmonic mean of the chords either side, and level where the
+    /// path turns back or stops drifting), so that a stretch between two knots
+    /// of one offset stays at it, and the curve never overshoots a knot.
+    fn tangent(&self, i: usize) -> f64 {
+        let k = &self.knots;
+        let chord = |j: usize| (k[j + 1].1 - k[j].1) / (k[j + 1].0 - k[j].0);
+        let width = |j: usize| k[j + 1].0 - k[j].0;
+        if i == 0 {
+            return chord(0);
+        }
+        if i == k.len() - 1 {
+            return chord(i - 1);
+        }
+        let (before, after) = (chord(i - 1), chord(i));
+        if before * after <= 0.0 {
+            return 0.0;
+        }
+        let (h0, h1) = (width(i - 1), width(i));
+        let (w0, w1) = (2.0 * h1 + h0, h1 + 2.0 * h0);
+        (w0 + w1) / (w0 / before + w1 / after)
+    }
+
+    /// The offset from the lane's middle at `station`, and its rate of change
+    /// along the road; held level past either end.
+    pub fn offset_at(&self, station: f64) -> (f64, f64) {
+        let k = &self.knots;
+        let (first, last) = self.stations();
+        if station <= first {
+            return (k[0].1, 0.0);
+        }
+        if station >= last {
+            return (k[k.len() - 1].1, 0.0);
+        }
+        let i = k
+            .partition_point(|knot| knot.0 <= station)
+            .saturating_sub(1);
+        let (s0, y0) = k[i];
+        let (s1, y1) = k[i + 1];
+        let h = s1 - s0;
+        let (m0, m1) = (self.tangent(i) * h, self.tangent(i + 1) * h);
+        let x = (station - s0) / h;
+        let (x2, x3) = (x * x, x * x * x);
+        let value = (2.0 * x3 - 3.0 * x2 + 1.0) * y0
+            + (x3 - 2.0 * x2 + x) * m0
+            + (-2.0 * x3 + 3.0 * x2) * y1
+            + (x3 - x2) * m1;
+        let slope = ((6.0 * x2 - 6.0 * x) * y0
+            + (3.0 * x2 - 4.0 * x + 1.0) * m0
+            + (-6.0 * x2 + 6.0 * x) * y1
+            + (3.0 * x2 - 2.0 * x) * m1)
+            / h;
+        (value, slope)
+    }
+}
+
+/// A path laid out on its road: where its middle is, metres to the left of the
+/// reference line, and how fast that changes, sampled along it.
+#[derive(Debug, Clone)]
+pub struct PathCentre {
+    start: f64,
+    step: f64,
+    samples: Vec<(f64, f64)>,
+}
+
+impl PathCentre {
+    /// How finely a path is laid out along its road, metres.
+    const STEP: f64 = 0.1;
+
+    /// Lays `path` out against its lane on `map`; `None` when the map has no such
+    /// lane.
+    pub fn of(map: &crate::map::Map, path: &LanePath) -> Option<PathCentre> {
+        let (first, last) = path.stations();
+        let count = (((last - first) / Self::STEP).ceil() as usize).max(1);
+        let step = (last - first) / count as f64;
+        let centre = |s: f64| -> Option<f64> {
+            Some(map.lane_centre_offset(&path.lane, s)? + path.offset_at(s).0)
+        };
+        let mut samples = Vec::with_capacity(count + 1);
+        for k in 0..=count {
+            let s = first + step * k as f64;
+            // The lane's own drift — a taper — counts as much as the path's.
+            let h = (step / 2.0).max(1e-3);
+            let slope = (centre(s + h)? - centre(s - h)?) / (2.0 * h);
+            samples.push((centre(s)?, slope));
+        }
+        Some(PathCentre {
+            start: first,
+            step,
+            samples,
+        })
+    }
+
+    /// The middle of the path and its slope across the road at `station`.
+    pub fn at(&self, station: f64) -> (f64, f64) {
+        let x = ((station - self.start) / self.step).clamp(0.0, (self.samples.len() - 1) as f64);
+        let i = (x.floor() as usize).min(self.samples.len().saturating_sub(2));
+        let f = x - i as f64;
+        let (a, b) = (
+            self.samples[i],
+            self.samples[(i + 1).min(self.samples.len() - 1)],
+        );
+        (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f)
+    }
+
+    /// The lateral range the path's middle sweeps, right then left, and the
+    /// steepest it runs across the road.
+    fn bounds(&self) -> (f64, f64, f64) {
+        self.samples.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY, 0.0_f64),
+            |(lo, hi, steep), &(t, k)| (lo.min(t), hi.max(t), steep.max(k.abs())),
+        )
+    }
 }
 
 /// What a raised feature is, in OpenStreetMap's `traffic_calming` words where it
@@ -310,6 +489,7 @@ impl SurfaceFeatureKind {
                 depth,
                 track,
                 trough,
+                ..
             } => vec![("depth", depth), ("track", track), ("trough", trough)],
             SurfaceFeatureKind::Pothole { depth, .. } => vec![("depth", depth)],
             SurfaceFeatureKind::Puddle { depth } => vec![("depth", depth)],
@@ -386,8 +566,85 @@ impl SurfaceFeature {
                 depth,
                 track,
                 trough,
+                path: None,
             },
         }
+    }
+
+    /// Wheel-path ruts along `path`, which wanders as it likes within and out of
+    /// its lane. The footprint is left empty: [`Self::fit_to_path`] fits it once
+    /// the lane exists, which the builder does.
+    pub fn rut_along(
+        id: SurfaceFeatureId,
+        road: RoadId,
+        path: LanePath,
+        depth: f64,
+        track: f64,
+        trough: f64,
+    ) -> SurfaceFeature {
+        let (from, to) = path.stations();
+        SurfaceFeature {
+            id,
+            road,
+            station: from,
+            length: to - from,
+            offset: 0.0,
+            width: track + trough,
+            kind: SurfaceFeatureKind::Rut {
+                depth,
+                track,
+                trough,
+                path: Some(path),
+            },
+        }
+    }
+
+    /// The path the feature follows, if it follows one.
+    pub fn path(&self) -> Option<&LanePath> {
+        match &self.kind {
+            SurfaceFeatureKind::Rut { path, .. } => path.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The footprint a rut along a path needs on `map`: from the path's first
+    /// station to its last, and across everything its troughs sweep. `None` for a
+    /// feature that follows no path, or one whose lane `map` does not hold.
+    pub fn footprint_on(&self, map: &crate::map::Map) -> Option<(f64, f64, f64, f64)> {
+        let SurfaceFeatureKind::Rut {
+            track,
+            trough,
+            path: Some(path),
+            ..
+        } = &self.kind
+        else {
+            return None;
+        };
+        let centre = PathCentre::of(map, path)?;
+        let (lo, hi, steep) = centre.bounds();
+        let reach = (track + trough) / 2.0 * (1.0 + steep * steep).sqrt();
+        let (from, to) = path.stations();
+        Some((from, to - from, (lo + hi) / 2.0, hi - lo + 2.0 * reach))
+    }
+
+    /// Sets the footprint of a rut along a path to [`Self::footprint_on`] `map`.
+    pub fn fit_to_path(&mut self, map: &crate::map::Map) -> Result<(), String> {
+        if self.path().is_none() {
+            return Ok(());
+        }
+        let lane = self.path().map(|path| path.lane.clone());
+        let (station, length, offset, width) = self.footprint_on(map).ok_or_else(|| {
+            format!(
+                "{} follows a path along {}, which the map does not have",
+                self.id,
+                lane.map_or_else(String::new, |lane| lane.to_string())
+            )
+        })?;
+        self.station = station;
+        self.length = length;
+        self.offset = offset;
+        self.width = width;
+        Ok(())
     }
 
     /// The station range the footprint covers.
@@ -430,7 +687,23 @@ impl SurfaceFeature {
 
     /// How far the surface stands above the design at `(station, lateral)`,
     /// metres; negative below it. Zero outside the footprint.
+    ///
+    /// A rut along a path needs to know where its lane is, which only the map
+    /// does: [`Relief`] lays the path out and asks [`Self::displacement_on`].
+    /// Asked here, the path is read as if its lane's middle were the middle of
+    /// the footprint and ran straight.
     pub fn displacement(&self, station: f64, lateral: f64) -> f64 {
+        let centre = self.path().map(|path| {
+            let (offset, slope) = path.offset_at(station);
+            (self.offset + offset, slope)
+        });
+        self.displacement_on(station, lateral, centre)
+    }
+
+    /// [`Self::displacement`], with the middle of a rut's path at `station` and its
+    /// slope across the road there given, as [`PathCentre::at`] gives them. Ignored
+    /// by every other kind, and by a rut that runs straight.
+    pub fn displacement_on(&self, station: f64, lateral: f64, centre: Option<(f64, f64)>) -> f64 {
         if !self.covers(station, lateral) {
             return 0.0;
         }
@@ -441,10 +714,19 @@ impl SurfaceFeature {
                 depth,
                 track,
                 trough,
+                ..
             } => {
                 let ease = RUT_EASE.min(self.length / 4.0);
                 let ends = ease_in(along.min(self.length - along), ease);
-                let half = trough / 2.0;
+                // Across the path rather than across the road: at an angle, a
+                // trough's section along the road's lateral is wider by 1 / cos.
+                let (middle, stretch) = match centre {
+                    Some((middle, slope)) => (middle, (1.0 + slope * slope).sqrt()),
+                    None => (self.offset, 1.0),
+                };
+                let across = lateral - middle;
+                let half = trough / 2.0 * stretch;
+                let apart = track / 2.0 * stretch;
                 let profile = |centre: f64| {
                     let from = (across - centre).abs();
                     if from >= half {
@@ -453,7 +735,7 @@ impl SurfaceFeature {
                         0.5 * (1.0 + (PI * from / half).cos())
                     }
                 };
-                -depth * ends * (profile(track / 2.0) + profile(-track / 2.0)).min(1.0)
+                -depth * ends * (profile(apart) + profile(-apart)).min(1.0)
             }
             SurfaceFeatureKind::Pothole { depth, seed } => {
                 let (r, angle) = self.elliptic(along, across);
@@ -640,16 +922,36 @@ impl SplitMix64 {
 #[derive(Debug, Clone, Default)]
 pub struct Relief<'a> {
     pub features: Vec<&'a SurfaceFeature>,
+    /// Each feature's path laid out on the road, beside it; `None` for one that
+    /// follows no path.
+    paths: Vec<Option<PathCentre>>,
 }
 
 impl<'a> Relief<'a> {
     pub fn of(map: &'a crate::map::Map, road: &RoadId) -> Relief<'a> {
-        Relief {
-            features: map
-                .surface_features
-                .iter()
-                .filter(|feature| feature.road == *road)
-                .collect(),
+        let features: Vec<&SurfaceFeature> = map
+            .surface_features
+            .iter()
+            .filter(|feature| feature.road == *road)
+            .collect();
+        let paths = features
+            .iter()
+            .map(|feature| feature.path().and_then(|path| PathCentre::of(map, path)))
+            .collect();
+        Relief { features, paths }
+    }
+
+    /// One feature's displacement, its path laid out on the road.
+    fn displacement_of(&self, index: usize, station: f64, lateral: f64) -> f64 {
+        let feature = self.features[index];
+        match &self.paths[index] {
+            Some(centre) => {
+                if !feature.covers(station, lateral) {
+                    return 0.0;
+                }
+                feature.displacement_on(station, lateral, Some(centre.at(station)))
+            }
+            None => feature.displacement(station, lateral),
         }
     }
 
@@ -659,9 +961,8 @@ impl<'a> Relief<'a> {
 
     /// The sum of every feature's displacement at `(station, lateral)`.
     pub fn displacement(&self, station: f64, lateral: f64) -> f64 {
-        self.features
-            .iter()
-            .map(|feature| feature.displacement(station, lateral))
+        (0..self.features.len())
+            .map(|index| self.displacement_of(index, station, lateral))
             .sum()
     }
 
@@ -861,6 +1162,102 @@ mod tests {
         assert!(rms > 0.002 && rms < 0.03, "rms {rms}");
         assert_eq!(a.displacement(30.0, 1.75), 0.0);
         assert_eq!(a.displacement(50.0, 1.75 + 3.5), 0.0);
+    }
+
+    #[test]
+    fn a_lane_path_passes_through_its_knots_smoothly() {
+        let path = LanePath::new(
+            LaneId::new("main/0"),
+            vec![(0.0, 0.0), (10.0, 1.0), (20.0, -0.5), (30.0, 0.0)],
+        )
+        .unwrap();
+        for &(s, t) in path.knots() {
+            assert!((path.offset_at(s).0 - t).abs() < 1e-12);
+        }
+        // Continuous in value and slope either side of an inner knot.
+        let (left, right) = (path.offset_at(10.0 - 1e-6), path.offset_at(10.0 + 1e-6));
+        assert!((left.0 - right.0).abs() < 1e-5);
+        assert!((left.1 - right.1).abs() < 1e-4);
+        // Two knots are a straight line.
+        let straight = LanePath::new(LaneId::new("main/0"), vec![(0.0, 0.0), (10.0, 2.0)]).unwrap();
+        assert!((straight.offset_at(2.5).0 - 0.5).abs() < 1e-12);
+        assert!((straight.offset_at(2.5).1 - 0.2).abs() < 1e-12);
+        assert!(LanePath::new(LaneId::new("x"), vec![(0.0, 0.0)]).is_err());
+        assert!(LanePath::new(LaneId::new("x"), vec![(1.0, 0.0), (1.0, 1.0)]).is_err());
+    }
+
+    #[test]
+    fn a_rut_along_a_path_follows_it_across_the_lane_and_into_the_next() {
+        use crate::prelude::*;
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(100.0, 0.0, 0.0),
+                    vec![
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Forward),
+                        LaneSpec::new(PositiveWidth::new(3.5).unwrap(), Direction::Backward),
+                    ],
+                )
+                .unwrap()
+                .with_name("main"),
+            )
+            .unwrap();
+        // The forward lane is to the right, its middle at t = -1.75. The path
+        // starts in its middle and drifts 3.5 m left, into the other lane.
+        let id = builder
+            .add_rut_along(
+                &LaneRef::new(road.clone(), 0),
+                vec![(10.0, 0.0), (30.0, 0.0), (60.0, 3.5), (80.0, 3.5)],
+                0.04,
+                1.8,
+                0.6,
+            )
+            .unwrap();
+        let map = builder.finish().unwrap().validate().unwrap();
+        let rut = map.surface_features.get(&id).unwrap();
+        // The footprint was fitted: it spans the path and both ends of its drift.
+        let (t0, t1) = rut.laterals();
+        assert!(t0 <= -1.75 - 1.2 && t1 >= 1.75 + 1.2, "{t0}..{t1}");
+        assert_eq!(rut.stations(), (10.0, 80.0));
+        let relief = Relief::of(&map, &road);
+        // In the middle stretch, the troughs straddle the forward lane's middle;
+        // at the far end, the backward lane's.
+        assert!((relief.displacement(20.0, -1.75 + 0.9) + 0.04).abs() < 1e-6);
+        assert!(relief.displacement(20.0, -1.75).abs() < 1e-6);
+        assert!((relief.displacement(70.0, 1.75 - 0.9) + 0.04).abs() < 1e-6);
+        assert!(relief.displacement(70.0, -1.75 + 0.9).abs() < 1e-6);
+        // On the slant, the troughs stand wider apart across the road.
+        let (centre, slope) = PathCentre::of(&map, rut.path().unwrap()).unwrap().at(45.0);
+        assert!(slope > 0.05);
+        let apart = 0.9 * (1.0 + slope * slope).sqrt();
+        assert!((relief.displacement(45.0, centre + apart) + 0.04).abs() < 1e-6);
+        // A path that leaves its lane's stations does not validate.
+        let mut builder = MapBuilder::default();
+        let road = builder
+            .add_road(
+                RoadSpec::line(
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(20.0, 0.0, 0.0),
+                    vec![LaneSpec::new(
+                        PositiveWidth::new(3.5).unwrap(),
+                        Direction::Forward,
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        builder
+            .add_rut_along(
+                &LaneRef::new(road, 0),
+                vec![(5.0, 0.0), (25.0, 0.0)],
+                0.03,
+                1.8,
+                0.6,
+            )
+            .unwrap();
+        assert!(builder.finish().unwrap().validate().is_err());
     }
 
     #[test]

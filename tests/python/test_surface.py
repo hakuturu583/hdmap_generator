@@ -79,3 +79,29 @@ def test_features_survive_the_ir_document(tmp_path):
     assert back.surface_displacement("road/main", 40.4, 1.5) == m.surface_displacement(
         "road/main", 40.4, 1.5
     )
+
+
+def test_ruts_follow_a_path_out_of_their_lane(tmp_path):
+    m = roadgen.Map(name="drift")
+    road = m.add_road(
+        start=(0.0, 0.0, 0.0),
+        end=(100.0, 0.0, 0.0),
+        name="main",
+        lanes=[
+            roadgen.Lane(width=3.5, direction="forward"),
+            roadgen.Lane(width=3.5, direction="backward"),
+        ],
+    )
+    rut = m.add_rut_along(
+        road.lane(0), [(10.0, 0.0), (30.0, 0.0), (60.0, 3.5), (80.0, 3.5)], depth=0.04
+    )
+    assert rut == "surface/main/rut/0"
+    # In the forward lane (middle at t = -1.75) first, in the other one last.
+    assert abs(m.surface_displacement("main", 20.0, -1.75 + 0.9)[0] + 0.04) < 1e-6
+    assert abs(m.surface_displacement("main", 70.0, 1.75 - 0.9)[0] + 0.04) < 1e-6
+    path = tmp_path / "map.roadgen.pb"
+    m.export_proto(str(path))
+    back = roadgen.read_proto(str(path))
+    assert back.surface_displacement("main", 45.0, 0.0) == m.surface_displacement(
+        "main", 45.0, 0.0
+    )

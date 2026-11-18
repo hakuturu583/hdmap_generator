@@ -568,6 +568,50 @@ fn check_surface_features(map: &Map, issues: &mut Vec<ValidationIssue>) {
                 ));
             }
         }
+        // A rut along a path follows a lane of its own road, within the stations
+        // that lane has, and its footprint bounds where the path takes it.
+        if let Some(path) = surface.path() {
+            match map.lanes.get(&path.lane) {
+                None => {
+                    issues.push(ValidationIssue::DanglingFeatureReference {
+                        referrer: feature.clone(),
+                        feature: path.lane.to_string(),
+                    });
+                    continue;
+                }
+                Some(lane) => {
+                    let (from, to) = path.stations();
+                    let (first, last) = lane.station_range;
+                    if lane.road != surface.road {
+                        implausible(format!(
+                            "its path follows {}, which is on {} rather than {}",
+                            lane.id, lane.road, surface.road
+                        ));
+                    } else if from < first - 1e-6 || to > last + 1e-6 {
+                        implausible(format!(
+                            "its path runs from station {from:.3} to {to:.3}, and {} only from \
+                             {first:.3} to {last:.3}",
+                            lane.id
+                        ));
+                    } else if let Some((station, length, offset, width)) = surface.footprint_on(map)
+                    {
+                        let tolerance = 1e-3;
+                        let (t0, t1) = surface.laterals();
+                        if station < surface.station - tolerance
+                            || station + length > surface.station + surface.length + tolerance
+                            || offset - width / 2.0 < t0 - tolerance
+                            || offset + width / 2.0 > t1 + tolerance
+                        {
+                            implausible(
+                                "its footprint does not bound the path it follows; fit it to \
+                                 the path"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let Some(road) = map.roads.get(&surface.road) else {
             issues.push(ValidationIssue::DanglingFeatureReference {
                 referrer: feature.clone(),

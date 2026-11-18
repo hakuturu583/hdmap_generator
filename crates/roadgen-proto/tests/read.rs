@@ -316,6 +316,7 @@ fn every_kind_of_surface_feature_comes_back_as_it_went() {
             depth: 0.03,
             track: 1.8,
             trough: 0.6,
+            path: None,
         },
         SurfaceFeatureKind::Pothole {
             depth: 0.05,
@@ -342,12 +343,21 @@ fn every_kind_of_surface_feature_comes_back_as_it_went() {
             .add_surface_feature(&road, 10.0 * index as f64 + 5.0, 3.0, 0.0, 2.4, kind)
             .unwrap();
     }
+    builder
+        .add_rut_along(
+            &LaneRef::new(road.clone(), 0),
+            vec![(70.0, 0.0), (85.0, 1.2), (95.0, 3.5)],
+            0.05,
+            1.8,
+            0.6,
+        )
+        .unwrap();
     let map = builder.finish().unwrap().validate().unwrap();
     let back = roadgen_proto::from_bytes(&roadgen_proto::to_bytes(&map).unwrap())
         .unwrap()
         .validate()
         .unwrap();
-    assert_eq!(back.surface_features.len(), 6);
+    assert_eq!(back.surface_features.len(), 7);
     assert_eq!(back.as_map(), map.as_map());
 
     // A kind of bump the schema leaves unset is refused, not guessed.

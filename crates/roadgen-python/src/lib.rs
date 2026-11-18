@@ -2552,6 +2552,7 @@ impl PyMap {
                 depth: depth.unwrap_or(0.025),
                 track,
                 trough,
+                path: None,
             },
             "pothole" => SurfaceFeatureKind::Pothole {
                 depth: depth.unwrap_or(0.05),
@@ -2600,6 +2601,28 @@ impl PyMap {
         let id = self
             .builder_mut()?
             .add_surface_feature(&road, station, length, offset, width, kind)
+            .map_err(value_error)?;
+        self.invalidate();
+        Ok(id.to_string())
+    }
+
+    /// Wears ruts into `lane` along a path in the lane's own coordinates: `path`
+    /// is `[(station, offset), ...]`, the offset metres to the left of the lane's
+    /// middle, joined smoothly (a monotone cubic), and free to leave the lane —
+    /// a truck cutting a bend, a lane change worn in. The troughs are `track`
+    /// apart and `trough` wide across the path, and `depth` deep. Returns the id.
+    #[pyo3(signature = (lane, path, depth = 0.025, track = 1.8, trough = 0.6))]
+    fn add_rut_along(
+        &mut self,
+        lane: &PyLaneRef,
+        path: Vec<(f64, f64)>,
+        depth: f64,
+        track: f64,
+        trough: f64,
+    ) -> PyResult<String> {
+        let id = self
+            .builder_mut()?
+            .add_rut_along(&lane.reference, path, depth, track, trough)
             .map_err(value_error)?;
         self.invalidate();
         Ok(id.to_string())
