@@ -89,6 +89,24 @@ pub(crate) fn map(message: &v1::Map) -> Result<Map> {
         interchanges => interchange,
         surface_features => surface_feature,
     }
+    // A rut's path is laid out against its lane, which the document does not
+    // carry: it follows from the lanes, as it did when the map was built. One
+    // whose lane is missing is left as it is, for validation to refuse.
+    let laid: Vec<SurfaceFeature> = map
+        .surface_features
+        .iter()
+        .filter(|feature| feature.path().is_some())
+        .map(|feature| {
+            let mut feature = feature.clone();
+            feature.lay_out(&map);
+            feature
+        })
+        .collect();
+    for feature in laid {
+        if let Some(held) = map.surface_features.get_mut(&feature.id) {
+            *held = feature;
+        }
+    }
     Ok(map)
 }
 

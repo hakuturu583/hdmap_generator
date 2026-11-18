@@ -159,6 +159,10 @@ fn without_the_option_nothing_changes_but_the_warning() {
     assert!(check(&map)
         .iter()
         .any(|problem| problem.contains("5 surface features")));
+    // Asked for the grids, the export loses nothing, and says nothing.
+    assert!(!roadgen_opendrive::check_with(&map, &with_crg())
+        .iter()
+        .any(|problem| problem.contains("surface features")));
 }
 
 #[test]
@@ -205,7 +209,7 @@ fn the_grid_holds_the_irs_displacement_cell_for_cell() {
     };
     let documents = roadgen_opendrive::crg_documents(&map, &options).unwrap();
     let elevation = &documents[0];
-    let text = &elevation.text;
+    let text = &elevation.text(map.as_map()).unwrap();
     assert!(text.starts_with("$CT\n"));
     assert!(text.contains("#:LRFI"));
     assert!(text.contains("REFERENCE_LINE_INCREMENT = 0.100000"));
@@ -245,7 +249,8 @@ fn the_grid_holds_the_irs_displacement_cell_for_cell() {
         (friction.rows, friction.columns),
         (elevation.rows, elevation.columns)
     );
-    let values = crg::parse_values(&friction.text, friction.columns).unwrap();
+    let values =
+        crg::parse_values(&friction.text(map.as_map()).unwrap(), friction.columns).unwrap();
     let all: Vec<f64> = values.into_iter().flatten().collect();
     let max = all.iter().copied().fold(f64::MIN, f64::max);
     let min = all.iter().copied().fold(f64::MAX, f64::min);

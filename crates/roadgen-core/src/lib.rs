@@ -105,8 +105,7 @@ pub use structure::{
     Tunnel, TunnelForm, TunnelSpec, Underneath,
 };
 pub use surface::{
-    BumpKind, BumpProfile, LanePath, PathCentre, Relief, RoughnessClass, SurfaceFeature,
-    SurfaceFeatureKind,
+    BumpKind, BumpProfile, LanePath, Relief, RoughnessClass, SurfaceFeature, SurfaceFeatureKind,
 };
 pub use terrain::{Tin, TinBreakline, TinError, TinLocator, TinSurface};
 pub use topology::{

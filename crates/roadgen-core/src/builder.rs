@@ -941,12 +941,7 @@ impl MapBuilder {
         width: f64,
         kind: SurfaceFeatureKind,
     ) -> Result<SurfaceFeatureId, BuildError> {
-        let count = self
-            .surface_features
-            .iter()
-            .filter(|feature| feature.road == *road && feature.kind.as_str() == kind.as_str())
-            .count();
-        let id = SurfaceFeatureId::new(format!("{}/{}/{count}", road.local_name(), kind.as_str()));
+        let id = self.next_surface_id(road, kind.as_str());
         self.add_surface_feature_as(SurfaceFeature {
             id: id.clone(),
             road: road.clone(),
@@ -975,12 +970,7 @@ impl MapBuilder {
         self.lane_spec(lane)?;
         let path = LanePath::new(LaneId::of_road(&lane.road, lane.index), knots)
             .map_err(BuildError::SurfaceFeature)?;
-        let count = self
-            .surface_features
-            .iter()
-            .filter(|feature| feature.road == lane.road && feature.kind.as_str() == "rut")
-            .count();
-        let id = SurfaceFeatureId::new(format!("{}/rut/{count}", lane.road.local_name()));
+        let id = self.next_surface_id(&lane.road, "rut");
         self.add_surface_feature_as(SurfaceFeature::rut_along(
             id.clone(),
             lane.road.clone(),
@@ -990,6 +980,17 @@ impl MapBuilder {
             trough,
         ))?;
         Ok(id)
+    }
+
+    /// `surface/<road>/<kind>/<n>`, `n` counting the features of that kind already
+    /// on the road.
+    fn next_surface_id(&self, road: &RoadId, kind: &str) -> SurfaceFeatureId {
+        let count = self
+            .surface_features
+            .iter()
+            .filter(|feature| feature.road == *road && feature.kind.as_str() == kind)
+            .count();
+        SurfaceFeatureId::new(format!("{}/{kind}/{count}", road.local_name()))
     }
 
     /// Puts a surface feature on the map under the identifier it already has.
@@ -1178,9 +1179,8 @@ impl Generator {
         self.place_structures()?;
         self.build_interchanges()?;
         structure::derive_separations(&mut self.map);
-        for feature in &self.builder.surface_features {
+        for mut feature in std::mem::take(&mut self.builder.surface_features) {
             // A rut along a path is fitted to it now that its lane exists.
-            let mut feature = feature.clone();
             feature
                 .fit_to_path(&self.map)
                 .map_err(BuildError::SurfaceFeature)?;

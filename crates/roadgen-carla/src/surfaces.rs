@@ -44,8 +44,9 @@
 //! A road with [surface features](roadgen_core::surface) on it — ruts, potholes,
 //! puddles, humps, roughness — is not the smooth ribbon its design is. Where a
 //! feature lies, the section gets extra rungs [`SurfaceConfig::relief_cell`] apart
-//! (finer where the feature is finer), the carriageway and gutter bands there are
-//! cut across into columns as fine, and every vertex is moved off the design by
+//! (finer where the feature is finer), every band a feature reaches into — the
+//! carriageway, a gutter, the foot of a kerb — is cut across into columns as fine
+//! over the stretch it reaches, and every vertex there is moved off the design by
 //! [`Relief::displacement`] at its own `(s, t)`: the same function the OpenCRG
 //! grids are written from, so the mesh CARLA drives on and the grid a vehicle
 //! model reads describe one surface. The paint is laid on the displaced surface,
@@ -168,8 +169,12 @@ pub fn build(map: &Map, map_name: &str, config: &SurfaceConfig) -> Vec<Mesh> {
             .junction
             .as_ref()
             .and_then(|junction| centres.get(junction).copied());
+        // Once per road: every section of it reads the same features.
+        let relief = Relief::of(map, &road.id);
         for section in 0..road.sections.len() {
-            let Some(layout) = Layout::of(map, road, section, &layout_config) else {
+            let Some(layout) = Layout::of(map, road, section, &layout_config)
+                .map(|layout| layout.with_relief(relief.clone()))
+            else {
                 continue;
             };
             // Every rung of the section, with its cuts worked out once: every band,
@@ -548,17 +553,21 @@ impl<'a> Layout<'a> {
             lanes: left,
             config: *config,
             pavement: &road.pavement,
-            relief: Relief::of(map, &road.id),
+            relief: Relief::default(),
         })
+    }
+
+    /// The layout with the road's surface features on it, which displace every
+    /// band and line they reach. Without, a layout reads the surface as designed,
+    /// which is all a post or a crossing placed against it needs.
+    pub(crate) fn with_relief(self, relief: Relief<'a>) -> Layout<'a> {
+        Layout { relief, ..self }
     }
 
     /// The rungs a section needs beyond its own where surface features lie on
     /// it: every station [`Relief::stations`] asks for within the section that
     /// is not one of `within`'s already. Empty for a road with no features.
     fn relief_rungs(&self, map: &Map, road: &Road, within: &[Cross]) -> Vec<Rung> {
-        if self.relief.is_empty() || within.len() < 2 {
-            return Vec::new();
-        }
         let (first, last) = (
             within[0].rung.station,
             within[within.len() - 1].rung.station,
@@ -574,14 +583,9 @@ impl<'a> Layout<'a> {
                         .any(|cross| (cross.rung.station - station).abs() < 1e-6)
             })
             .filter_map(|station| {
-                let sample = road
-                    .reference_line
-                    .sample_at(station, map.metadata.sampling)
-                    .ok()?;
-                let frame = sample.frame().ok()?;
                 Some(Rung {
                     station,
-                    frame: frame.banked(road.superelevation.evaluate(station)),
+                    frame: road.frame_at(station, map.metadata.sampling).ok()?,
                 })
             })
             .collect()
@@ -949,50 +953,19 @@ impl<'a> Layout<'a> {
         ordinals: &mut Ordinals,
         out: &mut Vec<Mesh>,
     ) {
-        if matches!(role, Role::Road | Role::Gutter) {
-            let first = rungs.first().map_or(0.0, |cross| cross.rung.station);
-            let last = rungs.last().map_or(0.0, |cross| cross.rung.station);
-            let (mut right_most, mut left_most) = (f64::INFINITY, f64::NEG_INFINITY);
-            for cross in rungs {
-                let (a, b) = (left(&cross.cuts), right(&cross.cuts));
-                left_most = left_most.max(a.max(b));
-                right_most = right_most.min(a.min(b));
-            }
-            if self
-                .relief
-                .touches_area((first, last), (right_most, left_most))
-            {
-                let step = self
-                    .relief
-                    .lateral_step(first, last, self.config.relief_cell);
-                let columns = (((left_most - right_most) / step).ceil() as usize).max(1);
-                let grid: Vec<Vec<Point3>> = rungs
-                    .iter()
-                    .map(|cross| {
-                        let station = cross.rung.station;
-                        let (from, to) = (left(&cross.cuts), right(&cross.cuts));
-                        let (rise_from, rise_to) = (left_rise(station), right_rise(station));
-                        (0..=columns)
-                            .map(|k| {
-                                let share = k as f64 / columns as f64;
-                                let lateral = from + (to - from) * share;
-                                let rise = rise_from + (rise_to - rise_from) * share;
-                                cross
-                                    .rung
-                                    .at(lateral, rise + self.relief.displacement(station, lateral))
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let mut mesh = Mesh::new(
-                    mesh_name(map_name, role, ordinals.take(role)),
-                    role,
-                    material,
-                );
-                mesh.grid(&grid, 0);
-                out.push(mesh);
-                return;
-            }
+        if let Some(mesh) = self.relief_band(
+            rungs,
+            &left,
+            &right,
+            &left_rise,
+            &right_rise,
+            role,
+            material,
+            map_name,
+            ordinals,
+        ) {
+            out.push(mesh);
+            return;
         }
         let mut left_rail = Vec::with_capacity(rungs.len());
         let mut right_rail = Vec::with_capacity(rungs.len());
@@ -1008,6 +981,102 @@ impl<'a> Layout<'a> {
         );
         mesh.strip(&left_rail, &right_rail, 0);
         out.push(mesh);
+    }
+
+    /// [`Self::band`] where a surface feature reaches into it: cut across into
+    /// columns as fine as the features ask, and every vertex displaced, over the
+    /// stretches between rungs a feature's footprint reaches into; a strip, as
+    /// ever, between them. `None` when no feature reaches the band at all.
+    ///
+    /// Which bands are displaced is a matter of where the features are, not of
+    /// what the band is: a hump across the carriageway takes the gutter and the
+    /// foot of the kerb with it. Where a run of grid meets a run of strip, the
+    /// rung they share is one no feature reaches, so both lie on the design there
+    /// and meet edge to edge.
+    #[allow(clippy::too_many_arguments)]
+    fn relief_band(
+        &self,
+        rungs: &[Cross],
+        left: &impl Fn(&[f64]) -> f64,
+        right: &impl Fn(&[f64]) -> f64,
+        left_rise: &impl Fn(f64) -> f64,
+        right_rise: &impl Fn(f64) -> f64,
+        role: Role,
+        material: usize,
+        map_name: &str,
+        ordinals: &mut Ordinals,
+    ) -> Option<Mesh> {
+        if self.relief.is_empty() || rungs.len() < 2 {
+            return None;
+        }
+        let (mut right_most, mut left_most) = (f64::INFINITY, f64::NEG_INFINITY);
+        for cross in rungs {
+            let (a, b) = (left(&cross.cuts), right(&cross.cuts));
+            left_most = left_most.max(a.max(b));
+            right_most = right_most.min(a.min(b));
+        }
+        // Whether a feature reaches into the stretch after each rung.
+        let touched: Vec<bool> = rungs
+            .windows(2)
+            .map(|pair| {
+                self.relief.touches_area(
+                    (pair[0].rung.station, pair[1].rung.station),
+                    (right_most, left_most),
+                )
+            })
+            .collect();
+        if !touched.contains(&true) {
+            return None;
+        }
+        let mut mesh = Mesh::new(
+            mesh_name(map_name, role, ordinals.take(role)),
+            role,
+            material,
+        );
+        let mut along = 0.0;
+        let mut start = 0;
+        while start < touched.len() {
+            let displaced = touched[start];
+            let end = touched[start..]
+                .iter()
+                .position(|&t| t != displaced)
+                .map_or(touched.len(), |run| start + run);
+            let run = &rungs[start..=end];
+            let columns = if displaced {
+                let step = self.relief.lateral_step(
+                    run[0].rung.station,
+                    run[run.len() - 1].rung.station,
+                    self.config.relief_cell,
+                );
+                (((left_most - right_most) / step).ceil() as usize).max(1)
+            } else {
+                1
+            };
+            let rows: Vec<Vec<Point3>> = run
+                .iter()
+                .map(|cross| {
+                    let station = cross.rung.station;
+                    let (from, to) = (left(&cross.cuts), right(&cross.cuts));
+                    let (rise_from, rise_to) = (left_rise(station), right_rise(station));
+                    (0..=columns)
+                        .map(|k| {
+                            let share = k as f64 / columns as f64;
+                            let lateral = from + (to - from) * share;
+                            let rise = rise_from + (rise_to - rise_from) * share;
+                            let lift = if displaced {
+                                self.relief.displacement(station, lateral)
+                            } else {
+                                0.0
+                            };
+                            cross.rung.at(lateral, rise + lift)
+                        })
+                        .collect()
+                })
+                .collect();
+            along = mesh.grid_from(&rows, 0, along);
+            start = end;
+        }
+        Some(mesh)
     }
 
     /// The paint.
@@ -1254,24 +1323,21 @@ fn puddles(map: &Map, map_name: &str, ordinals: &mut Ordinals) -> Vec<Mesh> {
             let frame = road.frame_at(s, map.metadata.sampling).ok()?;
             Some(frame.to_global([0.0, t, -PUDDLE_FREEBOARD]))
         };
-        let Some(middle) = point(0.0, 0.0) else {
+        // The middle, then ring by ring outwards, spoke by spoke round each.
+        let Some(positions) = std::iter::once((0.0, 0.0))
+            .chain((1..=RINGS).flat_map(|ring| {
+                (0..SPOKES).map(move |spoke| {
+                    (
+                        PUDDLE_REACH * ring as f64 / RINGS as f64,
+                        2.0 * std::f64::consts::PI * spoke as f64 / SPOKES as f64,
+                    )
+                })
+            }))
+            .map(|(r, angle)| point(r, angle))
+            .collect::<Option<Vec<Point3>>>()
+        else {
             continue;
         };
-        let mut positions = vec![middle];
-        let mut ok = true;
-        for ring in 1..=RINGS {
-            let r = PUDDLE_REACH * ring as f64 / RINGS as f64;
-            for spoke in 0..SPOKES {
-                let angle = 2.0 * std::f64::consts::PI * spoke as f64 / SPOKES as f64;
-                match point(r, angle) {
-                    Some(p) => positions.push(p),
-                    None => ok = false,
-                }
-            }
-        }
-        if !ok {
-            continue;
-        }
         // Anticlockwise from above: `t` is to the left of `s`, so the angle runs
         // anticlockwise in plan.
         let index = |ring: usize, spoke: usize| (1 + (ring - 1) * SPOKES + spoke % SPOKES) as u32;

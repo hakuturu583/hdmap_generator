@@ -750,7 +750,6 @@ impl Map {
         limits
     }
 
-    /// Lanes of a road, in cross-section order.
     /// Where the middle of `lane` is at `station`, metres to the left of its road's
     /// reference line: the road's lane offset, the widths of the lanes between it
     /// and the cross-section's origin, and half its own. `None` for a lane the map
@@ -759,21 +758,30 @@ impl Map {
     /// Read off the widths rather than off the lane's centreline, so that it is
     /// exact at any station and costs no search along a curve.
     pub fn lane_centre_offset(&self, lane: &LaneId, station: f64) -> Option<f64> {
+        self.lane_centre(lane).map(|centre| centre(station))
+    }
+
+    /// [`Self::lane_centre_offset`] as a function of station, with the lane, its
+    /// road and the lanes inside it looked up once: for asking at many stations.
+    pub fn lane_centre(&self, lane: &LaneId) -> Option<impl Fn(f64) -> f64 + '_> {
         let lane = self.lanes.get(lane)?;
         let road = self.roads.get(&lane.road)?;
-        let inner: f64 = self
+        let inner: Vec<&Lane> = self
             .lanes_of_section(&lane.road, lane.section)
             .into_iter()
             .filter(|other| other.side == lane.side && other.ordinal < lane.ordinal)
-            .map(|other| other.width_at(station))
-            .sum();
+            .collect();
         let sign = match lane.side {
             LateralSide::Left => 1.0,
             LateralSide::Right => -1.0,
         };
-        Some(road.lane_offset.evaluate(station) + sign * (inner + lane.width_at(station) / 2.0))
+        Some(move |station: f64| {
+            let inner: f64 = inner.iter().map(|other| other.width_at(station)).sum();
+            road.lane_offset.evaluate(station) + sign * (inner + lane.width_at(station) / 2.0)
+        })
     }
 
+    /// Lanes of a road, in cross-section order.
     pub fn lanes_of(&self, road: &RoadId) -> Vec<&Lane> {
         self.roads
             .get(road)

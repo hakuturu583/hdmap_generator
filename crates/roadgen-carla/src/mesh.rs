@@ -146,14 +146,21 @@ impl Mesh {
     /// its middle column, `v` across each rung by the distance from its left edge,
     /// so a grid and a strip of the same road read the same.
     pub fn grid(&mut self, rows: &[Vec<Point3>], slot: usize) {
+        self.grid_from(rows, slot, 0.0);
+    }
+
+    /// [`Mesh::grid`], with `u` starting `along` metres in rather than at zero, so
+    /// that grids laid end to end read as one ribbon. Returns how far along the
+    /// grid's last rung is.
+    pub fn grid_from(&mut self, rows: &[Vec<Point3>], slot: usize, along: f64) -> f64 {
         let columns = rows.iter().map(Vec::len).min().unwrap_or(0);
         if rows.len() < 2 || columns < 2 {
-            return;
+            return along;
         }
         let base = self.positions.len() as u32;
         let scale = self.texture_scale(slot);
         let middle = columns / 2;
-        let mut along = 0.0;
+        let mut along = along;
         for (index, row) in rows.iter().enumerate() {
             if index > 0 {
                 along += rows[index - 1][middle].distance_to(row[middle]);
@@ -178,6 +185,7 @@ impl Mesh {
                 self.push_triangle([a, b, d], slot);
             }
         }
+        along
     }
 
     /// Adds one flat polygon with vertices of its own, fanned into triangles.

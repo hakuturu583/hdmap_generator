@@ -102,7 +102,10 @@ impl CrgPurpose {
     }
 }
 
-/// One OpenCRG file, and where the OpenDRIVE road refers to it.
+/// One OpenCRG file, and where the OpenDRIVE road refers to it: the grid's layout,
+/// which is all the `<CRG>` needs. Its contents are rendered on demand by
+/// [`CrgDocument::text`], so that an export that does not write the files —
+/// a document as a string, a trace — never computes a value of them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CrgDocument {
     /// The file name, with no directory: the `<CRG file>` refers to it relative to
@@ -114,17 +117,16 @@ pub struct CrgDocument {
     /// `sEnd`.
     pub s_start: f64,
     pub s_end: f64,
-    /// The lateral range the grid covers, right edge then left, metres to the left
-    /// of the reference line.
+    /// The rightmost long section, metres to the left of the reference line.
     pub v_right: f64,
-    pub v_left: f64,
-    /// The features the grid describes.
-    pub features: Vec<SurfaceFeatureId>,
+    /// Metres between cross sections and between long sections.
+    pub increment_u: f64,
+    pub increment_v: f64,
     /// How many cross sections and long sections the grid has.
     pub rows: usize,
     pub columns: usize,
-    /// The file's contents.
-    pub text: String,
+    /// The features the grid describes.
+    pub features: Vec<SurfaceFeatureId>,
 }
 
 /// Every OpenCRG file the map's surface features call for, road by road in the
@@ -144,162 +146,123 @@ pub fn documents(map: &Map, options: &CrgOptions) -> Result<Vec<CrgDocument>, Ex
         if relief.is_empty() {
             continue;
         }
-        let grid = Grid::of(road, &relief, options)?;
         let stem = unique_stem(
             &format!("{}{}", options.file_prefix, sanitize(road.id.local_name())),
             &mut names,
         );
-        let features: Vec<SurfaceFeatureId> =
-            relief.features.iter().map(|f| f.id.clone()).collect();
-        out.push(grid.document(
-            map,
-            road,
-            &relief,
-            &stem,
-            CrgPurpose::Elevation,
-            features.clone(),
-        ));
-        if options.friction && relief.features.iter().any(|f| f.holds_water()) {
-            out.push(
-                grid.document(
-                    map,
-                    road,
-                    &relief,
-                    &stem,
-                    CrgPurpose::Friction,
-                    relief
-                        .features
-                        .iter()
-                        .filter(|f| f.holds_water())
-                        .map(|f| f.id.clone())
-                        .collect(),
-                ),
-            );
-        }
+        let elevation = laid_out(road, &relief, options, &stem)?;
+        let wet: Vec<SurfaceFeatureId> = relief
+            .features
+            .iter()
+            .filter(|f| f.holds_water())
+            .map(|f| f.id.clone())
+            .collect();
+        let friction = (options.friction && !wet.is_empty()).then(|| CrgDocument {
+            file_name: format!("{stem}.{}.crg", CrgPurpose::Friction.as_str()),
+            purpose: CrgPurpose::Friction,
+            features: wet,
+            ..elevation.clone()
+        });
+        out.push(elevation);
+        out.extend(friction);
     }
     Ok(out)
 }
 
-/// The grid one road's files share.
-struct Grid {
-    s_start: f64,
-    increment_u: f64,
-    rows: usize,
-    v_right: f64,
-    increment_v: f64,
-    columns: usize,
+/// The elevation grid of one road: over every feature on it, with a margin, in
+/// whole increments.
+fn laid_out(
+    road: &Road,
+    relief: &Relief,
+    options: &CrgOptions,
+    stem: &str,
+) -> Result<CrgDocument, ExportError> {
+    let length = road.horizontal_length()?;
+    let (mut s0, mut s1, mut t0, mut t1) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for feature in &relief.features {
+        let (from, to) = feature.stations();
+        let (right, left) = feature.laterals();
+        s0 = s0.min(from);
+        s1 = s1.max(to);
+        t0 = t0.min(right);
+        t1 = t1.max(left);
+    }
+    let s0 = (s0 - options.margin).max(0.0);
+    let s1 = (s1 + options.margin).min(length);
+    let (du, dv) = (options.increment_u, options.increment_v);
+    // Whole increments, so the last cross section is where the header says the
+    // grid ends; the grid grows past the features rather than short of them, and
+    // is moved back onto the road if that takes it past an end.
+    let rows = ((s1 - s0) / du - 1e-9).ceil().max(1.0) as usize;
+    let mut start = s0;
+    if start + rows as f64 * du > length {
+        start = (length - rows as f64 * du).max(0.0);
+    }
+    let right = ((t0 - options.margin) / dv).floor() * dv;
+    let left = ((t1 + options.margin) / dv).ceil() * dv;
+    let columns = ((left - right) / dv).round().max(1.0) as usize;
+    Ok(CrgDocument {
+        file_name: format!("{stem}.{}.crg", CrgPurpose::Elevation.as_str()),
+        road: road.id.clone(),
+        purpose: CrgPurpose::Elevation,
+        s_start: start,
+        s_end: start + rows as f64 * du,
+        v_right: right,
+        increment_u: du,
+        increment_v: dv,
+        rows: rows + 1,
+        columns: columns + 1,
+        features: relief.features.iter().map(|f| f.id.clone()).collect(),
+    })
 }
 
-impl Grid {
-    fn of(road: &Road, relief: &Relief, options: &CrgOptions) -> Result<Grid, ExportError> {
-        let length = road.horizontal_length()?;
-        let (mut s0, mut s1, mut t0, mut t1) = (
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-        );
-        for feature in &relief.features {
-            let (from, to) = feature.stations();
-            let (right, left) = feature.laterals();
-            s0 = s0.min(from);
-            s1 = s1.max(to);
-            t0 = t0.min(right);
-            t1 = t1.max(left);
-        }
-        let s0 = (s0 - options.margin).max(0.0);
-        let s1 = (s1 + options.margin).min(length);
-        let (du, dv) = (options.increment_u, options.increment_v);
-        // Whole increments, so the last cross section is where the header says the
-        // grid ends; the grid grows past the features rather than short of them,
-        // and is moved back onto the road if that takes it past an end.
-        let rows = ((s1 - s0) / du - 1e-9).ceil().max(1.0) as usize;
-        let mut start = s0;
-        if start + rows as f64 * du > length {
-            start = (length - rows as f64 * du).max(0.0);
-        }
-        let right = ((t0 - options.margin) / dv).floor() * dv;
-        let left = ((t1 + options.margin) / dv).ceil() * dv;
-        let columns = ((left - right) / dv).round().max(1.0) as usize;
-        Ok(Grid {
-            s_start: start,
-            increment_u: du,
-            rows: rows + 1,
-            v_right: right,
-            increment_v: dv,
-            columns: columns + 1,
-        })
-    }
-
-    fn s_end(&self) -> f64 {
-        self.s_start + (self.rows - 1) as f64 * self.increment_u
-    }
-
-    fn v_left(&self) -> f64 {
+impl CrgDocument {
+    /// The leftmost long section, metres to the left of the reference line.
+    pub fn v_left(&self) -> f64 {
         self.v_right + (self.columns - 1) as f64 * self.increment_v
     }
 
-    fn document(
-        &self,
-        map: &Map,
-        road: &Road,
-        relief: &Relief,
-        stem: &str,
-        purpose: CrgPurpose,
-        features: Vec<SurfaceFeatureId>,
-    ) -> CrgDocument {
-        let file_name = format!("{stem}.{}.crg", purpose.as_str());
-        let value = |s: f64, t: f64| match purpose {
-            CrgPurpose::Elevation => relief.displacement(s, t),
-            CrgPurpose::Friction => {
-                let dry = road
-                    .pavement
-                    .at(s)
-                    .map_or(materials::DEFAULT_FRICTION, |p| materials::nominal(p).0);
-                dry * materials::wet_share(relief.water_depth(s, t))
-            }
-        };
-        let mut text = String::new();
-        self.header(map, road, relief, purpose, &features, &mut text);
+    /// The file's contents, from `map`, which has to be the map the document was
+    /// laid out from.
+    pub fn text(&self, map: &Map) -> Result<String, ExportError> {
+        let road = map
+            .road(&self.road)
+            .ok_or_else(|| ExportError::Unknown(self.road.to_string()))?;
+        let relief = Relief::of(map, &self.road);
+        let records_per_row = self.columns.div_ceil(VALUES_PER_RECORD);
+        let mut text =
+            String::with_capacity(4096 + self.rows * (self.columns * 10 + records_per_row));
+        self.header(map, &relief, &mut text);
         for row in 0..self.rows {
             let s = self.s_start + row as f64 * self.increment_u;
-            let values: Vec<f64> = (0..self.columns)
-                .map(|column| value(s, self.v_right + column as f64 * self.increment_v))
-                .collect();
-            for record in values.chunks(VALUES_PER_RECORD) {
-                for value in record {
-                    text.push_str(&field(*value));
+            // A friction grid's dry value is the pavement's at this station.
+            let dry = road
+                .pavement
+                .at(s)
+                .map_or_else(materials::default_friction, |p| materials::nominal(p).0);
+            for column in 0..self.columns {
+                let t = self.v_right + column as f64 * self.increment_v;
+                let value = match self.purpose {
+                    CrgPurpose::Elevation => relief.displacement(s, t),
+                    CrgPurpose::Friction => dry * materials::wet_share(relief.water_depth(s, t)),
+                };
+                field(value, &mut text);
+                if (column + 1) % VALUES_PER_RECORD == 0 || column + 1 == self.columns {
+                    text.push('\n');
                 }
-                text.push('\n');
             }
         }
-        CrgDocument {
-            file_name,
-            road: road.id.clone(),
-            purpose,
-            s_start: self.s_start,
-            s_end: self.s_end(),
-            v_right: self.v_right,
-            v_left: self.v_left(),
-            features,
-            rows: self.rows,
-            columns: self.columns,
-            text,
-        }
+        Ok(text)
     }
 
-    fn header(
-        &self,
-        map: &Map,
-        road: &Road,
-        relief: &Relief,
-        purpose: CrgPurpose,
-        features: &[SurfaceFeatureId],
-        out: &mut String,
-    ) {
-        let mut line = |text: String| {
+    fn header(&self, map: &Map, relief: &Relief, out: &mut String) {
+        let mut line = |mut text: String| {
             // A header record is at most 72 characters.
-            let mut text = text;
             if text.len() > HEADER_RECORD {
                 let mut cut = HEADER_RECORD;
                 while !text.is_char_boundary(cut) {
@@ -313,42 +276,44 @@ impl Grid {
         line("$CT".into());
         line(format!(
             "{} of {}, written by roadgen {}",
-            match purpose {
+            match self.purpose {
                 CrgPurpose::Elevation => "Surface elevation",
                 CrgPurpose::Friction => "Surface friction",
             },
-            road.id,
+            self.road,
             env!("CARGO_PKG_VERSION")
         ));
         if let Some(name) = &map.metadata.name {
             line(format!("map: {name}"));
         }
-        line(match purpose {
+        line(match self.purpose {
             CrgPurpose::Elevation => {
                 "values: metres above the road's designed surface (attached mode)".into()
             }
             CrgPurpose::Friction => "values: tyre-on-surface friction coefficient".into(),
         });
         line("u = s - sStart along the road, v = t (left positive), metres".into());
-        for id in features {
-            if let Some(feature) = relief.features.iter().find(|f| f.id == *id) {
-                line(format!(
-                    "{} {} s={:.2}+{:.2} t={:.2}+-{:.2}",
-                    feature.id,
-                    feature.kind.as_str(),
-                    feature.station,
-                    feature.length,
-                    feature.offset,
-                    feature.width / 2.0
-                ));
-            }
+        for feature in relief
+            .features
+            .iter()
+            .filter(|feature| self.features.contains(&feature.id))
+        {
+            line(format!(
+                "{} {} s={:.2}+{:.2} t={:.2}+-{:.2}",
+                feature.id,
+                feature.kind.as_str(),
+                feature.station,
+                feature.length,
+                feature.offset,
+                feature.width / 2.0
+            ));
         }
         line("$".into());
         line("$ROAD_CRG".into());
         line(format!("REFERENCE_LINE_START_U   = {:.6}", 0.0));
         line(format!(
             "REFERENCE_LINE_END_U     = {:.6}",
-            self.s_end() - self.s_start
+            self.s_end - self.s_start
         ));
         line(format!(
             "REFERENCE_LINE_INCREMENT = {:.6}",
@@ -381,20 +346,19 @@ const VALUES_PER_RECORD: usize = 8;
 const SEPARATOR: &str =
     "$$$$$$$$10$$$$$$$$20$$$$$$$$30$$$$$$$$40$$$$$$$$50$$$$$$$$60$$$$$$$$70$$$$$$$$80";
 
-/// One value, right-justified in ten characters: fixed point while it fits,
-/// scientific when it does not.
-fn field(value: f64) -> String {
-    let fixed = format!("{value:10.7}");
-    if fixed.len() <= 10 {
-        return fixed;
-    }
-    for precision in (0..7).rev() {
-        let fixed = format!("{value:10.precision$}");
-        if fixed.len() <= 10 {
-            return fixed;
+/// One value, right-justified in ten characters, onto `out`: fixed point at the
+/// most decimals that fit, scientific when even none do.
+fn field(value: f64, out: &mut String) {
+    use std::fmt::Write;
+    let mark = out.len();
+    for precision in (0..=7).rev() {
+        write!(out, "{value:10.precision$}").expect("writing to a string does not fail");
+        if out.len() - mark <= 10 {
+            return;
         }
+        out.truncate(mark);
     }
-    format!("{value:10.3e}")
+    write!(out, "{value:10.3e}").expect("writing to a string does not fail");
 }
 
 /// A road's IR name as a file name.
@@ -421,26 +385,67 @@ fn unique_stem(stem: &str, taken: &mut BTreeSet<String>) -> String {
     candidate
 }
 
-/// Rewrites every `<CRG>` the `opendrive` crate serialised into the spelling
-/// OpenDRIVE 1.7 has for a road's CRG: `mode="attached"` for the crate's only
-/// mode, `global`, and `orientation="same"`/`"opposite"` for `+`/`-`. See the
-/// [module documentation](self).
-pub(crate) fn patch_xml(xml: &str) -> String {
-    let mut out = String::with_capacity(xml.len());
-    let mut rest = xml;
-    while let Some(start) = rest.find("<CRG ") {
-        out.push_str(&rest[..start]);
-        let tail = &rest[start..];
-        let end = tail.find('>').map_or(tail.len(), |end| end + 1);
-        let element = tail[..end]
-            .replace("mode=\"global\"", "mode=\"attached\"")
-            .replace("orientation=\"+\"", "orientation=\"same\"")
-            .replace("orientation=\"-\"", "orientation=\"opposite\"");
-        out.push_str(&element);
-        rest = &tail[end..];
+/// Rewrites every `<CRG>` of a road's `<surface>` the `opendrive` crate serialised
+/// into the spelling OpenDRIVE 1.7 has for it: `mode="attached"` for the crate's
+/// only mode, `global`, and `orientation="same"`/`"opposite"` for `+`/`-`. A
+/// junction's `<CRG>`, whose only mode *is* `global`, is left alone. Every other
+/// event is copied through as it was. See the [module documentation](self).
+pub(crate) fn patch_xml(xml: &str) -> Result<String, ExportError> {
+    use quick_xml::events::{BytesStart, Event};
+    use quick_xml::{Reader, Writer};
+
+    let fail = |error: &dyn std::fmt::Display| ExportError::Serialization(error.to_string());
+    let mut reader = Reader::from_str(xml);
+    let mut writer = Writer::new(Vec::with_capacity(xml.len()));
+    // The element names enclosing the current event, outermost first.
+    let mut open: Vec<Vec<u8>> = Vec::new();
+    let patched = |element: &BytesStart<'_>| {
+        let mut fixed =
+            BytesStart::new(String::from_utf8_lossy(element.name().as_ref()).into_owned());
+        for attribute in element.attributes().flatten() {
+            let value = match (attribute.key.as_ref(), attribute.value.as_ref()) {
+                (b"mode", b"global") => Some("attached"),
+                (b"orientation", b"+") => Some("same"),
+                (b"orientation", b"-") => Some("opposite"),
+                _ => None,
+            };
+            match value {
+                Some(value) => fixed.push_attribute((
+                    String::from_utf8_lossy(attribute.key.as_ref()).as_ref(),
+                    value,
+                )),
+                None => fixed.push_attribute(attribute),
+            }
+        }
+        fixed
+    };
+    loop {
+        let event = reader.read_event().map_err(|e| fail(&e))?;
+        let on_road = open.len() >= 2
+            && open[open.len() - 1] == b"surface"
+            && open[open.len() - 2] == b"road";
+        let event = match event {
+            Event::Eof => break,
+            Event::Empty(element) if on_road && element.name().as_ref() == b"CRG" => {
+                Event::Empty(patched(&element))
+            }
+            Event::Start(element) => {
+                open.push(element.name().as_ref().to_vec());
+                if on_road && element.name().as_ref() == b"CRG" {
+                    Event::Start(patched(&element))
+                } else {
+                    Event::Start(element)
+                }
+            }
+            Event::End(element) => {
+                open.pop();
+                Event::End(element)
+            }
+            other => other,
+        };
+        writer.write_event(event).map_err(|e| fail(&e))?;
     }
-    out.push_str(rest);
-    out
+    String::from_utf8(writer.into_inner()).map_err(|e| fail(&e))
 }
 
 /// Reads the values of an OpenCRG file this module wrote, as one row per cross
@@ -478,7 +483,8 @@ mod tests {
             98_765.4,
             1e12,
         ] {
-            let text = field(value);
+            let mut text = String::new();
+            field(value, &mut text);
             assert_eq!(text.len(), 10, "{value} → {text:?}");
             let back: f64 = text.trim().parse().unwrap();
             assert!(
@@ -490,12 +496,13 @@ mod tests {
 
     #[test]
     fn the_crates_crg_attributes_are_rewritten_to_a_roads() {
-        let xml = r#"<surface><CRG file="a.crg" mode="global" orientation="+" sEnd="1" sStart="0"/></surface><object orientation="+"/>"#;
-        let patched = patch_xml(xml);
+        let xml = r#"<OpenDRIVE><road><surface><CRG file="a.crg" mode="global" orientation="+" sEnd="1" sStart="0"/></surface><object orientation="+"/></road><junction><surface><CRG file="j.crg" mode="global" orientation="+"/></surface></junction></OpenDRIVE>"#;
+        let patched = patch_xml(xml).unwrap();
         assert!(patched.contains(r#"mode="attached""#));
         assert!(patched.contains(r#"<CRG file="a.crg" mode="attached" orientation="same""#));
-        // Nothing outside a <CRG> is touched.
-        assert!(patched.ends_with(r#"<object orientation="+"/>"#));
+        // Nothing outside a road's <CRG> is touched: not an object, not a junction's.
+        assert!(patched.contains(r#"<object orientation="+"/>"#));
+        assert!(patched.contains(r#"<CRG file="j.crg" mode="global" orientation="+"/>"#));
     }
 
     #[test]

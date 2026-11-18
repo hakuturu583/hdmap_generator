@@ -117,12 +117,12 @@ fn point(value: (f64, f64, f64)) -> Point3 {
     Point3::new(value.0, value.1, value.2)
 }
 
-/// One lane of a road's cross-section.
-// `from_py_object` because a list of these is passed into `add_road`.
 /// A surface feature as Python sees it: `(id, road, kind, station, length, offset,
 /// width)`.
 type SurfaceFeatureRow = (String, String, String, f64, f64, f64, f64);
 
+/// One lane of a road's cross-section.
+// `from_py_object` because a list of these is passed into `add_road`.
 #[pyclass(name = "Lane", module = "roadgen", from_py_object)]
 #[derive(Clone)]
 pub struct PyLane {
@@ -2544,9 +2544,6 @@ impl PyMap {
                     PyValueError::new_err("a road is a Road or a road's identifier")
                 })?),
             };
-        let needs = |value: Option<f64>, name: &str| {
-            value.ok_or_else(|| PyValueError::new_err(format!("a {kind} needs a {name}")))
-        };
         let kind = match kind.to_ascii_lowercase().as_str() {
             "rut" | "ruts" | "rutting" => SurfaceFeatureKind::Rut {
                 depth: depth.unwrap_or(0.025),
@@ -2564,15 +2561,10 @@ impl PyMap {
             "bump" | "hump" => {
                 let bump = BumpKind::parse(bump)
                     .ok_or_else(|| PyValueError::new_err(format!("no such bump: {bump}")))?;
-                let profile = match profile.map(str::to_ascii_lowercase).as_deref() {
+                let profile = match profile {
                     None => bump.default_profile(),
-                    Some("circular" | "watts") => BumpProfile::Circular,
-                    Some("parabolic") => BumpProfile::Parabolic,
-                    Some("sinusoidal") => BumpProfile::Sinusoidal,
-                    Some("flat") => BumpProfile::Flat { ramp },
-                    Some(other) => {
-                        return Err(PyValueError::new_err(format!("no such profile: {other}")))
-                    }
+                    Some(name) => BumpProfile::parse(name, ramp)
+                        .ok_or_else(|| PyValueError::new_err(format!("no such profile: {name}")))?,
                 };
                 SurfaceFeatureKind::Bump {
                     kind: bump,
@@ -2596,7 +2588,9 @@ impl PyMap {
         };
         let width = match kind {
             SurfaceFeatureKind::Rut { track, trough, .. } => width.unwrap_or(track + trough),
-            _ => needs(width, "width")?,
+            _ => width.ok_or_else(|| {
+                PyValueError::new_err(format!("a {} needs a width", kind.as_str()))
+            })?,
         };
         let id = self
             .builder_mut()?

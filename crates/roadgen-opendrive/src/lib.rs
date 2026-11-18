@@ -365,7 +365,8 @@ pub fn to_xml_traced(
 
 /// Turns a validated map into OpenDRIVE XML with its [`Trace`], and the OpenCRG
 /// files its `<CRG>`s refer to — none unless [`Options::crg`] asks for them. The
-/// caller writes the files beside the document, under their own names.
+/// caller writes each file beside the document, under its own name, with the
+/// contents [`CrgDocument::text`] renders.
 pub fn to_xml_with_crg(
     map: &ValidatedMap,
     options: &Options,
@@ -377,7 +378,7 @@ pub fn to_xml_with_crg(
     let xml = if documents.is_empty() {
         xml
     } else {
-        crg::patch_xml(&xml)
+        crg::patch_xml(&xml)?
     };
     Ok((xml, trace, documents))
 }
@@ -420,7 +421,7 @@ pub fn write_with_traced(
         .unwrap_or_default();
     for document in documents {
         let file = directory.join(&document.file_name);
-        std::fs::write(&file, &document.text)
+        std::fs::write(&file, document.text(map.as_map())?)
             .map_err(|error| ExportError::Io(format!("{}: {error}", file.display())))?;
         trace.files.push(file);
     }
@@ -529,8 +530,14 @@ pub fn lane_id(map: &ValidatedMap, lane: &LaneId) -> Option<(String, i64)> {
 /// rather than in `roadgen-core`, keeps the format's rules on the format's side of
 /// the boundary.
 pub fn check(map: &ValidatedMap) -> Vec<String> {
+    check_with(map, &Options::default())
+}
+
+/// [`check`], for an export made with `options`: surface features are only lost
+/// when the export writes no OpenCRG files for them.
+pub fn check_with(map: &ValidatedMap, options: &Options) -> Vec<String> {
     let mut problems = Vec::new();
-    if !map.surface_features.is_empty() {
+    if !map.surface_features.is_empty() && options.crg.is_none() {
         problems.push(format!(
             "OpenDRIVE has no element for a rut, a pothole, a puddle, a hump or roughness, so \
              the map's {} surface features are written only as OpenCRG files beside the \
