@@ -486,6 +486,32 @@ function render() {
     ctx.arc(kx, ky, 5.5, 0, Math.PI * 2)
     ctx.fillStyle = '#ffd33d'
     ctx.fill()
+    // Where each piece ends: a knob to drag along the road to change its length.
+    const dragging = state.drag?.kind === 'length' && state.drag.road === chosen.id ? state.drag.index : null
+    for (const end of elementEnds(chosen)) {
+      const [ex, ey] = toScreen(end.point)
+      ctx.beginPath()
+      ctx.moveTo(ex, ey - 6.5)
+      ctx.lineTo(ex + 6.5, ey)
+      ctx.lineTo(ex, ey + 6.5)
+      ctx.lineTo(ex - 6.5, ey)
+      ctx.closePath()
+      ctx.fillStyle = end.index === dragging ? '#ffffff' : '#ffd33d'
+      ctx.fill()
+      ctx.strokeStyle = '#0d1117'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+      if (end.index === dragging) {
+        const element = chosen.elements[end.index]
+        const label = `#${end.index} ${element.kind === 'spiral' ? 'clothoid' : element.kind === 'line' ? 'straight' : 'arc'} ${element.length.toFixed(1)} m`
+        ctx.font = '12px system-ui, sans-serif'
+        const width = ctx.measureText(label).width
+        ctx.fillStyle = '#000000cc'
+        ctx.fillRect(ex + 10, ey - 22, width + 10, 18)
+        ctx.fillStyle = '#ffffff'
+        ctx.fillText(label, ex + 15, ey - 9)
+      }
+    }
   } else if (chosen && chosen.shape !== 'polyline' && state.point != null && chosen.points[state.point]) {
     // The selected point's tangent handle, either side of it: solid where it was
     // set, hollow where the curve works it out.
@@ -513,15 +539,8 @@ function render() {
     const ends = isAligned(road) ? [road.points[0], endPoint(road, 'end')] : road.points
     ends.forEach((point, i) => {
       const isEnd = i === 0 || i === ends.length - 1
-      if (isAligned(road) && i > 0 && selected) {
-        // An alignment's far end is where its pieces take it: shown, not held.
-        const [sx, sy] = toScreen(point)
-        ctx.beginPath()
-        ctx.arc(sx, sy, 4, 0, Math.PI * 2)
-        ctx.fillStyle = '#c9d1d9'
-        ctx.fill()
-        return
-      }
+      // A selected alignment's far end is its last piece's knob, drawn above.
+      if (isAligned(road) && i > 0 && selected) return
       if (!selected && !(isEnd && (state.tool !== 'select' || scale > 0.8))) return
       const [sx, sy] = toScreen(point)
       ctx.beginPath()
@@ -606,6 +625,39 @@ function drawElementTicks(road, line, px) {
     ctx.lineTo(x + uy * half, y - ux * half)
     ctx.stroke()
   }
+}
+
+/// Where each piece of an alignment ends on the built road: its index, the
+/// station, and the point.
+function elementEnds(road) {
+  const line = builtRoad(road.id)?.reference_line
+  if (!line) return []
+  let station = 0
+  return (road.elements ?? []).flatMap((element, index) => {
+    station += element.length
+    const at = alongLine(line, station)
+    return at ? [{ index, station, point: [at[0], at[1]] }] : []
+  })
+}
+
+/// How far along a polyline a point is, metres: the station of the nearest point
+/// on it — carried on past either end along the line's first or last segment, so
+/// that a road's end can be dragged further than the road goes.
+function stationOn(line, [x, y]) {
+  let best = null
+  let along = 0
+  for (let i = 1; i < line.length; i++) {
+    const [a, b] = [line[i - 1], line[i]]
+    const [dx, dy] = [b[0] - a[0], b[1] - a[1]]
+    const length = Math.hypot(dx, dy)
+    if (length === 0) continue
+    let t = ((x - a[0]) * dx + (y - a[1]) * dy) / (length * length)
+    if (!(i === 1 && t < 0) && !(i === line.length - 1 && t > 1)) t = Math.max(0, Math.min(1, t))
+    const d = Math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy))
+    if (!best || d < best.d) best = { d, station: along + t * length }
+    along += length
+  }
+  return best?.station ?? 0
 }
 
 /// The point `station` metres along a polyline, and the direction there.
@@ -717,8 +769,22 @@ function tangentAt(screen) {
   if (isAligned(road)) {
     const [sx, sy] = toScreen(road.points[0])
     const [ux, uy] = headingVector(road)
-    const hit = Math.hypot(sx + ux * HEADING_PX - screen[0], sy - uy * HEADING_PX - screen[1]) <= HANDLE_PX
-    return hit ? { kind: 'heading', road: road.id } : null
+    if (Math.hypot(sx + ux * HEADING_PX - screen[0], sy - uy * HEADING_PX - screen[1]) <= HANDLE_PX) {
+      return { kind: 'heading', road: road.id }
+    }
+    const end = elementEnds(road).find((end) => screenDistance(end.point, screen) <= HANDLE_PX)
+    if (!end) return null
+    const line = builtRoad(road.id).reference_line
+    return {
+      kind: 'length',
+      road: road.id,
+      index: end.index,
+      // The road as it was when the drag began: a piece that changes length can
+      // change shape before its end too — a clothoid does — so the pointer is
+      // measured along the road it grabbed, not the one it is reshaping.
+      line,
+      begins: end.station - road.elements[end.index].length,
+    }
   }
   if (road.shape === 'polyline' || state.point == null || !road.points[state.point]) return null
   const [hx, hy] = handleOf(road, state.point)
@@ -974,7 +1040,7 @@ canvas.addEventListener('pointermove', (event) => {
     moveSurface(drag, world)
     return
   }
-  if (drag?.kind === 'tangent' || drag?.kind === 'heading') {
+  if (drag?.kind === 'tangent' || drag?.kind === 'heading' || drag?.kind === 'length') {
     turnHandle(drag, world)
     return
   }
@@ -985,9 +1051,11 @@ canvas.addEventListener('pointerup', (event) => {
   const drag = state.drag
   state.drag = null
   if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
-  if (['point', 'surface', 'tangent', 'heading'].includes(drag?.kind) && drag.moved) {
+  if (['point', 'surface', 'tangent', 'heading', 'length'].includes(drag?.kind) && drag.moved) {
     checkpoint(drag.snapshot)
     changed()
+  } else if (drag) {
+    render()
   }
 })
 
@@ -1076,7 +1144,10 @@ function movePoint(drag, world, free) {
 function turnHandle(drag, world) {
   const road = findRoad(drag.road)
   if (!road) return
-  if (drag.kind === 'heading') {
+  if (drag.kind === 'length') {
+    const length = Math.round((stationOn(drag.line, world) - drag.begins) * 10) / 10
+    road.elements[drag.index].length = Math.max(0.5, length)
+  } else if (drag.kind === 'heading') {
     const start = road.points[0]
     const degrees = (Math.atan2(world[1] - start[1], world[0] - start[0]) * 180) / Math.PI
     road.heading = Math.round(degrees * 10) / 10
@@ -1435,7 +1506,7 @@ function renderAlignmentSection(tab, road) {
   const total = (road.elements ?? []).reduce((sum, e) => sum + (e.length || 0), 0)
   tab.append(
     h('h4', {}, `Alignment (${(road.elements ?? []).length} pieces, ${total.toFixed(1)} m)`),
-    h('p', { class: 'muted' }, 'From its start, at its heading, each piece where the last one ended. Radius in metres: positive turns left, negative right. A clothoid eases from the curvature before it to the radius it ends at — blank for straight. Drag the square to move the road, the yellow knob to turn it.'),
+    h('p', { class: 'muted' }, 'From its start, at its heading, each piece where the last one ended. Radius in metres: positive turns left, negative right. A clothoid eases from the curvature before it to the radius it ends at — blank for straight. Drag the square to move the road, the round knob to turn it, and a diamond along the road to change the length of the piece that ends there.'),
     ...['x', 'y', 'z'].map((axis, k) =>
       field(`start ${axis} m`, numberInput(start[k].toFixed(3), (v) => v != null && editRoad(id, (r) => (r.points[0][k] = v)))),
     ),

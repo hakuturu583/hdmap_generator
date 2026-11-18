@@ -2860,8 +2860,10 @@ A few things the document does for you:
   `polyline` for straight segments. Or set it to **`alignment`**, the way a road
   designer writes one: a start point, a heading, and a chain of straights, arcs and
   clothoids, each with its length, radius (positive left) and rise — `+ curve set`
-  adds the usual clothoid–arc–clothoid bend. Ticks on the map mark where each piece
-  gives way to the next; the square moves the road and the yellow knob turns it.
+  adds the usual clothoid–arc–clothoid bend. A diamond on the map marks where each
+  piece ends: drag it along the road to change that piece's length (the last one is
+  the road's end, and drags past it to lengthen the road). The square moves the road
+  and the round knob turns it.
   An OpenDRIVE or IR file whose roads are straights, arcs and clothoids opens as
   alignments, exactly, rather than as points sampled along them.
 - **Direct joints have no corner.** Where two smooth roads are joined directly, both

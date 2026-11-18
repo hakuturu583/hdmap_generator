@@ -169,8 +169,24 @@ try {
   check(built.valid, `the aligned road does not validate: ${JSON.stringify(built.problems)}`)
   const aligned = built.scene.roads.find((r) => r.id === 'road/north')
   check(Math.abs(aligned.length - 128) < 0.01 && aligned.end.point[0] < -20, `north's alignment ends at ${aligned.end.point}, ${aligned.length} m`)
+  // Drag the road's end, the last piece's diamond, 20 m further on.
+  const tail = aligned.reference_line.slice(-2)
+  const run = Math.hypot(tail[1][0] - tail[0][0], tail[1][1] - tail[0][1])
+  const grip = await at(aligned.end.point)
+  const pull = await at([
+    tail[1][0] + ((tail[1][0] - tail[0][0]) / run) * 20,
+    tail[1][1] + ((tail[1][1] - tail[0][1]) / run) * 20,
+  ])
+  await page.mouse.move(...grip)
+  await page.mouse.down()
+  await page.mouse.move(...pull, { steps: 8 })
+  await page.mouse.up()
+  const pieces = (await editor(() => window.roadgenEditor.document())).roads.find((r) => r.id === 'north').elements
+  check(Math.abs(pieces[3].length - 40) < 0.5 && pieces[0].length === 58, `dragging north's end gave pieces ${JSON.stringify(pieces.map((p) => p.length))}`)
+  built = await editor(() => window.roadgenEditor.built())
+  check(built.valid, `the lengthened road does not validate: ${JSON.stringify(built.problems)}`)
   await shoot('alignment')
-  for (let i = 0; i < 3; i++) await page.keyboard.press('Control+z')
+  for (let i = 0; i < 4; i++) await page.keyboard.press('Control+z')
   const restored = await editor(() => window.roadgenEditor.document())
   check(restored.roads.find((r) => r.id === 'north').shape === 'smooth' && !restored.roads.find((r) => r.id === 'east').handles?.length, 'undo did not take the handle and the alignment back')
   await page.keyboard.press('f')
