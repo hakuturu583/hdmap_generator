@@ -247,7 +247,7 @@ try {
   // The land: turned on, a hill added, generated round the roads by the real
   // generator, drawn with contours; the map still valid; then off again.
   await page.locator('.tabs button', { hasText: 'Map' }).click()
-  await page.locator('#tab-map input[type=checkbox]').check()
+  await page.getByRole('checkbox', { name: 'generate land round the roads' }).check()
   await editor(() => window.roadgenEditor.view(-60, 80, 3))
   await page.locator('#tab-map button', { hasText: '+ hill' }).click()
   await page.waitForFunction(() => (window.roadgenEditor.built().scene.terrain ?? []).length > 0, null, { timeout: 60_000 })
@@ -267,7 +267,7 @@ try {
   await page.waitForTimeout(200)
   await shoot('land')
   await page.locator('.tabs button', { hasText: 'Map' }).click()
-  await page.locator('#tab-map input[type=checkbox]').uncheck()
+  await page.getByRole('checkbox', { name: 'generate land round the roads' }).uncheck()
   built = await editor(() => window.roadgenEditor.built())
   check(!built.scene.terrain.length && built.valid, 'turning the land off did not take it away')
   await page.keyboard.press('f')
