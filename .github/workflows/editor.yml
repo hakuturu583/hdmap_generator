@@ -104,7 +104,7 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
-          EDITOR_PRINT_SCREENSHOTS=1 node smoke.mjs
+          node smoke.mjs
 
       - name: Upload the editor
         if: always()
